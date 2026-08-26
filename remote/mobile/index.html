@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#07111f">
+  <meta name="description" content="MacroRelay Studio 모바일 원격 제어">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <title>MacroRelay Remote</title>
+</head>
+<body>
+  <div class="ambient one"></div><div class="ambient two"></div>
+  <main class="shell">
+    <header>
+      <div class="mark" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div><p class="eyebrow">MACRORELAY</p><h1>Remote</h1></div>
+      <span id="connection" class="status offline">오프라인</span>
+    </header>
+
+    <section id="pair-card" class="card pair-card">
+      <p class="eyebrow">처음 한 번만 연결</p>
+      <h2>PC와 페어링</h2>
+      <p class="muted">Studio 설정의 원격 제어 탭에 표시된 6자리 코드를 입력하세요.</p>
+      <form id="pair-form">
+        <input id="pair-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="000000" aria-label="페어링 코드">
+        <button type="submit" class="primary">안전하게 연결</button>
+      </form>
+      <p id="pair-error" class="error"></p>
+    </section>
+
+    <div id="dashboard" hidden>
+      <section class="hero card">
+        <div><p class="eyebrow">연결된 PC</p><h2 id="device-name">MacroRelay PC</h2></div>
+        <button id="refresh" class="icon-btn" aria-label="새로 고침">↻</button>
+        <div class="metrics">
+          <div><span>상태</span><strong id="run-state">대기 중</strong></div>
+          <div><span>현재 단계</span><strong id="progress">—</strong></div>
+        </div>
+        <div class="now"><span class="pulse"></span><span id="running-name">실행 중인 매크로 없음</span></div>
+        <button id="stop" class="danger" disabled>실행 중지</button>
+      </section>
+
+      <section class="section-head"><div><p class="eyebrow">AUTOMATIONS</p><h2>매크로</h2></div><span id="macro-count">0개</span></section>
+      <label class="search"><span>⌕</span><input id="macro-search" placeholder="매크로 검색" autocomplete="off"></label>
+      <section id="macro-list" class="macro-list"></section>
+
+      <section class="section-head event-head"><div><p class="eyebrow">ACTIVITY</p><h2>최근 알림</h2></div></section>
+      <section id="events" class="events card"><p class="empty">아직 수신한 알림이 없습니다.</p></section>
+      <button id="disconnect" class="text-btn">이 PC 연결 해제</button>
+    </div>
+  </main>
+  <div id="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

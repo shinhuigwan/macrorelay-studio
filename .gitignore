@@ -1,0 +1,58 @@
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
+
+# Local runtimes and downloaded third-party binaries/models
+.venv/
+runtime_packages/
+models/
+tessdata/
+tessdata_best/
+
+# User-created macros, images and recorded private data
+macros/
+assets/
+exports/
+.history/
+.automation/
+.archive/
+data_tables.json
+automation_blocks.json
+macro_order.json
+macro_tags.json
+hotkeys.json
+hotkey_actions.json
+browser_profiles/
+*_profile/
+
+# Machine paths, secrets and live process state
+*_path.txt
+remote_config.json
+runtime/
+remote/*.db*
+*.pid
+*.log
+*.result*.txt
+opencv_*_result.txt
+opencv_live_check.txt
+.component-installing
+studio-launch-error.txt
+
+# Generated UI captures and design drafts
+/*.png
+branding/*
+!branding/macrorelay-studio.ico
+!branding/macrorelay-studio.png
+!branding/macrorelay-runner.ico
+!branding/macrorelay-runner.png
+!branding/macrorelay-tray.png
+!branding/live-studio-window-icon.png
+
+# Portable/export build residue
+*.zip
+*.dmg
+*.building-*

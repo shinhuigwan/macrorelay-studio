@@ -34,7 +34,23 @@ def create_app(root=None) -> tuple[QtWidgets.QApplication, MainWindow]:
     repository = MacroRepository(root)
     remote = RemoteController(repository.root)
     if remote.load().get("enabled"):
-        remote.start_agent()
+        remote.ensure_running()
+    remote_watchdog = QtCore.QTimer(app)
+    remote_watchdog.setInterval(5000)
+    remote_watchdog.timeout.connect(remote.ensure_running)
+    remote_watchdog.start()
+    # QApplication owns this timer, but retaining explicit Python references
+    # also prevents wrapper collection in long-running Studio sessions.
+    app._macrorelay_remote = remote  # type: ignore[attr-defined]
+    app._macrorelay_remote_watchdog = remote_watchdog  # type: ignore[attr-defined]
+
+    def stop_remote_runtime() -> None:
+        remote_watchdog.stop()
+        remote.stop_agent()
+        if remote.uses_local_relay():
+            remote.stop_local_relay()
+
+    app.aboutToQuit.connect(stop_remote_runtime)
     icon_path = repository.root / "branding" / "macrorelay-studio.ico"
     icon = QtGui.QIcon()
     if icon_path.exists():

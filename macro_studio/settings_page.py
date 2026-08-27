@@ -233,7 +233,7 @@ class SettingsPage(QtWidgets.QWidget):
         config_card = Card()
         form = QtWidgets.QFormLayout(config_card)
         form.setContentsMargins(20, 18, 20, 18)
-        self.remote_enabled = QtWidgets.QCheckBox("Studio 시작 시 원격 에이전트 자동 실행")
+        self.remote_enabled = QtWidgets.QCheckBox("Studio 실행 중 항상 모바일 연결 유지")
         self.remote_relay_url = QtWidgets.QLineEdit()
         self.remote_relay_url.setPlaceholderText("https://relay.example.com")
         self.remote_device_name = QtWidgets.QLineEdit()
@@ -275,7 +275,7 @@ class SettingsPage(QtWidgets.QWidget):
         outer.addWidget(status_card)
 
         note = QtWidgets.QLabel(
-            "같은 Wi-Fi에서는 ‘로컬 서버 시작’ 후 표시된 주소를 휴대폰에서 여세요. "
+            "같은 Wi-Fi에서는 원격 제어를 켜고 저장하면 로컬 서버와 에이전트가 자동으로 유지됩니다. "
             "외부 인터넷에서 사용하려면 HTTPS가 적용된 중계 서버 주소를 입력해야 합니다. 비밀 키는 화면이나 GitHub에 노출되지 않습니다."
         )
         note.setObjectName("Muted")
@@ -341,9 +341,11 @@ class SettingsPage(QtWidgets.QWidget):
             "allowed_macros": allowed,
         })
         if config.get("enabled"):
-            self.remote.start_agent()
+            self.remote.ensure_running()
         else:
             self.remote.stop_agent()
+            if self.remote.uses_local_relay(config):
+                self.remote.stop_local_relay()
         self.remote_mobile_url.setText(self.remote.mobile_url())
         self._refresh_remote_status()
         self.status.emit("모바일 원격 설정을 저장하고 즉시 적용했습니다.")

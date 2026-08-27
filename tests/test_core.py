@@ -3020,6 +3020,30 @@ class UiSmokeTests(unittest.TestCase):
 
 
 class RemoteFeatureTests(unittest.TestCase):
+    def test_remote_controller_recognizes_only_loopback_relay_as_local(self):
+        from macro_studio.remote import RemoteController
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = RemoteController(Path(directory))
+            self.assertTrue(controller.uses_local_relay({"relay_url": "http://127.0.0.1:8765"}))
+            self.assertTrue(controller.uses_local_relay({"relay_url": "http://localhost:9000"}))
+            self.assertFalse(controller.uses_local_relay({"relay_url": "https://relay.example.com"}))
+
+    def test_remote_controller_keeps_local_relay_and_agent_alive_when_enabled(self):
+        from macro_studio.remote import RemoteController
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = RemoteController(Path(directory))
+            with mock.patch.object(controller, "load", return_value={
+                "enabled": True, "relay_url": "http://127.0.0.1:9123",
+            }), mock.patch.object(controller, "start_local_relay", return_value=True) as relay, mock.patch.object(
+                controller, "start_agent", return_value=True
+            ) as agent, mock.patch.object(controller, "status", return_value={"agent_running": True}):
+                status = controller.ensure_running()
+            relay.assert_called_once_with(9123)
+            agent.assert_called_once_with()
+            self.assertTrue(status["agent_running"])
+
     def test_relay_pair_status_command_and_event_roundtrip(self):
         from remote.relay_server import create_server
         from remote_common import request_json

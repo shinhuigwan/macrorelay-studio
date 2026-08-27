@@ -55,4 +55,5 @@ branding/*
 # Portable/export build residue
 *.zip
 *.dmg
+*.apk
 *.building-*

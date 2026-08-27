@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -40,14 +42,16 @@ class RemoteController:
         if pid <= 0:
             return False
         if os.name == "nt":
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            return result.returncode == 0 and f'"{pid}"' in result.stdout
+            # Avoid launching tasklist every few seconds: a direct kernel handle
+            # check keeps the always-on watchdog effectively idle.
+            synchronize = 0x00100000
+            handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, pid)
+            if not handle:
+                return False
+            try:
+                return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 258
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
         try:
             os.kill(pid, 0)
             return True
@@ -121,6 +125,26 @@ class RemoteController:
     def stop_local_relay(self) -> bool:
         return self._stop(self.relay_pid)
 
+    def uses_local_relay(self, config: dict[str, Any] | None = None) -> bool:
+        """Return whether the configured endpoint is the relay bundled with Studio."""
+        relay_url = str((config or self.load()).get("relay_url") or "http://127.0.0.1:8765")
+        try:
+            host = (urllib.parse.urlsplit(relay_url).hostname or "").lower()
+        except ValueError:
+            return False
+        return host in {"127.0.0.1", "localhost", "::1"}
+
+    def ensure_running(self) -> dict[str, Any]:
+        """Keep remote access alive while Studio is open, independently of a macro run."""
+        config = self.load()
+        if not config.get("enabled"):
+            return self.status()
+        if self.uses_local_relay(config):
+            parsed = urllib.parse.urlsplit(str(config.get("relay_url") or "http://127.0.0.1:8765"))
+            self.start_local_relay(parsed.port or 8765)
+        self.start_agent()
+        return self.status()
+
     def status(self) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         try:
@@ -155,4 +179,3 @@ class RemoteController:
 
     def open_mobile(self) -> None:
         webbrowser.open(self.mobile_url())
-

@@ -71,6 +71,8 @@ JSON에서 `click` 매개변수는 `{"offset":[dx,dy],"button":"Left","count":1}
 
 ## 모바일 원격 제어
 
-Studio의 `설정 > 모바일 원격`에서 로컬 중계 서버와 저전력 PC 에이전트를 시작할 수 있습니다. 같은 Wi-Fi의 휴대폰 브라우저에서 표시된 주소를 열고 6자리 코드로 연결하면 매크로 조회·실행·정지 및 완료 알림을 사용할 수 있습니다.
+Studio의 `설정 > 모바일 원격`에서 원격 제어를 켜면 Studio가 실행되는 동안 로컬 중계 서버와 저전력 PC 에이전트를 자동으로 유지합니다. 매크로가 실행 중이지 않아도 같은 Wi-Fi의 휴대폰에서 연결할 수 있으며, 6자리 코드로 연결하면 매크로 조회·실행·정지 및 완료 알림을 사용할 수 있습니다.
+
+Android에서는 [최신 릴리스](https://github.com/shinhuigwan/macrorelay-studio/releases/latest)의 `MacroRelay-Remote-*.apk`를 내려받아 설치할 수 있습니다. 앱을 처음 열 때 Studio 설정 화면에 표시된 `같은 Wi-Fi 접속 주소`를 입력하세요. APK 소스는 `android/`에 있으며, 로컬에서는 `android/gradlew.bat assembleDebug`로 다시 빌드할 수 있습니다.
 
 인터넷 외부 접속, 권한 모델, 설치형 PWA와 서버 운영 방법은 [REMOTE.md](REMOTE.md)를 참고하세요. `remote_config.json`에는 기기 비밀 키가 있으므로 Git에 포함하지 마세요.

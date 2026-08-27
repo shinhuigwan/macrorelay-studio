@@ -56,4 +56,6 @@ branding/*
 *.zip
 *.dmg
 *.apk
+*.jks
+*.keystore
 *.building-*

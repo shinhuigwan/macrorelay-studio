@@ -31,7 +31,7 @@ class RemoteController:
 
     def save(self, values: dict[str, Any]) -> dict[str, Any]:
         config = self.load()
-        for key in ("enabled", "relay_url", "device_name", "allow_remote_run", "allow_remote_stop", "allowed_macros"):
+        for key in ("enabled", "relay_url", "prefer_cloud", "device_name", "allow_remote_run", "allow_remote_stop", "allowed_macros"):
             if key in values:
                 config[key] = values[key]
         save_config(config, self.root)

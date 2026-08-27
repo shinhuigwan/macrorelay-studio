@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "macrorelay-remote-shin",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-27",
+  "workers_dev": true,
+  "assets": {
+    "directory": "../mobile",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAY", "class_name": "Relay" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Relay"] }
+  ]
+}

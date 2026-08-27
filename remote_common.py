@@ -18,14 +18,27 @@ from typing import Any
 DEFAULT_RELAY_URL = "http://127.0.0.1:8765"
 
 
+def bundled_cloud_url(root: Path | None = None) -> str:
+    path = (root or Path(__file__).resolve().parent) / "remote" / "endpoint.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ""
+    value = str(payload.get("relay_url") or "").strip().rstrip("/") if isinstance(payload, dict) else ""
+    return value if value.startswith("https://") else ""
+
+
 def config_path(root: Path | None = None) -> Path:
     return (root or Path(__file__).resolve().parent) / "remote_config.json"
 
 
 def default_config() -> dict[str, Any]:
     return {
-        "enabled": False,
+        # New installations connect as soon as Studio opens. Users can still
+        # turn mobile access off explicitly in Settings.
+        "enabled": True,
         "relay_url": DEFAULT_RELAY_URL,
+        "prefer_cloud": True,
         "device_name": platform.node() or "MacroRelay PC",
         "device_id": uuid.uuid4().hex,
         "device_secret": secrets.token_urlsafe(32),
@@ -50,6 +63,12 @@ def load_config(root: Path | None = None, create: bool = True) -> dict[str, Any]
         if key not in payload:
             payload[key] = value
             changed = True
+    cloud_url = bundled_cloud_url(root)
+    configured_url = str(payload.get("relay_url") or "").rstrip("/")
+    if payload.get("prefer_cloud", True) and cloud_url and configured_url in {"", DEFAULT_RELAY_URL}:
+        payload["relay_url"] = cloud_url
+        payload["enabled"] = True
+        changed = True
     if create and (changed or not path.exists()):
         save_config(payload, root)
     return payload

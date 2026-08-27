@@ -35,6 +35,13 @@ public final class MainActivity extends Activity {
         setTitle("MacroRelay Remote");
         buildView();
         currentUrl = getPreferences(MODE_PRIVATE).getString(SERVER_URL, "");
+        if (currentUrl.isEmpty() || isPrivateNetworkUrl(currentUrl)) {
+            String bundled = normalizeUrl(BuildConfig.DEFAULT_RELAY_URL);
+            if (bundled != null) {
+                currentUrl = bundled;
+                getPreferences(MODE_PRIVATE).edit().putString(SERVER_URL, currentUrl).apply();
+            }
+        }
         if (currentUrl.isEmpty()) {
             webView.post(() -> showServerDialog(false));
         } else {
@@ -96,13 +103,13 @@ public final class MainActivity extends Activity {
         int padding = (int) (20 * getResources().getDisplayMetrics().density);
         panel.setPadding(padding, 0, padding, 0);
         TextView guide = new TextView(this);
-        guide.setText("Studio 설정 > 모바일 원격에 표시된 ‘같은 Wi-Fi 접속 주소’를 입력하세요.");
+        guide.setText("기본 인터넷 연결이 실패한 경우에만 Studio 설정 > 모바일 원격의 연결 주소를 입력하세요.");
         guide.setTextSize(15);
         panel.addView(guide);
         EditText input = new EditText(this);
         input.setSingleLine(true);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        input.setHint("http://192.168.0.10:8765");
+        input.setHint("https://relay.example.workers.dev");
         input.setText(currentUrl);
         panel.addView(input, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -143,6 +150,27 @@ public final class MainActivity extends Activity {
             return candidate.endsWith("/") ? candidate : candidate + "/";
         } catch (IllegalArgumentException error) {
             return null;
+        }
+    }
+
+    private boolean isPrivateNetworkUrl(String value) {
+        try {
+            String host = URI.create(value).getHost();
+            if (host == null) return true;
+            host = host.toLowerCase();
+            if (host.equals("localhost") || host.equals("127.0.0.1") || host.startsWith("10.") || host.startsWith("192.168.")) {
+                return true;
+            }
+            if (host.startsWith("172.")) {
+                String[] parts = host.split("\\.");
+                if (parts.length > 1) {
+                    int second = Integer.parseInt(parts[1]);
+                    return second >= 16 && second <= 31;
+                }
+            }
+            return false;
+        } catch (Exception ignored) {
+            return true;
         }
     }
 

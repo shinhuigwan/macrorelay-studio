@@ -1,8 +1,17 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
 plugins {
     id "com.android.application"
 }
 
 def releaseKeystore = System.getenv("MACRORELAY_KEYSTORE_PATH")
+def endpointFile = rootProject.file("../remote/endpoint.json")
+def defaultRelayUrl = ""
+if (endpointFile.isFile()) {
+    def endpoint = new JsonSlurper().parse(endpointFile)
+    defaultRelayUrl = endpoint.relay_url ?: ""
+}
 
 android {
     namespace "studio.macrorelay.remote"
@@ -12,8 +21,9 @@ android {
         applicationId "studio.macrorelay.remote"
         minSdk 24
         targetSdk 35
-        versionCode 22301
-        versionName "2.23.1"
+        versionCode 22400
+        versionName "2.24.0"
+        buildConfigField "String", "DEFAULT_RELAY_URL", JsonOutput.toJson(defaultRelayUrl)
     }
 
     signingConfigs {
@@ -40,5 +50,9 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 }

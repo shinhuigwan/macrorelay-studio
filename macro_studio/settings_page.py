@@ -223,8 +223,8 @@ class SettingsPage(QtWidgets.QWidget):
         outer = QtWidgets.QVBoxLayout(page)
         outer.setSpacing(12)
         intro = QtWidgets.QLabel(
-            "휴대폰에서 매크로 상태를 확인하고 실행·정지하며 완료 알림을 받을 수 있습니다. "
-            "PC 에이전트는 외부로만 연결하며, 대기 중에는 저전력 장기 폴링으로 동작합니다."
+            "휴대폰 네트워크와 관계없이 매크로 상태를 확인하고 실행·정지하며 완료 알림을 받을 수 있습니다. "
+            "Studio가 고정 HTTPS 중계 서버에 자동 연결되며, 대기 중에는 저전력 장기 폴링으로 동작합니다."
         )
         intro.setObjectName("Muted")
         intro.setWordWrap(True)
@@ -269,20 +269,20 @@ class SettingsPage(QtWidgets.QWidget):
         grid.addWidget(self.remote_state, 0, 1)
         grid.addWidget(QtWidgets.QLabel("휴대폰 연결 코드"), 1, 0)
         grid.addWidget(self.remote_pair_code, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("같은 Wi-Fi 접속 주소"), 2, 0)
+        grid.addWidget(QtWidgets.QLabel("모바일 자동 접속 주소"), 2, 0)
         grid.addWidget(self.remote_mobile_url, 2, 1)
         grid.setColumnStretch(1, 1)
         outer.addWidget(status_card)
 
         note = QtWidgets.QLabel(
-            "같은 Wi-Fi에서는 원격 제어를 켜고 저장하면 로컬 서버와 에이전트가 자동으로 유지됩니다. "
-            "외부 인터넷에서 사용하려면 HTTPS가 적용된 중계 서버 주소를 입력해야 합니다. 비밀 키는 화면이나 GitHub에 노출되지 않습니다."
+            "기본 인터넷 중계 서버를 사용하면 주소 입력이나 같은 Wi-Fi가 필요 없습니다. "
+            "로컬 서버는 인터넷 장애 시 같은 네트워크에서 쓰는 고급 복구 옵션입니다. 비밀 키는 화면이나 GitHub에 노출되지 않습니다."
         )
         note.setObjectName("Muted")
         note.setWordWrap(True)
         outer.addWidget(note)
         actions = QtWidgets.QHBoxLayout()
-        self.remote_local_button = QtWidgets.QPushButton("로컬 서버 시작")
+        self.remote_local_button = QtWidgets.QPushButton("고급: 로컬 서버 시작")
         self.remote_local_button.clicked.connect(self._toggle_local_relay)
         self.remote_agent_button = QtWidgets.QPushButton("에이전트 시작")
         self.remote_agent_button.clicked.connect(self._toggle_remote_agent)
@@ -387,7 +387,7 @@ class SettingsPage(QtWidgets.QWidget):
         self.remote_state.setStyleSheet(f"font-weight: 700; color: {color};")
         self.remote_pair_code.setText(str(status.get("pairing_code") or "—"))
         relay_running = bool(status.get("relay_running"))
-        self.remote_local_button.setText("로컬 서버 중지" if relay_running else "로컬 서버 시작")
+        self.remote_local_button.setText("고급: 로컬 서버 중지" if relay_running else "고급: 로컬 서버 시작")
         self.remote_agent_button.setText("에이전트 중지" if running else "에이전트 시작")
         self.remote_mobile_url.setText(self.remote.mobile_url())
 

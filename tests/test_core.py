@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import base64
+import json
 from copy import deepcopy
 import ctypes
 import io
@@ -3020,6 +3021,30 @@ class UiSmokeTests(unittest.TestCase):
 
 
 class RemoteFeatureTests(unittest.TestCase):
+    def test_cloud_endpoint_migrates_loopback_config_and_enables_agent(self):
+        from remote_common import load_config, save_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "remote").mkdir()
+            (root / "remote" / "endpoint.json").write_text(
+                json.dumps({"relay_url": "https://relay.example.workers.dev"}), encoding="utf-8"
+            )
+            config = {
+                "enabled": False,
+                "relay_url": "http://127.0.0.1:8765",
+                "device_name": "Test PC",
+                "device_id": "device",
+                "device_secret": "secret",
+                "allow_remote_run": True,
+                "allow_remote_stop": True,
+                "allowed_macros": [],
+            }
+            save_config(config, root)
+            migrated = load_config(root)
+            self.assertTrue(migrated["enabled"])
+            self.assertEqual("https://relay.example.workers.dev", migrated["relay_url"])
+
     def test_remote_controller_recognizes_only_loopback_relay_as_local(self):
         from macro_studio.remote import RemoteController
 

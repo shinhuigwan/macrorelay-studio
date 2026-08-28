@@ -2704,6 +2704,33 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(repository.macro_path("delete-me").exists())
             window.close()
 
+    def test_backward_edges_route_outside_nodes_without_overlapping(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        macro = {
+            "steps": [
+                {"action": "wait", "duration": 10, "on_success": 2},
+                {"action": "wait", "duration": 20, "on_success": 1, "on_fail": 1},
+            ],
+            "graph_positions": {"1": [0, 0], "2": [360, 0]},
+        }
+        canvas.set_macro(macro)
+        app.processEvents()
+        forward = next(edge for edge in canvas.edges if edge.source == 1 and edge.kind == "success")
+        success = next(edge for edge in canvas.edges if edge.source == 2 and edge.kind == "success")
+        failure = next(edge for edge in canvas.edges if edge.source == 2 and edge.kind == "fail")
+        top = min(node.sceneBoundingRect().top() for node in canvas.nodes.values())
+        bottom = max(node.sceneBoundingRect().bottom() for node in canvas.nodes.values())
+        self.assertEqual("", forward.route_side)
+        self.assertEqual("top", success.route_side)
+        self.assertEqual("bottom", failure.route_side)
+        self.assertLess(success.path().boundingRect().top(), top - 40)
+        self.assertGreater(failure.path().boundingRect().bottom(), bottom + 40)
+        canvas.close()
+
     def test_drag_style_multi_selection_delete_and_restore_macros(self) -> None:
         from PySide6 import QtCore, QtWidgets
         from PySide6.QtTest import QTest

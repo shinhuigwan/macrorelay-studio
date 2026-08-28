@@ -491,6 +491,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self.setToolTip("선을 빈 공간으로 드래그해 즉시 끊거나, 다른 노드로 드래그해 다시 연결합니다.")
         self._drag_origin = QtCore.QPointF()
         self._dragging = False
+        self.route_side = ""
+        self.route_lane = 0
         self.update_path()
 
     def shape(self) -> QtGui.QPainterPath:
@@ -507,17 +509,45 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         start = port.mapToScene(port.rect().center())
         end = target_node.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2))
         distance = abs(end.x() - start.x())
-        bend = max(75.0, distance * 0.42)
-        lane_offset = (self.condition_index + 1) * 34.0 if self.is_condition else 0.0
-        if end.x() < start.x():
-            bend = max(110.0, distance * 0.55)
-            c1 = QtCore.QPointF(start.x() + bend, start.y() + lane_offset)
-            c2 = QtCore.QPointF(end.x() - bend, end.y() + lane_offset)
+        if self.route_side:
+            source_rect = source_node.sceneBoundingRect()
+            target_rect = target_node.sceneBoundingRect()
+            span_left = min(start.x(), end.x())
+            span_right = max(start.x(), end.x())
+            route_rects = [
+                node.sceneBoundingRect()
+                for node in self.canvas.nodes.values()
+                if node.sceneBoundingRect().right() >= span_left
+                and node.sceneBoundingRect().left() <= span_right
+            ]
+            if not route_rects:
+                route_rects = [source_rect, target_rect]
+            margin = 64.0 + self.route_lane * 38.0
+            if self.route_side == "top":
+                lane_y = min(rect.top() for rect in route_rects) - margin
+                direction = -1.0
+            else:
+                lane_y = max(rect.bottom() for rect in route_rects) + margin
+                direction = 1.0
+            corner = 18.0
+            exit_x = max(start.x() + 42.0, source_rect.right() + 42.0)
+            entry_x = min(end.x() - 42.0, target_rect.left() - 42.0)
+            near_lane_y = lane_y - direction * corner
+            path = QtGui.QPainterPath(start)
+            path.lineTo(exit_x, start.y())
+            path.lineTo(exit_x, near_lane_y)
+            path.quadTo(exit_x, lane_y, exit_x - corner, lane_y)
+            path.lineTo(entry_x + corner, lane_y)
+            path.quadTo(entry_x, lane_y, entry_x, near_lane_y)
+            path.lineTo(entry_x, end.y())
+            path.lineTo(end)
         else:
+            bend = max(75.0, distance * 0.42)
+            lane_offset = (self.condition_index + 1) * 34.0 if self.is_condition else 0.0
             c1 = QtCore.QPointF(start.x() + bend, start.y() + lane_offset)
             c2 = QtCore.QPointF(end.x() - bend, end.y() + lane_offset)
-        path = QtGui.QPainterPath(start)
-        path.cubicTo(c1, c2, end)
+            path = QtGui.QPainterPath(start)
+            path.cubicTo(c1, c2, end)
         self.setPath(path)
 
         point = path.pointAtPercent(0.55)
@@ -550,7 +580,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             if delay:
                 text += f" · {delay}ms"
         self.label.setText(text)
-        self.label.setPos(point + QtCore.QPointF(8, -17))
+        label_y = 5 if self.route_side == "bottom" else -17
+        self.label.setPos(point + QtCore.QPointF(8, label_y))
 
     def hoverEnterEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
         style = QtCore.Qt.DashLine if self.is_condition else QtCore.Qt.SolidLine
@@ -834,8 +865,7 @@ class NodeCanvas(QtWidgets.QWidget):
         }
 
     def node_moved(self) -> None:
-        for edge in self.edges:
-            edge.update_path()
+        self._route_edges()
         self._positions_timer.start()
 
     def rebuild_edges(self) -> None:
@@ -861,6 +891,49 @@ class NodeCanvas(QtWidgets.QWidget):
                         edge = EdgeItem(self, index, target, kind, condition_index, rule)
                         self.scene.addItem(edge)
                         self.edges.append(edge)
+        self._route_edges()
+
+    def _route_edges(self) -> None:
+        """Assign non-overlapping outer lanes to backward/overlapping links."""
+        candidates: dict[str, list[tuple[float, float, EdgeItem]]] = {"top": [], "bottom": []}
+        for edge in self.edges:
+            edge.route_side = ""
+            edge.route_lane = 0
+            source = self.nodes.get(edge.source)
+            target = self.nodes.get(edge.target)
+            if source is None or target is None:
+                continue
+            port = source.success_port if edge.kind == "success" else source.fail_port
+            start = port.mapToScene(port.rect().center())
+            end = target.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2))
+            if end.x() > start.x() + 80.0:
+                continue
+            side = "top" if edge.kind == "success" else "bottom"
+            candidates[side].append((min(start.x(), end.x()), max(start.x(), end.x()), edge))
+
+        for side, routed in candidates.items():
+            lanes: list[list[tuple[float, float]]] = []
+            for span_start, span_end, edge in sorted(
+                routed,
+                key=lambda item: (item[0], item[1], item[2].source, item[2].target, item[2].condition_index),
+            ):
+                lane = 0
+                while lane < len(lanes):
+                    overlaps = any(
+                        not (span_end + 36.0 < used_start or span_start > used_end + 36.0)
+                        for used_start, used_end in lanes[lane]
+                    )
+                    if not overlaps:
+                        break
+                    lane += 1
+                if lane == len(lanes):
+                    lanes.append([])
+                lanes[lane].append((span_start, span_end))
+                edge.route_side = side
+                edge.route_lane = lane
+
+        for edge in self.edges:
+            edge.update_path()
 
     def remove_edge(self, source: int, target: int, kind: str, condition_index: int = -1) -> None:
         for edge in list(self.edges):

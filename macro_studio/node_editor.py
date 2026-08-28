@@ -493,6 +493,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self._dragging = False
         self.route_side = ""
         self.route_lane = 0
+        self.target_offset_y = 0.0
         self.update_path()
 
     def shape(self) -> QtGui.QPainterPath:
@@ -507,7 +508,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             return
         port = source_node.success_port if self.kind == "success" else source_node.fail_port
         start = port.mapToScene(port.rect().center())
-        end = target_node.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2))
+        end = target_node.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + self.target_offset_y))
         distance = abs(end.x() - start.x())
         if self.route_side:
             source_rect = source_node.sceneBoundingRect()
@@ -542,7 +543,10 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             path.lineTo(entry_x, end.y())
             path.lineTo(end)
         else:
-            bend = max(75.0, distance * 0.42)
+            # Keep close, forward links inside the gap between nodes.  A large
+            # minimum bend makes their control points cross over each other and
+            # produces the small loops seen when nodes are placed close by.
+            bend = min(110.0, max(18.0, distance * 0.42))
             lane_offset = (self.condition_index + 1) * 34.0 if self.is_condition else 0.0
             c1 = QtCore.QPointF(start.x() + bend, start.y() + lane_offset)
             c2 = QtCore.QPointF(end.x() - bend, end.y() + lane_offset)
@@ -899,14 +903,44 @@ class NodeCanvas(QtWidgets.QWidget):
         for edge in self.edges:
             edge.route_side = ""
             edge.route_lane = 0
+            edge.target_offset_y = 0.0
+
+        # Fan multiple incoming links across a small part of the target's left
+        # edge.  This keeps close forward links visually separate instead of
+        # forcing every path through the exact same point.
+        incoming: dict[int, list[EdgeItem]] = {}
+        for edge in self.edges:
+            if edge.target in self.nodes and edge.source in self.nodes:
+                incoming.setdefault(edge.target, []).append(edge)
+        for target_edges in incoming.values():
+            if len(target_edges) < 2:
+                continue
+            ordered = sorted(
+                target_edges,
+                key=lambda edge: (
+                    self.nodes[edge.source].sceneBoundingRect().center().y(),
+                    edge.source,
+                    edge.kind,
+                    edge.condition_index,
+                ),
+            )
+            spacing = min(18.0, 42.0 / max(1, len(ordered) - 1))
+            center = (len(ordered) - 1) / 2.0
+            for position, edge in enumerate(ordered):
+                edge.target_offset_y = (position - center) * spacing
+
+        for edge in self.edges:
             source = self.nodes.get(edge.source)
             target = self.nodes.get(edge.target)
             if source is None or target is None:
                 continue
             port = source.success_port if edge.kind == "success" else source.fail_port
             start = port.mapToScene(port.rect().center())
-            end = target.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2))
-            if end.x() > start.x() + 80.0:
+            end = target.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + edge.target_offset_y))
+            # Any genuine horizontal gap is a normal forward connection, even
+            # when the nodes are very close.  Only backward or horizontally
+            # overlapping links need an outside lane.
+            if end.x() > start.x() + 4.0:
                 continue
             side = "top" if edge.kind == "success" else "bottom"
             candidates[side].append((min(start.x(), end.x()), max(start.x(), end.x()), edge))

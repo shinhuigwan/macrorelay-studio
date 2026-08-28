@@ -2731,6 +2731,34 @@ class UiSmokeTests(unittest.TestCase):
         self.assertGreater(failure.path().boundingRect().bottom(), bottom + 40)
         canvas.close()
 
+    def test_close_forward_edges_do_not_turn_into_outer_loops(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro(
+            {
+                "steps": [
+                    {"action": "wait", "on_success": 2},
+                    {"action": "wait", "on_success": 1},
+                    {"action": "wait", "on_success": 2},
+                ],
+                "graph_positions": {"1": [0, 0], "2": [310, 0], "3": [0, 150]},
+            }
+        )
+        app.processEvents()
+        first = next(edge for edge in canvas.edges if edge.source == 1)
+        lower = next(edge for edge in canvas.edges if edge.source == 3)
+        backward = next(edge for edge in canvas.edges if edge.source == 2)
+        self.assertEqual("", first.route_side)
+        self.assertEqual("", lower.route_side)
+        self.assertEqual("top", backward.route_side)
+        self.assertLess(first.path().boundingRect().width(), 45)
+        self.assertLess(lower.path().boundingRect().width(), 45)
+        self.assertNotEqual(first.target_offset_y, lower.target_offset_y)
+        canvas.close()
+
     def test_drag_style_multi_selection_delete_and_restore_macros(self) -> None:
         from PySide6 import QtCore, QtWidgets
         from PySide6.QtTest import QTest

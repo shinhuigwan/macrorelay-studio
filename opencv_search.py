@@ -188,6 +188,115 @@ def match_frame(
     return best, best[0]
 
 
+def adaptive_standard_match(
+    frame,
+    template,
+    mask,
+    threshold: float,
+    profile: str,
+    cv2,
+    np,
+    cache=None,
+    *,
+    crop_origin=(0, 0),
+    canvas_size=None,
+    fallback_full: bool = True,
+):
+    """Locate on a reduced frame, then verify only a small full-resolution ROI.
+
+    A failed local verification falls back to the original full-frame search,
+    so the optimization cannot turn an existing valid match into a miss.
+    """
+    cache = cache if cache is not None else {}
+    profile = profile if profile in {"fast", "balanced"} else "balanced"
+    frame_h, frame_w = frame.shape[:2]
+    cropped_h, cropped_w = template.shape[:2]
+    template_w, template_h = canvas_size or (cropped_w, cropped_h)
+    full_key = ("standard-full", profile)
+    if full_key not in cache:
+        cache[full_key] = prepare_templates(
+            template,
+            profile,
+            cv2,
+            mask,
+            crop_origin=crop_origin,
+            canvas_size=(template_w, template_h),
+        )
+    full_templates = cache[full_key]
+
+    # Small regions and tiny icons are already cheap and can lose detail when
+    # reduced, so use the established full-resolution path for them.
+    if frame_w * frame_h < 900_000 or min(template_w, template_h) < 24:
+        return match_frame(frame, full_templates, threshold, profile, cv2, np)
+
+    if min(template_w, template_h) <= 40:
+        reduction = 0.75
+    elif min(template_w, template_h) <= 80:
+        reduction = 0.50
+    else:
+        reduction = 0.40
+    base_scales = (1.0,) if profile == "fast" else (1.0, 0.95, 1.05)
+    coarse_key = ("standard-coarse", profile, reduction)
+    if coarse_key not in cache:
+        cache[coarse_key] = prepare_templates(
+            template,
+            "fast",
+            cv2,
+            mask,
+            scales=tuple(scale * reduction for scale in base_scales),
+            crop_origin=crop_origin,
+            canvas_size=(template_w, template_h),
+        )
+    reduced = cv2.resize(frame, None, fx=reduction, fy=reduction, interpolation=cv2.INTER_AREA)
+    coarse_match, coarse_score = match_frame(
+        reduced,
+        cache[coarse_key],
+        threshold,
+        "fast",
+        cv2,
+        np,
+        return_best=True,
+        stop_on_threshold=False,
+    )
+    probe_score = float(coarse_score)
+    if coarse_match is not None:
+        _confidence, location, width, height = coarse_match
+        center_x = (location[0] + width / 2.0) / reduction
+        center_y = (location[1] + height / 2.0) / reduction
+        max_scale = max(base_scales)
+        padding_x = max(56, int(template_w * max_scale * 1.45))
+        padding_y = max(56, int(template_h * max_scale * 1.45))
+        left = max(0, int(center_x - padding_x))
+        top = max(0, int(center_y - padding_y))
+        right = min(frame_w, int(center_x + padding_x + 1))
+        bottom = min(frame_h, int(center_y + padding_y + 1))
+        roi = frame[top:bottom, left:right]
+        local_match, local_score = match_frame(
+            roi,
+            full_templates,
+            threshold,
+            profile,
+            cv2,
+            np,
+            return_best=True,
+        )
+        probe_score = max(probe_score, float(local_score))
+        if local_match is not None and local_score >= threshold:
+            confidence, local_location, width, height = local_match
+            translated = (
+                confidence,
+                (local_location[0] + left, local_location[1] + top),
+                width,
+                height,
+            )
+            return translated, float(confidence)
+
+    if not fallback_full:
+        return None, probe_score
+    full_match, full_score = match_frame(frame, full_templates, threshold, profile, cv2, np)
+    return full_match, max(float(coarse_score), float(full_score))
+
+
 def adaptive_precise_match(
     frame,
     template,
@@ -428,19 +537,8 @@ def main() -> int:
 
     regions = [parse_region(text) for text in args.region]
     threshold = max(0.5, min(0.99, float(args.threshold)))
-    templates = (
-        None
-        if args.profile == "precise"
-        else prepare_templates(
-            template,
-            args.profile,
-            cv2,
-            template_mask,
-            crop_origin=crop_origin,
-            canvas_size=canvas_size,
-        )
-    )
     precise_cache = {}
+    standard_cache = {}
     deadline = time.perf_counter() + max(0, args.timeout) / 1000.0
     best_score = 0.0
     grabber = None
@@ -458,19 +556,45 @@ def main() -> int:
                 if frame is None:
                     continue
                 if args.profile == "precise":
-                    match, score = adaptive_precise_match(
+                    match, score = adaptive_standard_match(
                         frame,
                         template,
                         template_mask,
                         threshold,
+                        "fast",
                         cv2,
                         np,
-                        precise_cache,
+                        standard_cache,
+                        crop_origin=crop_origin,
+                        canvas_size=canvas_size,
+                        fallback_full=False,
+                    )
+                    if match is None:
+                        match, precise_score = adaptive_precise_match(
+                            frame,
+                            template,
+                            template_mask,
+                            threshold,
+                            cv2,
+                            np,
+                            precise_cache,
+                            crop_origin=crop_origin,
+                            canvas_size=canvas_size,
+                        )
+                        score = max(float(score), float(precise_score))
+                else:
+                    match, score = adaptive_standard_match(
+                        frame,
+                        template,
+                        template_mask,
+                        threshold,
+                        args.profile,
+                        cv2,
+                        np,
+                        standard_cache,
                         crop_origin=crop_origin,
                         canvas_size=canvas_size,
                     )
-                else:
-                    match, score = match_frame(frame, templates, threshold, args.profile, cv2, np)
                 best_score = max(best_score, float(score))
                 if match is not None:
                     confidence, location, tpl_w, tpl_h = match

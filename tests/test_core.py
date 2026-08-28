@@ -88,6 +88,59 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn('Goto, Step3', script)
         self.assertIn('edge condition: 3회 이상은 예외 처리', script)
 
+    def test_ocr_number_variable_drives_dynamic_step_repeat(self) -> None:
+        macro = {
+            "name": "ocr-repeat",
+            "steps": [
+                {
+                    "action": "ocr",
+                    "ocr_action": "extract_number",
+                    "value_regex": r"횟수\s*[:=]?\s*(\d+)",
+                    "value_group": 1,
+                    "store_var": "run_count",
+                    "on_success": 2,
+                },
+                {"action": "wait", "duration": 5, "repeat_var": "run_count"},
+            ],
+        }
+        script = self.engine.render_macro_script(macro, {})
+        self.assertIn('""value_regex"": ""횟수\\\\s*[:=]?\\\\s*(\\\\d+)""', script)
+        self.assertIn('run_count := OCR_LastNumber', script)
+        self.assertIn('__rep_limit2 := Floor(run_count + 0)', script)
+        self.assertIn('if (__rep2 < __rep_limit2)', script)
+        self.assertIn('dynamic repeat loaded: run_count=', script)
+        self.assertIn('REPEAT_VALUE_INVALID', script)
+
+    def test_ocr_regex_group_extracts_keyword_value(self) -> None:
+        from ocr_postprocess import extract_regex_value
+
+        text = "현재 횟수: 3회 / 남은 시간 20초"
+        self.assertEqual("3", extract_regex_value(text, r"횟수\s*[:=]?\s*(\d+)", 1))
+        self.assertIsNone(extract_regex_value(text, r"레벨\s*(\d+)", 1))
+        self.assertIsNone(extract_regex_value(text, "(", 1))
+
+    def test_image_search_can_repeat_on_success_until_first_failure(self) -> None:
+        macro = {
+            "name": "search-until-missing",
+            "steps": [
+                {
+                    "action": "image_search",
+                    "asset": "target",
+                    "repeat_on_success": True,
+                    "repeat_on_success_delay": 25,
+                    "on_fail": 2,
+                },
+                {"action": "wait", "duration": 10},
+            ],
+        }
+        script = self.engine.render_macro_script(macro, {"target": {"file": "target.png"}})
+        success_loop = script.index("image search success loop: step 1")
+        failure_branch = script.index('TraceStep(1, "image_search", "FAIL")')
+        self.assertLess(success_loop, failure_branch)
+        self.assertIn("Sleep, 25", script[success_loop:failure_branch])
+        self.assertIn("Goto, Step1", script[success_loop:failure_branch])
+        self.assertIn("Goto, Step2", script[failure_branch:])
+
     def test_image_search_uses_centered_single_click_and_optimized_opencv(self) -> None:
         step = {
             "action": "image_search",
@@ -669,6 +722,34 @@ class EngineBehaviorTests(unittest.TestCase):
         prepared = opencv_search.prepare_templates(template, "fast", cv2)
 
         match, score = opencv_search.match_frame(frame, prepared, 0.90, "fast", cv2, np)
+
+        self.assertIsNotNone(match)
+        self.assertGreater(score, 0.99)
+        self.assertEqual((expected_x, expected_y), match[1])
+
+    def test_opencv_adaptive_standard_match_keeps_exact_coordinates(self) -> None:
+        import opencv_search
+
+        try:
+            import cv2
+            import numpy as np
+        except Exception as exc:
+            self.skipTest(f"full OpenCV binary is unavailable in this test interpreter: {exc}")
+
+        rng = np.random.default_rng(77)
+        frame = rng.integers(0, 256, size=(1000, 1200, 3), dtype=np.uint8)
+        expected_x, expected_y = 827, 614
+        template = frame[expected_y : expected_y + 54, expected_x : expected_x + 72].copy()
+        match, score = opencv_search.adaptive_standard_match(
+            frame,
+            template,
+            None,
+            0.90,
+            "balanced",
+            cv2,
+            np,
+            {},
+        )
 
         self.assertIsNotNone(match)
         self.assertGreater(score, 0.99)
@@ -1971,9 +2052,14 @@ class UiSmokeTests(unittest.TestCase):
             self.assertFalse(builder.stop_button.isEnabled())
             self.assertIn("▤ 최근 녹화 검토", labels)
             self.assertIn("⌑ 비활성 클릭 핸들 실험실", labels)
+            self.assertIn("⑂ 선택 노드 분기 묶기", labels)
             self.assertGreater(
                 builder.inactive_handle_lab_btn.geometry().left(),
                 builder.review_recording_btn.geometry().right(),
+            )
+            self.assertGreater(
+                builder.branch_group_btn.geometry().left(),
+                builder.inactive_handle_lab_btn.geometry().right(),
             )
             self.assertIn("▶ 선택 단계 테스트", labels)
             self.assertIn("블록 저장", labels)
@@ -2279,6 +2365,9 @@ class UiSmokeTests(unittest.TestCase):
             self.assertFalse(builder.json_panel.isVisible())
             self.assertIn("duration", editor.widgets["wait"])
             self.assertIn("asset", editor.widgets["image_search"])
+            self.assertIn("value_regex", editor.widgets["ocr"])
+            self.assertIn("value_group", editor.widgets["ocr"])
+            self.assertTrue(hasattr(builder, "repeat_var_edit"))
             self.assertNotIn("target_control", editor.widgets["inactive_click"])
             self.assertNotIn("target_hwnd", editor.widgets["inactive_click"])
             inactive_method = editor.widgets["inactive_click"]["method"]
@@ -2547,16 +2636,35 @@ class UiSmokeTests(unittest.TestCase):
             builder = BuilderPage(repository)
             builder.refresh("run-save")
             builder.repeat_spin.setValue(3)
+            builder.repeat_var_edit.setText("$run_count")
             emitted: list[str] = []
             builder.run_macro.connect(emitted.append)
             builder._run_current()
             self.assertEqual(["run-save"], emitted)
             self.assertEqual(3, repository.load_macro("run-save")["steps"][0]["repeat"])
+            self.assertEqual("run_count", repository.load_macro("run-save")["steps"][0]["repeat_var"])
             builder._open_logs()
             self.assertIsNotNone(builder._log_dialog)
             self.assertIn("실행 로그", builder._log_dialog.windowTitle())
             builder._log_dialog.close()
             builder.close()
+
+    def test_smart_recording_notice_can_be_hidden_for_today(self) -> None:
+        from PySide6 import QtCore
+        from macro_studio.builder import BuilderPage
+
+        settings = QtCore.QSettings("MacroRelay", "Studio")
+        previous = settings.value("smart_recording/hide_notice_date", "")
+        try:
+            settings.setValue(
+                "smart_recording/hide_notice_date",
+                QtCore.QDate.currentDate().toString(QtCore.Qt.ISODate),
+            )
+            self.assertTrue(BuilderPage._recording_notice_hidden_today())
+            settings.setValue("smart_recording/hide_notice_date", "2000-01-01")
+            self.assertFalse(BuilderPage._recording_notice_hidden_today())
+        finally:
+            settings.setValue("smart_recording/hide_notice_date", previous)
 
     def test_run_current_blocks_missing_image_asset(self) -> None:
         from PySide6 import QtWidgets
@@ -2705,7 +2813,7 @@ class UiSmokeTests(unittest.TestCase):
             window.close()
 
     def test_backward_edges_route_outside_nodes_without_overlapping(self) -> None:
-        from PySide6 import QtWidgets
+        from PySide6 import QtCore, QtWidgets
         from macro_studio.node_editor import NodeCanvas
 
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -2729,6 +2837,46 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual("bottom", failure.route_side)
         self.assertLess(success.path().boundingRect().top(), top - 40)
         self.assertGreater(failure.path().boundingRect().bottom(), bottom + 40)
+        target_top = canvas.nodes[1].mapToScene(QtCore.QPointF(0, 0)).y()
+        target_bottom = canvas.nodes[1].mapToScene(QtCore.QPointF(0, canvas.nodes[1].HEIGHT)).y()
+        self.assertAlmostEqual(target_top, success.path().pointAtPercent(1).y(), delta=1.0)
+        self.assertAlmostEqual(target_bottom, failure.path().pointAtPercent(1).y(), delta=1.0)
+        canvas.close()
+
+    def test_long_forward_edge_avoids_intermediate_node_and_graph_layout_keeps_chain_short(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro(
+            {
+                "steps": [
+                    {"action": "wait", "on_success": 3},
+                    {"action": "wait"},
+                    {"action": "wait"},
+                ],
+                "graph_positions": {"1": [0, 0], "2": [350, 0], "3": [700, 0]},
+            }
+        )
+        app.processEvents()
+        crossing = next(edge for edge in canvas.edges if edge.source == 1 and edge.target == 3)
+        self.assertEqual("top", crossing.route_side)
+        self.assertLess(crossing.path().boundingRect().top(), canvas.nodes[2].sceneBoundingRect().top() - 40)
+
+        canvas.set_macro(
+            {
+                "steps": [
+                    {"action": "wait", "on_success": 2},
+                    {"action": "wait", "on_success": 3},
+                    {"action": "wait"},
+                ]
+            }
+        )
+        positions = canvas.positions()
+        self.assertLess(positions["1"][0], positions["2"][0])
+        self.assertLess(positions["2"][0], positions["3"][0])
+        self.assertTrue(all(edge.route_side == "" for edge in canvas.edges))
         canvas.close()
 
     def test_close_forward_edges_do_not_turn_into_outer_loops(self) -> None:
@@ -2880,6 +3028,40 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual((12, 8), (dialog.image.width(), dialog.image.height()))
             dialog.save()
             self.assertTrue(any((root / ".history" / "assets" / "sample").glob("*.png")))
+
+    def test_image_editor_precision_brush_and_connected_colour_cutout(self) -> None:
+        from PySide6 import QtCore, QtGui
+        from macro_studio.image_editor import ImageEditorDialog
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "precision.png"
+            image = QtGui.QImage(24, 24, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#336699"))
+            painter = QtGui.QPainter(image)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#EE3355"), 2))
+            painter.setBrush(QtGui.QColor("#336699"))
+            painter.drawRect(7, 7, 10, 10)
+            painter.end()
+            self.assertTrue(image.save(str(path)))
+
+            dialog = ImageEditorDialog(path, "precision", root / ".history")
+            dialog.picked_point = QtCore.QPoint(0, 0)
+            dialog.picked_color = QtGui.QColor("#336699")
+            dialog.tolerance.setValue(0)
+            dialog.remove_connected_color()
+            self.assertEqual(0, dialog.image.pixelColor(0, 0).alpha())
+            self.assertEqual(255, dialog.image.pixelColor(12, 12).alpha())
+
+            dialog.eraser.setChecked(True)
+            dialog.eraser_size.setValue(3)
+            dialog.brush_point = QtCore.QPoint(12, 12)
+            dialog._stamp_brush()
+            self.assertEqual(0, dialog.image.pixelColor(12, 12).alpha())
+            key = QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Right, QtCore.Qt.NoModifier)
+            dialog.keyPressEvent(key)
+            self.assertEqual(QtCore.QPoint(13, 12), dialog.brush_point)
+            dialog.close()
 
     def test_builder_export_button_opens_export_page_with_current_macro(self) -> None:
         from PySide6 import QtWidgets

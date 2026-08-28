@@ -271,6 +271,8 @@ def handle_ocr(state: EngineState, req: dict) -> dict:
     ocr_action = req.get("ocr_action", "extract")
     number_condition = req.get("number_condition", "")
     number_value = float(req.get("number_value", 0) or 0)
+    value_regex = str(req.get("value_regex", "") or "")
+    value_group = max(0, int(req.get("value_group", 1) or 0))
     minimum_confidence = max(0.0, min(float(req.get("minimum_confidence", 0) or 0), 1.0))
     position_priority = str(req.get("position_priority", "top_left") or "top_left")
 
@@ -502,6 +504,24 @@ def handle_ocr(state: EngineState, req: dict) -> dict:
             "profile": final.profile,
             "elapsed_ms": round(elapsed, 2),
         }
+
+        if value_regex:
+            extracted_value = _postprocess_mod.extract_regex_value(
+                final.normalized_text or final.text,
+                value_regex,
+                value_group,
+            ) if _postprocess_mod else None
+            response["extract_matched"] = extracted_value is not None
+            if extracted_value is None:
+                response["success"] = False
+            else:
+                response["extracted_value"] = extracted_value
+                if is_number and _postprocess_mod:
+                    extracted_number = _postprocess_mod.extract_number(extracted_value)
+                    if extracted_number is None:
+                        response["success"] = False
+                    else:
+                        final.extracted_number = extracted_number
 
         if final.match_found:
             response["match_found"] = True

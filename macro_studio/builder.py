@@ -453,6 +453,13 @@ class BuilderPage(QtWidgets.QWidget):
             "대상 프로그램의 핸들을 시험하고 저장합니다. 이후 같은 프로그램의 스마트 녹화 클릭에 자동 적용됩니다."
         )
         self.inactive_handle_lab_btn.clicked.connect(self._open_inactive_handle_lab)
+        self.branch_group_btn = QtWidgets.QPushButton("⑂ 선택 노드 분기 묶기")
+        self.branch_group_btn.setToolTip(
+            "여러 이미지 서치 노드를 선택한 순서대로 검사합니다. 성공한 노드의 흐름만 실행하고, 미탐지 시 다음 후보로 이동합니다."
+        )
+        self.branch_group_btn.clicked.connect(
+            lambda: self._configure_start_search_candidates(self.node_canvas.selected_indexes())
+        )
         self.action_combo = QtWidgets.QComboBox()
         self._populate_action_combo(self.action_combo)
         self.action_combo.setMinimumWidth(145)
@@ -487,6 +494,7 @@ class BuilderPage(QtWidgets.QWidget):
         toolbar_recording.addWidget(self.record_btn)
         toolbar_recording.addWidget(self.review_recording_btn)
         toolbar_recording.addWidget(self.inactive_handle_lab_btn)
+        toolbar_recording.addWidget(self.branch_group_btn)
         toolbar_recording.addStretch(1)
         action_label = QtWidgets.QLabel("추가할 노드 액션")
         action_label.setObjectName("Muted")
@@ -677,6 +685,9 @@ class BuilderPage(QtWidgets.QWidget):
         self._populate_action_combo(self.inspector_action)
         self.label_edit = QtWidgets.QLineEdit()
         self.repeat_spin = WheelSafeSpinBox()
+        self.repeat_var_edit = QtWidgets.QLineEdit()
+        self.repeat_var_edit.setPlaceholderText("예: $run_count")
+        self.repeat_var_edit.setToolTip("OCR나 변수 노드에서 저장한 값을 이 단계의 실행 횟수로 사용합니다.")
         self.success_spin = WheelSafeSpinBox()
         self.fail_spin = WheelSafeSpinBox()
         self.success_delay_spin = WheelSafeSpinBox()
@@ -693,6 +704,7 @@ class BuilderPage(QtWidgets.QWidget):
         form.addRow("액션", self.inspector_action)
         form.addRow("표시 이름", self.label_edit)
         form.addRow("단계 반복", self.repeat_spin)
+        form.addRow("반복 횟수 변수", self.repeat_var_edit)
         form.addRow("성공 시 이동", self.success_spin)
         form.addRow("성공 이동 전 대기", self.success_delay_spin)
         form.addRow("실패 시 이동", self.fail_spin)
@@ -802,6 +814,11 @@ class BuilderPage(QtWidgets.QWidget):
                 payload[key] = value
             else:
                 payload.pop(key, None)
+        repeat_var = self.repeat_var_edit.text().strip().lstrip("$")
+        if repeat_var:
+            payload["repeat_var"] = repeat_var
+        else:
+            payload.pop("repeat_var", None)
         return payload
 
     def _open_action_settings(self) -> None:
@@ -908,6 +925,7 @@ class BuilderPage(QtWidgets.QWidget):
     def _load_common_fields(self, step: dict[str, Any]) -> None:
         self.label_edit.setText(str(step.get("label") or ""))
         self.repeat_spin.setValue(max(1, int(step.get("repeat") or 1)))
+        self.repeat_var_edit.setText(str(step.get("repeat_var") or ""))
         self.success_spin.setValue(int(step.get("on_success") or 0))
         self.fail_spin.setValue(int(step.get("on_fail") or 0))
         self.success_delay_spin.setValue(int(step.get("on_success_delay") or 0))
@@ -1334,7 +1352,7 @@ class BuilderPage(QtWidgets.QWidget):
         current = self._build_form_payload()
         payload = deepcopy(ACTION_TEMPLATES.get(action, {"action": action}))
         payload["action"] = action
-        for key in ("label", "repeat", "on_success", "on_fail", "on_success_delay", "on_fail_delay", "sleep_after"):
+        for key in ("label", "repeat", "repeat_var", "on_success", "on_fail", "on_success_delay", "on_fail_delay", "sleep_after"):
             if key in current:
                 payload[key] = current[key]
         self.action_editor.load_step(payload)
@@ -1499,17 +1517,7 @@ class BuilderPage(QtWidgets.QWidget):
         if self._recording_controller is not None:
             self.status.emit("스마트 녹화가 이미 실행 중입니다.")
             return
-        answer = QtWidgets.QMessageBox.question(
-            self,
-            "스마트 동작 녹화",
-            "2초 뒤 녹화가 준비됩니다. 단독 ` 키를 한 번 누르면 기록이 켜지고 다시 누르면 일시정지됩니다.\n"
-            "Shift+` 키는 일반 액션과 순차 이미지 분기 후보 모드를 전환합니다.\n"
-            "분기 모드의 클릭·키 입력·텍스트도 분기 액션으로 저장되며, F8 이미지는 대체 후보로 추가됩니다.\n"
-            "`과 Shift+` 키 자체는 대상 프로그램에 입력되거나 매크로 동작으로 저장되지 않습니다.\n"
-            "암호·개인정보를 입력했다면 검토 화면에서 텍스트 저장을 해제하세요.\n\n"
-            "녹화를 시작할까요? 시작 F9 · 종료 F10입니다.",
-        )
-        if answer != QtWidgets.QMessageBox.Yes:
+        if not self._confirm_smart_recording():
             return
         controller = SmartRecordingController(self.repository, self.window())
         controller.completed.connect(self._review_smart_recording)
@@ -1517,6 +1525,40 @@ class BuilderPage(QtWidgets.QWidget):
         self._recording_controller = controller
         controller.start()
         self.status.emit("스마트 녹화 준비 · ` 기록 ON/OFF · Shift+` 일반/분기 모드 · F8 캡처 · F10 종료")
+
+    @staticmethod
+    def _recording_notice_hidden_today() -> bool:
+        today = QtCore.QDate.currentDate().toString(QtCore.Qt.ISODate)
+        hidden_date = str(
+            QtCore.QSettings("MacroRelay", "Studio").value("smart_recording/hide_notice_date", "") or ""
+        )
+        return hidden_date == today
+
+    def _confirm_smart_recording(self) -> bool:
+        if self._recording_notice_hidden_today():
+            return True
+        message = QtWidgets.QMessageBox(self)
+        message.setWindowTitle("스마트 동작 녹화")
+        message.setIcon(QtWidgets.QMessageBox.Question)
+        message.setText(
+            "2초 뒤 녹화가 준비됩니다. 단독 ` 키를 한 번 누르면 기록이 켜지고 다시 누르면 일시정지됩니다.\n"
+            "Shift+` 키는 일반 액션과 순차 이미지 분기 후보 모드를 전환합니다.\n"
+            "분기 모드의 클릭·키 입력·텍스트도 분기 액션으로 저장되며, F8 이미지는 대체 후보로 추가됩니다.\n"
+            "`과 Shift+` 키 자체는 대상 프로그램에 입력되거나 매크로 동작으로 저장되지 않습니다.\n"
+            "암호·개인정보를 입력했다면 검토 화면에서 텍스트 저장을 해제하세요.\n\n"
+            "녹화를 시작할까요? 시작 F9 · 종료 F10입니다."
+        )
+        message.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        message.setDefaultButton(QtWidgets.QMessageBox.Yes)
+        hide_today = QtWidgets.QCheckBox("오늘 하루 다시 표시하지 않기")
+        message.setCheckBox(hide_today)
+        accepted = message.exec() == QtWidgets.QMessageBox.Yes
+        if accepted and hide_today.isChecked():
+            QtCore.QSettings("MacroRelay", "Studio").setValue(
+                "smart_recording/hide_notice_date",
+                QtCore.QDate.currentDate().toString(QtCore.Qt.ISODate),
+            )
+        return accepted
 
     @QtCore.Slot(list)
     def _review_smart_recording(self, events: list[dict[str, Any]]) -> None:

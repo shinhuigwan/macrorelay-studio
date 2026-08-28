@@ -373,6 +373,13 @@ class NodeItem(QtWidgets.QGraphicsObject):
         delay = int(self.step.get("sleep_after") or 0)
         success_delay = int(self.step.get("on_success_delay") or 0)
         detail = f"완료 {delay}ms" if delay else "완료 즉시"
+        repeat_var = str(self.step.get("repeat_var") or "").strip().lstrip("$")
+        if repeat_var:
+            detail = f"반복 ${repeat_var}회  ·  " + detail
+        elif int(self.step.get("repeat") or 1) > 1:
+            detail = f"반복 {int(self.step.get('repeat') or 1)}회  ·  " + detail
+        if action == "image_search" and bool(self.step.get("repeat_on_success")):
+            detail = "탐지 중 재검색 · 미탐지 시 실패  ·  " + detail
         if success_delay:
             detail += f"  ·  연결 {success_delay}ms"
         if candidate_position:
@@ -508,39 +515,49 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             return
         port = source_node.success_port if self.kind == "success" else source_node.fail_port
         start = port.mapToScene(port.rect().center())
-        end = target_node.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + self.target_offset_y))
+        if self.route_side == "top":
+            end = target_node.mapToScene(QtCore.QPointF(NodeItem.WIDTH / 2 + self.target_offset_y, 0))
+        elif self.route_side == "bottom":
+            end = target_node.mapToScene(
+                QtCore.QPointF(NodeItem.WIDTH / 2 + self.target_offset_y, NodeItem.HEIGHT)
+            )
+        else:
+            end = target_node.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + self.target_offset_y))
         distance = abs(end.x() - start.x())
         if self.route_side:
             source_rect = source_node.sceneBoundingRect()
             target_rect = target_node.sceneBoundingRect()
             span_left = min(start.x(), end.x())
             span_right = max(start.x(), end.x())
+            corridor_top = min(source_rect.top(), target_rect.top()) - NodeItem.HEIGHT * 0.45
+            corridor_bottom = max(source_rect.bottom(), target_rect.bottom()) + NodeItem.HEIGHT * 0.45
             route_rects = [
                 node.sceneBoundingRect()
                 for node in self.canvas.nodes.values()
                 if node.sceneBoundingRect().right() >= span_left
                 and node.sceneBoundingRect().left() <= span_right
+                and node.sceneBoundingRect().bottom() >= corridor_top
+                and node.sceneBoundingRect().top() <= corridor_bottom
             ]
             if not route_rects:
                 route_rects = [source_rect, target_rect]
-            margin = 64.0 + self.route_lane * 38.0
+            margin = 46.0 + self.route_lane * 30.0
             if self.route_side == "top":
                 lane_y = min(rect.top() for rect in route_rects) - margin
                 direction = -1.0
             else:
                 lane_y = max(rect.bottom() for rect in route_rects) + margin
                 direction = 1.0
-            corner = 18.0
-            exit_x = max(start.x() + 42.0, source_rect.right() + 42.0)
-            entry_x = min(end.x() - 42.0, target_rect.left() - 42.0)
+            exit_x = start.x() + 26.0
+            horizontal_direction = 1.0 if end.x() >= exit_x else -1.0
+            corner = min(16.0, max(5.0, abs(end.x() - exit_x) / 3.0))
             near_lane_y = lane_y - direction * corner
             path = QtGui.QPainterPath(start)
             path.lineTo(exit_x, start.y())
             path.lineTo(exit_x, near_lane_y)
-            path.quadTo(exit_x, lane_y, exit_x - corner, lane_y)
-            path.lineTo(entry_x + corner, lane_y)
-            path.quadTo(entry_x, lane_y, entry_x, near_lane_y)
-            path.lineTo(entry_x, end.y())
+            path.quadTo(exit_x, lane_y, exit_x + horizontal_direction * corner, lane_y)
+            path.lineTo(end.x() - horizontal_direction * corner, lane_y)
+            path.quadTo(end.x(), lane_y, end.x(), near_lane_y)
             path.lineTo(end)
         else:
             # Keep close, forward links inside the gap between nodes.  A large
@@ -585,6 +602,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 text += f" · {delay}ms"
         self.label.setText(text)
         label_y = 5 if self.route_side == "bottom" else -17
+        if not self.route_side:
+            label_y += self.target_offset_y * 1.15
         self.label.setPos(point + QtCore.QPointF(8, label_y))
 
     def hoverEnterEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
@@ -853,13 +872,59 @@ class NodeCanvas(QtWidgets.QWidget):
             self.node_selected.emit(selected[-1])
 
     def _suggest_positions(self) -> dict[int, QtCore.QPointF]:
+        total = len(self.steps)
+        if not total:
+            return {}
+        outgoing: dict[int, list[int]] = {index: [] for index in range(1, total + 1)}
+        indegree = {index: 0 for index in range(1, total + 1)}
+        for index, step in enumerate(self.steps, start=1):
+            targets: list[int] = []
+            success = int(step.get("on_success") or 0)
+            if success:
+                targets.append(success)
+            elif index < total and not bool(step.get("stop_on_success")):
+                targets.append(index + 1)
+            failure = int(step.get("on_fail") or 0)
+            if failure:
+                targets.append(failure)
+            for rule in step.get("edge_conditions") or []:
+                if isinstance(rule, dict):
+                    target = int(rule.get("target") or 0)
+                    if target:
+                        targets.append(target)
+            for target in targets:
+                if 0 < target <= total and target not in outgoing[index]:
+                    outgoing[index].append(target)
+                    indegree[target] += 1
+
+        preferred_start = int(self.macro.get("graph_start_step") or 0)
+        roots = ([preferred_start] if 0 < preferred_start <= total else []) + [
+            index for index in range(1, total + 1) if indegree[index] == 0 and index != preferred_start
+        ]
+        ranks: dict[int, int] = {}
+        pending: list[int] = []
+        for root in roots:
+            if root not in ranks:
+                ranks[root] = 0
+                pending.append(root)
+        while pending:
+            source = pending.pop(0)
+            for target in outgoing[source]:
+                if target not in ranks:
+                    ranks[target] = ranks[source] + 1
+                    pending.append(target)
+        for index in range(1, total + 1):
+            if index not in ranks:
+                ranks[index] = 0
+
+        columns: dict[int, list[int]] = {}
+        for index in range(1, total + 1):
+            columns.setdefault(ranks[index], []).append(index)
         positions: dict[int, QtCore.QPointF] = {}
-        columns = 4
-        for index in range(1, len(self.steps) + 1):
-            row = (index - 1) // columns
-            offset = (index - 1) % columns
-            column = offset if row % 2 == 0 else columns - 1 - offset
-            positions[index] = QtCore.QPointF(column * 338.0, row * 190.0)
+        for rank, indexes in columns.items():
+            center = (len(indexes) - 1) / 2.0
+            for row, index in enumerate(indexes):
+                positions[index] = QtCore.QPointF(rank * 350.0, (row - center) * 172.0)
         return positions
 
     def positions(self) -> dict[str, list[float]]:
@@ -937,10 +1002,21 @@ class NodeCanvas(QtWidgets.QWidget):
             port = source.success_port if edge.kind == "success" else source.fail_port
             start = port.mapToScene(port.rect().center())
             end = target.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + edge.target_offset_y))
-            # Any genuine horizontal gap is a normal forward connection, even
-            # when the nodes are very close.  Only backward or horizontally
-            # overlapping links need an outside lane.
-            if end.x() > start.x() + 4.0:
+            forward = end.x() > start.x() + 4.0
+            obstacle = False
+            if forward and end.x() - start.x() > 90.0:
+                direct_corridor = QtCore.QRectF(
+                    start.x(),
+                    min(start.y(), end.y()) - 22.0,
+                    max(1.0, end.x() - start.x()),
+                    abs(end.y() - start.y()) + 44.0,
+                )
+                obstacle = any(
+                    index not in {edge.source, edge.target}
+                    and direct_corridor.intersects(node.sceneBoundingRect().adjusted(-10.0, -8.0, 10.0, 8.0))
+                    for index, node in self.nodes.items()
+                )
+            if forward and not obstacle:
                 continue
             side = "top" if edge.kind == "success" else "bottom"
             candidates[side].append((min(start.x(), end.x()), max(start.x(), end.x()), edge))
@@ -1011,8 +1087,7 @@ class NodeCanvas(QtWidgets.QWidget):
         for index, node in self.nodes.items():
             node.setPos(positions[index])
         self.suspended = False
-        for edge in self.edges:
-            edge.update_path()
+        self._route_edges()
         self.positions_changed.emit(self.positions())
         self.fit_all()
 

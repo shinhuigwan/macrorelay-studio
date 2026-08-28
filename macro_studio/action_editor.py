@@ -190,6 +190,15 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("click.keys", "클릭 후 키 입력", "text", "", section="검색 성공 후 동작"),
         FieldSpec("click.key_mode", "키 입력 방식", "choice", "inactive", options=choice(("비활성", "inactive"), ("활성", "active")), section="검색 성공 후 동작"),
         FieldSpec("abort_on_fail", "검색 실패 시 중단", "bool", False, section="완료 처리"),
+        FieldSpec(
+            "repeat_on_success",
+            "성공하면 같은 노드 재검색",
+            "bool",
+            False,
+            tooltip="이미지가 계속 발견되는 동안 현재 노드를 반복하고, 처음 미탐지되면 실패선으로 이동합니다.",
+            section="완료 처리",
+        ),
+        FieldSpec("repeat_on_success_delay", "재검색 간격", "duration", 50, 0, 60_000, section="완료 처리"),
         FieldSpec("sleep_after", "완료 후 대기", "duration", 0, 0, 600_000, section="완료 처리"),
     ],
     "type_text": [
@@ -287,6 +296,16 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
             ("다름", "neq"),
         ), section="숫자 조건"),
         FieldSpec("number_value", "비교 값", "float", 0, -999999999, 999999999, section="숫자 조건"),
+        FieldSpec(
+            "value_regex",
+            "값 추출 정규식",
+            "text",
+            "",
+            placeholder=r"예: 횟수\s*[:=]?\s*(\d+)",
+            tooltip="괄호로 묶은 값만 변수에 저장합니다. 비워두면 전체 OCR 결과에서 첫 숫자를 추출합니다.",
+            section="변수 저장",
+        ),
+        FieldSpec("value_group", "저장할 그룹 번호", "int", 1, 0, 20, section="변수 저장"),
         FieldSpec("store_var", "결과 변수명", "text", "", section="변수 저장"),
         FieldSpec("output_path", "추가 저장 경로", "path", "", section="결과 저장"),
         FieldSpec("output_format", "저장 형식", "choice", "csv", options=choice(("CSV", "csv"), ("JSON", "json"), ("텍스트", "txt")), section="결과 저장"),
@@ -1211,6 +1230,8 @@ class ActionEditor(QtWidgets.QWidget):
             "match_mode": str(step.get("match_mode", "contains")),
             "engine_preference": str(step.get("engine_preference", "auto")),
             "ocr_action": str(step.get("ocr_action", "extract")),
+            "value_regex": str(step.get("value_regex", "")),
+            "value_group": int(step.get("value_group", 1) or 0),
             "minimum_confidence": float(step.get("minimum_confidence", 35) or 0) / 100.0,
             "position_priority": str(step.get("position_priority", "top_left")),
             "debug": True,
@@ -1300,6 +1321,12 @@ class ActionEditor(QtWidgets.QWidget):
             )
             match_label.setObjectName("Muted")
             layout.addWidget(match_label)
+
+        if "extracted_value" in result or "extracted_number" in result:
+            extracted = result.get("extracted_number", result.get("extracted_value", ""))
+            extracted_label = QtWidgets.QLabel(f"변수에 저장될 값: {extracted}")
+            extracted_label.setStyleSheet("color: #5ED9FF; font-weight: 700;")
+            layout.addWidget(extracted_label)
 
         layout.addWidget(QtWidgets.QLabel("인식된 전체 텍스트"))
         text_view = QtWidgets.QPlainTextEdit()

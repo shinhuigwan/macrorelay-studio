@@ -21,6 +21,7 @@ __all__ = [
     "match_text",
     "normalize_text",
     "select_best_box",
+    "extract_regex_value",
 ]
 
 logger = logging.getLogger(__name__)
@@ -333,6 +334,23 @@ def extract_number(text: str) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def extract_regex_value(text: str, pattern: str, group: int = 1) -> str | None:
+    """Return one capture group from OCR text, or ``None`` when it does not match."""
+    if not pattern:
+        return None
+    try:
+        match = re.search(pattern, text or "")
+    except re.error:
+        return None
+    if match is None:
+        return None
+    try:
+        value = match.group(max(0, int(group)))
+    except (IndexError, TypeError, ValueError):
+        return None
+    return str(value).strip()
 
 
 def check_number_condition(

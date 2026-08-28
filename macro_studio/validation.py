@@ -67,6 +67,15 @@ class ProjectValidator:
                 action = str(step.get("action") or "")
                 if not action:
                     issues.append(Issue("error", "액션 누락", "action 값이 없습니다.", summary.name, index))
+                repeat_var = str(step.get("repeat_var") or "").strip().lstrip("$")
+                if repeat_var and (
+                    not repeat_var.isascii()
+                    or not (repeat_var[0].isalpha() or repeat_var[0] == "_")
+                    or not all(char.isalnum() or char == "_" for char in repeat_var)
+                ):
+                    issues.append(
+                        Issue("error", "반복 변수 이름 오류", f"'{repeat_var}'", summary.name, index)
+                    )
                 if action == "image_search":
                     alias = str(step.get("asset") or "")
                     metadata = assets.get(alias)

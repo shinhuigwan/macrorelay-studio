@@ -133,15 +133,8 @@ class VisionState:
             "mask": mask,
             "crop_origin": crop_origin,
             "canvas_size": canvas_size,
-            "templates": None if profile == "precise" else search.prepare_templates(
-                template,
-                profile,
-                cv2,
-                mask,
-                crop_origin=crop_origin,
-                canvas_size=canvas_size,
-            ),
             "precise_cache": {},
+            "standard_cache": {},
         }
         self.cache[key] = prepared
         while len(self.cache) > self.cache_limit:
@@ -151,7 +144,22 @@ class VisionState:
     def _match(self, frame, prepared: dict[str, Any], threshold: float, profile: str):
         cv2, np = self._modules()
         if profile == "precise":
-            return search.adaptive_precise_match(
+            probe, probe_score = search.adaptive_standard_match(
+                frame,
+                prepared["template"],
+                prepared["mask"],
+                threshold,
+                "fast",
+                cv2,
+                np,
+                prepared["standard_cache"],
+                crop_origin=prepared["crop_origin"],
+                canvas_size=prepared["canvas_size"],
+                fallback_full=False,
+            )
+            if probe is not None:
+                return probe, probe_score
+            match, score = search.adaptive_precise_match(
                 frame,
                 prepared["template"],
                 prepared["mask"],
@@ -162,7 +170,19 @@ class VisionState:
                 crop_origin=prepared["crop_origin"],
                 canvas_size=prepared["canvas_size"],
             )
-        return search.match_frame(frame, prepared["templates"], threshold, profile, cv2, np)
+            return match, max(float(probe_score), float(score))
+        return search.adaptive_standard_match(
+            frame,
+            prepared["template"],
+            prepared["mask"],
+            threshold,
+            profile,
+            cv2,
+            np,
+            prepared["standard_cache"],
+            crop_origin=prepared["crop_origin"],
+            canvas_size=prepared["canvas_size"],
+        )
 
     @staticmethod
     def _regions(raw_regions: Any) -> list[tuple[int, int, int, int]]:

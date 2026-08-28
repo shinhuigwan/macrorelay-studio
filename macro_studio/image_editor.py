@@ -63,6 +63,43 @@ class SelectionRubberBand(QtWidgets.QRubberBand):
             painter.drawRect(QtCore.QRect(point.x() - 4, point.y() - 4, 9, 9))
 
 
+class PrecisionImageView(QtWidgets.QLabel):
+    """Image label that paints a scalable precision-brush cursor."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.brush_enabled = False
+        self.brush_point = QtCore.QPointF()
+        self.brush_radius = 0.0
+
+    def set_brush_preview(self, enabled: bool, point: QtCore.QPointF, radius: float) -> None:
+        self.brush_enabled = enabled
+        self.brush_point = QtCore.QPointF(point)
+        self.brush_radius = max(1.0, float(radius))
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        super().paintEvent(event)
+        if not self.brush_enabled:
+            return
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 3.0))
+        painter.setBrush(QtGui.QColor(16, 22, 32, 35))
+        painter.drawEllipse(self.brush_point, self.brush_radius, self.brush_radius)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#19D7D0"), 1.4))
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawEllipse(self.brush_point, self.brush_radius, self.brush_radius)
+        painter.drawLine(
+            QtCore.QPointF(self.brush_point.x() - 5, self.brush_point.y()),
+            QtCore.QPointF(self.brush_point.x() + 5, self.brush_point.y()),
+        )
+        painter.drawLine(
+            QtCore.QPointF(self.brush_point.x(), self.brush_point.y() - 5),
+            QtCore.QPointF(self.brush_point.x(), self.brush_point.y() + 5),
+        )
+
+
 class ScreenCaptureDialog(QtWidgets.QDialog):
     """Full-screen region picker backed by a captured screen pixmap."""
 
@@ -260,6 +297,8 @@ class ImageEditorDialog(QtWidgets.QDialog):
         self.erasing = False
         self.pick_mode = False
         self.picked_color: QtGui.QColor | None = None
+        self.picked_point: QtCore.QPoint | None = None
+        self.brush_point = QtCore.QPoint(max(0, self.image.width() // 2), max(0, self.image.height() // 2))
         self.setWindowTitle(f"이미지 편집 · {alias}")
         self.setMinimumSize(940, 700)
         self.resize(1180, 820)
@@ -320,12 +359,20 @@ class ImageEditorDialog(QtWidgets.QDialog):
         self.eraser_size = WheelSafeSpinBox()
         self.eraser_size.setRange(1, 200)
         self.eraser_size.setValue(20)
+        self.eraser_size.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.eraser_size.valueChanged.connect(self._update_brush_preview)
         clear_selection = QtWidgets.QPushButton("선택 영역 투명화")
         clear_selection.clicked.connect(self.clear_selection)
         self.pick_button = QtWidgets.QPushButton("색상 찍기")
         self.pick_button.clicked.connect(self.start_pick_color)
         remove_color = QtWidgets.QPushButton("찍은 색상 제거")
         remove_color.clicked.connect(self.remove_color)
+        remove_connected = QtWidgets.QPushButton("연결된 유사색만 제거")
+        remove_connected.setToolTip("찍은 지점에서 이어진 비슷한 색만 투명하게 만들어 전경의 같은 색은 보호합니다.")
+        remove_connected.clicked.connect(self.remove_connected_color)
+        clear_outside = QtWidgets.QPushButton("선택 밖 투명화")
+        clear_outside.setToolTip("드래그한 전경 영역만 남기고 바깥을 투명하게 만듭니다.")
+        clear_outside.clicked.connect(self.clear_outside_selection)
         self.tolerance = WheelSafeSpinBox()
         self.tolerance.setRange(0, 255)
         self.tolerance.setValue(20)
@@ -333,21 +380,40 @@ class ImageEditorDialog(QtWidgets.QDialog):
         second.addWidget(QtWidgets.QLabel("크기"))
         second.addWidget(self.eraser_size)
         second.addWidget(clear_selection)
+        second.addWidget(clear_outside)
         second.addSpacing(12)
         second.addWidget(self.pick_button)
         second.addWidget(remove_color)
+        second.addWidget(remove_connected)
         second.addWidget(QtWidgets.QLabel("허용도"))
         second.addWidget(self.tolerance)
         second.addStretch(1)
         tool_layout.addLayout(second)
+
+        precision = QtWidgets.QHBoxLayout()
+        precision_hint = QtWidgets.QLabel(
+            "정밀 붓: 마우스 이동/드래그 · +/− 크기 · 방향키 1px · Shift+방향키 10px · 지정 키로 한 번 투명화"
+        )
+        precision_hint.setObjectName("Muted")
+        self.stamp_key_edit = QtWidgets.QKeySequenceEdit()
+        settings = QtCore.QSettings("MacroRelay", "Studio")
+        saved_stamp_key = str(settings.value("image_editor/erase_stamp_shortcut", "Space") or "Space")
+        self.stamp_key_edit.setKeySequence(QtGui.QKeySequence(saved_stamp_key))
+        self.stamp_key_edit.setMaximumWidth(130)
+        self.stamp_key_edit.editingFinished.connect(self._update_stamp_shortcut)
+        precision.addWidget(precision_hint, 1)
+        precision.addWidget(QtWidgets.QLabel("투명화 키"))
+        precision.addWidget(self.stamp_key_edit)
+        tool_layout.addLayout(precision)
         root.addWidget(tools)
 
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setAlignment(QtCore.Qt.AlignCenter)
         self.scroll.setStyleSheet("background:#090B10; border:1px solid #303647; border-radius:10px;")
-        self.view = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
+        self.view = PrecisionImageView(alignment=QtCore.Qt.AlignCenter)
         self.view.setStyleSheet("background:#0D0F15;")
+        self.view.setMouseTracking(True)
         self.view.installEventFilter(self)
         self.scroll.setWidget(self.view)
         self.rubber = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self.view)
@@ -382,6 +448,9 @@ class ImageEditorDialog(QtWidgets.QDialog):
         self.redo_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.Redo), self)
         self.undo_shortcut.activated.connect(self.undo)
         self.redo_shortcut.activated.connect(self.redo)
+        self.erase_stamp_shortcut = QtGui.QShortcut(self.stamp_key_edit.keySequence(), self)
+        self.erase_stamp_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.erase_stamp_shortcut.activated.connect(self._stamp_brush)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -404,6 +473,11 @@ class ImageEditorDialog(QtWidgets.QDialog):
                 self.rubber.show()
                 return True
             if event.type() == QtCore.QEvent.MouseMove:
+                if self.erase_mode:
+                    mapped = self._image_point(point)
+                    if mapped is not None:
+                        self.brush_point = mapped
+                        self._update_brush_preview()
                 if self.erasing and event.buttons() & QtCore.Qt.LeftButton:
                     self._erase(point)
                     return True
@@ -425,6 +499,33 @@ class ImageEditorDialog(QtWidgets.QDialog):
                 return True
         return super().eventFilter(obj, event)
 
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if self.erase_mode and event.key() in (
+            QtCore.Qt.Key_Left,
+            QtCore.Qt.Key_Right,
+            QtCore.Qt.Key_Up,
+            QtCore.Qt.Key_Down,
+        ):
+            amount = 10 if event.modifiers() & QtCore.Qt.ShiftModifier else 1
+            dx = -amount if event.key() == QtCore.Qt.Key_Left else amount if event.key() == QtCore.Qt.Key_Right else 0
+            dy = -amount if event.key() == QtCore.Qt.Key_Up else amount if event.key() == QtCore.Qt.Key_Down else 0
+            self.brush_point = QtCore.QPoint(
+                max(0, min(self.image.width() - 1, self.brush_point.x() + dx)),
+                max(0, min(self.image.height() - 1, self.brush_point.y() + dy)),
+            )
+            self._update_brush_preview()
+            event.accept()
+            return
+        if self.erase_mode and event.key() in (QtCore.Qt.Key_Plus, QtCore.Qt.Key_Equal):
+            self.eraser_size.setValue(min(self.eraser_size.maximum(), self.eraser_size.value() + 2))
+            event.accept()
+            return
+        if self.erase_mode and event.key() in (QtCore.Qt.Key_Minus, QtCore.Qt.Key_Underscore):
+            self.eraser_size.setValue(max(self.eraser_size.minimum(), self.eraser_size.value() - 2))
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _update_view(self) -> None:
         pixmap = QtGui.QPixmap.fromImage(self.image)
         if self.fit_to_view:
@@ -444,6 +545,7 @@ class ImageEditorDialog(QtWidgets.QDialog):
         self.info.setText(f"{self.image.width()} × {self.image.height()} px · {self.path.name}")
         self.undo_button.setEnabled(self.history_index > 0)
         self.redo_button.setEnabled(self.history_index < len(self.history) - 1)
+        self._update_brush_preview()
 
     def set_zoom(self, value: float) -> None:
         self.fit_to_view = False
@@ -547,15 +649,28 @@ class ImageEditorDialog(QtWidgets.QDialog):
             if selected.width() >= 8 and selected.height() >= 8:
                 left = max(1, selected.x())
                 top = max(1, selected.y())
-                rect = (
-                    left,
-                    top,
-                    min(width - left - 1, selected.width()),
-                    min(height - top - 1, selected.height()),
-                )
-                if rect[2] < 4 or rect[3] < 4:
+                selected_width = min(width - left - 1, selected.width())
+                selected_height = min(height - top - 1, selected.height())
+                if selected_width < 4 or selected_height < 4:
                     return
-                cv2.grabCut(bgr, mask, rect, background_model, foreground_model, 7, cv2.GC_INIT_WITH_RECT)
+                mask[top : top + selected_height, left : left + selected_width] = cv2.GC_PR_FGD
+                inset_x = max(1, selected_width // 8)
+                inset_y = max(1, selected_height // 8)
+                mask[
+                    top + inset_y : top + selected_height - inset_y,
+                    left + inset_x : left + selected_width - inset_x,
+                ] = cv2.GC_FGD
+                # A manually sampled background colour is a strong exclusion
+                # hint.  It prevents GrabCut from keeping same-colour scenery
+                # around the selected foreground subject.
+                if self.picked_color is not None:
+                    sampled = np.array(
+                        [self.picked_color.blue(), self.picked_color.green(), self.picked_color.red()],
+                        dtype=np.int16,
+                    )
+                    distance = np.max(np.abs(bgr.astype(np.int16) - sampled), axis=2)
+                    mask[distance <= self.tolerance.value()] = cv2.GC_BGD
+                cv2.grabCut(bgr, mask, None, background_model, foreground_model, 8, cv2.GC_INIT_WITH_MASK)
             else:
                 # The common smart-recording case has one wanted icon or hand
                 # around the middle of the capture.  Seed GrabCut from the
@@ -654,12 +769,46 @@ class ImageEditorDialog(QtWidgets.QDialog):
     def _toggle_eraser(self, enabled: bool) -> None:
         self.erase_mode = enabled
         self.pick_mode = False
-        self.view.setCursor(QtCore.Qt.CrossCursor if enabled else QtCore.Qt.ArrowCursor)
+        self.view.setCursor(QtCore.Qt.BlankCursor if enabled else QtCore.Qt.ArrowCursor)
+        self._update_brush_preview()
+
+    def _update_stamp_shortcut(self) -> None:
+        sequence = self.stamp_key_edit.keySequence()
+        if sequence.isEmpty():
+            sequence = QtGui.QKeySequence("Space")
+            self.stamp_key_edit.setKeySequence(sequence)
+        self.erase_stamp_shortcut.setKey(sequence)
+        QtCore.QSettings("MacroRelay", "Studio").setValue(
+            "image_editor/erase_stamp_shortcut", sequence.toString()
+        )
+
+    def _update_brush_preview(self) -> None:
+        if not hasattr(self, "view"):
+            return
+        pixmap = self.view.pixmap()
+        if not self.erase_mode or not pixmap or pixmap.isNull() or self.image.isNull():
+            self.view.set_brush_preview(False, QtCore.QPointF(), 1.0)
+            return
+        scale_x = pixmap.width() / max(1, self.image.width())
+        scale_y = pixmap.height() / max(1, self.image.height())
+        widget_point = QtCore.QPointF(self.brush_point.x() * scale_x, self.brush_point.y() * scale_y)
+        radius = self.eraser_size.value() * 0.25 * (scale_x + scale_y)
+        self.view.set_brush_preview(True, widget_point, radius)
+
+    def _stamp_brush(self) -> None:
+        if not self.erase_mode:
+            return
+        self._erase_image_point(self.brush_point)
+        self._push_history()
 
     def _erase(self, point: QtCore.QPoint) -> None:
         mapped = self._image_point(point)
         if mapped is None:
             return
+        self.brush_point = mapped
+        self._erase_image_point(mapped)
+
+    def _erase_image_point(self, mapped: QtCore.QPoint) -> None:
         radius = max(1, self.eraser_size.value() // 2)
         painter = QtGui.QPainter(self.image)
         painter.setCompositionMode(QtGui.QPainter.CompositionMode_Clear)
@@ -680,6 +829,17 @@ class ImageEditorDialog(QtWidgets.QDialog):
         painter.end()
         self._replace(image)
 
+    def clear_outside_selection(self) -> None:
+        rect = self._image_rect(self.selection)
+        if rect.width() < 1 or rect.height() < 1:
+            return
+        result = QtGui.QImage(self.image.size(), QtGui.QImage.Format_ARGB32)
+        result.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(result)
+        painter.drawImage(rect, self.image, rect)
+        painter.end()
+        self._replace(result)
+
     def start_pick_color(self) -> None:
         self.pick_mode = True
         self.eraser.setChecked(False)
@@ -690,6 +850,7 @@ class ImageEditorDialog(QtWidgets.QDialog):
         if mapped is None:
             return
         self.picked_color = self.image.pixelColor(mapped)
+        self.picked_point = mapped
         self.pick_mode = False
         self.view.setCursor(QtCore.Qt.ArrowCursor)
         self.pick_button.setStyleSheet(f"background:rgb({self.picked_color.red()},{self.picked_color.green()},{self.picked_color.blue()});")
@@ -705,6 +866,47 @@ class ImageEditorDialog(QtWidgets.QDialog):
                 return QtGui.QColor(c.red(), c.green(), c.blue(), 0)
             return c
         self._map_pixels(convert)
+
+    def remove_connected_color(self) -> None:
+        if self.picked_color is None or self.picked_point is None:
+            QtWidgets.QMessageBox.information(self, "연결 유사색 제거", "먼저 '색상 찍기'로 시작점을 선택하세요.")
+            return
+        width, height = self.image.width(), self.image.height()
+        target = self.picked_color
+        tolerance = self.tolerance.value()
+        visited = bytearray(width * height)
+        stack = [(self.picked_point.x(), self.picked_point.y())]
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            x, y = stack.pop()
+            offset = y * width + x
+            if visited[offset]:
+                continue
+            visited[offset] = 1
+            color = self.image.pixelColor(x, y)
+            if max(
+                abs(color.red() - target.red()),
+                abs(color.green() - target.green()),
+                abs(color.blue() - target.blue()),
+            ) > tolerance:
+                continue
+            pixels.append((x, y))
+            if x > 0:
+                stack.append((x - 1, y))
+            if x + 1 < width:
+                stack.append((x + 1, y))
+            if y > 0:
+                stack.append((x, y - 1))
+            if y + 1 < height:
+                stack.append((x, y + 1))
+        if not pixels:
+            return
+        image = self.image.copy()
+        for x, y in pixels:
+            color = image.pixelColor(x, y)
+            color.setAlpha(0)
+            image.setPixelColor(x, y, color)
+        self._replace(image)
 
     def _backup_original(self) -> None:
         if not self.path.exists():

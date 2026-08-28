@@ -46,6 +46,16 @@ ACTIONS = [
 ]
 
 
+def normalize_variable_name(value: Any) -> str:
+    """Return a safe ASCII variable identifier used by generated AHK code."""
+    name = str(value or "").strip().lstrip("$")
+    if not name or not name.isascii() or not (name[0].isalpha() or name[0] == "_"):
+        return ""
+    if not all(char.isalnum() or char == "_" for char in name):
+        return ""
+    return name
+
+
 def col_to_index(col: str) -> int:
     col = (col or "").strip().upper()
     if not col:
@@ -3099,6 +3109,8 @@ def render_ocr_engine(step: Dict[str, Any]) -> List[str]:
     profile = str(step.get("profile", "auto"))
     expect_text = str(step.get("expect_text", ""))
     regex_pattern = str(step.get("regex", ""))
+    value_regex = str(step.get("value_regex", ""))
+    value_group = max(0, min(int(step.get("value_group", 1) or 0), 20))
     whitelist = str(step.get("whitelist", ""))
     find_text = str(step.get("find_text", ""))
     match_mode = str(step.get("match_mode", "contains"))
@@ -3112,7 +3124,7 @@ def render_ocr_engine(step: Dict[str, Any]) -> List[str]:
     number_value = float(step.get("number_value", 0) or 0)
     minimum_confidence = max(0, min(int(step.get("minimum_confidence", 35) or 0), 100))
     position_priority = str(step.get("position_priority", "top_left"))
-    store_var = str(step.get("store_var", ""))
+    store_var = normalize_variable_name(step.get("store_var"))
     
     region = step.get("region") or []
     region_json = json.dumps(list(region[:4]) if len(region) >= 4 else [0, 0, 0, 0])
@@ -3129,6 +3141,8 @@ def render_ocr_engine(step: Dict[str, Any]) -> List[str]:
         "profile": profile,
         "expect_text": expect_text,
         "regex": regex_pattern,
+        "value_regex": value_regex,
+        "value_group": value_group,
         "whitelist": whitelist,
         "find_text": find_text if ocr_action_type in ("find_text", "find_click", "find_click_offset") else "",
         "match_mode": match_mode,
@@ -3188,12 +3202,30 @@ def render_ocr_engine(step: Dict[str, Any]) -> List[str]:
     legacy_lines = render_ocr(step)
     for ll in legacy_lines:
         lines.append('    ' + ll)
+    if value_regex:
+        lines.extend([
+            f'    RegExMatch(OCR_LastText, "{ahk_quote(value_regex)}", __ocr_value_match)',
+            f'    OCR_ExtractedValue := __ocr_value_match{value_group}',
+            '    __ocr_success := (OCR_ExtractedValue != "")',
+        ])
+    if ocr_action_type in ("extract_number", "number_condition"):
+        if not value_regex:
+            lines.extend([
+                '    RegExMatch(OCR_LastText, "[+-]?\\d+(?:\\.\\d+)?", __ocr_value_match)',
+                '    OCR_ExtractedValue := __ocr_value_match',
+                '    __ocr_success := (OCR_ExtractedValue != "")',
+            ])
+        lines.extend([
+            '    OCR_LastNumber := OCR_ExtractedValue + 0',
+            '    Log("ocr fallback number: " . OCR_LastNumber)',
+        ])
     lines.extend([
         '} else {',
         '    ; Parse engine response',
         '    OCR_LastText := OcrEngine_ParseText(__ocr_resp)',
         '    OCR_LastConfidence := OcrEngine_ParseField(__ocr_resp, "confidence")',
         '    OCR_LastEngine := OcrEngine_ParseField(__ocr_resp, "engine")',
+        '    OCR_ExtractedValue := OcrEngine_ParseField(__ocr_resp, "extracted_value")',
         '    __ocr_success := OcrEngine_IsSuccess(__ocr_resp)',
         '    Log("ocr engine result: " . StrLen(OCR_LastText) . " chars, conf=" . OCR_LastConfidence . ", engine=" . OCR_LastEngine)',
     ])
@@ -3223,12 +3255,18 @@ def render_ocr_engine(step: Dict[str, Any]) -> List[str]:
             '    Log("ocr number: " . OCR_LastNumber)',
         ])
     
-    # Handle variable storage
-    if store_var:
-        var_name = ahk_quote(store_var)
-        lines.append(f'    {var_name} := OCR_LastText')
-    
     lines.append('}')
+
+    # Store after the engine/fallback branch so both execution paths expose
+    # the same variable semantics.
+    if store_var:
+        if ocr_action_type in ("extract_number", "number_condition"):
+            lines.append(f'{store_var} := OCR_LastNumber')
+        elif value_regex:
+            lines.append(f'{store_var} := OCR_ExtractedValue')
+        else:
+            lines.append(f'{store_var} := OCR_LastText')
+        lines.append(f'Log("ocr variable stored: {store_var}=" . {store_var})')
     
     # Handle table storage (reuse existing pattern from render_ocr)
     table_name = step.get("table")
@@ -3721,6 +3759,7 @@ def render_macro_script(
         lines.append('OCR_FoundX := 0')
         lines.append('OCR_FoundY := 0')
         lines.append('OCR_LastNumber := 0')
+        lines.append('OCR_ExtractedValue := ""')
         lines.append('')
     if start_step:
         lines.append(f"Goto, Step{start_step}")
@@ -3729,6 +3768,7 @@ def render_macro_script(
         label = step.get("label") or step.get("action")
         action = step.get("action")
         repeat = int(step.get("repeat", 1) or 1)
+        repeat_var = normalize_variable_name(step.get("repeat_var"))
         on_success = step.get("on_success")
         on_fail = step.get("on_fail")
         stop_on_success = bool(step.get("stop_on_success", False))
@@ -3736,6 +3776,7 @@ def render_macro_script(
         on_fail_delay = int(step.get("on_fail_delay", 0) or 0)
         if action == "flow_control":
             repeat = 1
+            repeat_var = ""
             on_success = None
             on_fail = None
             on_success_delay = 0
@@ -3752,13 +3793,41 @@ def render_macro_script(
             on_success_delay = 0
         if on_fail_delay < 0:
             on_fail_delay = 0
+        has_repeat = repeat > 1 or bool(repeat_var)
+        repeat_limit = f"__rep_limit{count}" if repeat_var else str(repeat)
 
         lines.append(f"; Step {count}: {label}")
         lines.append(f"Step{count}:")
         lines.append(f"SetRunProgress({count})")
         lines.append(f'Log("step start: {count} | {ahk_quote(str(label))}")')
         lines.append(f'TraceStep({count}, "{ahk_quote(str(label))}", "START")')
-        if repeat > 1:
+        if repeat_var:
+            lines.append(f"if (__rep{count} = \"\")")
+            lines.append("{")
+            lines.append(f"    __rep_limit{count} := Floor({repeat_var} + 0)")
+            lines.append(f"    if (__rep_limit{count} > 999999)")
+            lines.append(f"        __rep_limit{count} := 999999")
+            lines.append(f"    if (__rep_limit{count} <= 0)")
+            lines.append("    {")
+            lines.append(f'        Log("dynamic repeat invalid: {repeat_var}=" . {repeat_var})')
+            lines.append(
+                f'        SetRunResult("FAILED", "REPEAT_VALUE_INVALID", "반복 변수 {repeat_var} 값이 1 이상이 아닙니다.")'
+            )
+            lines.append(f'        TraceStep({count}, "{ahk_quote(str(label))}", "FAIL")')
+            lines.append(f"        __rep{count} := \"\"")
+            lines.append(f"        __rep_limit{count} := \"\"")
+            if on_fail:
+                if on_fail_delay > 0:
+                    lines.append(f"        Sleep, {on_fail_delay}")
+                lines.append(f"        Goto, Step{on_fail}")
+            else:
+                lines.append("        Return")
+            lines.append("    }")
+            lines.append(f"    __rep{count} := 0")
+            lines.append(f'    Log("dynamic repeat loaded: {repeat_var}=" . __rep_limit{count})')
+            lines.append("}")
+            lines.append(f"__rep{count} += 1")
+        elif repeat > 1:
             lines.append(f"if (__rep{count} = \"\")")
             lines.append(f"    __rep{count} := 0")
             lines.append(f"__rep{count} += 1")
@@ -3778,12 +3847,20 @@ def render_macro_script(
             lines.append(f"if ({found_var})")
             lines.append("{")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
-            if repeat > 1:
-                lines.append(f"    if (__rep{count} < {repeat})")
+            if has_repeat:
+                lines.append(f"    if (__rep{count} < {repeat_limit})")
                 lines.append("    {")
                 lines.append(f"        Goto, Step{count}")
                 lines.append("    }")
                 lines.append(f"    __rep{count} := 0")
+                if repeat_var:
+                    lines.append(f"    __rep_limit{count} := \"\"")
+            if action == "image_search" and bool(step.get("repeat_on_success")):
+                repeat_on_success_delay = max(0, int(step.get("repeat_on_success_delay", 50) or 0))
+                lines.append(f'    Log("image search success loop: step {count}")')
+                if repeat_on_success_delay:
+                    lines.append(f"    Sleep, {repeat_on_success_delay}")
+                lines.append(f"    Goto, Step{count}")
             lines.extend(render_edge_conditions(step, count, "success", "    "))
             if on_success:
                 if on_success_delay > 0:
@@ -3797,12 +3874,14 @@ def render_macro_script(
             lines.append("else")
             lines.append("{")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "FAIL")')
-            if repeat > 1:
-                lines.append(f"    if (__rep{count} < {repeat})")
+            if has_repeat:
+                lines.append(f"    if (__rep{count} < {repeat_limit})")
                 lines.append("    {")
                 lines.append(f"        Goto, Step{count}")
                 lines.append("    }")
                 lines.append(f"    __rep{count} := 0")
+                if repeat_var:
+                    lines.append(f"    __rep_limit{count} := \"\"")
             lines.extend(render_edge_conditions(step, count, "fail", "    "))
             if on_fail:
                 if on_fail_delay > 0:
@@ -3811,13 +3890,15 @@ def render_macro_script(
             elif count >= total_steps:
                 lines.append("    Return")
             lines.append("}")
-        elif repeat > 1:
+        elif has_repeat:
             lines.append(f'TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
-            lines.append(f"if (__rep{count} < {repeat})")
+            lines.append(f"if (__rep{count} < {repeat_limit})")
             lines.append("{")
             lines.append(f"    Goto, Step{count}")
             lines.append("}")
             lines.append(f"__rep{count} := 0")
+            if repeat_var:
+                lines.append(f"__rep_limit{count} := \"\"")
             lines.extend(render_edge_conditions(step, count, "success"))
             if on_success:
                 if on_success_delay > 0:

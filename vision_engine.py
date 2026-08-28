@@ -220,6 +220,90 @@ class VisionState:
             int(height),
         ), float(score)
 
+    def _search_multi(
+        self,
+        image_paths: list[str],
+        regions: list[tuple[int, int, int, int]],
+        threshold: float,
+        profile: str,
+        timeout_ms: int,
+        poll_ms: int,
+        started: float,
+    ) -> dict[str, Any]:
+        prepared_items: list[tuple[dict[str, Any], bool]] = [
+            self._template(path, profile) for path in image_paths
+        ]
+        self._modules()
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+        best_score = 0.0
+        while True:
+            cycle_started = time.perf_counter()
+            hits: list[tuple[float, int, int, int, int, int, dict[str, Any]]] = []
+            for left, top, right, bottom in regions:
+                # Capture each region once, then compare every registered
+                # template against that immutable frame.
+                frame = search.capture_region(left, top, right, bottom, self._grabber or None)
+                if frame is None:
+                    continue
+                for index, (prepared, _cache_hit) in enumerate(prepared_items):
+                    match, score = self._match(frame, prepared, threshold, profile)
+                    best_score = max(best_score, float(score))
+                    if match is None:
+                        continue
+                    confidence, location, width, height = match
+                    hits.append(
+                        (
+                            float(confidence),
+                            index,
+                            left + int(location[0]) + int(width) // 2,
+                            top + int(location[1]) + int(height) // 2,
+                            int(width),
+                            int(height),
+                            prepared,
+                        )
+                    )
+            if hits:
+                # Highest confidence wins. Stable index ordering supplies the
+                # user's checklist priority when scores are equal.
+                confidence, index, center_x, center_y, width, height, prepared = max(
+                    hits, key=lambda item: (item[0], -item[1])
+                )
+                image_key = str(prepared["path"]).casefold()
+                self.last_hits[image_key] = (center_x, center_y, width, height)
+                canvas_width, canvas_height = prepared.get("canvas_size") or (width, height)
+                return {
+                    "ok": True,
+                    "found": True,
+                    "x": center_x,
+                    "y": center_y,
+                    "confidence": round(confidence, 6),
+                    "best_score": round(max(best_score, confidence), 6),
+                    "width": width,
+                    "height": height,
+                    "source_width": int(canvas_width),
+                    "source_height": int(canvas_height),
+                    "match_index": index + 1,
+                    "matched_image": str(prepared["path"]),
+                    "image_count": len(prepared_items),
+                    "profile": profile,
+                    "cache_hit": all(hit for _prepared, hit in prepared_items),
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                }
+            if timeout_ms <= 0 or time.perf_counter() >= deadline:
+                break
+            remaining = max(0.0, poll_ms / 1000.0 - (time.perf_counter() - cycle_started))
+            if remaining:
+                time.sleep(remaining)
+        return {
+            "ok": True,
+            "found": False,
+            "best_score": round(best_score, 6),
+            "image_count": len(prepared_items),
+            "profile": profile,
+            "cache_hit": all(hit for _prepared, hit in prepared_items),
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+
     def search(self, request: dict[str, Any]) -> dict[str, Any]:
         started = time.perf_counter()
         with self._lock:
@@ -233,6 +317,23 @@ class VisionState:
             timeout_ms = max(0, int(request.get("timeout") or 0))
             poll_ms = max(10, int(request.get("poll") or 60))
             regions = self._regions(request.get("regions"))
+            raw_images = request.get("images")
+            image_paths = list(
+                dict.fromkeys(
+                    str(value)
+                    for value in raw_images if str(value).strip()
+                )
+            ) if isinstance(raw_images, list) else []
+            if len(image_paths) > 1:
+                return self._search_multi(
+                    image_paths,
+                    regions,
+                    threshold,
+                    profile,
+                    timeout_ms,
+                    poll_ms,
+                    started,
+                )
             prepared, cache_hit = self._template(image_path, profile)
             self._modules()
 

@@ -141,6 +141,63 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("Goto, Step1", script[success_loop:failure_branch])
         self.assertIn("Goto, Step2", script[failure_branch:])
 
+    def test_multi_image_search_uses_one_engine_request_and_forces_opencv(self) -> None:
+        step = {
+            "action": "image_search",
+            "asset": "first",
+            "assets": ["first", "second"],
+            "engine": "ahk",
+            "regions": [[0, 0, 800, 600]],
+            "confidence": 82,
+        }
+        script = "\n".join(
+            self.engine.render_image_search(
+                step,
+                {"first": {"file": "first.png"}, "second": {"file": "second.png"}},
+                3,
+            )
+        )
+        self.assertIn('""images"":[', script)
+        self.assertIn("MultiImagePath2", script)
+        self.assertIn("multi=2", script)
+        self.assertIn('MatchedImageIndex := VisionEngine_ParseField(VisionResp, "match_index")', script)
+        self.assertNotIn("engine=ahk", script)
+
+    def test_vision_engine_multi_search_captures_region_once_and_selects_best(self) -> None:
+        import vision_engine
+
+        state = vision_engine.VisionState()
+        state._modules = lambda: (object(), object())
+        state._template = lambda path, _profile: (
+            {"path": path, "canvas_size": (30, 20)},
+            True,
+        )
+        state._match = lambda _frame, prepared, _threshold, _profile: (
+            ((0.94, (11, 13), 30, 20), 0.94)
+            if prepared["path"].endswith("second.png")
+            else ((0.86, (3, 5), 20, 10), 0.86)
+        )
+        captures: list[tuple[int, int, int, int]] = []
+
+        def fake_capture(left, top, right, bottom, _grabber=None):
+            captures.append((left, top, right, bottom))
+            return object()
+
+        with mock.patch.object(vision_engine.search, "capture_region", side_effect=fake_capture):
+            result = state.search(
+                {
+                    "images": ["first.png", "second.png"],
+                    "regions": [[100, 200, 900, 800]],
+                    "threshold": 0.8,
+                    "timeout": 0,
+                    "profile": "fast",
+                }
+            )
+        self.assertEqual([(100, 200, 900, 800)], captures)
+        self.assertTrue(result["found"])
+        self.assertEqual(2, result["match_index"])
+        self.assertEqual((126, 223), (result["x"], result["y"]))
+
     def test_image_search_uses_centered_single_click_and_optimized_opencv(self) -> None:
         step = {
             "action": "image_search",
@@ -851,6 +908,33 @@ class EngineBehaviorTests(unittest.TestCase):
             self.assertTrue((target.parent / "vision_engine.py").is_file())
             self.assertTrue((target.parent / "opencv_search.py").is_file())
 
+    def test_multi_image_export_copies_every_selected_asset(self) -> None:
+        macro = {
+            "steps": [
+                {
+                    "action": "image_search",
+                    "asset": "first",
+                    "assets": ["first", "second"],
+                    "engine": "opencv",
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source").mkdir()
+            (root / "source" / "first.png").write_bytes(b"first")
+            (root / "source" / "second.png").write_bytes(b"second")
+            records = {
+                "first": {"file": "source/first.png"},
+                "second": {"file": "source/second.png"},
+            }
+            with mock.patch.object(self.engine, "BASE_DIR", root), mock.patch.object(
+                self.engine, "read_assets", return_value=records
+            ):
+                self.engine.copy_assets_for_macro(macro, root / "export")
+            self.assertEqual(b"first", (root / "export" / "assets" / "first.png").read_bytes())
+            self.assertEqual(b"second", (root / "export" / "assets" / "second.png").read_bytes())
+
     def test_remote_notify_renderer_remains_available_with_vision_helpers(self) -> None:
         rendered = self.engine.render_remote_notify(
             {"action": "remote_notify", "message": "완료", "include_last_ocr": True}
@@ -1218,6 +1302,15 @@ class ProjectDataTests(unittest.TestCase):
         self.assertEqual("ahk", macro["steps"][0]["engine"], "원본 매크로 설정은 변경하지 않아야 합니다.")
         with self.assertRaisesRegex(ValueError, "Python 필수"):
             macro_tool.prepare_macro_for_runtime({"steps": [{"action": "ocr"}]}, "ahk")
+        with self.assertRaisesRegex(ValueError, "멀티 이미지 서치"):
+            macro_tool.prepare_macro_for_runtime(
+                {
+                    "steps": [
+                        {"action": "image_search", "asset": "one", "assets": ["one", "two"]}
+                    ]
+                },
+                "ahk",
+            )
 
     def test_browser_portable_requirement_uses_greenlet_package_without_duplicate_binary(self) -> None:
         from macro_studio.repository import MacroRepository
@@ -1770,6 +1863,53 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("image_search", steps[0]["action"])
             saved = QtGui.QImage(str(repository.asset_path(steps[0]["asset"])))
             self.assertEqual(QtCore.QSize(148, 92), saved.size())
+            dialog.close()
+        app.processEvents()
+
+    def test_recording_review_merges_selected_images_into_one_multi_search_node(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.automation import RecordingReviewDialog
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        image = QtGui.QImage(64, 48, QtGui.QImage.Format_RGB32)
+        image.fill(QtGui.QColor("#4ACFA6"))
+        payload = QtCore.QByteArray()
+        buffer = QtCore.QBuffer(payload)
+        buffer.open(QtCore.QIODevice.WriteOnly)
+        self.assertTrue(image.save(buffer, "PNG"))
+        buffer.close()
+        encoded = base64.b64encode(bytes(payload)).decode("ascii")
+        events = [
+            {
+                "type": "capture",
+                "t": 100 + index * 300,
+                "x": 400 + index * 20,
+                "y": 300,
+                "client_x": 200 + index * 20,
+                "client_y": 150,
+                "image_sample_bmp": encoded,
+                "image_sample_size": [64, 48],
+                "image_anchor": [32, 24],
+                "window": {"hwnd": 10, "exe": "sample.exe", "client_size": [800, 600]},
+            }
+            for index in range(2)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog(events, MacroRepository(Path(directory)))
+            selection = dialog.table.selectionModel()
+            for row in range(2):
+                selection.select(
+                    dialog.table.model().index(row, 0),
+                    QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows,
+                )
+            dialog._merge_selected_images()
+            steps = dialog.build_steps()
+            self.assertEqual(1, len(steps))
+            self.assertEqual("image_search", steps[0]["action"])
+            self.assertEqual("opencv", steps[0]["engine"])
+            self.assertEqual(2, len(steps[0]["assets"]))
+            self.assertIn("멀티 이미지 서치", steps[0]["label"])
             dialog.close()
         app.processEvents()
 
@@ -2469,6 +2609,38 @@ class UiSmokeTests(unittest.TestCase):
             editor.close()
         app.processEvents()
 
+    def test_action_editor_multi_asset_picker_round_trips_and_forces_opencv(self) -> None:
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.action_editor import ActionEditor, MultiAssetPicker
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            for alias, colour in (("첫 이미지", "#33CFAA"), ("둘째 이미지", "#4D9FFF")):
+                image = QtGui.QImage(20, 14, QtGui.QImage.Format_RGB32)
+                image.fill(QtGui.QColor(colour))
+                repository.add_asset_image(image, alias)
+            editor = ActionEditor(repository)
+            editor.refresh_sources()
+            editor.load_step(
+                {
+                    "action": "image_search",
+                    "asset": "첫 이미지",
+                    "assets": ["첫 이미지", "둘째 이미지"],
+                    "engine": "ahk",
+                }
+            )
+            picker = editor.widgets["image_search"]["assets"]
+            self.assertIsInstance(picker, MultiAssetPicker)
+            self.assertEqual(["첫 이미지", "둘째 이미지"], picker.value())
+            step = editor.build_step()
+            self.assertEqual(["첫 이미지", "둘째 이미지"], step["assets"])
+            self.assertEqual("opencv", step["engine"])
+            editor.close()
+        app.processEvents()
+
     def test_recent_click_preview_uses_hover_icon_and_click_pin(self) -> None:
         from PySide6 import QtCore, QtGui, QtWidgets
         from macro_studio.builder import BuilderPage
@@ -2867,6 +3039,64 @@ class UiSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(target_bottom, failure.path().pointAtPercent(1).y(), delta=1.0)
         canvas.close()
 
+    def test_manual_edge_waypoint_is_restored_dragged_and_cleared(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro(
+            {
+                "steps": [{"action": "wait", "on_success": 2}, {"action": "wait"}],
+                "graph_positions": {"1": [0, 0], "2": [500, 0]},
+                "graph_routes": {"1:success:2:-1": [[360, -140]]},
+            }
+        )
+        edge = canvas.edges[0]
+        self.assertEqual([QtCore.QPointF(360, -140)], edge.manual_points)
+        self.assertLess(edge.path().boundingRect().top(), -100)
+        changed: list[dict] = []
+        canvas.routes_changed.connect(changed.append)
+        edge.add_manual_point(QtCore.QPointF(430, 120))
+        self.assertEqual(2, len(changed[-1]["1:success:2:-1"]))
+        edge.clear_manual_points()
+        self.assertNotIn("1:success:2:-1", changed[-1])
+        edge.setSelected(True)
+        app.processEvents()
+        self.assertEqual(1, len(edge._waypoint_handles))
+        self.assertTrue(edge._waypoint_handles[0].seed)
+        canvas.close()
+
+    def test_manual_edge_routes_follow_node_reindex_and_drop_deleted_links(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            builder = BuilderPage(MacroRepository(Path(directory)))
+            builder.current_macro = {
+                "steps": [
+                    {"action": "wait"},
+                    {"action": "wait", "on_success": 1},
+                ],
+                "graph_routes": {
+                    "1:success:2:-1": [[250, -80]],
+                    "2:success:1:-1": [[300, 90]],
+                },
+            }
+            builder._remap_graph_routes({1: 2, 2: 1})
+            self.assertEqual({"2:success:1:-1": [[250, -80]]}, builder.current_macro["graph_routes"])
+
+            builder.current_macro = {
+                "steps": [{"action": "wait"}],
+                "graph_routes": {"1:success:2:-1": [[250, -80]]},
+            }
+            builder._remap_graph_routes({1: 1})
+            self.assertNotIn("graph_routes", builder.current_macro)
+            builder.close()
+        app.processEvents()
+
     def test_long_forward_edge_avoids_intermediate_node_and_graph_layout_keeps_chain_short(self) -> None:
         from PySide6 import QtWidgets
         from macro_studio.node_editor import NodeCanvas
@@ -3085,6 +3315,9 @@ class UiSmokeTests(unittest.TestCase):
             key = QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Right, QtCore.Qt.NoModifier)
             dialog.keyPressEvent(key)
             self.assertEqual(QtCore.QPoint(13, 12), dialog.brush_point)
+            self.assertFalse(dialog.pick_colour_shortcut.key().isEmpty())
+            self.assertFalse(dialog.remove_colour_shortcut.key().isEmpty())
+            self.assertFalse(dialog.remove_connected_shortcut.key().isEmpty())
             dialog.close()
 
     def test_builder_export_button_opens_export_page_with_current_macro(self) -> None:

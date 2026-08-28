@@ -1969,7 +1969,12 @@ def render_image_search(
     assets: Dict[str, Dict[str, Any]],
     step_index: int,
 ) -> List[str]:
-    alias = step.get("asset")
+    raw_aliases = step.get("assets") if isinstance(step.get("assets"), list) else []
+    aliases = list(dict.fromkeys(str(value) for value in raw_aliases if str(value).strip()))
+    primary_alias = str(step.get("asset") or "").strip()
+    if primary_alias and primary_alias not in aliases:
+        aliases.insert(0, primary_alias)
+    alias = aliases[0] if aliases else primary_alias
     found_var = f"__step_found_{step_index}"
     if not alias:
         return [
@@ -1978,15 +1983,24 @@ def render_image_search(
             'Log("image search configuration error: no asset selected")',
             'SetRunResult("FAILED", "IMAGE_NOT_CONFIGURED", "이미지 서치에 검색 이미지가 지정되지 않았습니다.")',
         ]
-    asset_file = resolve_asset_filename(alias, assets)
-    if not asset_file:
+    asset_files: list[str] = []
+    missing_aliases: list[str] = []
+    for candidate_alias in aliases or [alias]:
+        candidate_file = resolve_asset_filename(candidate_alias, assets)
+        if candidate_file:
+            asset_files.append(candidate_file)
+        else:
+            missing_aliases.append(candidate_alias)
+    if missing_aliases:
         safe_alias = ahk_quote(str(alias))
+        safe_missing = ahk_quote(", ".join(missing_aliases))
         return [
             f"{found_var} := 0",
-            f"; image_search skipped, asset {alias} missing",
-            f'Log("image search configuration error: missing asset - {safe_alias}")',
-            f'SetRunResult("FAILED", "IMAGE_ASSET_MISSING", "이미지 자산을 찾을 수 없습니다: {safe_alias}")',
+            f"; image_search skipped, assets missing: {safe_missing}",
+            f'Log("image search configuration error: missing asset - {safe_missing}")',
+            f'SetRunResult("FAILED", "IMAGE_ASSET_MISSING", "이미지 자산을 찾을 수 없습니다: {safe_missing}")',
         ]
+    asset_file = asset_files[0]
     image_path = rf"{asset_file}"
     lines: List[str] = [
         f"{found_var} := 0",
@@ -2000,6 +2014,21 @@ def render_image_search(
         "}",
         "ImageSpec := ImagePath",
     ]
+    multi_image_vars = ["ImagePath"]
+    for index, candidate_file in enumerate(asset_files[1:], start=2):
+        variable = f"MultiImagePath{index}"
+        multi_image_vars.append(variable)
+        lines.extend(
+            [
+                f'{variable} := A_ScriptDir . "\\assets\\{candidate_file}"',
+                f"if !FileExist({variable})",
+                "{",
+                f'    Log("멀티 이미지 파일 없음: " . {variable})',
+                f'    SetRunResult("FAILED", "IMAGE_FILE_MISSING", "멀티 이미지 파일을 찾을 수 없습니다: " . {variable})',
+                "    Return",
+                "}",
+            ]
+        )
     variation = step.get("variation", 16)
     options = step.get("options", "")
     if isinstance(options, list):
@@ -2143,6 +2172,8 @@ def render_image_search(
         search_profile = "balanced"
     confidence = step.get("confidence")
     engine = str(step.get("engine") or "ahk").lower()
+    if len(asset_files) > 1:
+        engine = "opencv"
     if engine not in {"ahk", "opencv"}:
         engine = "ahk"
 
@@ -2265,10 +2296,25 @@ def render_image_search(
     def emit_opencv_search(region_vars, indent=""):
         """Use the warm local engine first and preserve the CLI as recovery."""
         lines.append(f'{indent}VisionEngineScript := A_ScriptDir . "\\vision_engine.py"')
-        lines.append(f"{indent}VisionImageJson := VisionEngine_JsonEscape(ImagePath)")
-        lines.append(
-            f'{indent}VisionPayload := "{{""cmd"":""search"",""image"":""" . VisionImageJson . """,""regions"":["'
-        )
+        if len(multi_image_vars) > 1:
+            for image_index, variable in enumerate(multi_image_vars, start=1):
+                lines.append(
+                    f"{indent}VisionImageJson{image_index} := VisionEngine_JsonEscape({variable})"
+                )
+            lines.append(
+                f'{indent}VisionPayload := "{{""cmd"":""search"",""images"":['
+                '""" . VisionImageJson1 . """"'
+            )
+            for image_index in range(2, len(multi_image_vars) + 1):
+                lines.append(
+                    f'{indent}VisionPayload .= ",""" . VisionImageJson{image_index} . """"'
+                )
+            lines.append(f'{indent}VisionPayload .= "],""regions"":["')
+        else:
+            lines.append(f"{indent}VisionImageJson := VisionEngine_JsonEscape(ImagePath)")
+            lines.append(
+                f'{indent}VisionPayload := "{{""cmd"":""search"",""image"":""" . VisionImageJson . """,""regions"":["'
+            )
         for index, (left_var, top_var, right_var, bottom_var) in enumerate(region_vars):
             prefix = "," if index else ""
             lines.append(
@@ -2335,13 +2381,22 @@ def render_image_search(
         lines.append(f'{indent}    OpenCvBestScore := VisionEngine_ParseField(VisionResp, "confidence")')
         lines.append(f'{indent}    FoundImageW := VisionEngine_ParseField(VisionResp, "width")')
         lines.append(f'{indent}    FoundImageH := VisionEngine_ParseField(VisionResp, "height")')
+        if len(multi_image_vars) > 1:
+            lines.append(f'{indent}    SourceImageW := VisionEngine_ParseField(VisionResp, "source_width")')
+            lines.append(f'{indent}    SourceImageH := VisionEngine_ParseField(VisionResp, "source_height")')
+            lines.append(f'{indent}    MatchedImageIndex := VisionEngine_ParseField(VisionResp, "match_index")')
         lines.append(f"{indent}    FoundScaleX := (SourceImageW > 0 ? FoundImageW / SourceImageW : 1.0)")
         lines.append(f"{indent}    FoundScaleY := (SourceImageH > 0 ? FoundImageH / SourceImageH : 1.0)")
         lines.append(f'{indent}    VisionElapsed := VisionEngine_ParseField(VisionResp, "elapsed_ms")')
         lines.append(f'{indent}    VisionCacheHit := VisionEngine_ParseField(VisionResp, "cache_hit")')
-        lines.append(
-            f'{indent}    Log("vision engine hit: " . VisionElapsed . "ms cache=" . VisionCacheHit . " confidence=" . OpenCvBestScore)'
-        )
+        if len(multi_image_vars) > 1:
+            lines.append(
+                f'{indent}    Log("vision engine multi hit: " . VisionElapsed . "ms cache=" . VisionCacheHit . " confidence=" . OpenCvBestScore . " match=" . MatchedImageIndex)'
+            )
+        else:
+            lines.append(
+                f'{indent}    Log("vision engine hit: " . VisionElapsed . "ms cache=" . VisionCacheHit . " confidence=" . OpenCvBestScore)'
+            )
         lines.append(f"{indent}    ErrorLevel := 0")
         lines.append(f"{indent}}}")
         lines.append(f"{indent}else")
@@ -2355,7 +2410,8 @@ def render_image_search(
         lines.append(f"{indent}}}")
 
     if engine == "opencv":
-        lines.append(f'Log("image search start: {alias} | engine=opencv | " . ImagePath)')
+        multi_suffix = f" | multi={len(asset_files)}" if len(asset_files) > 1 else ""
+        lines.append(f'Log("image search start: {alias} | engine=opencv{multi_suffix} | " . ImagePath)')
         lines.append('OpenCvErrorCode := ""')
         lines.append('OpenCvErrorDetail := ""')
     else:
@@ -2365,6 +2421,8 @@ def render_image_search(
     # them as the current mouse position in MouseClick.
     lines.append('FoundX := ""')
     lines.append('FoundY := ""')
+    if len(asset_files) > 1:
+        lines.append("MatchedImageIndex := 0")
     if engine == "opencv":
         threshold = 0.86
         if confidence is not None:
@@ -3717,7 +3775,11 @@ def render_macro_script(
         lines.extend(browser_action_helpers())
         lines.append("")
     has_vision = any(
-        step.get("action") == "image_search" and str(step.get("engine") or "ahk").lower() == "opencv"
+        step.get("action") == "image_search"
+        and (
+            str(step.get("engine") or "ahk").lower() == "opencv"
+            or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
+        )
         for step in steps
     )
     if has_vision:
@@ -3950,6 +4012,8 @@ def prepare_macro_for_runtime(macro: Dict[str, Any], runtime_mode: str = "auto")
         if not isinstance(step, dict) or step.get("action") != "image_search":
             continue
         if mode == "ahk":
+            if isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1:
+                raise ValueError("멀티 이미지 서치는 OpenCV가 필요하므로 AutoHotkey 전용으로 내보낼 수 없습니다.")
             step["engine"] = "ahk"
         elif mode == "python":
             step["engine"] = "opencv"
@@ -4024,7 +4088,10 @@ def export_macro_payload(
             shutil.copytree(tessdata, target.parent / "tessdata", dirs_exist_ok=True)
     if any(
         step.get("action") == "image_search"
-        and str(step.get("engine") or "ahk").lower() == "opencv"
+        and (
+            str(step.get("engine") or "ahk").lower() == "opencv"
+            or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
+        )
         for step in expanded_steps
     ):
         for helper_name in ("opencv_search.py", "vision_engine.py"):
@@ -4063,6 +4130,9 @@ def copy_assets_for_macro(macro: Dict[str, Any], destination: Path) -> None:
             alias = step.get("asset")
             if alias:
                 aliases.add(alias)
+            for multi_alias in step.get("assets") if isinstance(step.get("assets"), list) else []:
+                if multi_alias:
+                    aliases.add(str(multi_alias))
     if not aliases:
         return
     target_dir = destination / "assets"

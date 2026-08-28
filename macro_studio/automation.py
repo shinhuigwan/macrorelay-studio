@@ -105,6 +105,8 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                 }
             if isinstance(event.get("_handle_profile"), dict):
                 draft["handle_profile"] = dict(event["_handle_profile"])
+            if event.get("_review_multi_group"):
+                draft["_review_multi_group"] = str(event["_review_multi_group"])
             drafts.append(draft)
             previous_time = current_time
             index += 1
@@ -125,6 +127,8 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                 }
             if isinstance(event.get("_handle_profile"), dict):
                 draft["handle_profile"] = dict(event["_handle_profile"])
+            if event.get("_review_multi_group"):
+                draft["_review_multi_group"] = str(event["_review_multi_group"])
             drafts.append(draft)
             previous_time = current_time
             index += 1
@@ -1245,10 +1249,16 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self.edit_content_button = QtWidgets.QPushButton("✎ 선택 내용 편집")
         self.edit_content_button.setToolTip("텍스트, 키 입력 또는 대기 시간을 넓은 편집창에서 수정합니다.")
         self.edit_content_button.clicked.connect(self._edit_selected_row)
+        self.merge_multi_image_button = QtWidgets.QPushButton("▦ 선택 이미지를 멀티 서치로 묶기")
+        self.merge_multi_image_button.setToolTip(
+            "Ctrl/Shift로 이미지 캡처·이미지 인식 행을 2개 이상 선택하면 한 개의 멀티 이미지 서치 노드로 생성합니다."
+        )
+        self.merge_multi_image_button.clicked.connect(self._merge_selected_images)
         selection_hint = QtWidgets.QLabel("Ctrl/Shift 다중 선택 · Delete 제거 · 내용 더블클릭 편집")
         selection_hint.setObjectName("Muted")
         row_tools.addWidget(self.remove_rows_button)
         row_tools.addWidget(self.edit_content_button)
+        row_tools.addWidget(self.merge_multi_image_button)
         row_tools.addWidget(selection_hint)
         row_tools.addStretch(1)
         layout.addLayout(row_tools)
@@ -1332,6 +1342,8 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             kind_label = kind_labels.get(str(draft.get("kind")), "동작")
             if str(draft.get("record_mode") or "action") == "branch":
                 kind_label = "분기 " + kind_label
+            if draft.get("_review_multi_group"):
+                kind_label = "멀티 " + kind_label
             self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(kind_label))
             if draft.get("kind") == "wait":
                 duration = WheelSafeSpinBox()
@@ -1435,6 +1447,39 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         if isinstance(focus, (QtWidgets.QLineEdit, QtWidgets.QPlainTextEdit, QtWidgets.QAbstractSpinBox)):
             return
         self._remove_selected_rows()
+
+    def _merge_selected_images(self) -> None:
+        rows = self._selected_rows()
+        if len(rows) < 2:
+            QtWidgets.QMessageBox.information(self, "멀티 이미지 서치", "이미지 행을 2개 이상 선택해 주세요.")
+            return
+        self._sync_table_state()
+        invalid = [
+            row for row in rows
+            if self.drafts[row].get("kind") not in {"mouse", "image_capture"}
+            or str(self.drafts[row].get("_review_strategy") or "") != "image"
+        ]
+        if invalid:
+            QtWidgets.QMessageBox.information(
+                self,
+                "멀티 이미지 서치",
+                "선택한 모든 행의 인식 방식을 ‘이미지 찾아 클릭’으로 먼저 바꿔 주세요.",
+            )
+            return
+        group_id = f"review-multi-{datetime.now():%Y%m%d%H%M%S%f}"
+        selected_set = set(rows)
+        for row, draft in enumerate(self.drafts):
+            if row in selected_set:
+                draft["_review_multi_group"] = group_id
+                event = draft.get("event") if isinstance(draft.get("event"), dict) else None
+                if event is not None:
+                    event["_review_multi_group"] = group_id
+            elif draft.get("_review_multi_group") == group_id:
+                draft.pop("_review_multi_group", None)
+        self._populate_table()
+        for row in rows:
+            self.table.selectRow(row)
+        self.events_changed.emit(self.events)
 
     def _remove_selected_rows(self) -> None:
         rows = self._selected_rows()
@@ -1920,7 +1965,36 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                     },
                 }
             step["_recording_mode"] = record_mode
+            multi_group = str(draft.get("_review_multi_group") or "")
+            if multi_group:
+                step["_recording_multi_group"] = multi_group
             steps.append(step)
+        multi_groups: dict[str, list[int]] = {}
+        for index, step in enumerate(steps):
+            group = str(step.get("_recording_multi_group") or "")
+            if group and step.get("action") == "image_search":
+                multi_groups.setdefault(group, []).append(index)
+        removed_indexes: set[int] = set()
+        for group, indexes in multi_groups.items():
+            if len(indexes) < 2:
+                continue
+            primary = steps[indexes[0]]
+            members = [steps[index] for index in indexes]
+            aliases = [str(member.get("asset") or "") for member in members if str(member.get("asset") or "")]
+            primary["assets"] = list(dict.fromkeys(aliases))
+            primary["asset"] = primary["assets"][0]
+            primary["engine"] = "opencv"
+            primary["label"] = f"멀티 이미지 서치 {len(primary['assets'])}개"
+            primary["_recording_mode"] = "action"
+            primary.pop("_recording_multi_group", None)
+            automation = primary.get("_automation") if isinstance(primary.get("_automation"), dict) else {}
+            automation.update({"recording_multi_group": group, "image_count": len(primary["assets"])})
+            primary["_automation"] = automation
+            removed_indexes.update(indexes[1:])
+        if removed_indexes:
+            steps = [step for index, step in enumerate(steps) if index not in removed_indexes]
+        for step in steps:
+            step.pop("_recording_multi_group", None)
         if self.connect_steps.isChecked():
             for index, step in enumerate(steps[:-1]):
                 if step.get("action") != "flow_control":
@@ -2006,8 +2080,12 @@ class AutomationAnalyzer:
                         AutomationIssue("error", "잘못된 연결", f"{field} 목적지 {target}번이 없습니다.", index, f"clear:{index}:{field}")
                     )
             if action == "image_search":
+                image_aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
                 alias = str(step.get("asset") or "")
-                if not alias or alias not in assets:
+                if alias and alias not in image_aliases:
+                    image_aliases.insert(0, alias)
+                missing_aliases = [value for value in image_aliases or [alias] if not value or value not in assets]
+                if missing_aliases:
                     issues.append(AutomationIssue("error", "검색 이미지 누락", "이미지 서치에 사용할 이미지가 없습니다.", index))
                 target_exe = str(step.get("region_window_exe") or "").casefold()
                 if alias.startswith("자동녹화-") and target_exe in {"python.exe", "pythonw.exe"}:

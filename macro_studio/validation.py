@@ -77,14 +77,18 @@ class ProjectValidator:
                         Issue("error", "반복 변수 이름 오류", f"'{repeat_var}'", summary.name, index)
                     )
                 if action == "image_search":
-                    alias = str(step.get("asset") or "")
-                    metadata = assets.get(alias)
-                    if not isinstance(metadata, dict):
-                        issues.append(Issue("error", "이미지 누락", f"'{alias}' 이미지 별칭이 없습니다.", summary.name, index))
-                    else:
-                        path = (self.repository.root / str(metadata.get("file") or "")).resolve()
-                        if not path.exists():
-                            issues.append(Issue("error", "이미지 파일 누락", str(path), summary.name, index))
+                    aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
+                    primary = str(step.get("asset") or "")
+                    if primary and primary not in aliases:
+                        aliases.insert(0, primary)
+                    for alias in aliases or [primary]:
+                        metadata = assets.get(alias)
+                        if not isinstance(metadata, dict):
+                            issues.append(Issue("error", "이미지 누락", f"'{alias}' 이미지 별칭이 없습니다.", summary.name, index))
+                        else:
+                            path = (self.repository.root / str(metadata.get("file") or "")).resolve()
+                            if not path.exists():
+                                issues.append(Issue("error", "이미지 파일 누락", str(path), summary.name, index))
                     regions = step.get("regions") or []
                     if step.get("region") is not None:
                         regions = list(regions) + [step.get("region")]

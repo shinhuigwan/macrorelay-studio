@@ -461,6 +461,35 @@ class NodeItem(QtWidgets.QGraphicsObject):
         event.accept()
 
 
+class EdgeWaypointHandle(QtWidgets.QGraphicsEllipseItem):
+    def __init__(self, edge: "EdgeItem", index: int, seed: bool = False) -> None:
+        super().__init__(-7, -7, 14, 14, edge)
+        self.edge = edge
+        self.index = index
+        self.seed = seed
+        self.setBrush(QtGui.QColor("#151B27"))
+        self.setPen(QtGui.QPen(edge.color.lighter(145), 2.2))
+        self.setCursor(QtCore.Qt.SizeAllCursor)
+        self.setZValue(80)
+        self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QtWidgets.QGraphicsItem.ItemSendsGeometryChanges, True)
+        self.setToolTip("드래그해 연결선 경로를 조정합니다.")
+
+    def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        self.edge._handle_dragging = True
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        super().mouseMoveEvent(event)
+        self.edge._waypoint_moved(self)
+
+    def mouseReleaseEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        super().mouseReleaseEvent(event)
+        self.edge._waypoint_moved(self)
+        self.edge._handle_dragging = False
+        self.edge.canvas.commit_manual_route(self)
+
+
 class EdgeItem(QtWidgets.QGraphicsPathItem):
     def __init__(
         self,
@@ -501,7 +530,70 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self.route_side = ""
         self.route_lane = 0
         self.target_offset_y = 0.0
+        self.manual_points = self.canvas.route_points(self)
+        self._waypoint_handles: list[EdgeWaypointHandle] = []
+        self._handle_dragging = False
         self.update_path()
+
+    def paint(
+        self,
+        painter: QtGui.QPainter,
+        option: QtWidgets.QStyleOptionGraphicsItem,
+        widget=None,
+    ) -> None:
+        # Selection is represented by editable waypoint handles. Qt's default
+        # dotted bounding rectangle spans the entire route and obscures nearby
+        # nodes, so suppress only that default selection decoration.
+        was_selected = bool(option.state & QtWidgets.QStyle.State_Selected)
+        if was_selected:
+            option.state &= ~QtWidgets.QStyle.State_Selected
+        super().paint(painter, option, widget)
+        if was_selected:
+            option.state |= QtWidgets.QStyle.State_Selected
+
+    def itemChange(self, change: QtWidgets.QGraphicsItem.GraphicsItemChange, value: Any) -> Any:
+        result = super().itemChange(change, value)
+        if change == QtWidgets.QGraphicsItem.ItemSelectedHasChanged:
+            QtCore.QTimer.singleShot(0, self._sync_waypoint_handles)
+        return result
+
+    def _clear_waypoint_handles(self) -> None:
+        for handle in self._waypoint_handles:
+            if handle.scene() is not None:
+                handle.scene().removeItem(handle)
+        self._waypoint_handles = []
+
+    def _sync_waypoint_handles(self) -> None:
+        if self._handle_dragging:
+            return
+        self._clear_waypoint_handles()
+        if not self.isSelected() or self.scene() is None:
+            return
+        points = self.manual_points or [self.path().pointAtPercent(0.5)]
+        seed = not bool(self.manual_points)
+        for index, point in enumerate(points):
+            handle = EdgeWaypointHandle(self, index, seed=seed and index == 0)
+            handle.setPos(point)
+            self._waypoint_handles.append(handle)
+
+    def _waypoint_moved(self, handle: EdgeWaypointHandle) -> None:
+        point = QtCore.QPointF(handle.pos())
+        if handle.seed:
+            self.manual_points = [point]
+            handle.seed = False
+            handle.index = 0
+        elif 0 <= handle.index < len(self.manual_points):
+            self.manual_points[handle.index] = point
+        self.update_path()
+
+    def add_manual_point(self, point: QtCore.QPointF) -> None:
+        self.manual_points.append(QtCore.QPointF(point))
+        self.update_path()
+        self.canvas.commit_manual_route(self)
+
+    def clear_manual_points(self) -> None:
+        self.manual_points = []
+        self.canvas.commit_manual_route(self)
 
     def shape(self) -> QtGui.QPainterPath:
         stroker = QtGui.QPainterPathStroker()
@@ -515,7 +607,9 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             return
         port = source_node.success_port if self.kind == "success" else source_node.fail_port
         start = port.mapToScene(port.rect().center())
-        if self.route_side == "top":
+        if self.manual_points:
+            end = target_node.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + self.target_offset_y))
+        elif self.route_side == "top":
             end = target_node.mapToScene(QtCore.QPointF(NodeItem.WIDTH / 2 + self.target_offset_y, 0))
         elif self.route_side == "bottom":
             end = target_node.mapToScene(
@@ -524,7 +618,12 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         else:
             end = target_node.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + self.target_offset_y))
         distance = abs(end.x() - start.x())
-        if self.route_side:
+        if self.manual_points:
+            path = QtGui.QPainterPath(start)
+            for control in self.manual_points:
+                path.lineTo(control)
+            path.lineTo(end)
+        elif self.route_side:
             source_rect = source_node.sceneBoundingRect()
             target_rect = target_node.sceneBoundingRect()
             span_left = min(start.x(), end.x())
@@ -605,6 +704,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         if not self.route_side:
             label_y += self.target_offset_y * 1.15
         self.label.setPos(point + QtCore.QPointF(8, label_y))
+        self._sync_waypoint_handles()
 
     def hoverEnterEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
         style = QtCore.Qt.DashLine if self.is_condition else QtCore.Qt.SolidLine
@@ -651,10 +751,17 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
     def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:
         menu = QtWidgets.QMenu()
         delay = menu.addAction("연결 설정 · 딜레이와 조건 분기")
+        add_point = menu.addAction("＋ 이 위치에 경유점 추가")
+        reset_route = menu.addAction("수동 경로 초기화")
+        reset_route.setEnabled(bool(self.manual_points))
         remove = menu.addAction("연결 끊기")
         chosen = menu.exec(event.screenPos())
         if chosen == delay:
             self.canvas.edge_delay_requested.emit(self.source, self.target, self.kind)
+        elif chosen == add_point:
+            self.add_manual_point(event.scenePos())
+        elif chosen == reset_route:
+            self.clear_manual_points()
         elif chosen == remove:
             if self.is_condition:
                 self.canvas.edge_condition_delete_requested.emit(self.source, self.condition_index)
@@ -668,6 +775,7 @@ class NodeCanvas(QtWidgets.QWidget):
     node_selected = QtCore.Signal(int)
     inspector_requested = QtCore.Signal(int)
     positions_changed = QtCore.Signal(dict)
+    routes_changed = QtCore.Signal(dict)
     link_requested = QtCore.Signal(int, int, str)
     edge_delete_requested = QtCore.Signal(int, int, str)
     edge_delay_requested = QtCore.Signal(int, int, str)
@@ -686,6 +794,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.steps: list[dict[str, Any]] = []
         self.nodes: dict[int, NodeItem] = {}
         self.edges: list[EdgeItem] = []
+        self.manual_routes: dict[str, list[list[float]]] = {}
         self.start_step = 0
         self.start_candidates: list[int] = []
         self.end_step = 0
@@ -724,7 +833,7 @@ class NodeCanvas(QtWidgets.QWidget):
         legend = QtWidgets.QLabel(
             f"<span style='color:{COLORS['success']}'>● 성공</span>  "
             f"<span style='color:{COLORS['danger']}'>● 실패</span>  "
-            "<span style='color:#9DA7BA'>· 선 바깥 드롭=제거 · 바닥 더블클릭 유지=이동</span>"
+            "<span style='color:#9DA7BA'>· 선 선택→손잡이 드래그=경로 · 선 바깥 드롭=제거 · 바닥 더블클릭 유지=이동</span>"
         )
         legend.setObjectName("Muted")
         toolbar_layout.addWidget(self.flow_label)
@@ -748,7 +857,8 @@ class NodeCanvas(QtWidgets.QWidget):
         if label:
             return label
         if action == "image_search":
-            return str(step.get("asset") or "이미지 선택 필요")
+            assets = step.get("assets") if isinstance(step.get("assets"), list) else []
+            return f"멀티 이미지 {len(assets)}개" if len(assets) > 1 else str(step.get("asset") or "이미지 선택 필요")
         if action == "ocr":
             ocr_action = str(step.get("ocr_action") or "extract")
             if ocr_action in {"find_text", "find_click", "find_click_offset"}:
@@ -781,6 +891,8 @@ class NodeCanvas(QtWidgets.QWidget):
         self.steps = list(self.macro.get("steps") or [])
         self.nodes = {}
         self.edges = []
+        raw_routes = self.macro.get("graph_routes") or {}
+        self.manual_routes = dict(raw_routes) if isinstance(raw_routes, dict) else {}
         self.start_step = int(self.macro.get("graph_start_step") or 0)
         raw_candidates = self.macro.get("start_search_candidates") or []
         self.start_candidates = []
@@ -933,6 +1045,30 @@ class NodeCanvas(QtWidgets.QWidget):
             for index, node in self.nodes.items()
         }
 
+    @staticmethod
+    def edge_route_key(edge: EdgeItem) -> str:
+        return f"{edge.source}:{edge.kind}:{edge.target}:{edge.condition_index}"
+
+    def route_points(self, edge: EdgeItem) -> list[QtCore.QPointF]:
+        raw = self.manual_routes.get(self.edge_route_key(edge)) or []
+        points: list[QtCore.QPointF] = []
+        for value in raw if isinstance(raw, list) else []:
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                try:
+                    points.append(QtCore.QPointF(float(value[0]), float(value[1])))
+                except (TypeError, ValueError):
+                    continue
+        return points
+
+    def commit_manual_route(self, edge: EdgeItem) -> None:
+        key = self.edge_route_key(edge)
+        if edge.manual_points:
+            self.manual_routes[key] = [[round(point.x(), 2), round(point.y(), 2)] for point in edge.manual_points]
+        else:
+            self.manual_routes.pop(key, None)
+        edge.update_path()
+        self.routes_changed.emit(dict(self.manual_routes))
+
     def node_moved(self) -> None:
         self._route_edges()
         self._positions_timer.start()
@@ -995,6 +1131,8 @@ class NodeCanvas(QtWidgets.QWidget):
                 edge.target_offset_y = (position - center) * spacing
 
         for edge in self.edges:
+            if edge.manual_points:
+                continue
             source = self.nodes.get(edge.source)
             target = self.nodes.get(edge.target)
             if source is None or target is None:

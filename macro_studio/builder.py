@@ -624,6 +624,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.node_selected.connect(self._select_graph_node)
         self.node_canvas.inspector_requested.connect(self._focus_inspector)
         self.node_canvas.positions_changed.connect(self._graph_positions_changed)
+        self.node_canvas.routes_changed.connect(self._graph_routes_changed)
         self.node_canvas.link_requested.connect(self._connect_graph_nodes)
         self.node_canvas.edge_delete_requested.connect(self._delete_graph_edge)
         self.node_canvas.edge_delay_requested.connect(self._set_graph_edge_delay)
@@ -872,8 +873,9 @@ class BuilderPage(QtWidgets.QWidget):
                 if isinstance(step.get(key), (list, tuple)) and len(step[key]) == 4
             )
             range_summary = f"{region_label} · {region_count}개" if region_count else f"{region_label} 전체"
+            multi_assets = step.get("assets") if isinstance(step.get("assets"), list) else []
             details = [
-                f"이미지: {step.get('asset') or '미선택'}",
+                f"이미지: 멀티 {len(multi_assets)}개" if len(multi_assets) > 1 else f"이미지: {step.get('asset') or '미선택'}",
                 f"엔진: {step.get('engine') or 'ahk'}",
                 f"검색 범위: {range_summary}",
             ]
@@ -1162,6 +1164,16 @@ class BuilderPage(QtWidgets.QWidget):
         if self.current_macro is None:
             return
         self.current_macro["graph_positions"] = positions
+        self._graph_save_timer.start()
+
+    @QtCore.Slot(dict)
+    def _graph_routes_changed(self, routes: dict) -> None:
+        if self.current_macro is None:
+            return
+        if routes:
+            self.current_macro["graph_routes"] = routes
+        else:
+            self.current_macro.pop("graph_routes", None)
         self._graph_save_timer.start()
 
     def _save_graph_positions(self) -> None:
@@ -1485,6 +1497,7 @@ class BuilderPage(QtWidgets.QWidget):
         if len(steps) == 1 and isinstance(steps[0], dict) and _is_unconfigured_template_step(steps[0]):
             steps.clear()
             self.current_macro["graph_positions"] = {}
+            self.current_macro.pop("graph_routes", None)
         base = len(steps)
         prepared = deepcopy(new_steps)
         for step in prepared:
@@ -1923,8 +1936,54 @@ class BuilderPage(QtWidgets.QWidget):
         self._persist("단계를 매크로 내부 보관함으로 이동했습니다.")
         self._refresh_steps(min(row, len(steps) - 1))
 
+    def _remap_graph_routes(self, mapping: dict[int, int]) -> None:
+        """Keep saved manual edge paths attached to their logical nodes."""
+        if self.current_macro is None:
+            return
+        routes = self.current_macro.get("graph_routes") or {}
+        if not isinstance(routes, dict):
+            self.current_macro.pop("graph_routes", None)
+            return
+        remapped: dict[str, Any] = {}
+        for raw_key, points in routes.items():
+            parts = str(raw_key).split(":")
+            if len(parts) != 4:
+                continue
+            try:
+                source = mapping[int(parts[0])]
+                target = mapping[int(parts[2])]
+                condition_index = int(parts[3])
+            except (KeyError, TypeError, ValueError):
+                continue
+            remapped[f"{source}:{parts[1]}:{target}:{condition_index}"] = points
+
+        # Drop paths for links that no longer exist after an edit. This also
+        # prevents an old route from being applied to a later, unrelated edge.
+        valid_keys: set[str] = set()
+        steps = self.current_macro.get("steps") or []
+        for source, step in enumerate(steps, start=1):
+            for field, kind in (("on_success", "success"), ("on_fail", "fail")):
+                target = int(step.get(field) or 0)
+                if 1 <= target <= len(steps):
+                    valid_keys.add(f"{source}:{kind}:{target}:-1")
+            conditions = step.get("edge_conditions") or []
+            if isinstance(conditions, list):
+                for condition_index, rule in enumerate(conditions):
+                    if not isinstance(rule, dict):
+                        continue
+                    target = int(rule.get("target") or 0)
+                    kind = str(rule.get("kind") or "success")
+                    if 1 <= target <= len(steps) and kind in {"success", "fail"}:
+                        valid_keys.add(f"{source}:{kind}:{target}:{condition_index}")
+        remapped = {key: points for key, points in remapped.items() if key in valid_keys}
+        if remapped:
+            self.current_macro["graph_routes"] = remapped
+        else:
+            self.current_macro.pop("graph_routes", None)
+
     def _normalize_edges_after_delete(self, deleted: int) -> None:
         steps = (self.current_macro or {}).get("steps") or []
+        old_count = len(steps) + 1
         for step in steps:
             for field in ("on_success", "on_fail", "target_step", "jump_to"):
                 value = int(step.get(field) or 0)
@@ -1994,6 +2053,13 @@ class BuilderPage(QtWidgets.QWidget):
                         automation["candidate_count"] = len(normalized_candidates)
             else:
                 self.current_macro.pop("start_search_candidates", None)
+        self._remap_graph_routes(
+            {
+                old_index: old_index - 1 if old_index > deleted else old_index
+                for old_index in range(1, old_count + 1)
+                if old_index != deleted
+            }
+        )
 
     def _move_step(self, direction: int) -> None:
         if not self.current_macro:
@@ -2033,6 +2099,9 @@ class BuilderPage(QtWidgets.QWidget):
         candidates = self.current_macro.get("start_search_candidates") or []
         if isinstance(candidates, list):
             self.current_macro["start_search_candidates"] = [mapping.get(int(value), int(value)) for value in candidates]
+        self._remap_graph_routes(
+            {index: mapping.get(index, index) for index in range(1, len(steps) + 1)}
+        )
         self._persist("단계 순서를 변경했습니다.")
         self._refresh_steps(target)
 

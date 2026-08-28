@@ -87,6 +87,81 @@ class SearchableAssetCombo(QtWidgets.QComboBox):
         return self.currentText().strip()
 
 
+class MultiAssetPicker(QtWidgets.QWidget):
+    """Compact searchable checklist used by one-node multi image search."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("여러 이미지 검색 · 이름 또는 초성")
+        self.search.textChanged.connect(self._filter)
+        self.list = QtWidgets.QListWidget()
+        self.list.setMinimumHeight(145)
+        self.list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.list.itemChanged.connect(lambda _item: self._update_count())
+        controls = QtWidgets.QHBoxLayout()
+        select_visible = QtWidgets.QPushButton("검색 결과 모두 선택")
+        clear = QtWidgets.QPushButton("선택 해제")
+        select_visible.clicked.connect(self._select_visible)
+        clear.clicked.connect(lambda: self.set_value([]))
+        self.count_label = QtWidgets.QLabel("0개 선택")
+        self.count_label.setObjectName("Muted")
+        controls.addWidget(select_visible)
+        controls.addWidget(clear)
+        controls.addStretch(1)
+        controls.addWidget(self.count_label)
+        layout.addWidget(self.search)
+        layout.addWidget(self.list)
+        layout.addLayout(controls)
+
+    def set_options(self, values: list[str]) -> None:
+        selected = set(self.value())
+        self.list.clear()
+        for value in values:
+            item = QtWidgets.QListWidgetItem(str(value))
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked if value in selected else QtCore.Qt.Unchecked)
+            self.list.addItem(item)
+        self._update_count()
+
+    def set_value(self, values: Any) -> None:
+        selected = {str(value) for value in values if str(value).strip()} if isinstance(values, list) else set()
+        known = {self.list.item(index).text() for index in range(self.list.count())}
+        for missing in sorted(selected - known):
+            item = QtWidgets.QListWidgetItem(missing)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            self.list.addItem(item)
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            item.setCheckState(QtCore.Qt.Checked if item.text() in selected else QtCore.Qt.Unchecked)
+        self._update_count()
+
+    def value(self) -> list[str]:
+        return [
+            self.list.item(index).text()
+            for index in range(self.list.count())
+            if self.list.item(index).checkState() == QtCore.Qt.Checked
+        ]
+
+    def _filter(self, query: str) -> None:
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            item.setHidden(not korean_contains(query, item.text()))
+
+    def _select_visible(self) -> None:
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            if not item.isHidden():
+                item.setCheckState(QtCore.Qt.Checked)
+        self._update_count()
+
+    def _update_count(self) -> None:
+        self.count_label.setText(f"{len(self.value())}개 선택")
+
+
 @dataclass(frozen=True)
 class FieldSpec:
     key: str
@@ -158,6 +233,13 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
     ],
     "image_search": [
         FieldSpec("asset", "검색 이미지", "asset", ""),
+        FieldSpec(
+            "assets",
+            "멀티 검색 이미지",
+            "assets",
+            [],
+            tooltip="2개 이상 선택하면 한 화면 캡처에서 모두 비교하고 정확도가 가장 높은 이미지를 선택합니다. 단일 검색 이미지는 우선 후보로 함께 포함됩니다.",
+        ),
         FieldSpec("engine", "검색 엔진", "choice", "ahk", options=choice(("AutoHotkey · 가볍고 빠름", "ahk"), ("OpenCV · 정밀(선택 설치)", "opencv"))),
         FieldSpec("search_profile", "검색 품질", "choice", "fast", options=choice(("빠름 · 권장", "fast"), ("균형 · 색상 보강", "balanced"), ("정밀 · 70~150% 자동 배율", "precise"))),
         FieldSpec("variation", "색상 허용 오차", "int", 16, 0, 255, tooltip="낮을수록 더 정확하고 엄격하게 일치합니다."),
@@ -1605,19 +1687,24 @@ class ActionEditor(QtWidgets.QWidget):
 
     def _diagnose_image_search(self) -> None:
         step = self.build_step()
+        aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
         alias = str(step.get("asset") or "")
-        path = self.repository.asset_path(alias) if alias else None
+        if alias and alias not in aliases:
+            aliases.insert(0, alias)
         issues: list[str] = []
-        if not alias:
+        if not aliases:
             issues.append("검색 이미지가 선택되지 않았습니다.")
-        elif path is None:
-            issues.append("이미지 파일이 인덱스에 없거나 이동되었습니다.")
         else:
-            image = QtGui.QImage(str(path))
-            if image.isNull():
-                issues.append("이미지 파일을 디코딩할 수 없습니다.")
-            elif image.width() < 3 or image.height() < 3:
-                issues.append("검색 이미지가 너무 작습니다.")
+            for candidate in aliases:
+                path = self.repository.asset_path(candidate)
+                if path is None:
+                    issues.append(f"'{candidate}' 이미지 파일이 인덱스에 없거나 이동되었습니다.")
+                    continue
+                image = QtGui.QImage(str(path))
+                if image.isNull():
+                    issues.append(f"'{candidate}' 이미지 파일을 디코딩할 수 없습니다.")
+                elif image.width() < 3 or image.height() < 3:
+                    issues.append(f"'{candidate}' 검색 이미지가 너무 작습니다.")
         regions = step.get("regions") or []
         raw_regions: list[list[int]] = []
         for key in ("region", "region2"):
@@ -1651,6 +1738,8 @@ class ActionEditor(QtWidgets.QWidget):
                 widget.setSuffix(" ms")
         elif spec.kind == "offset":
             widget = OffsetEditor()
+        elif spec.kind == "assets":
+            widget = MultiAssetPicker()
         elif spec.kind == "bool":
             widget = QtWidgets.QCheckBox()
         elif spec.kind in {"choice", "asset", "macro", "table"}:
@@ -1703,9 +1792,12 @@ class ActionEditor(QtWidgets.QWidget):
             for spec in specs:
                 if spec.key in COMMON_FIELD_KEYS:
                     continue
-                if spec.kind not in {"asset", "macro", "table"}:
+                if spec.kind not in {"asset", "assets", "macro", "table"}:
                     continue
                 combo = self.widgets[action].get(spec.key)
+                if isinstance(combo, MultiAssetPicker):
+                    combo.set_options(assets)
+                    continue
                 if not isinstance(combo, QtWidgets.QComboBox):
                     continue
                 previous = combo.currentText()
@@ -1762,6 +1854,16 @@ class ActionEditor(QtWidgets.QWidget):
             else:
                 set_path(payload, spec.key, value)
         if action == "image_search":
+            multi_assets = [str(value) for value in payload.get("assets") or [] if str(value).strip()]
+            primary_asset = str(payload.get("asset") or "").strip()
+            if multi_assets:
+                if primary_asset and primary_asset not in multi_assets:
+                    multi_assets.insert(0, primary_asset)
+                payload["assets"] = list(dict.fromkeys(multi_assets))
+                payload["asset"] = payload["assets"][0]
+                payload["engine"] = "opencv"
+            else:
+                payload.pop("assets", None)
             click_enabled = bool(payload.pop("click_enabled", False))
             region2 = payload.pop("region2", None)
             region = payload.get("region")
@@ -1809,6 +1911,8 @@ class ActionEditor(QtWidgets.QWidget):
         target = self._value_widget(widget)
         if isinstance(target, OffsetEditor):
             target.set_value(value)
+        elif isinstance(target, MultiAssetPicker):
+            target.set_value(value)
         elif isinstance(target, QtWidgets.QSpinBox):
             try:
                 target.setValue(int(value or 0))
@@ -1835,6 +1939,8 @@ class ActionEditor(QtWidgets.QWidget):
     def _widget_value(self, widget: QtWidgets.QWidget, spec: FieldSpec) -> Any:
         target = self._value_widget(widget)
         if isinstance(target, OffsetEditor):
+            return target.value()
+        if isinstance(target, MultiAssetPicker):
             return target.value()
         if isinstance(target, QtWidgets.QSpinBox):
             return target.value()

@@ -405,6 +405,30 @@ class ImageEditorDialog(QtWidgets.QDialog):
         precision.addWidget(QtWidgets.QLabel("투명화 키"))
         precision.addWidget(self.stamp_key_edit)
         tool_layout.addLayout(precision)
+
+        colour_shortcuts = QtWidgets.QHBoxLayout()
+        colour_shortcuts.addWidget(QtWidgets.QLabel("색상 도구 단축키"))
+        settings = QtCore.QSettings("MacroRelay", "Studio")
+        self.pick_key_edit = QtWidgets.QKeySequenceEdit(
+            QtGui.QKeySequence(str(settings.value("image_editor/pick_colour_shortcut", "P") or "P"))
+        )
+        self.remove_colour_key_edit = QtWidgets.QKeySequenceEdit(
+            QtGui.QKeySequence(str(settings.value("image_editor/remove_colour_shortcut", "R") or "R"))
+        )
+        self.remove_connected_key_edit = QtWidgets.QKeySequenceEdit(
+            QtGui.QKeySequence(str(settings.value("image_editor/remove_connected_shortcut", "Shift+R") or "Shift+R"))
+        )
+        for editor in (self.pick_key_edit, self.remove_colour_key_edit, self.remove_connected_key_edit):
+            editor.setMaximumWidth(115)
+            editor.editingFinished.connect(self._update_colour_shortcuts)
+        colour_shortcuts.addWidget(QtWidgets.QLabel("색상 찍기"))
+        colour_shortcuts.addWidget(self.pick_key_edit)
+        colour_shortcuts.addWidget(QtWidgets.QLabel("전체 유사색 제거"))
+        colour_shortcuts.addWidget(self.remove_colour_key_edit)
+        colour_shortcuts.addWidget(QtWidgets.QLabel("연결 유사색 제거"))
+        colour_shortcuts.addWidget(self.remove_connected_key_edit)
+        colour_shortcuts.addStretch(1)
+        tool_layout.addLayout(colour_shortcuts)
         root.addWidget(tools)
 
         self.scroll = QtWidgets.QScrollArea()
@@ -451,6 +475,14 @@ class ImageEditorDialog(QtWidgets.QDialog):
         self.erase_stamp_shortcut = QtGui.QShortcut(self.stamp_key_edit.keySequence(), self)
         self.erase_stamp_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
         self.erase_stamp_shortcut.activated.connect(self._stamp_brush)
+        self.pick_colour_shortcut = QtGui.QShortcut(self.pick_key_edit.keySequence(), self)
+        self.remove_colour_shortcut = QtGui.QShortcut(self.remove_colour_key_edit.keySequence(), self)
+        self.remove_connected_shortcut = QtGui.QShortcut(self.remove_connected_key_edit.keySequence(), self)
+        for shortcut in (self.pick_colour_shortcut, self.remove_colour_shortcut, self.remove_connected_shortcut):
+            shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.pick_colour_shortcut.activated.connect(self.start_pick_color)
+        self.remove_colour_shortcut.activated.connect(self.remove_color)
+        self.remove_connected_shortcut.activated.connect(self.remove_connected_color)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -781,6 +813,26 @@ class ImageEditorDialog(QtWidgets.QDialog):
         QtCore.QSettings("MacroRelay", "Studio").setValue(
             "image_editor/erase_stamp_shortcut", sequence.toString()
         )
+
+    def _update_colour_shortcuts(self) -> None:
+        defaults = (
+            (self.pick_key_edit, self.pick_colour_shortcut, "image_editor/pick_colour_shortcut", "P"),
+            (self.remove_colour_key_edit, self.remove_colour_shortcut, "image_editor/remove_colour_shortcut", "R"),
+            (
+                self.remove_connected_key_edit,
+                self.remove_connected_shortcut,
+                "image_editor/remove_connected_shortcut",
+                "Shift+R",
+            ),
+        )
+        settings = QtCore.QSettings("MacroRelay", "Studio")
+        for editor, shortcut, key, fallback in defaults:
+            sequence = editor.keySequence()
+            if sequence.isEmpty():
+                sequence = QtGui.QKeySequence(fallback)
+                editor.setKeySequence(sequence)
+            shortcut.setKey(sequence)
+            settings.setValue(key, sequence.toString())
 
     def _update_brush_preview(self) -> None:
         if not hasattr(self, "view"):

@@ -395,6 +395,7 @@ class BuilderPage(QtWidgets.QWidget):
     run_macro_step = QtCore.Signal(str, int)
     stop_macros = QtCore.Signal()
     open_export = QtCore.Signal(str)
+    edit_committed = QtCore.Signal()
 
     def __init__(self, repository: MacroRepository, parent=None) -> None:
         super().__init__(parent)
@@ -402,6 +403,10 @@ class BuilderPage(QtWidgets.QWidget):
         self.repository = repository
         self.current_name = ""
         self.current_macro: dict[str, Any] | None = None
+        self._undo_history: dict[str, list[dict[str, Any]]] = {}
+        self._redo_history: dict[str, list[dict[str, Any]]] = {}
+        self._last_persisted_macro: dict[str, Any] | None = None
+        self._history_suspended = False
         self._loading = False
         self._graph_save_timer = QtCore.QTimer(self)
         self._graph_save_timer.setSingleShot(True)
@@ -428,6 +433,7 @@ class BuilderPage(QtWidgets.QWidget):
         root.addWidget(PageHeader("노드 매크로 빌더", "스마트 녹화 · 자동 설정 · 단계 테스트 · 자동 진단 · 재사용 블록"))
 
         toolbar_top = QtWidgets.QHBoxLayout()
+        toolbar_recording = QtWidgets.QHBoxLayout()
         toolbar_bottom = QtWidgets.QHBoxLayout()
         new_btn = primary_button("＋ 새 매크로")
         new_btn.clicked.connect(self._create_macro)
@@ -474,13 +480,14 @@ class BuilderPage(QtWidgets.QWidget):
         toolbar_top.addWidget(new_btn)
         toolbar_top.addWidget(duplicate_btn)
         toolbar_top.addWidget(archive_btn)
-        toolbar_top.addWidget(self.record_btn)
-        toolbar_top.addWidget(self.review_recording_btn)
-        toolbar_top.addWidget(self.inactive_handle_lab_btn)
         toolbar_top.addStretch(1)
         toolbar_top.addWidget(self.run_button)
         toolbar_top.addWidget(self.stop_button)
         toolbar_top.addWidget(log_btn)
+        toolbar_recording.addWidget(self.record_btn)
+        toolbar_recording.addWidget(self.review_recording_btn)
+        toolbar_recording.addWidget(self.inactive_handle_lab_btn)
+        toolbar_recording.addStretch(1)
         action_label = QtWidgets.QLabel("추가할 노드 액션")
         action_label.setObjectName("Muted")
         toolbar_bottom.addWidget(action_label)
@@ -490,6 +497,7 @@ class BuilderPage(QtWidgets.QWidget):
         toolbar_bottom.addStretch(1)
         toolbar_bottom.addWidget(diagnose_btn)
         root.addLayout(toolbar_top)
+        root.addLayout(toolbar_recording)
         root.addLayout(toolbar_bottom)
 
         self.shortcut_buttons.update(
@@ -584,7 +592,15 @@ class BuilderPage(QtWidgets.QWidget):
         node_actions.setSpacing(7)
         action_hint = QtWidgets.QLabel("선택한 노드")
         action_hint.setObjectName("Muted")
+        self.undo_button = QtWidgets.QPushButton("↶ 실행 취소")
+        self.undo_button.setToolTip("마지막 매크로 편집 실행 취소 (Ctrl+Z)")
+        self.undo_button.clicked.connect(self.undo_edit)
+        self.redo_button = QtWidgets.QPushButton("↷ 다시 실행")
+        self.redo_button.setToolTip("취소한 매크로 편집 다시 실행 (Ctrl+Y)")
+        self.redo_button.clicked.connect(self.redo_edit)
         node_actions.addWidget(action_hint)
+        node_actions.addWidget(self.undo_button)
+        node_actions.addWidget(self.redo_button)
         node_actions.addWidget(duplicate_node_btn)
         node_actions.addWidget(sequential_btn)
         node_actions.addWidget(start_btn)
@@ -594,6 +610,7 @@ class BuilderPage(QtWidgets.QWidget):
         node_actions.addWidget(add_block_btn)
         node_actions.addWidget(delete_node_btn)
         node_actions.addStretch(1)
+        self._update_history_buttons()
 
         self.node_canvas = NodeCanvas()
         self.node_canvas.node_selected.connect(self._select_graph_node)
@@ -1041,6 +1058,8 @@ class BuilderPage(QtWidgets.QWidget):
             self.status.emit(str(exc))
             return
         self.current_name = name
+        self._last_persisted_macro = deepcopy(self.current_macro)
+        self._update_history_buttons()
         self.macro_title.setText(f"{name}  ·  {len(self.current_macro.get('steps') or [])}단계")
         self._refresh_steps()
 
@@ -1130,8 +1149,7 @@ class BuilderPage(QtWidgets.QWidget):
     def _save_graph_positions(self) -> None:
         if not self.current_name or self.current_macro is None:
             return
-        self.repository.save_macro(self.current_name, self.current_macro)
-        self.status.emit("노드 위치를 저장했습니다.")
+        self._persist("노드 위치를 저장했습니다.")
 
     @QtCore.Slot(int, int, str)
     def _connect_graph_nodes(self, source: int, target: int, kind: str) -> None:
@@ -1991,10 +2009,63 @@ class BuilderPage(QtWidgets.QWidget):
     def _persist(self, message: str) -> None:
         if not self.current_name or self.current_macro is None:
             return
+        current = deepcopy(self.current_macro)
+        previous = deepcopy(self._last_persisted_macro) if self._last_persisted_macro is not None else None
+        if not self._history_suspended and previous is not None and previous != current:
+            history = self._undo_history.setdefault(self.current_name, [])
+            if not history or history[-1] != previous:
+                history.append(previous)
+                del history[:-50]
+            self._redo_history.setdefault(self.current_name, []).clear()
         self.repository.save_macro(self.current_name, self.current_macro)
+        self._last_persisted_macro = current
         self.macro_title.setText(f"{self.current_name}  ·  {len(self.current_macro.get('steps') or [])}단계")
         self.status.emit(message)
+        self.edit_committed.emit()
+        self._update_history_buttons()
         self._data_change_timer.start()
+
+    def _update_history_buttons(self) -> None:
+        if not hasattr(self, "undo_button"):
+            return
+        self.undo_button.setEnabled(bool(self._undo_history.get(self.current_name)))
+        self.redo_button.setEnabled(bool(self._redo_history.get(self.current_name)))
+
+    def undo_edit(self) -> bool:
+        if not self.current_name or self.current_macro is None:
+            return False
+        history = self._undo_history.setdefault(self.current_name, [])
+        if not history:
+            self.status.emit("실행 취소할 매크로 편집 기록이 없습니다.")
+            return False
+        selected = max(0, self.steps_table.currentRow())
+        self._redo_history.setdefault(self.current_name, []).append(deepcopy(self.current_macro))
+        self.current_macro = history.pop()
+        self.repository.save_macro(self.current_name, self.current_macro)
+        self._last_persisted_macro = deepcopy(self.current_macro)
+        self._refresh_steps(selected)
+        self._update_history_buttons()
+        self.status.emit("마지막 매크로 편집을 실행 취소했습니다.")
+        self._data_change_timer.start()
+        return True
+
+    def redo_edit(self) -> bool:
+        if not self.current_name or self.current_macro is None:
+            return False
+        history = self._redo_history.setdefault(self.current_name, [])
+        if not history:
+            self.status.emit("다시 실행할 매크로 편집 기록이 없습니다.")
+            return False
+        selected = max(0, self.steps_table.currentRow())
+        self._undo_history.setdefault(self.current_name, []).append(deepcopy(self.current_macro))
+        self.current_macro = history.pop()
+        self.repository.save_macro(self.current_name, self.current_macro)
+        self._last_persisted_macro = deepcopy(self.current_macro)
+        self._refresh_steps(selected)
+        self._update_history_buttons()
+        self.status.emit("취소한 매크로 편집을 다시 실행했습니다.")
+        self._data_change_timer.start()
+        return True
 
     def _create_macro(self) -> None:
         dialog = MacroDialog("새 매크로", parent=self)
@@ -2069,7 +2140,11 @@ class BuilderPage(QtWidgets.QWidget):
         snapshot = deepcopy(self.current_macro)
         name = self.current_name
         before = len(self.current_macro.get("steps") or [])
-        self._delete_nodes(indexes)
+        self._history_suspended = True
+        try:
+            self._delete_nodes(indexes)
+        finally:
+            self._history_suspended = False
         after = len((self.current_macro or {}).get("steps") or [])
         if after >= before:
             return None
@@ -2135,10 +2210,12 @@ class BuilderPage(QtWidgets.QWidget):
     def _clear_editor(self) -> None:
         self.current_name = ""
         self.current_macro = None
+        self._last_persisted_macro = None
         self.macro_title.setText("매크로를 선택하세요")
         self.steps_table.setRowCount(0)
         self.json_edit.clear()
         self.node_canvas.set_macro(None)
+        self._update_history_buttons()
 
     def shutdown_automation(self) -> None:
         if self._recording_controller is not None:

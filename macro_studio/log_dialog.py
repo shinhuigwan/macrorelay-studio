@@ -5,6 +5,7 @@ from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .repository import MacroRepository
+from .diagnostics import build_diagnostic_bundle
 from .theme import COLORS
 
 
@@ -31,6 +32,7 @@ class MacroLogDialog(QtWidgets.QDialog):
             ),
             ("Studio 실행", (repository.exports_dir / "studio_run.log",)),
             ("매크로 실행", (repository.exports_dir / "macro_log.txt",)),
+            ("단계 실행 추적", (repository.exports_dir / "execution_trace.log",)),
             ("Quick Slots", (repository.root / "runtime" / "runner.log",)),
             ("브라우저", (repository.exports_dir / "browser_action_log.txt",)),
             ("비활성 클릭", (repository.exports_dir / "inactive_click_test.log",)),
@@ -56,9 +58,13 @@ class MacroLogDialog(QtWidgets.QDialog):
         refresh_btn.clicked.connect(lambda: self.refresh(force=True))
         clear_btn = QtWidgets.QPushButton("현재 로그 지우기")
         clear_btn.clicked.connect(self._clear_current)
+        bundle_btn = QtWidgets.QPushButton("진단 자료 저장")
+        bundle_btn.setToolTip("로그·실행 추적·엔진 상태를 개인정보 제거 후 ZIP으로 저장")
+        bundle_btn.clicked.connect(self._save_diagnostic_bundle)
         controls.addWidget(self.source_combo, 1)
         controls.addWidget(refresh_btn)
         controls.addWidget(clear_btn)
+        controls.addWidget(bundle_btn)
         root.addLayout(controls)
 
         self.path_label = QtWidgets.QLabel()
@@ -165,3 +171,43 @@ class MacroLogDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "로그 지우기 실패", str(exc))
                 break
         self.refresh(force=True)
+
+    def _save_diagnostic_bundle(self) -> None:
+        stamp = QtCore.QDateTime.currentDateTime().toString("yyyyMMdd-HHmmss")
+        default = self.repository.root / "exports" / f"MacroRelay-diagnostics-{stamp}.zip"
+        selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "진단 자료 저장",
+            str(default),
+            "ZIP 파일 (*.zip)",
+        )
+        if not selected:
+            return
+        destination = Path(selected)
+        if destination.suffix.casefold() != ".zip":
+            destination = destination.with_suffix(".zip")
+        screens = [
+            {
+                "name": screen.name(),
+                "geometry": [screen.geometry().x(), screen.geometry().y(), screen.geometry().width(), screen.geometry().height()],
+                "available": [
+                    screen.availableGeometry().x(),
+                    screen.availableGeometry().y(),
+                    screen.availableGeometry().width(),
+                    screen.availableGeometry().height(),
+                ],
+                "device_pixel_ratio": screen.devicePixelRatio(),
+                "logical_dpi": screen.logicalDotsPerInch(),
+            }
+            for screen in QtGui.QGuiApplication.screens()
+        ]
+        try:
+            saved = build_diagnostic_bundle(self.repository.root, destination, screens)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "진단 자료 저장 실패", str(exc))
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "진단 자료 저장 완료",
+            f"개인정보와 인증 키를 제거한 진단 자료를 저장했습니다.\n\n{saved}",
+        )

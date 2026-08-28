@@ -69,6 +69,9 @@ class RemoteController:
         old_pid = self._read_pid(pid_path)
         if self._pid_alive(old_pid):
             return True
+        if len(command) > 1 and command[1].lower().endswith(".py") and not Path(command[1]).is_file():
+            return False
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
         process = subprocess.Popen(
             command,

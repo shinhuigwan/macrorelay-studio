@@ -31,6 +31,19 @@ def create_app(root=None) -> tuple[QtWidgets.QApplication, MainWindow]:
     app.setApplicationDisplayName(f"MacroRelay Studio {__version__}")
     app.setStyle("Fusion")
     app.setStyleSheet(stylesheet())
+    old_watchdog = getattr(app, "_macrorelay_remote_watchdog", None)
+    old_remote = getattr(app, "_macrorelay_remote", None)
+    if isinstance(old_watchdog, QtCore.QTimer):
+        old_watchdog.stop()
+        try:
+            old_watchdog.timeout.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        old_watchdog.deleteLater()
+    if isinstance(old_remote, RemoteController):
+        old_remote.stop_agent()
+        if old_remote.uses_local_relay():
+            old_remote.stop_local_relay()
     repository = MacroRepository(root)
     remote = RemoteController(repository.root)
     if remote.load().get("enabled"):
@@ -38,7 +51,8 @@ def create_app(root=None) -> tuple[QtWidgets.QApplication, MainWindow]:
     remote_watchdog = QtCore.QTimer(app)
     remote_watchdog.setInterval(5000)
     remote_watchdog.timeout.connect(remote.ensure_running)
-    remote_watchdog.start()
+    if remote.load().get("enabled"):
+        remote_watchdog.start()
     # QApplication owns this timer, but retaining explicit Python references
     # also prevents wrapper collection in long-running Studio sessions.
     app._macrorelay_remote = remote  # type: ignore[attr-defined]

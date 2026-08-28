@@ -136,8 +136,23 @@ def match_frame(
         img_h, img_w = frame.shape[:2]
         if tpl_h > img_h or tpl_w > img_w:
             continue
-        method = cv2.TM_CCORR_NORMED if template_mask is not None else cv2.TM_CCOEFF_NORMED
-        if profile == "edge" and edge_img is not None and edge_tpl is not None:
+        flat_template = template_mask is None and float(np.std(gray_tpl)) < 0.75
+        method = (
+            cv2.TM_CCORR_NORMED
+            if template_mask is not None
+            else cv2.TM_SQDIFF_NORMED if flat_template else cv2.TM_CCOEFF_NORMED
+        )
+        if flat_template:
+            # CCOEFF reports 1.0 everywhere for a constant-colour template.
+            # SQDIFF remains meaningful; invert it so all profiles keep the
+            # existing convention that a larger score is better.
+            gray_result = 1.0 - cv2.matchTemplate(gray_img, gray_tpl, method)
+            if profile == "fast":
+                score_map = gray_result
+            else:
+                color_result = 1.0 - cv2.matchTemplate(frame, template, method)
+                score_map = gray_result * 0.58 + color_result * 0.42
+        elif profile == "edge" and edge_img is not None and edge_tpl is not None:
             edge_result = cv2.matchTemplate(edge_img, edge_tpl, method, mask=template_mask)
             if np.isfinite(edge_result).any():
                 score_map = edge_result

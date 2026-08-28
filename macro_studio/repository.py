@@ -1256,9 +1256,12 @@ internal static class Program
         result_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.txt"
         progress_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.progress.txt"
         click_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.click.txt"
+        trace_path = self.exports_dir / "execution_trace.log"
+        trace_path.write_text("", encoding="utf-8")
         environment["MACRORELAY_RESULT_FILE"] = str(result_path)
         environment["MACRORELAY_PROGRESS_FILE"] = str(progress_path)
         environment["MACRORELAY_CLICK_FILE"] = str(click_path)
+        environment["MACRORELAY_TRACE_FILE"] = str(trace_path)
         executable = self._read_text_path("ahk_path.txt")
         if not executable or not executable.exists():
             raise FileNotFoundError("AutoHotkey 실행 파일을 찾을 수 없습니다.")
@@ -1267,6 +1270,7 @@ internal static class Program
         process.macrorelay_result_path = result_path  # type: ignore[attr-defined]
         process.macrorelay_progress_path = progress_path  # type: ignore[attr-defined]
         process.macrorelay_click_path = click_path  # type: ignore[attr-defined]
+        process.macrorelay_trace_path = trace_path  # type: ignore[attr-defined]
         return process
 
     def _ensure_ocr_runtime(self) -> tuple[Path, Path]:

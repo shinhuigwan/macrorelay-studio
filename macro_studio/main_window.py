@@ -50,9 +50,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_monitor.setInterval(100)
         self._run_monitor.timeout.connect(self._poll_running_macros)
         self.setWindowTitle("MacroRelay Studio")
-        self.setMinimumSize(1380, 780)
+        self.setMinimumSize(1120, 700)
         self.resize(1780, 980)
         self.settings = QtCore.QSettings("MacroRelay", "Studio")
+        self._sidebar_collapsed = bool(self.settings.value("sidebar_collapsed", False, type=bool))
+        self._resolved_shortcuts: dict[str, str] = {}
         geometry = self.settings.value("geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -96,24 +98,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_sidebar(self) -> QtWidgets.QWidget:
         sidebar = QtWidgets.QWidget()
+        self.sidebar = sidebar
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(260)
         layout = QtWidgets.QVBoxLayout(sidebar)
         layout.setContentsMargins(14, 20, 14, 16)
         layout.setSpacing(5)
-        brand = QtWidgets.QLabel("MACRO\nRELAY")
-        brand.setStyleSheet(f"font-size:18pt; font-weight:800; color:{COLORS['accent']}; padding: 4px 8px 18px 8px;")
-        caption = QtWidgets.QLabel("STUDIO · AUTOMATION")
-        caption.setObjectName("Muted")
-        caption.setStyleSheet("padding: 0 8px 14px 8px;")
-        layout.addWidget(brand)
-        layout.addWidget(caption)
+        header = QtWidgets.QHBoxLayout()
+        self.sidebar_brand = QtWidgets.QLabel("MACRO\nRELAY")
+        self.sidebar_brand.setStyleSheet(f"font-size:18pt; font-weight:800; color:{COLORS['accent']}; padding: 4px 8px 18px 8px;")
+        self.sidebar_toggle = QtWidgets.QPushButton("‹")
+        self.sidebar_toggle.setFixedSize(38, 38)
+        self.sidebar_toggle.setToolTip("좌측 메뉴 접기/펼치기")
+        self.sidebar_toggle.clicked.connect(self._toggle_sidebar)
+        header.addWidget(self.sidebar_brand, 1)
+        header.addWidget(self.sidebar_toggle, 0, QtCore.Qt.AlignTop)
+        self.sidebar_caption = QtWidgets.QLabel("STUDIO · AUTOMATION")
+        self.sidebar_caption.setObjectName("Muted")
+        self.sidebar_caption.setStyleSheet("padding: 0 8px 14px 8px;")
+        layout.addLayout(header)
+        layout.addWidget(self.sidebar_caption)
         self.nav_group = QtWidgets.QButtonGroup(self)
         self.nav_group.setExclusive(True)
         self.nav_buttons: dict[str, QtWidgets.QPushButton] = {}
         for key, label in NAV_ITEMS:
             button = QtWidgets.QPushButton(label)
             button.setObjectName("Nav")
+            button.setProperty("nav_base", label)
             button.setCheckable(True)
             button.clicked.connect(lambda _checked=False, page=key: self.switch_page(page))
             self.nav_group.addButton(button)
@@ -121,11 +131,40 @@ class MainWindow(QtWidgets.QMainWindow):
             layout.addWidget(button)
             if key == "export":
                 layout.addStretch(1)
-        footer = QtWidgets.QLabel("MacroRelay · JSON/AHK 호환")
-        footer.setObjectName("Muted")
-        footer.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(footer)
+        self.sidebar_footer = QtWidgets.QLabel("MacroRelay · JSON/AHK 호환")
+        self.sidebar_footer.setObjectName("Muted")
+        self.sidebar_footer.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self.sidebar_footer)
+        self._apply_sidebar_state(save=False)
         return sidebar
+
+    def _toggle_sidebar(self) -> None:
+        self._sidebar_collapsed = not self._sidebar_collapsed
+        self._apply_sidebar_state()
+
+    def _apply_sidebar_state(self, save: bool = True) -> None:
+        if not hasattr(self, "sidebar"):
+            return
+        collapsed = self._sidebar_collapsed
+        self.sidebar.setFixedWidth(74 if collapsed else 260)
+        self.sidebar_brand.setVisible(not collapsed)
+        self.sidebar_caption.setVisible(not collapsed)
+        self.sidebar_footer.setVisible(not collapsed)
+        self.sidebar_toggle.setText("☰" if collapsed else "‹")
+        self._refresh_nav_labels()
+        if save:
+            self.settings.setValue("sidebar_collapsed", collapsed)
+
+    def _refresh_nav_labels(self) -> None:
+        nav_labels = dict(NAV_ITEMS)
+        for key, button in getattr(self, "nav_buttons", {}).items():
+            base = nav_labels.get(key, str(button.property("nav_base") or button.text()))
+            sequence = self._resolved_shortcuts.get(NAV_SHORTCUT_IDS.get(key, ""), "")
+            button.setToolTip(f"{base}{f' · {sequence}' if sequence else ''}")
+            if self._sidebar_collapsed:
+                button.setText(base.split(maxsplit=1)[0])
+            else:
+                button.setText(f"{base}    {sequence}" if sequence else base)
 
     def _connect_pages(self) -> None:
         for page in self.pages.values():
@@ -144,6 +183,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pages["settings"].shortcut_config_changed.connect(self._register_studio_shortcuts)
         self.pages["builder"].open_export.connect(self._open_export_for_macro)
         self.pages["builder"].stop_macros.connect(self.stop_running_macros)
+        self.pages["builder"].edit_committed.connect(self._undo_deletions.clear)
 
     @QtCore.Slot(str)
     def _open_export_for_macro(self, name: str) -> None:
@@ -216,11 +256,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_shortcut_labels(resolved)
 
     def _apply_shortcut_labels(self, resolved: dict[str, str]) -> None:
-        nav_labels = dict(NAV_ITEMS)
-        for key, button in self.nav_buttons.items():
-            base = nav_labels.get(key, button.text())
-            sequence = resolved.get(NAV_SHORTCUT_IDS.get(key, ""), "")
-            button.setText(f"{base}    {sequence}" if sequence else base)
+        self._resolved_shortcuts = dict(resolved)
+        self._refresh_nav_labels()
         builder = self.pages.get("builder")
         apply_labels = getattr(builder, "set_shortcut_labels", None)
         if callable(apply_labels):
@@ -400,7 +437,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._archive_current_selection()
                     return True
                 if event.key() == QtCore.Qt.Key_Z and modifiers == QtCore.Qt.ControlModifier:
-                    self._restore_last_deletion()
+                    if self._undo_deletions:
+                        self._restore_last_deletion()
+                    elif current is self.pages.get("builder"):
+                        current.undo_edit()
+                    return True
+                if event.key() == QtCore.Qt.Key_Y and modifiers == QtCore.Qt.ControlModifier:
+                    if current is self.pages.get("builder"):
+                        current.redo_edit()
                     return True
         return super().eventFilter(watched, event)
 
@@ -674,4 +718,5 @@ class MainWindow(QtWidgets.QMainWindow):
         if app is not None:
             app.removeEventFilter(self)
         self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("sidebar_collapsed", self._sidebar_collapsed)
         super().closeEvent(event)

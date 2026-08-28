@@ -6,6 +6,7 @@ import json
 from copy import deepcopy
 import ctypes
 import io
+import socket
 import sys
 import tempfile
 import threading
@@ -107,9 +108,9 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("FileGetSize, OpenCvResultSize", script)
 
         self.assertIn("OpenCvResultDeadline", script)
-        self.assertIn("OpenCvNativeHit := 0", script)
-        self.assertIn("image search fast-path: native exact-size hit", script)
-        self.assertLess(script.index("OpenCvNativeHit := 0"), script.index("RunWait, %OpenCvCmd%"))
+        self.assertNotIn("OpenCvNativeHit", script)
+        self.assertNotIn("image search fast-path: native exact-size hit", script)
+        self.assertIn("VisionEngine_Send(VisionPayload", script)
         self.assertIn("StringSplit, OpenCvParts, OpenCvResult, `,", script)
         self.assertNotIn("OUTPUT_MISSING", script)
         self.assertIn('OpenCvErrorCode = "IMPORT_FAILED"', script)
@@ -651,6 +652,28 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertLessEqual(abs(match[1][0] - 42), 2)
         self.assertLessEqual(abs(match[1][1] - 20), 2)
 
+    def test_opencv_constant_colour_template_does_not_match_everywhere(self) -> None:
+        import opencv_search
+
+        try:
+            import cv2
+            import numpy as np
+        except Exception as exc:
+            self.skipTest(f"full OpenCV binary is unavailable in this test interpreter: {exc}")
+
+        rng = np.random.default_rng(42)
+        frame = rng.integers(0, 90, size=(100, 150, 3), dtype=np.uint8)
+        template = np.full((18, 24, 3), (40, 180, 220), dtype=np.uint8)
+        expected_x, expected_y = 83, 47
+        frame[expected_y : expected_y + 18, expected_x : expected_x + 24] = template
+        prepared = opencv_search.prepare_templates(template, "fast", cv2)
+
+        match, score = opencv_search.match_frame(frame, prepared, 0.90, "fast", cv2, np)
+
+        self.assertIsNotNone(match)
+        self.assertGreater(score, 0.99)
+        self.assertEqual((expected_x, expected_y), match[1])
+
     def test_opencv_precise_search_refines_scaled_transparent_template(self) -> None:
         import opencv_search
 
@@ -711,6 +734,113 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("no asset selected", without_asset)
         self.assertIn("__step_found_3 := 0", missing_asset)
         self.assertIn("missing asset", missing_asset)
+
+    def test_opencv_macro_uses_persistent_vision_engine_with_cli_fallback(self) -> None:
+        macro = {
+            "name": "persistent-vision",
+            "steps": [
+                {
+                    "action": "image_search",
+                    "asset": "button",
+                    "engine": "opencv",
+                    "region": [0, 0, 100, 100],
+                    "confidence": 88,
+                }
+            ],
+        }
+        script = self.engine.render_macro_script(macro, {"button": {"file": "assets/button.png"}})
+
+        self.assertIn("VisionEnginePort := 9235", script)
+        self.assertIn("VisionEngine_Send(VisionPayload", script)
+        self.assertIn("vision_engine.py", script)
+        self.assertIn("one-shot OpenCV fallback", script)
+        self.assertIn("RunWait, %OpenCvCmd%", script)
+        self.assertIn('""regions"":["', script)
+        self.assertNotIn("OpenCvNativeHit", script)
+        self.assertLess(script.index('if (VisionResp = "")'), script.index("RunWait, %OpenCvCmd%"))
+
+    def test_opencv_export_copies_persistent_and_fallback_helpers(self) -> None:
+        macro = {
+            "name": "vision-export",
+            "steps": [{"action": "image_search", "asset": "missing", "engine": "opencv"}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "vision-export.ahk"
+            self.engine.export_macro_payload(macro, target)
+            self.assertTrue((target.parent / "vision_engine.py").is_file())
+            self.assertTrue((target.parent / "opencv_search.py").is_file())
+
+    def test_remote_notify_renderer_remains_available_with_vision_helpers(self) -> None:
+        rendered = self.engine.render_remote_notify(
+            {"action": "remote_notify", "message": "완료", "include_last_ocr": True}
+        )
+        self.assertIsInstance(rendered, list)
+        self.assertTrue(any("remote_notify.py" in line for line in rendered))
+        self.assertTrue(any("OCR_LastText" in line for line in rendered))
+
+    def test_generated_macro_records_structured_step_trace(self) -> None:
+        macro = {"name": "trace", "steps": [{"action": "wait", "duration": 10, "label": "짧은 대기"}]}
+        script = self.engine.render_macro_script(macro, {})
+        self.assertIn("MACRORELAY_TRACE_FILE", script)
+        self.assertIn('TraceStep(1, "짧은 대기", "START")', script)
+        self.assertIn('TraceStep(1, "짧은 대기", "SUCCESS")', script)
+
+
+class DiagnosticBundleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import macro_tool
+
+        self.engine = macro_tool
+
+    def test_bundle_redacts_remote_credentials_and_excludes_user_assets(self) -> None:
+        import zipfile
+
+        from macro_studio.diagnostics import build_diagnostic_bundle
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "exports").mkdir()
+            (root / "assets").mkdir()
+            (root / "exports" / "studio_run.log").write_text(
+                'Authorization: Bearer very-secret-token\n{"token":"mobile-token"}', encoding="utf-8"
+            )
+            (root / "remote_config.json").write_text(
+                json.dumps({"relay_url": "https://relay.example", "device_secret": "pc-secret"}), encoding="utf-8"
+            )
+            (root / "assets" / "private.png").write_bytes(b"private-image")
+            destination = root / "diagnostics.zip"
+
+            build_diagnostic_bundle(root, destination)
+
+            with zipfile.ZipFile(destination) as archive:
+                names = set(archive.namelist())
+                combined = "\n".join(
+                    archive.read(name).decode("utf-8", errors="replace") for name in names
+                )
+            self.assertIn("system.json", names)
+            self.assertIn("remote_config.sanitized.json", names)
+            self.assertNotIn("pc-secret", combined)
+            self.assertNotIn("mobile-token", combined)
+            self.assertNotIn("very-secret-token", combined)
+            self.assertFalse(any("private.png" in name for name in names))
+
+    def test_vision_engine_accepts_newline_request_without_client_shutdown(self) -> None:
+        from vision_engine import VisionServer
+
+        server = VisionServer(0)
+        port = int(server.server_address[1])
+        worker = threading.Thread(target=server.handle_request, daemon=True)
+        worker.start()
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2.0) as client:
+                client.settimeout(2.0)
+                client.sendall(b'{"cmd":"ping"}\n')
+                response = json.loads(client.recv(65536).decode("utf-8"))
+            self.assertTrue(response["ok"])
+            self.assertTrue(response["running"])
+        finally:
+            worker.join(timeout=2.0)
+            server.server_close()
 
     def test_generated_helpers_prefer_bundled_python_runtime(self) -> None:
         macro = {
@@ -1028,16 +1158,17 @@ class ProjectDataTests(unittest.TestCase):
             correct = root / "correct"
             (wrong / "greenlet").mkdir(parents=True)
             (correct / "greenlet").mkdir(parents=True)
-            (wrong / "greenlet" / "__init__.py").write_text("", encoding="utf-8")
-            (wrong / "greenlet" / "_greenlet.cp311-win_amd64.pyd").write_bytes(b"wrong")
             abi = f"cp{sys.version_info.major}{sys.version_info.minor}"
+            wrong_abi = "cp312" if abi == "cp311" else "cp311"
+            (wrong / "greenlet" / "__init__.py").write_text("", encoding="utf-8")
+            (wrong / "greenlet" / f"_greenlet.{wrong_abi}-win_amd64.pyd").write_bytes(b"wrong")
             (correct / "greenlet" / "__init__.py").write_text("", encoding="utf-8")
             (correct / "greenlet" / f"_greenlet.{abi}-win_amd64.pyd").write_bytes(b"correct")
             destination = root / "bundle"
             with mock.patch.object(repository, "_portable_package_roots", return_value=[wrong, correct]):
                 repository._copy_portable_packages(destination, {"greenlet"})
             self.assertTrue((destination / "greenlet" / f"_greenlet.{abi}-win_amd64.pyd").is_file())
-            self.assertFalse((destination / "greenlet" / "_greenlet.cp311-win_amd64.pyd").exists())
+            self.assertFalse((destination / "greenlet" / f"_greenlet.{wrong_abi}-win_amd64.pyd").exists())
 
     def test_portable_package_copy_selects_numpy_for_copied_python_abi(self) -> None:
         from macro_studio.repository import MacroRepository
@@ -1114,6 +1245,35 @@ class UiSmokeTests(unittest.TestCase):
         self.assertFalse(window.windowIcon().isNull())
         self.assertEqual(app.windowIcon().cacheKey(), window.windowIcon().cacheKey())
         window.close()
+
+    def test_builder_snapshot_undo_redo_and_collapsible_sidebar(self) -> None:
+        from macro_studio.app import create_app
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            repository.create_macro("history-test")
+            (root / "remote_config.json").write_text('{"enabled": false}', encoding="utf-8")
+            app, window = create_app(root)
+            builder = window.pages["builder"]
+            builder.refresh("history-test")
+            original_count = len(builder.current_macro.get("steps") or [])
+
+            builder.current_macro.setdefault("steps", []).append({"action": "wait", "duration": 250})
+            builder._persist("테스트 편집")
+            self.assertEqual(original_count + 1, len(repository.load_macro("history-test")["steps"]))
+            self.assertTrue(builder.undo_edit())
+            self.assertEqual(original_count, len(repository.load_macro("history-test")["steps"]))
+            self.assertTrue(builder.redo_edit())
+            self.assertEqual(original_count + 1, len(repository.load_macro("history-test")["steps"]))
+
+            original_state = window._sidebar_collapsed
+            window._toggle_sidebar()
+            self.assertNotEqual(original_state, window._sidebar_collapsed)
+            self.assertEqual(74 if window._sidebar_collapsed else 260, window.sidebar.width())
+            window.close()
+            app.processEvents()
 
     def test_smart_recording_compresses_events_and_diagnostics_fix_connections(self) -> None:
         from macro_studio.automation import AutomationAnalyzer, recording_drafts
@@ -1952,7 +2112,8 @@ class UiSmokeTests(unittest.TestCase):
             repository.save_hotkey_actions({"tab_macro": "Alt+1", "action_smart_record": "F9"})
             app, window = create_app(root)
             app.processEvents()
-            self.assertIn("Alt+1", window.nav_buttons["builder"].text())
+            nav = window.nav_buttons["builder"]
+            self.assertIn("Alt+1", nav.text() + " " + nav.toolTip())
             self.assertIn("F9", window.pages["builder"].record_btn.text())
             window.close()
 
@@ -2013,8 +2174,8 @@ class UiSmokeTests(unittest.TestCase):
             app.processEvents()
             self.assertEqual(2, builder.node_canvas.active_step)
             self.assertEqual(20, builder.node_canvas.nodes[2].zValue())
-            self.assertGreaterEqual(window.minimumWidth(), 1380)
-            self.assertEqual(260, window.nav_buttons["builder"].parentWidget().width())
+            self.assertGreaterEqual(window.minimumWidth(), 1120)
+            self.assertIn(window.nav_buttons["builder"].parentWidget().width(), {74, 260})
             self.assertTrue(builder.run_button.isVisible())
             builder.set_running_step(0)
             self.assertEqual(0, builder.node_canvas.active_step)
@@ -2905,7 +3066,10 @@ class UiSmokeTests(unittest.TestCase):
         assert hasattr(ActionEditor, "build_step")
 
     def test_ocr_engine_returns_physical_screen_coordinates(self):
-        import numpy as np
+        try:
+            import numpy as np
+        except ModuleNotFoundError:
+            self.skipTest("NumPy가 설치된 OCR 런타임에서 실행하는 테스트입니다.")
         import ocr_engine
         import ocr_postprocess
 
@@ -2947,7 +3111,10 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual([30, 15], result["match_box"]["local_center"])
 
     def test_tesseract_scales_boxes_back_and_normalizes_confidence(self):
-        import numpy as np
+        try:
+            import numpy as np
+        except ModuleNotFoundError:
+            self.skipTest("NumPy가 설치된 OCR 런타임에서 실행하는 테스트입니다.")
         import ocr_tesseract
 
         fake_data = {

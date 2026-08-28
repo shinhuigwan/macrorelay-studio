@@ -307,6 +307,7 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "EnvGet, MacroRunResultFile, MACRORELAY_RESULT_FILE",
         "EnvGet, MacroRunProgressFile, MACRORELAY_PROGRESS_FILE",
         "EnvGet, MacroRunClickFile, MACRORELAY_CLICK_FILE",
+        "EnvGet, MacroRunTraceFile, MACRORELAY_TRACE_FILE",
         'MacroRunStatus := "RUNNING"',
         "SetRunProgress(step) {",
         "    global MacroRunProgressFile",
@@ -333,48 +334,27 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "    FileDelete, %MacroRunClickFile%",
         '    FileAppend, % screenX . "|" . screenY . "|" . clickKind, %MacroRunClickFile%, UTF-8',
         "}",
+        "TraceStep(step, label, status, detail := \"\") {",
+        "    global MacroRunTraceFile",
+        "    if (MacroRunTraceFile = \"\")",
+        "        return",
+        "    StringReplace, cleanLabel, label, |, /, All",
+        "    StringReplace, cleanDetail, detail, |, /, All",
+        "    StringReplace, cleanDetail, cleanDetail, `r, %A_Space%, All",
+        "    StringReplace, cleanDetail, cleanDetail, `n, %A_Space%, All",
+        "    FormatTime, traceStamp,, yyyy-MM-dd HH:mm:ss",
+        '    FileAppend, % traceStamp . "|" . step . "|" . status . "|" . cleanLabel . "|" . cleanDetail . "`n", %MacroRunTraceFile%, UTF-8',
+        "}",
         "MacroRelayFinalize(exitReason, exitCode) {",
         "    global MacroRunStatus",
         "    SetRunProgress(0)",
+        '    TraceStep(0, "매크로", "END", exitReason . ":" . exitCode)',
         '    if (MacroRunStatus = "RUNNING")',
         '        SetRunResult("SUCCESS", "COMPLETED", "매크로 실행 완료")',
         "}",
         'SetRunResult("RUNNING", "STARTED", "매크로 실행 중")',
         'OnExit("MacroRelayFinalize")',
         f'Log("macro start: {name}")',
-        "",
-    ]
-
-
-def browser_action_helpers() -> List[str]:
-    return [
-        "BrowserAction_Send(payload, server_port) {",
-        "    static wsainit := 0",
-        "    if (!wsainit) {",
-        "        VarSetCapacity(wsaData, 32, 0)",
-        "        if (DllCall(\"Ws2_32\\WSAStartup\", \"UShort\", 0x202, \"Ptr\", &wsaData) != 0)",
-        "            return \"\"",
-        "        wsainit := 1",
-        "    }",
-        "    sock := DllCall(\"Ws2_32\\socket\", \"Int\", 2, \"Int\", 1, \"Int\", 6, \"Ptr\")",
-        "    if (sock = -1)",
-        "        return \"\"",
-        "    VarSetCapacity(addr, 16, 0)",
-        "    NumPut(2, addr, 0, \"UShort\")",
-        "    NumPut(DllCall(\"Ws2_32\\htons\", \"UShort\", server_port, \"UShort\"), addr, 2, \"UShort\")",
-        "    NumPut(DllCall(\"Ws2_32\\inet_addr\", \"AStr\", \"127.0.0.1\", \"UInt\"), addr, 4, \"UInt\")",
-        "    if (DllCall(\"Ws2_32\\connect\", \"Ptr\", sock, \"Ptr\", &addr, \"Int\", 16) != 0) {",
-        "        DllCall(\"Ws2_32\\closesocket\", \"Ptr\", sock)",
-        "        return \"\"",
-        "    }",
-        "    size := StrPut(payload, \"UTF-8\")",
-        "    VarSetCapacity(sendbuf, size, 0)",
-        "    StrPut(payload, &sendbuf, size, \"UTF-8\")",
-        "    DllCall(\"Ws2_32\\send\", \"Ptr\", sock, \"Ptr\", &sendbuf, \"Int\", size - 1, \"Int\", 0)",
-        "    ; Signal end-of-request so the Python server doesn't wait on a read timeout.",
-        "    DllCall(\"Ws2_32\\shutdown\", \"Ptr\", sock, \"Int\", 1)",
-        "    VarSetCapacity(buf, 16384, 0)",
-        "    recv := DllCall(\"Ws2_32\\recv\", \"Ptr\", sock, \"Ptr\", &buf, \"Int\", 16384, \"Int\", 0)",
         "",
     ]
 
@@ -1885,6 +1865,95 @@ def render_remote_notify(step: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def vision_engine_helpers() -> List[str]:
+    """Generate AHK helpers for the persistent local OpenCV engine."""
+    return [
+        "VisionEngine_Send(payload, server_port) {",
+        "    static wsainit := 0",
+        "    if (!wsainit) {",
+        "        VarSetCapacity(wsaData, 32, 0)",
+        "        if (DllCall(\"Ws2_32\\WSAStartup\", \"UShort\", 0x202, \"Ptr\", &wsaData) != 0)",
+        "            return \"\"",
+        "        wsainit := 1",
+        "    }",
+        "    sock := DllCall(\"Ws2_32\\socket\", \"Int\", 2, \"Int\", 1, \"Int\", 6, \"Ptr\")",
+        "    if (sock = -1)",
+        "        return \"\"",
+        "    VarSetCapacity(timeout_buf, 4, 0)",
+        "    NumPut(10000, timeout_buf, 0, \"UInt\")",
+        "    DllCall(\"Ws2_32\\setsockopt\", \"Ptr\", sock, \"Int\", 0xFFFF, \"Int\", 0x1005, \"Ptr\", &timeout_buf, \"Int\", 4)",
+        "    DllCall(\"Ws2_32\\setsockopt\", \"Ptr\", sock, \"Int\", 0xFFFF, \"Int\", 0x1006, \"Ptr\", &timeout_buf, \"Int\", 4)",
+        "    VarSetCapacity(addr, 16, 0)",
+        "    NumPut(2, addr, 0, \"UShort\")",
+        "    NumPut(DllCall(\"Ws2_32\\htons\", \"UShort\", server_port, \"UShort\"), addr, 2, \"UShort\")",
+        "    NumPut(DllCall(\"Ws2_32\\inet_addr\", \"AStr\", \"127.0.0.1\", \"UInt\"), addr, 4, \"UInt\")",
+        "    if (DllCall(\"Ws2_32\\connect\", \"Ptr\", sock, \"Ptr\", &addr, \"Int\", 16) != 0) {",
+        "        DllCall(\"Ws2_32\\closesocket\", \"Ptr\", sock)",
+        "        return \"\"",
+        "    }",
+        "    payload .= \"`n\"",
+        "    size := StrPut(payload, \"UTF-8\")",
+        "    VarSetCapacity(sendbuf, size, 0)",
+        "    StrPut(payload, &sendbuf, size, \"UTF-8\")",
+        "    DllCall(\"Ws2_32\\send\", \"Ptr\", sock, \"Ptr\", &sendbuf, \"Int\", size - 1, \"Int\", 0)",
+        "    DllCall(\"Ws2_32\\shutdown\", \"Ptr\", sock, \"Int\", 1)",
+        "    VarSetCapacity(buf, 65536, 0)",
+        "    resp := \"\"",
+        "    Loop {",
+        "        recv := DllCall(\"Ws2_32\\recv\", \"Ptr\", sock, \"Ptr\", &buf, \"Int\", 65536, \"Int\", 0)",
+        "        if (recv <= 0)",
+        "            break",
+        "        resp .= StrGet(&buf, recv, \"UTF-8\")",
+        "    }",
+        "    DllCall(\"Ws2_32\\closesocket\", \"Ptr\", sock)",
+        "    return resp",
+        "}",
+        "",
+        "VisionEngine_ParseField(json_resp, field_name) {",
+        "    q := Chr(34)",
+        "    needle := q . field_name . q",
+        "    pos := InStr(json_resp, needle)",
+        "    if (!pos)",
+        "        return \"\"",
+        "    pos := InStr(json_resp, \":\", false, pos)",
+        "    if (!pos)",
+        "        return \"\"",
+        "    rest := LTrim(SubStr(json_resp, pos + 1))",
+        "    if (SubStr(rest, 1, 1) = q) {",
+        "        start := 2",
+        "        end := InStr(rest, q, false, start)",
+        "        if (!end)",
+        "            return \"\"",
+        "        return SubStr(rest, start, end - start)",
+        "    }",
+        "    end := 1",
+        "    Loop {",
+        "        ch := SubStr(rest, end, 1)",
+        "        if (ch = \",\" or ch = \"}\" or ch = \" \" or ch = \"`n\")",
+        "            break",
+        "        end += 1",
+        "    }",
+        "    return SubStr(rest, 1, end - 1)",
+        "}",
+        "",
+        "VisionEngine_IsTrue(json_resp, field_name) {",
+        "    value := VisionEngine_ParseField(json_resp, field_name)",
+        "    return (value = \"true\" or value = \"1\")",
+        "}",
+        "",
+        "VisionEngine_JsonEscape(value) {",
+        '    slash := "\\"',
+        "    doubledSlash := slash . slash",
+        "    StringReplace, value, value, %slash%, %doubledSlash%, All",
+        "    quote := Chr(34)",
+        "    escapedQuote := slash . quote",
+        "    StringReplace, value, value, %quote%, %escapedQuote%, All",
+        "    return value",
+        "}",
+        "",
+    ]
+
+
 def render_image_search(
     step: Dict[str, Any],
     assets: Dict[str, Dict[str, Any]],
@@ -2105,37 +2174,7 @@ def render_image_search(
         lines.append(f"{indent}}}")
         return left_var, top_var, right_var, bottom_var
 
-    def emit_opencv_search(region_vars, indent=""):
-        cmd = f'{indent}OpenCvCmd := """" . PythonExe . """ """ . OpenCvScript . """ --image """ . ImagePath . """"'
-        lines.append(f"{indent}FileDelete, %OpenCvOut%")
-        lines.append(cmd)
-        for left_var, top_var, right_var, bottom_var in region_vars:
-            lines.append(
-                f'{indent}OpenCvCmd .= " --region " . {left_var} . "," . {top_var} . "," . {right_var} . "," . {bottom_var}'
-            )
-        lines.append(
-            f'{indent}OpenCvCmd .= " --threshold " . OpenCvThreshold . " --profile " . OpenCvProfile . " --timeout " . OpenCvTimeout . " --poll " . OpenCvPoll . " --out """ . OpenCvOut . """"'
-        )
-        lines.append(f"{indent}RunWait, %OpenCvCmd%,, Hide")
-        lines.append(f"{indent}OpenCvExit := ErrorLevel")
-        lines.append(f'{indent}OpenCvResult := ""')
-        lines.append(f"{indent}OpenCvResultSize := 0")
-        lines.append(f"{indent}if (OpenCvExit = 0)")
-        lines.append(f"{indent}{{")
-        lines.append(f"{indent}    OpenCvResultDeadline := A_TickCount + OpenCvTimeout + 2000")
-        lines.append(f"{indent}    Loop")
-        lines.append(f"{indent}    {{")
-        lines.append(f"{indent}        if FileExist(OpenCvOut)")
-        lines.append(f"{indent}        {{")
-        lines.append(f"{indent}            FileGetSize, OpenCvResultSize, %OpenCvOut%")
-        lines.append(f"{indent}            if (OpenCvResultSize > 0)")
-        lines.append(f"{indent}                break")
-        lines.append(f"{indent}        }}")
-        lines.append(f"{indent}        if (A_TickCount >= OpenCvResultDeadline)")
-        lines.append(f"{indent}            break")
-        lines.append(f"{indent}        Sleep, 20")
-        lines.append(f"{indent}    }}")
-        lines.append(f"{indent}}}")
+    def emit_opencv_cli_result(indent=""):
         lines.append(f"{indent}if FileExist(OpenCvOut)")
         lines.append(f"{indent}    FileRead, OpenCvResult, %OpenCvOut%")
         lines.append(f"{indent}StringReplace, OpenCvResult, OpenCvResult, `r`n, , All")
@@ -2179,6 +2218,130 @@ def render_image_search(
         lines.append(f'{indent}    OpenCvErrorDetail := "result missing or invalid: " . OpenCvResult')
         lines.append(f'{indent}    Log("opencv search output invalid: " . OpenCvOut . " value=" . OpenCvResult)')
         lines.append(f"{indent}    ErrorLevel := 2")
+        lines.append(f"{indent}}}")
+
+    def emit_opencv_cli(region_vars, indent=""):
+        cmd = f'{indent}OpenCvCmd := """" . PythonExe . """ """ . OpenCvScript . """ --image """ . ImagePath . """"'
+        lines.append(f"{indent}FileDelete, %OpenCvOut%")
+        lines.append(cmd)
+        for left_var, top_var, right_var, bottom_var in region_vars:
+            lines.append(
+                f'{indent}OpenCvCmd .= " --region " . {left_var} . "," . {top_var} . "," . {right_var} . "," . {bottom_var}'
+            )
+        lines.append(
+            f'{indent}OpenCvCmd .= " --threshold " . OpenCvThreshold . " --profile " . OpenCvProfile . " --timeout " . OpenCvTimeout . " --poll " . OpenCvPoll . " --out """ . OpenCvOut . """"'
+        )
+        lines.append(f"{indent}RunWait, %OpenCvCmd%,, Hide")
+        lines.append(f"{indent}OpenCvExit := ErrorLevel")
+        lines.append(f'{indent}OpenCvResult := ""')
+        lines.append(f"{indent}OpenCvResultSize := 0")
+        lines.append(f"{indent}if (OpenCvExit = 0)")
+        lines.append(f"{indent}{{")
+        lines.append(f"{indent}    OpenCvResultDeadline := A_TickCount + OpenCvTimeout + 2000")
+        lines.append(f"{indent}    Loop")
+        lines.append(f"{indent}    {{")
+        lines.append(f"{indent}        if FileExist(OpenCvOut)")
+        lines.append(f"{indent}        {{")
+        lines.append(f"{indent}            FileGetSize, OpenCvResultSize, %OpenCvOut%")
+        lines.append(f"{indent}            if (OpenCvResultSize > 0)")
+        lines.append(f"{indent}                break")
+        lines.append(f"{indent}        }}")
+        lines.append(f"{indent}        if (A_TickCount >= OpenCvResultDeadline)")
+        lines.append(f"{indent}            break")
+        lines.append(f"{indent}        Sleep, 20")
+        lines.append(f"{indent}    }}")
+        lines.append(f"{indent}}}")
+
+    def emit_opencv_search(region_vars, indent=""):
+        """Use the warm local engine first and preserve the CLI as recovery."""
+        lines.append(f'{indent}VisionEngineScript := A_ScriptDir . "\\vision_engine.py"')
+        lines.append(f"{indent}VisionImageJson := VisionEngine_JsonEscape(ImagePath)")
+        lines.append(
+            f'{indent}VisionPayload := "{{""cmd"":""search"",""image"":""" . VisionImageJson . """,""regions"":["'
+        )
+        for index, (left_var, top_var, right_var, bottom_var) in enumerate(region_vars):
+            prefix = "," if index else ""
+            lines.append(
+                f'{indent}VisionPayload .= "{prefix}[" . {left_var} . "," . {top_var} . "," . {right_var} . "," . {bottom_var} . "]"'
+            )
+        lines.append(
+            f'{indent}VisionPayload .= "],""threshold"":" . OpenCvThreshold . ",""profile"":""" . OpenCvProfile . """,""timeout"":" . OpenCvTimeout . ",""poll"":" . OpenCvPoll . "}}"'
+        )
+        lines.append(f'{indent}if (VisionEngineStarted != 1 and FileExist(VisionEngineScript))')
+        lines.append(f"{indent}{{")
+        lines.append(
+            f'{indent}    VisionEngineCmd := """" . PythonExe . """ """ . VisionEngineScript . """ --server --port " . VisionEnginePort . " --idle-timeout 600 --log-file"'
+        )
+        lines.append(f"{indent}    Run, %VisionEngineCmd%, , Hide")
+        lines.append(f"{indent}    VisionEngineStarted := 1")
+        lines.append(f"{indent}}}")
+        lines.append(f'{indent}VisionResp := ""')
+        lines.append(f"{indent}VisionTry := 0")
+        lines.append(f'{indent}while (VisionTry < 30 and VisionResp = "")')
+        lines.append(f"{indent}{{")
+        lines.append(f"{indent}    VisionResp := VisionEngine_Send(VisionPayload, VisionEnginePort)")
+        lines.append(f'{indent}    if (VisionResp = "")')
+        lines.append(f"{indent}        Sleep, 50")
+        lines.append(f"{indent}    VisionTry += 1")
+        lines.append(f"{indent}}}")
+        # The server may have reached its idle timeout while the macro was
+        # waiting on unrelated nodes. Restart once before using the legacy CLI.
+        lines.append(f'{indent}if (VisionResp = "" and FileExist(VisionEngineScript))')
+        lines.append(f"{indent}{{")
+        lines.append(f"{indent}    VisionEngineStarted := 0")
+        lines.append(
+            f'{indent}    VisionEngineCmd := """" . PythonExe . """ """ . VisionEngineScript . """ --server --port " . VisionEnginePort . " --idle-timeout 600 --log-file"'
+        )
+        lines.append(f"{indent}    Run, %VisionEngineCmd%, , Hide")
+        lines.append(f"{indent}    VisionEngineStarted := 1")
+        lines.append(f"{indent}    VisionTry := 0")
+        lines.append(f'{indent}    while (VisionTry < 30 and VisionResp = "")')
+        lines.append(f"{indent}    {{")
+        lines.append(f"{indent}        VisionResp := VisionEngine_Send(VisionPayload, VisionEnginePort)")
+        lines.append(f'{indent}        if (VisionResp = "")')
+        lines.append(f"{indent}            Sleep, 50")
+        lines.append(f"{indent}        VisionTry += 1")
+        lines.append(f"{indent}    }}")
+        lines.append(f"{indent}}}")
+        lines.append(f'{indent}if (VisionResp = "")')
+        lines.append(f"{indent}{{")
+        lines.append(f'{indent}    Log("vision engine unavailable; using one-shot OpenCV fallback")')
+        emit_opencv_cli(region_vars, indent + "    ")
+        emit_opencv_cli_result(indent + "    ")
+        lines.append(f"{indent}}}")
+        lines.append(f'{indent}else if (!VisionEngine_IsTrue(VisionResp, "ok"))')
+        lines.append(f"{indent}{{")
+        lines.append(f'{indent}    OpenCvErrorCode := VisionEngine_ParseField(VisionResp, "error")')
+        lines.append(f'{indent}    OpenCvErrorDetail := VisionEngine_ParseField(VisionResp, "detail")')
+        lines.append(
+            f'{indent}    Log("vision engine error: code=" . OpenCvErrorCode . " detail=" . OpenCvErrorDetail)'
+        )
+        lines.append(f"{indent}    ErrorLevel := 2")
+        lines.append(f"{indent}}}")
+        lines.append(f'{indent}else if (VisionEngine_IsTrue(VisionResp, "found"))')
+        lines.append(f"{indent}{{")
+        lines.append(f'{indent}    FoundX := VisionEngine_ParseField(VisionResp, "x")')
+        lines.append(f'{indent}    FoundY := VisionEngine_ParseField(VisionResp, "y")')
+        lines.append(f'{indent}    OpenCvBestScore := VisionEngine_ParseField(VisionResp, "confidence")')
+        lines.append(f'{indent}    FoundImageW := VisionEngine_ParseField(VisionResp, "width")')
+        lines.append(f'{indent}    FoundImageH := VisionEngine_ParseField(VisionResp, "height")')
+        lines.append(f"{indent}    FoundScaleX := (SourceImageW > 0 ? FoundImageW / SourceImageW : 1.0)")
+        lines.append(f"{indent}    FoundScaleY := (SourceImageH > 0 ? FoundImageH / SourceImageH : 1.0)")
+        lines.append(f'{indent}    VisionElapsed := VisionEngine_ParseField(VisionResp, "elapsed_ms")')
+        lines.append(f'{indent}    VisionCacheHit := VisionEngine_ParseField(VisionResp, "cache_hit")')
+        lines.append(
+            f'{indent}    Log("vision engine hit: " . VisionElapsed . "ms cache=" . VisionCacheHit . " confidence=" . OpenCvBestScore)'
+        )
+        lines.append(f"{indent}    ErrorLevel := 0")
+        lines.append(f"{indent}}}")
+        lines.append(f"{indent}else")
+        lines.append(f"{indent}{{")
+        lines.append(f'{indent}    OpenCvBestScore := VisionEngine_ParseField(VisionResp, "best_score")')
+        lines.append(f'{indent}    VisionElapsed := VisionEngine_ParseField(VisionResp, "elapsed_ms")')
+        lines.append(
+            f'{indent}    Log("vision engine not found: " . VisionElapsed . "ms best=" . OpenCvBestScore)'
+        )
+        lines.append(f"{indent}    ErrorLevel := 1")
         lines.append(f"{indent}}}")
 
     if engine == "opencv":
@@ -2231,34 +2394,10 @@ def render_image_search(
             lines.append(
                 f'Log("{label}: " . {left_var} . ", " . {top_var} . ", " . {right_var} . ", " . {bottom_var})'
             )
-        # Most recorded assets are searched at the exact size they were
-        # captured.  AHK's in-process ImageSearch can resolve that common case
-        # without paying Python/OpenCV process startup and multi-scale costs.
-        # OpenCV remains the fallback for scaled or difficult matches.
-        lines.append("OpenCvNativeHit := 0")
-        for left_var, top_var, right_var, bottom_var in opencv_region_vars:
-            lines.append("if (!OpenCvNativeHit)")
-            lines.append("{")
-            lines.append(
-                f"    ImageSearch, FoundX, FoundY, %{left_var}%, %{top_var}%, %{right_var}%, %{bottom_var}%, %ImageSpec%"
-            )
-            lines.append("    if (ErrorLevel = 0)")
-            lines.append("    {")
-            lines.append("        FoundX += Floor(FoundImageW / 2)")
-            lines.append("        FoundY += Floor(FoundImageH / 2)")
-            lines.append("        OpenCvNativeHit := 1")
-            lines.append("    }")
-            lines.append("}")
-        lines.append("if (OpenCvNativeHit)")
-        lines.append("{")
-        lines.append('    OpenCvBestScore := "native"')
-        lines.append('    Log("image search fast-path: native exact-size hit")')
-        lines.append("    ErrorLevel := 0")
-        lines.append("}")
-        lines.append("else")
-        lines.append("{")
-        emit_opencv_search(opencv_region_vars, "    ")
-        lines.append("}")
+        # Route OpenCV steps straight to the warm engine. A full-desktop AHK
+        # ImageSearch pre-pass can block for many seconds on large/multi-monitor
+        # desktops and defeats the persistent engine's cache and last-hit ROI.
+        emit_opencv_search(opencv_region_vars)
         lines.append("OpenCvSearchStatus := ErrorLevel")
         lines.append('if (OpenCvBestScore != "")')
         lines.append('    Log("opencv best confidence: " . OpenCvBestScore . " threshold=" . OpenCvThreshold)')
@@ -3539,6 +3678,15 @@ def render_macro_script(
         lines.append("BrowserServerPort := 9233")
         lines.extend(browser_action_helpers())
         lines.append("")
+    has_vision = any(
+        step.get("action") == "image_search" and str(step.get("engine") or "ahk").lower() == "opencv"
+        for step in steps
+    )
+    if has_vision:
+        lines.append("VisionEngineStarted := 0")
+        lines.append("VisionEnginePort := 9235")
+        lines.extend(vision_engine_helpers())
+        lines.append("")
     has_ocr = any(step.get("action") == "ocr" for step in steps)
     if has_ocr:
         lines.append("OcrEngineStarted := 0")
@@ -3609,6 +3757,7 @@ def render_macro_script(
         lines.append(f"Step{count}:")
         lines.append(f"SetRunProgress({count})")
         lines.append(f'Log("step start: {count} | {ahk_quote(str(label))}")')
+        lines.append(f'TraceStep({count}, "{ahk_quote(str(label))}", "START")')
         if repeat > 1:
             lines.append(f"if (__rep{count} = \"\")")
             lines.append(f"    __rep{count} := 0")
@@ -3628,6 +3777,7 @@ def render_macro_script(
             found_var = f"__step_found_{count}" if action == "image_search" else "__ocr_success"
             lines.append(f"if ({found_var})")
             lines.append("{")
+            lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
             if repeat > 1:
                 lines.append(f"    if (__rep{count} < {repeat})")
                 lines.append("    {")
@@ -3646,6 +3796,7 @@ def render_macro_script(
             lines.append("}")
             lines.append("else")
             lines.append("{")
+            lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "FAIL")')
             if repeat > 1:
                 lines.append(f"    if (__rep{count} < {repeat})")
                 lines.append("    {")
@@ -3661,6 +3812,7 @@ def render_macro_script(
                 lines.append("    Return")
             lines.append("}")
         elif repeat > 1:
+            lines.append(f'TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
             lines.append(f"if (__rep{count} < {repeat})")
             lines.append("{")
             lines.append(f"    Goto, Step{count}")
@@ -3674,11 +3826,13 @@ def render_macro_script(
             elif count >= total_steps:
                 lines.append("Return")
         elif on_success:
+            lines.append(f'TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
             lines.extend(render_edge_conditions(step, count, "success"))
             if on_success_delay > 0:
                 lines.append(f"Sleep, {on_success_delay}")
             lines.append(f"Goto, Step{on_success}")
         elif action != "flow_control":
+            lines.append(f'TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
             lines.extend(render_edge_conditions(step, count, "success"))
             if count >= total_steps:
                 lines.append("Return")
@@ -3792,9 +3946,10 @@ def export_macro_payload(
         and str(step.get("engine") or "ahk").lower() == "opencv"
         for step in expanded_steps
     ):
-        opencv_helper = BASE_DIR / "opencv_search.py"
-        if opencv_helper.exists():
-            shutil.copy2(opencv_helper, target.parent / opencv_helper.name)
+        for helper_name in ("opencv_search.py", "vision_engine.py"):
+            opencv_helper = BASE_DIR / helper_name
+            if opencv_helper.exists():
+                shutil.copy2(opencv_helper, target.parent / opencv_helper.name)
     if any(step.get("action") == "ocr" and step.get("table") for step in expanded_steps):
         table_update = BASE_DIR / "table_update.py"
         if table_update.exists():

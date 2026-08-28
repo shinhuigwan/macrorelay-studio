@@ -21,8 +21,8 @@ android {
         applicationId "studio.macrorelay.remote"
         minSdk 24
         targetSdk 35
-        versionCode 22400
-        versionName "2.24.0"
+        versionCode 22500
+        versionName "2.25.0"
         buildConfigField "String", "DEFAULT_RELAY_URL", JsonOutput.toJson(defaultRelayUrl)
     }
 

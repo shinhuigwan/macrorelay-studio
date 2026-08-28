@@ -455,7 +455,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.inactive_handle_lab_btn.clicked.connect(self._open_inactive_handle_lab)
         self.branch_group_btn = QtWidgets.QPushButton("⑂ 선택 노드 분기 묶기")
         self.branch_group_btn.setToolTip(
-            "여러 이미지 서치 노드를 선택한 순서대로 검사합니다. 성공한 노드의 흐름만 실행하고, 미탐지 시 다음 후보로 이동합니다."
+            "여러 이미지 서치·OCR 노드를 번호 순서대로 검사합니다. 성공한 노드의 흐름만 실행하고, 실패 시 다음 후보로 이동합니다."
         )
         self.branch_group_btn.clicked.connect(
             lambda: self._configure_start_search_candidates(self.node_canvas.selected_indexes())
@@ -1424,11 +1424,11 @@ class BuilderPage(QtWidgets.QWidget):
                 index = int(value)
             except (TypeError, ValueError):
                 continue
-            if 0 < index <= len(steps) and steps[index - 1].get("action") == "image_search":
+            if 0 < index <= len(steps) and steps[index - 1].get("action") in {"image_search", "ocr"}:
                 candidate_set.add(index)
         candidates = sorted(candidate_set)
         if len(candidates) < 2:
-            self.status.emit("시작 조건으로 사용할 이미지 서치 노드를 2개 이상 선택하세요.")
+            self.status.emit("분기 후보로 사용할 이미지 서치·OCR 노드를 2개 이상 선택하세요.")
             return
         previous_candidates = self.current_macro.get("start_search_candidates") or []
         if isinstance(previous_candidates, list):
@@ -1474,7 +1474,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.current_macro["start_search_candidates"] = candidates
         self.current_macro["graph_start_step"] = candidates[0]
         self._persist(
-            f"이미지 서치 {', '.join(map(str, candidates))}번을 시작 검색 그룹으로 묶었습니다. 성공 흐름은 각각 독립 실행됩니다."
+            f"검색·인식 {', '.join(map(str, candidates))}번을 분기 후보 그룹으로 묶었습니다. 성공 흐름은 각각 독립 실행됩니다."
         )
         self._refresh_steps(candidates[0] - 1)
 

@@ -2112,6 +2112,30 @@ class UiSmokeTests(unittest.TestCase):
             window.close()
             app.processEvents()
 
+    def test_selected_ocr_nodes_can_be_grouped_as_fallback_branches(self) -> None:
+        from macro_studio.app import create_app
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            repository.create_macro("ocr-fallback-ui")
+            payload = repository.load_macro("ocr-fallback-ui")
+            payload["steps"] = [
+                {"action": "ocr", "find_text": "첫째"},
+                {"action": "ocr", "find_text": "둘째"},
+            ]
+            repository.save_macro("ocr-fallback-ui", payload)
+            app, window = create_app(root)
+            builder = window.pages["builder"]
+            builder.refresh("ocr-fallback-ui")
+            builder._configure_start_search_candidates([1, 2])
+            self.assertEqual([1, 2], builder.current_macro["start_search_candidates"])
+            self.assertEqual(2, builder.current_macro["steps"][0]["on_fail"])
+            self.assertTrue(builder.current_macro["steps"][0]["stop_on_success"])
+            window.close()
+            app.processEvents()
+
     def test_recording_bar_is_placed_next_to_main_window(self) -> None:
         from PySide6 import QtGui, QtWidgets
         from macro_studio.automation import RecordingBar

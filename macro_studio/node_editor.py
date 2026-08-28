@@ -713,7 +713,7 @@ class NodeCanvas(QtWidgets.QWidget):
         auto = QtWidgets.QPushButton("자동 정렬")
         auto.clicked.connect(self.auto_layout)
         start_group = QtWidgets.QPushButton("시작 검색 묶기")
-        start_group.setToolTip("선택한 이미지 서치 노드를 위 번호부터 검사하고, 미탐지 시 다음 후보로 이동합니다.")
+        start_group.setToolTip("선택한 이미지 서치·OCR 노드를 위 번호부터 검사하고, 실패 시 다음 후보로 이동합니다.")
         start_group.clicked.connect(lambda: self.start_search_group_requested.emit(self.selected_indexes()))
         fit = QtWidgets.QPushButton("전체 보기")
         fit.clicked.connect(self.fit_all)

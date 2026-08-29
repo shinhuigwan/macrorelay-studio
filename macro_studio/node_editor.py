@@ -487,7 +487,7 @@ class EdgeWaypointHandle(QtWidgets.QGraphicsEllipseItem):
         super().mouseReleaseEvent(event)
         self.edge._waypoint_moved(self)
         self.edge._handle_dragging = False
-        self.edge.canvas.commit_manual_route(self)
+        self.edge.canvas.commit_manual_route(self.edge)
 
 
 class EdgeItem(QtWidgets.QGraphicsPathItem):

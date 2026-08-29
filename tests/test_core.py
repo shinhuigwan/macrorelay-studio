@@ -3041,10 +3041,13 @@ class UiSmokeTests(unittest.TestCase):
 
     def test_manual_edge_waypoint_is_restored_dragged_and_cleared(self) -> None:
         from PySide6 import QtCore, QtWidgets
+        from PySide6.QtTest import QTest
         from macro_studio.node_editor import NodeCanvas
 
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         canvas = NodeCanvas()
+        canvas.resize(900, 520)
+        canvas.show()
         canvas.set_macro(
             {
                 "steps": [{"action": "wait", "on_success": 2}, {"action": "wait"}],
@@ -3065,6 +3068,15 @@ class UiSmokeTests(unittest.TestCase):
         app.processEvents()
         self.assertEqual(1, len(edge._waypoint_handles))
         self.assertTrue(edge._waypoint_handles[0].seed)
+        handle = edge._waypoint_handles[0]
+        start = canvas.view.mapFromScene(handle.scenePos())
+        finish = start + QtCore.QPoint(55, 35)
+        QTest.mousePress(canvas.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, start)
+        QTest.mouseMove(canvas.view.viewport(), finish, 20)
+        QTest.mouseRelease(canvas.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, finish)
+        app.processEvents()
+        self.assertIn("1:success:2:-1", canvas.manual_routes)
+        self.assertFalse(edge._waypoint_handles[0].seed)
         canvas.close()
 
     def test_manual_edge_routes_follow_node_reindex_and_drop_deleted_links(self) -> None:

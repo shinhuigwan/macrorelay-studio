@@ -243,6 +243,7 @@ class MacroRepository:
                     "modified": modified,
                     "steps": len(payload.get("steps") or []),
                     "description": str(payload.get("description") or ""),
+                    "channel": str((payload.get("meta") or {}).get("release_channel") or "test"),
                     "payload": payload,
                 }
             )
@@ -262,6 +263,15 @@ class MacroRepository:
             raise ValueError("선택한 버전 기록의 형식이 올바르지 않습니다.")
         payload = deepcopy(payload)
         payload["name"] = name
+        return self.save_macro(name, payload)
+
+    def set_macro_release_channel(self, name: str, channel: str) -> Path:
+        normalized = str(channel or "test").strip().casefold()
+        if normalized not in {"stable", "test"}:
+            raise ValueError("버전 채널은 stable 또는 test만 사용할 수 있습니다.")
+        payload = self.load_macro(name)
+        payload.setdefault("meta", {})["release_channel"] = normalized
+        payload["meta"]["release_marked_at"] = datetime.now().astimezone().isoformat()
         return self.save_macro(name, payload)
 
     def save_macro(self, name: str, payload: dict[str, Any]) -> Path:
@@ -393,10 +403,19 @@ class MacroRepository:
             metadata["updated_at"] = datetime.utcnow().isoformat() + "Z"
             self._write_json(self.assets_index_path, index)
 
-    def update_asset_organization(self, aliases: Iterable[str], group: str = "", tags: Iterable[str] = ()) -> None:
+    def update_asset_organization(
+        self,
+        aliases: Iterable[str],
+        group: str = "",
+        tags: Iterable[str] = (),
+        variant_group: str = "",
+        variant_kind: str = "",
+    ) -> None:
         index = self.load_assets()
         normalized_tags = list(dict.fromkeys(str(value).strip() for value in tags if str(value).strip()))
         target_group = str(group or "").strip()
+        target_variant_group = str(variant_group or "").strip()
+        target_variant_kind = str(variant_kind or "").strip()
         changed = False
         for alias in aliases:
             metadata = index.get(str(alias))
@@ -410,6 +429,14 @@ class MacroRepository:
                 metadata["tags"] = normalized_tags
             else:
                 metadata.pop("tags", None)
+            if target_variant_group:
+                metadata["variant_group"] = target_variant_group
+            else:
+                metadata.pop("variant_group", None)
+            if target_variant_kind:
+                metadata["variant_kind"] = target_variant_kind
+            else:
+                metadata.pop("variant_kind", None)
             changed = True
         if changed:
             self._write_json(self.assets_index_path, index)
@@ -460,13 +487,93 @@ class MacroRepository:
             by_digest.setdefault(digest.hexdigest(), []).append(alias)
         duplicates = [aliases for aliases in by_digest.values() if len(aliases) > 1]
         duplicate_aliases = sorted(alias for group in duplicates for alias in group)
+        perceptual: dict[str, tuple[int, tuple[float, float, float]]] = {}
+        try:
+            from PySide6 import QtCore, QtGui
+
+            for alias, metadata in index.items():
+                path = (self.root / str(metadata.get("file") or "")).resolve() if isinstance(metadata, dict) else None
+                image = QtGui.QImage(str(path)) if path and path.is_file() else QtGui.QImage()
+                if image.isNull():
+                    continue
+                color_tiny = image.scaled(8, 8, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
+                tiny = color_tiny.convertToFormat(QtGui.QImage.Format_Grayscale8)
+                values = [QtGui.qGray(tiny.pixel(x, y)) for y in range(8) for x in range(8)]
+                average = sum(values) / max(1, len(values))
+                bits = 0
+                for value in values:
+                    bits = (bits << 1) | int(value >= average)
+                colors = [color_tiny.pixelColor(x, y) for y in range(8) for x in range(8)]
+                mean_color = (
+                    sum(color.red() for color in colors) / 64,
+                    sum(color.green() for color in colors) / 64,
+                    sum(color.blue() for color in colors) / 64,
+                )
+                perceptual[alias] = bits, mean_color
+        except (ImportError, RuntimeError):
+            perceptual = {}
+        parents = {alias: alias for alias in perceptual}
+
+        def find(alias: str) -> str:
+            while parents[alias] != alias:
+                parents[alias] = parents[parents[alias]]
+                alias = parents[alias]
+            return alias
+
+        def union(left: str, right: str) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parents[right_root] = left_root
+
+        perceptual_items = list(perceptual.items())
+        for position, (left_alias, (left_hash, left_color)) in enumerate(perceptual_items):
+            for right_alias, (right_hash, right_color) in perceptual_items[position + 1 :]:
+                color_distance = sum((left_color[index] - right_color[index]) ** 2 for index in range(3)) ** 0.5
+                if (left_hash ^ right_hash).bit_count() <= 8 and color_distance <= 90:
+                    union(left_alias, right_alias)
+        similar_map: dict[str, list[str]] = {}
+        for alias in perceptual:
+            similar_map.setdefault(find(alias), []).append(alias)
+        similar = [aliases for aliases in similar_map.values() if len(aliases) > 1]
+        similar_aliases = sorted(alias for group in similar for alias in group)
         return {
             "references": references,
             "unused": sorted(alias for alias, macros in references.items() if not macros),
             "missing": sorted(missing),
             "duplicates": duplicates,
             "duplicate_aliases": duplicate_aliases,
+            "similar": similar,
+            "similar_aliases": similar_aliases,
         }
+
+    def list_asset_versions(self, alias: str) -> list[Path]:
+        root = (self.history_dir / "assets" / self.safe_name(alias)).resolve()
+        if not root.is_dir():
+            return []
+        return sorted(
+            (path for path in root.iterdir() if path.is_file() and path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".bmp"}),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+
+    def restore_asset_version(self, alias: str, version_path: Path) -> Path:
+        target = self.asset_path(alias)
+        if target is None:
+            raise FileNotFoundError(f"'{alias}' 이미지 파일이 없습니다.")
+        history_root = (self.history_dir / "assets" / self.safe_name(alias)).resolve()
+        source = version_path.resolve()
+        try:
+            source.relative_to(history_root)
+        except ValueError as exc:
+            raise ValueError("해당 이미지의 버전 기록 밖에 있는 파일은 복구할 수 없습니다.") from exc
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        history_root.mkdir(parents=True, exist_ok=True)
+        backup = history_root / f"before-restore-{datetime.now():%Y%m%d-%H%M%S-%f}{target.suffix}"
+        shutil.copy2(target, backup)
+        shutil.copy2(source, target)
+        self.refresh_asset_metadata(alias)
+        return target
 
     def sync_assets(self) -> int:
         index = self.load_assets()
@@ -1373,14 +1480,17 @@ internal static class Program
         progress_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.progress.txt"
         click_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.click.txt"
         control_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.control.txt"
+        variable_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.variables.ini"
         trace_path = self.exports_dir / "execution_trace.log"
         trace_path.write_text("", encoding="utf-8")
         control_path.write_text("RUN", encoding="utf-8")
+        variable_path.write_text("[variables]\n", encoding="utf-8-sig")
         environment["MACRORELAY_RESULT_FILE"] = str(result_path)
         environment["MACRORELAY_PROGRESS_FILE"] = str(progress_path)
         environment["MACRORELAY_CLICK_FILE"] = str(click_path)
         environment["MACRORELAY_TRACE_FILE"] = str(trace_path)
         environment["MACRORELAY_CONTROL_FILE"] = str(control_path)
+        environment["MACRORELAY_VARIABLE_FILE"] = str(variable_path)
         executable = self._read_text_path("ahk_path.txt")
         if not executable or not executable.exists():
             raise FileNotFoundError("AutoHotkey 실행 파일을 찾을 수 없습니다.")
@@ -1391,6 +1501,7 @@ internal static class Program
         process.macrorelay_click_path = click_path  # type: ignore[attr-defined]
         process.macrorelay_trace_path = trace_path  # type: ignore[attr-defined]
         process.macrorelay_control_path = control_path  # type: ignore[attr-defined]
+        process.macrorelay_variable_path = variable_path  # type: ignore[attr-defined]
         return process
 
     def _ensure_ocr_runtime(self) -> tuple[Path, Path]:

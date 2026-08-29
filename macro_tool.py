@@ -121,6 +121,11 @@ def slugify(name: str) -> str:
 
 
 def macro_path(name: str) -> Path:
+    raw_name = str(name or "").strip()
+    if raw_name and Path(raw_name).name == raw_name:
+        exact = MACRO_DIR / f"{raw_name}.json"
+        if exact.exists():
+            return exact
     candidate = MACRO_DIR / f"{slugify(name)}.json"
     if candidate.exists():
         return candidate
@@ -254,6 +259,53 @@ def list_macros() -> List[Path]:
     return sorted(MACRO_DIR.glob("*.json"))
 
 
+def debug_variable_names(steps: Iterable[Dict[str, Any]]) -> List[str]:
+    names: List[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "")
+        candidates: List[Any] = [step.get("repeat_var")]
+        if action in {"set_var", "calc_var"}:
+            candidates.append(step.get("name") or step.get("var"))
+        if action == "ocr":
+            candidates.append(step.get("store_var"))
+        for rule in step.get("edge_conditions") or []:
+            if isinstance(rule, dict) and str(rule.get("source") or "") == "variable":
+                candidates.append(rule.get("variable"))
+        for candidate in candidates:
+            name = normalize_variable_name(candidate)
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def debug_variable_helpers(macro: Dict[str, Any]) -> List[str]:
+    names = [normalize_variable_name(value) for value in macro.get("_debug_variables") or []]
+    names = [name for name in names if name]
+    globals_line = ", ".join(["MacroRunVariableFile", *names])
+    lines = [
+        "ApplyDebugVariables(step) {",
+        f"    global {globals_line}",
+        '    if (MacroRunVariableFile = "" or !FileExist(MacroRunVariableFile))',
+        "        return",
+    ]
+    for name in names:
+        lines.extend(
+            [
+                f'    IniRead, __debug_{name}, %MacroRunVariableFile%, variables, {name}, __MR_KEEP__',
+                f'    if (__debug_{name} != "__MR_KEEP__")',
+                "    {",
+                f"        {name} := __debug_{name}",
+                f"        IniDelete, %MacroRunVariableFile%, variables, {name}",
+                f'        TraceStep(step, "변수 디버거", "DETAIL", "var:{name}=" . {name} . "; injected=1")',
+                "    }",
+            ]
+        )
+    lines.extend(["}", ""])
+    return lines
+
+
 def build_macro_header(macro: Dict[str, Any]) -> List[str]:
     meta = macro.get("meta", {})
     coord_mode = meta.get("coord_mode", "Screen")
@@ -319,6 +371,7 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "EnvGet, MacroRunClickFile, MACRORELAY_CLICK_FILE",
         "EnvGet, MacroRunTraceFile, MACRORELAY_TRACE_FILE",
         "EnvGet, MacroRunControlFile, MACRORELAY_CONTROL_FILE",
+        "EnvGet, MacroRunVariableFile, MACRORELAY_VARIABLE_FILE",
         'MacroRunStatus := "RUNNING"',
         "SetRunProgress(step) {",
         "    global MacroRunProgressFile",
@@ -357,12 +410,14 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         '    traceStamp .= "." . SubStr("00" . A_MSec, -2)',
         '    FileAppend, % traceStamp . "|" . step . "|" . status . "|" . cleanLabel . "|" . cleanDetail . "`n", %MacroRunTraceFile%, UTF-8',
         "}",
+        *debug_variable_helpers(macro),
         "DebugCheckpoint(step) {",
         "    global MacroRunControlFile",
         "    if (MacroRunControlFile = \"\")",
         "        return",
         "    Loop",
         "    {",
+        "        ApplyDebugVariables(step)",
         "        command := \"RUN\"",
         "        if FileExist(MacroRunControlFile)",
         "            FileRead, command, %MacroRunControlFile%",
@@ -3791,33 +3846,102 @@ def _expand_macro_steps(
         active_stack = set()
     if depth >= max_depth:
         return []
-    expanded: List[Dict[str, Any]] = []
+    chunks: List[tuple[Dict[str, Any], List[Dict[str, Any]]]] = []
     for raw_step in steps:
         step = dict(raw_step or {})
         if step.get("action") != "call_submacro":
-            expanded.append(step)
+            chunks.append((step, [step]))
             continue
         submacro_name = str(
             step.get("macro") or step.get("name") or step.get("target") or ""
         ).strip()
         if not submacro_name:
+            chunks.append((step, [step]))
             continue
         stack_key = slugify(submacro_name)
         if stack_key in active_stack:
+            chunks.append((step, [step]))
             continue
         submacro_file = macro_path(submacro_name)
         if not submacro_file.exists():
+            chunks.append((step, [step]))
             continue
         try:
             submacro = load_json_file(submacro_file)
         except Exception:
+            chunks.append((step, [step]))
             continue
         child_steps = submacro.get("steps", [])
         if not isinstance(child_steps, list):
+            chunks.append((step, [step]))
             continue
         active_stack.add(stack_key)
-        expanded.extend(_expand_macro_steps(child_steps, active_stack, depth + 1, max_depth))
+        child_expanded = _expand_macro_steps(child_steps, active_stack, depth + 1, max_depth)
         active_stack.discard(stack_key)
+        if child_expanded:
+            chunks.append((step, child_expanded))
+        else:
+            chunks.append((step, [step]))
+
+    parent_starts: Dict[int, int] = {}
+    cursor = 1
+    for parent_index, (_source, chunk) in enumerate(chunks, start=1):
+        parent_starts[parent_index] = cursor
+        cursor += len(chunk)
+
+    def mapped_parent_target(value: Any) -> Any:
+        try:
+            target = int(value or 0)
+        except (TypeError, ValueError):
+            return value
+        return parent_starts.get(target, target) if target > 0 else value
+
+    def remap_step_targets(step: Dict[str, Any], mapper) -> Dict[str, Any]:
+        result = dict(step)
+        for field in ("on_success", "on_fail", "on_match", "on_no_match", "jump_to"):
+            try:
+                has_target = int(result.get(field) or 0) > 0
+            except (TypeError, ValueError):
+                has_target = False
+            if has_target:
+                result[field] = mapper(result[field])
+        conditions = result.get("edge_conditions")
+        if isinstance(conditions, list):
+            prepared_conditions: List[Any] = []
+            for rule in conditions:
+                try:
+                    has_target = isinstance(rule, dict) and int(rule.get("target") or 0) > 0
+                except (TypeError, ValueError):
+                    has_target = False
+                prepared_conditions.append({**rule, "target": mapper(rule.get("target"))} if has_target else rule)
+            result["edge_conditions"] = prepared_conditions
+        return result
+
+    expanded: List[Dict[str, Any]] = []
+    for parent_index, (source, chunk) in enumerate(chunks, start=1):
+        source_is_call = source.get("action") == "call_submacro" and not (
+            len(chunk) == 1 and chunk[0].get("action") == "call_submacro"
+        )
+        if not source_is_call:
+            prepared = remap_step_targets(chunk[0], mapped_parent_target)
+            prepared["_source_step_index"] = parent_index
+            expanded.append(prepared)
+            continue
+        offset = parent_starts[parent_index] - 1
+        for child_index, child in enumerate(chunk, start=1):
+            prepared = remap_step_targets(child, lambda value, base=offset: int(value) + base)
+            prepared["_source_step_index"] = parent_index
+            if child_index == 1:
+                parent_label = str(source.get("label") or source.get("macro") or "서브플로우")
+                child_label = str(prepared.get("label") or prepared.get("action") or "")
+                prepared["label"] = f"{parent_label} › {child_label}"
+            expanded.append(prepared)
+        outer_success = int(source.get("on_success") or 0)
+        outer_fail = int(source.get("on_fail") or 0)
+        if expanded and outer_success:
+            expanded[-1]["on_success"] = mapped_parent_target(outer_success)
+        if expanded and outer_fail:
+            expanded[-1]["on_fail"] = mapped_parent_target(outer_fail)
     return expanded
 
 
@@ -3826,11 +3950,21 @@ def render_macro_script(
     assets: Dict[str, Dict[str, Any]],
     browser_fast: bool = False,
 ) -> str:
-    lines = build_macro_header(macro)
     steps = _expand_macro_steps(list(macro.get("steps", [])))
+    header_macro = dict(macro)
+    header_macro["_debug_variables"] = debug_variable_names(steps)
+    lines = build_macro_header(header_macro)
     total_steps = len(steps)
-    start_step = int(macro.get("graph_start_step", 0) or 0)
-    end_step = int(macro.get("graph_end_step", 0) or 0)
+    source_start_step = int(macro.get("graph_start_step", 0) or 0)
+    source_end_step = int(macro.get("graph_end_step", 0) or 0)
+    start_step = next(
+        (index for index, step in enumerate(steps, start=1) if int(step.get("_source_step_index") or 0) == source_start_step),
+        source_start_step,
+    )
+    end_step = next(
+        (index for index in range(len(steps), 0, -1) if int(steps[index - 1].get("_source_step_index") or 0) == source_end_step),
+        source_end_step,
+    )
     if start_step < 1 or start_step > total_steps:
         start_step = 0
     if end_step < 1 or end_step > total_steps:

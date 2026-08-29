@@ -960,6 +960,46 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn('TraceStep(1, "짧은 대기", "START")', script)
         self.assertIn('TraceStep(1, "짧은 대기", "SUCCESS")', script)
 
+    def test_generated_macro_can_apply_debug_variable_overrides(self) -> None:
+        macro = {
+            "name": "variable-debug",
+            "steps": [
+                {"action": "set_var", "name": "run_count", "value": 2},
+                {"action": "wait", "duration": 10, "repeat_var": "$run_count"},
+            ],
+        }
+        script = self.engine.render_macro_script(macro, {})
+        self.assertIn("MACRORELAY_VARIABLE_FILE", script)
+        self.assertIn("ApplyDebugVariables(step)", script)
+        self.assertIn("global MacroRunVariableFile, run_count", script)
+        self.assertIn("IniRead, __debug_run_count", script)
+        self.assertIn("run_count := __debug_run_count", script)
+
+    def test_subflow_with_spaces_expands_and_remaps_parent_and_child_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            macro_dir = Path(directory)
+            child = {
+                "name": "로그인 처리",
+                "steps": [
+                    {"action": "wait", "duration": 10, "on_success": 2},
+                    {"action": "wait", "duration": 20},
+                ],
+            }
+            (macro_dir / "로그인 처리.json").write_text(json.dumps(child, ensure_ascii=False), encoding="utf-8")
+            parent_steps = [
+                {"action": "wait", "duration": 1, "on_success": 3},
+                {"action": "call_submacro", "macro": "로그인 처리"},
+                {"action": "wait", "duration": 30},
+            ]
+            with mock.patch.object(self.engine, "MACRO_DIR", macro_dir):
+                expanded = self.engine._expand_macro_steps(parent_steps)
+            self.assertEqual(4, len(expanded))
+            self.assertEqual(4, expanded[0]["on_success"])
+            self.assertEqual(3, expanded[1]["on_success"])
+            self.assertIn("로그인 처리", expanded[1]["label"])
+            self.assertEqual(2, expanded[1]["_source_step_index"])
+            self.assertEqual(2, expanded[2]["_source_step_index"])
+
 
     def test_vision_benchmark_captures_each_region_once_and_ranks_images(self):
         import vision_engine
@@ -1144,6 +1184,24 @@ class ProjectDataTests(unittest.TestCase):
             self.assertIn("OCR 검색어 누락", titles)
             self.assertIn("서브플로우 파일 누락", titles)
 
+    def test_preflight_reports_indirect_subflow_cycles_and_unbounded_loops(self) -> None:
+        from macro_studio.repository import MacroRepository
+        from macro_studio.validation import ProjectValidator
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            for name, target in (("A", "B"), ("B", "C"), ("C", "A")):
+                repository.create_macro(name)
+                payload = repository.load_macro(name)
+                payload["steps"] = [{"action": "call_submacro", "macro": target}]
+                if name == "A":
+                    payload["steps"].append({"action": "flow_control", "jump_to": 1, "repeat_count": 0})
+                repository.save_macro(name, payload)
+            issues = ProjectValidator(repository).validate()
+            titles = {issue.title for issue in issues}
+            self.assertIn("서브플로우 간접 순환", titles)
+            self.assertIn("무한 반복 가능성", titles)
+
     def test_automation_blocks_round_trip(self) -> None:
         from macro_studio.repository import MacroRepository
 
@@ -1280,15 +1338,39 @@ class ProjectDataTests(unittest.TestCase):
             payload = repository.load_macro("로그인")
             payload["steps"] = [{"action": "image_search", "asset": first}]
             repository.save_macro("로그인", payload)
-            repository.update_asset_organization([first], "로그인", ["버튼", "파란색"])
+            repository.update_asset_organization([first], "로그인", ["버튼", "파란색"], "로그인 버튼", "original")
 
             report = repository.analyze_assets()
             metadata = repository.load_assets()[first]
             self.assertEqual(["로그인"], report["references"][first])
             self.assertIn(second, report["unused"])
             self.assertEqual({first, second}, set(report["duplicate_aliases"]))
+            self.assertEqual({first, second}, set(report["similar_aliases"]))
             self.assertEqual("로그인", metadata["group"])
             self.assertEqual(["버튼", "파란색"], metadata["tags"])
+            self.assertEqual("로그인 버튼", metadata["variant_group"])
+            self.assertEqual("original", metadata["variant_kind"])
+
+    def test_asset_version_restore_keeps_the_replaced_image_in_history(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            original = QtGui.QImage(10, 10, QtGui.QImage.Format_ARGB32)
+            original.fill(QtGui.QColor("#2255AA"))
+            alias = repository.add_asset_image(original, "versioned-image")
+            history = repository.history_dir / "assets" / alias
+            history.mkdir(parents=True)
+            old_version = history / "old.png"
+            self.assertTrue(original.save(str(old_version), "PNG"))
+            changed = QtGui.QImage(10, 10, QtGui.QImage.Format_ARGB32)
+            changed.fill(QtGui.QColor("#EE5522"))
+            self.assertTrue(changed.save(str(repository.asset_path(alias)), "PNG"))
+            repository.restore_asset_version(alias, old_version)
+            restored = QtGui.QImage(str(repository.asset_path(alias)))
+            self.assertEqual(QtGui.QColor("#2255AA"), restored.pixelColor(2, 2))
+            self.assertTrue(any(path.name.startswith("before-restore-") for path in repository.list_asset_versions(alias)))
 
     def test_macro_version_history_can_restore_without_losing_current_state(self) -> None:
         from macro_studio.repository import MacroRepository
@@ -1302,6 +1384,8 @@ class ProjectDataTests(unittest.TestCase):
             second = repository.load_macro("versioned")
             second["steps"].append({"action": "wait", "duration": 200})
             repository.save_macro("versioned", second)
+            repository.set_macro_release_channel("versioned", "stable")
+            self.assertEqual("stable", repository.load_macro("versioned")["meta"]["release_channel"])
             versions = repository.list_macro_versions("versioned")
             one_step = next(item for item in versions if item["steps"] == 1)
             repository.restore_macro_version("versioned", one_step["path"])
@@ -2325,7 +2409,38 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIn("선택 노드를 블록으로 저장", menu_labels)
             self.assertIn("저장된 블록 추가", menu_labels)
             self.assertIn("버전 기록·복구", menu_labels)
+            self.assertIn("현재를 안정 버전으로 표시", menu_labels)
+            self.assertIn("현재를 테스트 버전으로 표시", menu_labels)
             window.close()
+
+    def test_subflow_node_opens_child_and_returns_to_parent(self) -> None:
+        from macro_studio.app import create_app
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            repository.create_macro("상위")
+            repository.create_macro("로그인 처리")
+            parent = repository.load_macro("상위")
+            parent["steps"] = [{"action": "call_submacro", "macro": "로그인 처리"}]
+            repository.save_macro("상위", parent)
+            child = repository.load_macro("로그인 처리")
+            child["steps"] = [{"action": "wait", "duration": 50}]
+            repository.save_macro("로그인 처리", child)
+            app, window = create_app(root)
+            builder = window.pages["builder"]
+            builder.refresh("상위")
+            self.assertEqual("서브플로우", builder.node_canvas.nodes[1].display_title)
+            self.assertIn("로그인 처리", builder.node_canvas.step_summary(parent["steps"][0]))
+            builder._focus_inspector(1)
+            self.assertEqual("로그인 처리", builder.current_name)
+            self.assertFalse(builder.subflow_back_button.isHidden())
+            builder._leave_subflow()
+            self.assertEqual("상위", builder.current_name)
+            self.assertEqual(1, builder.node_canvas.selected_index())
+            window.close()
+            app.processEvents()
 
     def test_start_search_group_and_selected_success_node_insertion(self) -> None:
         from PySide6 import QtWidgets
@@ -2590,6 +2705,8 @@ class UiSmokeTests(unittest.TestCase):
             process = FakeProcess()
             process.macrorelay_control_path = root / "control.txt"
             process.macrorelay_control_path.write_text("RUN", encoding="utf-8")
+            process.macrorelay_variable_path = root / "variables.ini"
+            process.macrorelay_variable_path.write_text("[variables]\n", encoding="utf-8")
             window._track_macro_process("stop-loop", process)
             self.assertFalse(builder.run_button.isEnabled())
             self.assertTrue(builder.stop_button.isEnabled())
@@ -2599,6 +2716,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("STEP", process.macrorelay_control_path.read_text(encoding="utf-8"))
             window.resume_running_macros()
             self.assertEqual("RUN", process.macrorelay_control_path.read_text(encoding="utf-8"))
+            self.assertTrue(window.set_running_variable("run_count", "3"))
+            self.assertIn("run_count=3", process.macrorelay_variable_path.read_text(encoding="utf-8-sig"))
             with mock.patch.object(window, "_terminate_macro_process") as terminate:
                 builder.stop_button.click()
             terminate.assert_called_once_with(process.pid, process)
@@ -2621,6 +2740,16 @@ class UiSmokeTests(unittest.TestCase):
                 super().__init__()
                 self._running_macro_processes = {1: object()}
                 self.commands: list[str] = []
+                self.pages = {
+                    "builder": SimpleNamespace(
+                        current_macro={
+                            "steps": [
+                                {"action": "wait", "repeat_var": "$count"},
+                                {"action": "wait", "edge_conditions": [{"source": "variable", "variable": "count", "operator": ">=", "value": 3}]},
+                            ]
+                        }
+                    )
+                }
 
             def pause_running_macros(self) -> None:
                 self.commands.append("PAUSE")
@@ -2651,6 +2780,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("150 ms", dialog.timeline_table.item(0, 3).text())
             self.assertEqual("count", dialog.variable_table.item(0, 0).text())
             self.assertEqual("3", dialog.variable_table.item(0, 1).text())
+            self.assertIn("1번 노드 반복 횟수 → 3", dialog._variable_impact("count", "3"))
+            self.assertIn("조건 성립", dialog._variable_impact("count", "3"))
             dialog.debug_control_buttons[0].click()
             self.assertEqual(["PAUSE"], host.commands)
             dialog.close()

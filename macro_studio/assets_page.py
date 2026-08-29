@@ -71,6 +71,7 @@ class AssetsPage(QtWidgets.QWidget):
             ("사용 중", "used"),
             ("미사용", "unused"),
             ("완전 중복", "duplicate"),
+            ("시각적으로 유사", "similar"),
             ("파일 없음", "missing"),
         ):
             self.filter_combo.addItem(label, value)
@@ -126,7 +127,10 @@ class AssetsPage(QtWidgets.QWidget):
         detail_actions = QtWidgets.QHBoxLayout()
         open_editor = primary_button("편집기 열기")
         open_editor.clicked.connect(self._edit)
+        restore_version = QtWidgets.QPushButton("버전 기록·복구")
+        restore_version.clicked.connect(self._restore_asset_version)
         detail_actions.addWidget(open_editor)
+        detail_actions.addWidget(restore_version)
         detail_actions.addStretch(1)
         detail_layout.addLayout(detail_actions)
         splitter.addWidget(detail_card)
@@ -166,7 +170,15 @@ class AssetsPage(QtWidgets.QWidget):
             item = QtWidgets.QListWidgetItem(alias + suffix)
             item.setData(QtCore.Qt.UserRole, alias)
             item.setData(QtCore.Qt.UserRole + 1, str(path))
-            item.setData(QtCore.Qt.UserRole + 2, {"group": group, "tags": tags})
+            item.setData(
+                QtCore.Qt.UserRole + 2,
+                {
+                    "group": group,
+                    "tags": tags,
+                    "variant_group": str(metadata.get("variant_group") or ""),
+                    "variant_kind": str(metadata.get("variant_kind") or ""),
+                },
+            )
             references = self._analysis.get("references", {}).get(alias, [])
             item.setToolTip(f"{path}\n사용 매크로: {', '.join(references) if references else '없음'}")
             if path.exists():
@@ -190,7 +202,8 @@ class AssetsPage(QtWidgets.QWidget):
         total = len(index)
         unused = len(self._analysis.get("unused") or [])
         duplicates = len(self._analysis.get("duplicate_aliases") or [])
-        self.analysis_label.setText(f"전체 {total} · 미사용 {unused} · 중복 {duplicates}")
+        similar = len(self._analysis.get("similar_aliases") or [])
+        self.analysis_label.setText(f"전체 {total} · 미사용 {unused} · 중복 {duplicates} · 유사 {similar}")
         QtCore.QTimer.singleShot(0, lambda value=scroll_value: self.asset_list.verticalScrollBar().setValue(value))
 
     def _asset_signature(self) -> tuple[int, int, int, int]:
@@ -230,6 +243,7 @@ class AssetsPage(QtWidgets.QWidget):
         references = self._analysis.get("references") or {}
         unused = set(self._analysis.get("unused") or [])
         duplicates = set(self._analysis.get("duplicate_aliases") or [])
+        similar = set(self._analysis.get("similar_aliases") or [])
         missing = set(self._analysis.get("missing") or [])
         for index in range(self.asset_list.count()):
             item = self.asset_list.item(index)
@@ -245,6 +259,7 @@ class AssetsPage(QtWidgets.QWidget):
                 "used": bool(references.get(alias)),
                 "unused": alias in unused,
                 "duplicate": alias in duplicates,
+                "similar": alias in similar,
                 "missing": alias in missing,
             }.get(mode, True)
             item.setHidden(not (matches_text and matches_group and matches_mode))
@@ -272,9 +287,12 @@ class AssetsPage(QtWidgets.QWidget):
         metadata = current.data(QtCore.Qt.UserRole + 2) or {}
         group = str(metadata.get("group") or "미분류")
         tags = ", ".join(str(value) for value in metadata.get("tags") or []) or "없음"
+        variant_group = str(metadata.get("variant_group") or "")
+        variant_kind = str(metadata.get("variant_kind") or "")
+        variant = f"{variant_group} / {variant_kind or '변형'}" if variant_group else "지정 안 함"
         references = self._analysis.get("references", {}).get(self.current_alias, [])
         usage = ", ".join(references) if references else "미사용 이미지"
-        self.info_label.setText(f"{dimensions}\n폴더: {group} · 태그: {tags}\n사용 매크로: {usage}")
+        self.info_label.setText(f"{dimensions}\n폴더: {group} · 태그: {tags}\n변형 묶음: {variant}\n사용 매크로: {usage}")
         self.path_label.setText(str(self.current_path))
 
     def _add(self) -> None:
@@ -372,8 +390,16 @@ class AssetsPage(QtWidgets.QWidget):
         group_edit.setPlaceholderText("예: 로그인, 전투, 공통 버튼")
         tags_edit = QtWidgets.QLineEdit(", ".join(str(value) for value in first.get("tags") or []))
         tags_edit.setPlaceholderText("쉼표로 구분: 버튼, 파란색, 확인")
+        variant_group_edit = QtWidgets.QLineEdit(str(first.get("variant_group") or ""))
+        variant_group_edit.setPlaceholderText("예: 로그인 확인 버튼")
+        variant_kind_combo = QtWidgets.QComboBox()
+        for label, value in (("지정 안 함", ""), ("원본", "original"), ("누끼", "cutout"), ("흑백", "grayscale"), ("윤곽", "edge"), ("기타", "variant")):
+            variant_kind_combo.addItem(label, value)
+        variant_kind_combo.setCurrentIndex(max(0, variant_kind_combo.findData(str(first.get("variant_kind") or ""))))
         layout.addRow("폴더", group_edit)
         layout.addRow("태그", tags_edit)
+        layout.addRow("변형 이미지 묶음", variant_group_edit)
+        layout.addRow("변형 종류", variant_kind_combo)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -381,11 +407,65 @@ class AssetsPage(QtWidgets.QWidget):
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
         tags = [value.strip() for value in tags_edit.text().split(",") if value.strip()]
-        self.repository.update_asset_organization(aliases, group_edit.text(), tags)
+        self.repository.update_asset_organization(
+            aliases,
+            group_edit.text(),
+            tags,
+            variant_group_edit.text(),
+            str(variant_kind_combo.currentData() or ""),
+        )
         self._loaded_signature = None
         self.refresh()
         self.data_changed.emit()
         self.status.emit(f"이미지 {len(aliases)}개의 폴더·태그를 저장했습니다.")
+
+    def _restore_asset_version(self) -> None:
+        if not self.current_alias:
+            self.status.emit("버전 기록을 볼 이미지를 선택하세요.")
+            return
+        versions = self.repository.list_asset_versions(self.current_alias)
+        if not versions:
+            QtWidgets.QMessageBox.information(self, "이미지 버전 기록", "아직 저장된 이전 이미지 버전이 없습니다.")
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"이미지 버전 기록 · {self.current_alias}")
+        dialog.resize(700, 480)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        hint = QtWidgets.QLabel("편집 전에 자동 저장된 이미지를 선택하세요. 현재 이미지는 복구 전에 다시 백업됩니다.")
+        hint.setObjectName("Muted")
+        layout.addWidget(hint)
+        items = QtWidgets.QListWidget()
+        items.setViewMode(QtWidgets.QListView.IconMode)
+        items.setIconSize(QtCore.QSize(150, 105))
+        items.setGridSize(QtCore.QSize(190, 145))
+        for path in versions:
+            modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%m-%d %H:%M:%S")
+            item = QtWidgets.QListWidgetItem(QtGui.QIcon(str(path)), modified)
+            item.setData(QtCore.Qt.UserRole, str(path))
+            item.setToolTip(str(path))
+            items.addItem(item)
+        items.setCurrentRow(0)
+        layout.addWidget(items, 1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.RestoreDefaults | QtWidgets.QDialogButtonBox.Cancel)
+        restore = buttons.button(QtWidgets.QDialogButtonBox.RestoreDefaults)
+        restore.setText("선택 버전 복구")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.Accepted or items.currentItem() is None:
+            return
+        try:
+            self.repository.restore_asset_version(
+                self.current_alias, Path(str(items.currentItem().data(QtCore.Qt.UserRole)))
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "이미지 복구 실패", str(exc))
+            return
+        self._thumbnail_cache.pop(str(self.current_path), None)
+        self._loaded_signature = None
+        self.refresh()
+        self.data_changed.emit()
+        self.status.emit(f"'{self.current_alias}' 이미지의 이전 버전을 복구했습니다.")
 
     def _archive(self) -> None:
         self._archive_selected(confirm=True)

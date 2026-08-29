@@ -44,6 +44,8 @@ class ProjectValidator:
             if not isinstance(steps, list):
                 issues.append(Issue("error", "잘못된 단계 목록", "steps가 배열이 아닙니다.", summary.name))
                 continue
+            if not steps:
+                issues.append(Issue("warning", "빈 매크로", "실행할 노드가 없습니다.", summary.name))
             if len(steps) > 1:
                 first = steps[0] if isinstance(steps[0], dict) else {}
                 if (
@@ -137,6 +139,29 @@ class ProjectValidator:
                         issues.append(Issue("error", "서브플로우 파일 누락", f"'{target_macro}' 매크로를 찾을 수 없습니다.", summary.name, index))
                     elif target_macro == summary.name:
                         issues.append(Issue("error", "서브플로우 순환 호출", "매크로가 자기 자신을 호출할 수 없습니다.", summary.name, index))
+                if action == "image_search" and bool(step.get("repeat_on_success")):
+                    issues.append(
+                        Issue(
+                            "warning",
+                            "이미지 성공 반복 확인",
+                            "이미지가 계속 보이면 같은 노드가 계속 실행됩니다. 정지 조건이 있는지 확인하세요.",
+                            summary.name,
+                            index,
+                        )
+                    )
+                if action == "flow_control":
+                    jump_to = int(step.get("jump_to") or 0)
+                    repeat_count = int(step.get("repeat_count") or 0)
+                    if repeat_count == 0 and 0 < jump_to <= index:
+                        issues.append(
+                            Issue(
+                                "warning",
+                                "무한 반복 가능성",
+                                f"{jump_to}번 노드로 제한 없이 되돌아갑니다.",
+                                summary.name,
+                                index,
+                            )
+                        )
                 table = str(step.get("table") or "")
                 if table and table not in tables:
                     issues.append(Issue("error", "데이터 테이블 누락", f"'{table}' 테이블이 없습니다.", summary.name, index))
@@ -161,6 +186,37 @@ class ProjectValidator:
                             variable = str(rule.get("variable") or "")
                             if not variable or not variable.replace("_", "a").isalnum() or variable[0].isdigit():
                                 issues.append(Issue("error", "조건 분기 변수 오류", f"규칙 {rule_index}: '{variable}'", summary.name, index))
+        call_graph: dict[str, set[str]] = {}
+        for summary in self.repository.list_macros():
+            try:
+                macro = self.repository.load_macro(summary.name)
+            except (OSError, ValueError):
+                continue
+            call_graph[summary.name] = {
+                str(step.get("macro") or "").strip()
+                for step in macro.get("steps") or []
+                if isinstance(step, dict) and step.get("action") == "call_submacro" and str(step.get("macro") or "").strip()
+            }
+        reported_cycles: set[tuple[str, ...]] = set()
+
+        def visit(origin: str, current: str, path: list[str]) -> None:
+            for target in call_graph.get(current, set()):
+                if target == origin:
+                    if current == origin and not path:
+                        continue
+                    cycle = tuple(sorted(set([*path, current, target])))
+                    if cycle not in reported_cycles:
+                        reported_cycles.add(cycle)
+                        issues.append(
+                            Issue("error", "서브플로우 간접 순환", " → ".join([*path, current, target]), origin)
+                        )
+                    continue
+                if target in path or target not in call_graph:
+                    continue
+                visit(origin, target, [*path, current])
+
+        for macro_name in call_graph:
+            visit(macro_name, macro_name, [])
         return issues
 
     def stats(self) -> dict[str, int]:

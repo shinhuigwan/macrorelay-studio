@@ -58,16 +58,19 @@ class MacroLogDialog(QtWidgets.QDialog):
         pause_btn = QtWidgets.QPushButton("Ⅱ 일시정지")
         step_btn = QtWidgets.QPushButton("▷ 한 단계")
         resume_btn = QtWidgets.QPushButton("▶ 재개")
+        variable_btn = QtWidgets.QPushButton("✎ 변수값 테스트")
         stop_btn = QtWidgets.QPushButton("■ 중단")
         pause_btn.clicked.connect(lambda: self._invoke_host("pause_running_macros"))
         step_btn.clicked.connect(lambda: self._invoke_host("step_running_macros"))
         resume_btn.clicked.connect(lambda: self._invoke_host("resume_running_macros"))
+        variable_btn.clicked.connect(self._override_variable)
         stop_btn.clicked.connect(lambda: self._invoke_host("stop_running_macros"))
-        self.debug_control_buttons = (pause_btn, step_btn, resume_btn, stop_btn)
+        self.debug_control_buttons = (pause_btn, step_btn, resume_btn, variable_btn, stop_btn)
         debugger_header.addWidget(self.debug_status, 1)
         debugger_header.addWidget(pause_btn)
         debugger_header.addWidget(step_btn)
         debugger_header.addWidget(resume_btn)
+        debugger_header.addWidget(variable_btn)
         debugger_header.addWidget(stop_btn)
         debugger_layout.addLayout(debugger_header)
         debugger_split = QtWidgets.QSplitter()
@@ -206,6 +209,89 @@ class MacroLogDialog(QtWidgets.QDialog):
         if callable(method):
             method()
         self._refresh_debugger()
+
+    def _override_variable(self) -> None:
+        host = self.parentWidget()
+        setter = getattr(host, "set_running_variable", None)
+        if not callable(setter):
+            return
+        selected = self.variable_table.currentRow()
+        default_name = self.variable_table.item(selected, 0).text() if selected >= 0 and self.variable_table.item(selected, 0) else ""
+        default_value = self.variable_table.item(selected, 1).text() if selected >= 0 and self.variable_table.item(selected, 1) else ""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("실행 중 변수값 테스트")
+        dialog.setMinimumWidth(480)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        form = QtWidgets.QFormLayout()
+        name_edit = QtWidgets.QLineEdit(default_name)
+        name_edit.setPlaceholderText("예: run_count")
+        value_edit = QtWidgets.QLineEdit(default_value)
+        form.addRow("변수", name_edit)
+        form.addRow("임시 값", value_edit)
+        layout.addLayout(form)
+        impact = QtWidgets.QLabel()
+        impact.setWordWrap(True)
+        impact.setStyleSheet("background:#101722; border:1px solid #2E3B50; border-radius:8px; padding:10px;")
+        layout.addWidget(impact)
+
+        def update_impact() -> None:
+            impact.setText(self._variable_impact(name_edit.text(), value_edit.text()))
+
+        name_edit.textChanged.connect(update_impact)
+        value_edit.textChanged.connect(update_impact)
+        update_impact()
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Apply | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Apply).setText("다음 노드부터 적용")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        if not setter(name_edit.text(), value_edit.text()):
+            QtWidgets.QMessageBox.warning(dialog, "변수 변경 실패", "실행 중인 매크로가 없거나 변수 이름이 올바르지 않습니다.")
+
+    def _variable_impact(self, name: str, value: str) -> str:
+        variable = str(name or "").strip().lstrip("$")
+        host = self.parentWidget()
+        builder = getattr(host, "pages", {}).get("builder") if host is not None else None
+        macro = getattr(builder, "current_macro", None) if builder is not None else None
+        usages: list[str] = []
+        try:
+            numeric = float(value)
+        except ValueError:
+            numeric = None
+        for index, step in enumerate((macro or {}).get("steps") or [], start=1):
+            if str(step.get("repeat_var") or "").strip().lstrip("$") == variable:
+                result = max(1, int(numeric)) if numeric is not None else "숫자 변환 실패"
+                usages.append(f"{index}번 노드 반복 횟수 → {result}")
+            for rule in step.get("edge_conditions") or []:
+                if not isinstance(rule, dict) or str(rule.get("source") or "") != "variable":
+                    continue
+                if str(rule.get("variable") or "").strip().lstrip("$") != variable:
+                    continue
+                operator = str(rule.get("operator") or "==")
+                expected = rule.get("value", 0)
+                result_text = "문자열 비교"
+                if numeric is not None:
+                    try:
+                        expected_number = float(expected)
+                        checks = {
+                            ">=": numeric >= expected_number,
+                            "<=": numeric <= expected_number,
+                            ">": numeric > expected_number,
+                            "<": numeric < expected_number,
+                            "==": numeric == expected_number,
+                            "!=": numeric != expected_number,
+                        }
+                        result_text = "조건 성립" if checks.get(operator, False) else "조건 불성립"
+                    except (TypeError, ValueError):
+                        pass
+                usages.append(f"{index}번 {operator} {expected} → {result_text}")
+        if not variable:
+            return "변수 이름을 입력하세요. 영문, 숫자, 밑줄만 사용할 수 있습니다."
+        if usages:
+            return "다음 체크포인트에서 적용됩니다.\n" + "\n".join(f"• {item}" for item in usages)
+        return "다음 체크포인트에서 값을 변경합니다. 현재 매크로의 반복/조건 직접 사용처는 없습니다."
 
     @staticmethod
     def _parse_trace_timestamp(value: str) -> datetime | None:

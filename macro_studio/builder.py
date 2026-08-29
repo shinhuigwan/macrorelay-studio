@@ -428,6 +428,7 @@ class BuilderPage(QtWidgets.QWidget):
         self._handle_profiles_path = self.repository.root / ".automation" / "inactive-click-profiles.json"
         self._inactive_handle_profiles = self._load_inactive_handle_profiles()
         self._last_recording_events = self._load_last_recording()
+        self._subflow_parent_stack: list[tuple[str, int]] = []
         self.shortcut_buttons: dict[str, QtWidgets.QPushButton] = {}
 
         root = QtWidgets.QVBoxLayout(self)
@@ -580,6 +581,10 @@ class BuilderPage(QtWidgets.QWidget):
         header = QtWidgets.QHBoxLayout()
         self.macro_title = QtWidgets.QLabel("매크로를 선택하세요")
         self.macro_title.setStyleSheet("font-size: 13pt; font-weight: 700;")
+        self.subflow_back_button = QtWidgets.QPushButton("← 상위 흐름")
+        self.subflow_back_button.setToolTip("서브플로우를 호출한 상위 매크로로 돌아갑니다.")
+        self.subflow_back_button.setVisible(False)
+        self.subflow_back_button.clicked.connect(self._leave_subflow)
         self.duplicate_node_button = QtWidgets.QPushButton("⧉ 노드 복제")
         self.duplicate_node_button.setToolTip("선택한 노드를 복제합니다 (Ctrl+D)")
         self.duplicate_node_button.clicked.connect(
@@ -609,7 +614,12 @@ class BuilderPage(QtWidgets.QWidget):
         version_action = self.node_more_menu.addAction("버전 기록·복구")
         version_action.setToolTip("자동 저장된 이전 버전을 확인하고 현재 매크로로 복구합니다.")
         version_action.triggered.connect(self._open_version_history)
+        stable_action = self.node_more_menu.addAction("현재를 안정 버전으로 표시")
+        stable_action.triggered.connect(lambda: self._set_current_release_channel("stable"))
+        test_channel_action = self.node_more_menu.addAction("현재를 테스트 버전으로 표시")
+        test_channel_action.triggered.connect(lambda: self._set_current_release_channel("test"))
         self.node_more_button.setMenu(self.node_more_menu)
+        header.addWidget(self.subflow_back_button)
         header.addWidget(self.macro_title)
         header.addStretch(1)
         node_actions = QtWidgets.QHBoxLayout()
@@ -1089,7 +1099,9 @@ class BuilderPage(QtWidgets.QWidget):
         self.current_name = name
         self._last_persisted_macro = deepcopy(self.current_macro)
         self._update_history_buttons()
-        self.macro_title.setText(f"{name}  ·  {len(self.current_macro.get('steps') or [])}단계")
+        channel = str((self.current_macro.get("meta") or {}).get("release_channel") or "test")
+        channel_label = "안정" if channel == "stable" else "테스트"
+        self.macro_title.setText(f"{name}  ·  {len(self.current_macro.get('steps') or [])}단계  ·  {channel_label}")
         self._refresh_steps()
 
     def _refresh_steps(self, selected: int = 0) -> None:
@@ -1134,6 +1146,8 @@ class BuilderPage(QtWidgets.QWidget):
             return str(step.get("selector") or step.get("title") or "브라우저 액션")
         if action in {"table_copy", "table_paste"}:
             return str(step.get("table") or "테이블 선택 필요")
+        if action == "call_submacro":
+            return f"서브플로우 · {step.get('macro') or '선택 필요'}"
         return str(action or "단계")
 
     def _select_step(self, row: int, _column: int, _old_row: int, _old_column: int) -> None:
@@ -1167,7 +1181,29 @@ class BuilderPage(QtWidgets.QWidget):
     @QtCore.Slot(int)
     def _focus_inspector(self, index: int) -> None:
         self._select_graph_node(index)
+        steps = list((self.current_macro or {}).get("steps") or [])
+        if 1 <= index <= len(steps) and str(steps[index - 1].get("action") or "") == "call_submacro":
+            target = str(steps[index - 1].get("macro") or "").strip()
+            if not target or not self.repository.macro_path(target).is_file():
+                QtWidgets.QMessageBox.warning(self, "서브플로우 열기", "호출할 서브매크로가 없거나 파일을 찾을 수 없습니다.")
+                return
+            if self.current_name:
+                self._subflow_parent_stack.append((self.current_name, index))
+            self.refresh(target)
+            self.subflow_back_button.setVisible(True)
+            self.status.emit(f"'{target}' 서브플로우 내부를 열었습니다. 상위 흐름 버튼으로 돌아갈 수 있습니다.")
+            return
         self.label_edit.setFocus(QtCore.Qt.MouseFocusReason)
+
+    def _leave_subflow(self) -> None:
+        if not self._subflow_parent_stack:
+            self.subflow_back_button.setVisible(False)
+            return
+        parent_name, node_index = self._subflow_parent_stack.pop()
+        self.refresh(parent_name)
+        self._select_graph_node(node_index)
+        self.subflow_back_button.setVisible(bool(self._subflow_parent_stack))
+        self.status.emit(f"'{parent_name}' 상위 흐름으로 돌아왔습니다.")
 
     @QtCore.Slot(dict)
     def _graph_positions_changed(self, positions: dict) -> None:
@@ -2337,16 +2373,50 @@ class BuilderPage(QtWidgets.QWidget):
                 issues.append(message)
             else:
                 warnings.append(message)
+        ocr_checked = False
         for index, step in enumerate((self.current_macro or {}).get("steps") or [], start=1):
-            if not isinstance(step, dict) or step.get("action") != "image_search":
+            if not isinstance(step, dict):
                 continue
-            if str(step.get("engine") or "ahk").lower() == "opencv":
+            action = str(step.get("action") or "")
+            if action == "image_search" and str(step.get("engine") or "ahk").lower() == "opencv":
                 try:
                     self.repository._ensure_opencv_runtime()
                 except Exception as exc:
                     issues.append(f"{index}번 이미지 서치: OpenCV 실행 환경을 사용할 수 없습니다. {exc}")
+            if action == "ocr" and not ocr_checked:
+                ocr_checked = True
+                try:
+                    self.repository._ensure_ocr_runtime()
+                except Exception as exc:
+                    issues.append(f"{index}번 OCR: OCR 실행 환경을 사용할 수 없습니다. {exc}")
+            target_title = ""
+            target_exe = ""
+            if action == "mouse_click" and str(step.get("coordinate_scope") or "screen") == "client":
+                target_title, target_exe = str(step.get("window") or ""), str(step.get("window_exe") or "")
+            elif action == "inactive_click":
+                target_title, target_exe = str(step.get("window") or ""), str(step.get("window_exe") or "")
+            elif action == "image_search" and str(step.get("region_mode") or "screen") in {"window", "client"}:
+                target_title, target_exe = str(step.get("region_window") or ""), str(step.get("region_window_exe") or "")
+            elif action == "ocr" and str(step.get("capture_mode") or "screen") in {"window", "client"}:
+                target_title = str(step.get("window_title") or "")
+            if (target_title or target_exe) and not self._target_window_exists(target_title, target_exe):
+                warnings.append(f"{index}번 대상 창을 현재 찾지 못했습니다 · {target_exe or target_title}")
         self._last_execution_warnings = list(dict.fromkeys(warnings))
         return list(dict.fromkeys(issues))
+
+    @staticmethod
+    def _target_window_exists(title: str, executable: str) -> bool:
+        try:
+            from .image_search_test import _find_window
+
+            if executable and _find_window(executable, title):
+                return True
+            import ctypes
+
+            plain_title = str(title or "").split(" ahk_", 1)[0].strip()
+            return bool(plain_title and ctypes.windll.user32.FindWindowW(None, plain_title))
+        except Exception:
+            return True
 
     def _open_version_history(self) -> None:
         if not self.current_name:
@@ -2367,8 +2437,8 @@ class BuilderPage(QtWidgets.QWidget):
         hint = QtWidgets.QLabel("복구해도 현재 상태가 새 버전으로 먼저 백업되므로 다시 되돌릴 수 있습니다.")
         hint.setObjectName("Muted")
         layout.addWidget(hint)
-        table = QtWidgets.QTableWidget(len(versions), 4)
-        table.setHorizontalHeaderLabels(["저장 시각", "노드", "현재와 비교", "설명"])
+        table = QtWidgets.QTableWidget(len(versions), 5)
+        table.setHorizontalHeaderLabels(["저장 시각", "채널", "노드", "현재와 비교", "설명"])
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.verticalHeader().setVisible(False)
@@ -2378,12 +2448,14 @@ class BuilderPage(QtWidgets.QWidget):
             step_count = int(version.get("steps") or 0)
             delta = step_count - current_steps
             comparison = "동일한 노드 수" if delta == 0 else f"노드 {abs(delta)}개 {'많음' if delta > 0 else '적음'}"
-            for column, value in enumerate((modified, str(step_count), comparison, str(version.get("description") or ""))):
+            channel = "안정" if str(version.get("channel") or "test") == "stable" else "테스트"
+            for column, value in enumerate((modified, channel, str(step_count), comparison, str(version.get("description") or ""))):
                 table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
         table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
         table.selectRow(0)
         layout.addWidget(table, 1)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.RestoreDefaults | QtWidgets.QDialogButtonBox.Close)
@@ -2414,6 +2486,19 @@ class BuilderPage(QtWidgets.QWidget):
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.refresh(self.current_name)
             self.status.emit(f"'{self.current_name}' 이전 버전을 복구했습니다. 복구 전 상태도 버전 기록에 남겼습니다.")
+
+    def _set_current_release_channel(self, channel: str) -> None:
+        if not self.current_name:
+            self.status.emit("버전 채널을 지정할 매크로를 먼저 선택하세요.")
+            return
+        try:
+            self.repository.set_macro_release_channel(self.current_name, channel)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "버전 채널 저장 실패", str(exc))
+            return
+        self.refresh(self.current_name)
+        label = "안정 버전" if channel == "stable" else "자동화 테스트 버전"
+        self.status.emit(f"'{self.current_name}' 현재 상태를 {label}으로 표시했습니다.")
 
     def _open_logs(self) -> None:
         if self._log_dialog is not None and self._log_dialog.isVisible():

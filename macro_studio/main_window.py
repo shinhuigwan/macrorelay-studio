@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ] = {}
         self._seen_click_traces: dict[int, str] = {}
         self._run_control_paths: dict[int, Path] = {}
+        self._run_variable_paths: dict[int, Path] = {}
         self._run_trace_paths: dict[int, Path] = {}
         self._trace_signatures: dict[int, tuple[int, int]] = {}
         self._failure_capture_steps: set[tuple[int, int]] = set()
@@ -506,6 +508,7 @@ class MainWindow(QtWidgets.QMainWindow):
             click_path = getattr(process, "macrorelay_click_path", None)
             control_path = getattr(process, "macrorelay_control_path", None)
             trace_path = getattr(process, "macrorelay_trace_path", None)
+            variable_path = getattr(process, "macrorelay_variable_path", None)
             self._running_macro_processes[pid] = (
                 name,
                 process,
@@ -517,6 +520,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._run_control_paths[pid] = control_path
             if isinstance(trace_path, Path):
                 self._run_trace_paths[pid] = trace_path
+            if isinstance(variable_path, Path):
+                self._run_variable_paths[pid] = variable_path
             builder = self.pages.get("builder")
             clear_states = getattr(builder, "clear_execution_states", None)
             if callable(clear_states):
@@ -567,6 +572,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._running_macro_processes.pop(pid, None)
             self._seen_click_traces.pop(pid, None)
             self._run_control_paths.pop(pid, None)
+            self._run_variable_paths.pop(pid, None)
             self._run_trace_paths.pop(pid, None)
             self._trace_signatures.pop(pid, None)
             self._failure_capture_steps = {key for key in self._failure_capture_steps if key[0] != pid}
@@ -612,6 +618,34 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_run_log("디버거 실행 재개 요청")
         else:
             self.show_status("재개할 매크로가 없습니다.")
+
+    def set_running_variable(self, name: str, value: str) -> bool:
+        variable = str(name or "").strip().lstrip("$")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable) or not self._run_variable_paths:
+            return False
+        clean_value = str(value).replace("\r", " ").replace("\n", " ")
+        written = False
+        for path in self._run_variable_paths.values():
+            try:
+                existing: dict[str, str] = {}
+                if path.is_file():
+                    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                        if "=" in line and not line.lstrip().startswith((";", "#")):
+                            key, old_value = line.split("=", 1)
+                            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key.strip()):
+                                existing[key.strip()] = old_value
+                existing[variable] = clean_value
+                body = "[variables]\n" + "".join(f"{key}={item}\n" for key, item in existing.items())
+                temporary = path.with_suffix(path.suffix + ".tmp")
+                temporary.write_text(body, encoding="utf-8-sig")
+                os.replace(temporary, path)
+                written = True
+            except OSError:
+                continue
+        if written:
+            self._append_run_log(f"디버거 변수 변경 예약 | {variable}={clean_value}")
+            self.show_status(f"다음 체크포인트에서 변수 {variable} 값을 {clean_value}(으)로 변경합니다.")
+        return written
 
     def _update_macro_run_state(self) -> None:
         builder = self.pages.get("builder")
@@ -667,6 +701,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._running_macro_processes.pop(pid, None)
             self._seen_click_traces.pop(pid, None)
             self._run_control_paths.pop(pid, None)
+            self._run_variable_paths.pop(pid, None)
             self._run_trace_paths.pop(pid, None)
             self._trace_signatures.pop(pid, None)
             self._failure_capture_steps = {key for key in self._failure_capture_steps if key[0] != pid}

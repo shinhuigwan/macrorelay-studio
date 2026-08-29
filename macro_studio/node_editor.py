@@ -298,6 +298,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.display_title = (
             "멀티 이미지 서치"
             if str(step.get("action") or "") == "image_search" and len(step.get("assets") or []) > 1
+            else "서브플로우"
+            if str(step.get("action") or "") == "call_submacro"
             else ACTION_TITLES.get(str(step.get("action") or "step"), str(step.get("action") or "step"))
         )
         self.setFlags(
@@ -969,6 +971,8 @@ class NodeCanvas(QtWidgets.QWidget):
             return f"{int(step.get('duration') or 0)} ms 대기"
         if action in {"run_program", "terminate_program"}:
             return str(step.get("path") or step.get("process") or action)
+        if action == "call_submacro":
+            return f"더블클릭해서 열기 · {step.get('macro') or '선택 필요'}"
         return action or "단계"
 
     def set_macro(self, macro: dict[str, Any] | None, selected: int = 0) -> None:

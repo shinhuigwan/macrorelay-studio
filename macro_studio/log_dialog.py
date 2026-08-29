@@ -389,7 +389,7 @@ class MacroLogDialog(QtWidgets.QDialog):
                 if "=" in variable_payload:
                     name, value = variable_payload.split("=", 1)
                     if name.strip():
-                        variables[name.strip()] = value.strip()
+                        variables[name.strip()] = value.split(";", 1)[0].strip()
             elif status == "CAPTURE" and detail:
                 captures.append(detail)
 
@@ -447,6 +447,9 @@ class MacroLogDialog(QtWidgets.QDialog):
         )
         image_durations: dict[str, list[float]] = {}
         ocr_engines: dict[str, list[bool]] = {}
+        traced_captures = 0
+        traced_reuses = 0
+        traced_capture_rows = 0
         for row in rows:
             detail = str(row.get("detail") or "")
             fields: dict[str, str] = {}
@@ -457,6 +460,13 @@ class MacroLogDialog(QtWidgets.QDialog):
                 image_durations.setdefault(fields["image"], []).append(float(fields.get("elapsed_ms") or row.get("duration") or 0))
             if fields.get("engine"):
                 ocr_engines.setdefault(fields["engine"], []).append(str(row.get("status") or "") == "SUCCESS")
+            if "captures" in fields or "capture_reuse" in fields:
+                try:
+                    traced_captures += int(float(fields.get("captures") or 0))
+                    traced_reuses += int(float(fields.get("capture_reuse") or 0))
+                    traced_capture_rows += 1
+                except ValueError:
+                    pass
         image_text = ""
         if image_durations:
             slow_image, durations = max(image_durations.items(), key=lambda item: sum(item[1]) / max(1, len(item[1])))
@@ -465,14 +475,17 @@ class MacroLogDialog(QtWidgets.QDialog):
         if ocr_engines:
             ocr_text = " · OCR " + ", ".join(f"{engine} {sum(values) / len(values):.0%}" for engine, values in sorted(ocr_engines.items()))
         capture_text = ""
-        try:
-            from vision_engine import send_request
-            vision = send_request(9235, {"cmd": "status"}, timeout=0.12)
-            capture_count = int(vision.get("capture_count") or 0)
-            reuse_count = int(vision.get("capture_reuse_count") or 0)
-            capture_text = f" · 캡처 {capture_count}회/재사용 {reuse_count}회"
-        except Exception:
-            pass
+        if traced_capture_rows:
+            capture_text = f" · 실행 캡처 {traced_captures}회/재사용 {traced_reuses}회"
+        else:
+            try:
+                from vision_engine import send_request
+                vision = send_request(9235, {"cmd": "status"}, timeout=0.12)
+                capture_count = int(vision.get("capture_count") or 0)
+                reuse_count = int(vision.get("capture_reuse_count") or 0)
+                capture_text = f" · 캡처 {capture_count}회/재사용 {reuse_count}회"
+            except Exception:
+                pass
         resource_text = ""
         if resource_samples:
             latest = resource_samples[-1]

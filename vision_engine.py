@@ -276,6 +276,8 @@ class VisionState:
         started: float,
         context: str = "screen",
         cache_ms: int = 45,
+        capture_before: int = 0,
+        reuse_before: int = 0,
     ) -> dict[str, Any]:
         prepared_items: list[tuple[dict[str, Any], bool]] = [
             self._template(path, profile) for path in image_paths
@@ -334,6 +336,8 @@ class VisionState:
                     "image_count": len(prepared_items),
                     "profile": profile,
                     "cache_hit": all(hit for _prepared, hit in prepared_items),
+                    "capture_count": self.capture_count - capture_before,
+                    "capture_reuse_count": self.capture_reuse_count - reuse_before,
                     "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
                 }
             if timeout_ms <= 0 or time.perf_counter() >= deadline:
@@ -349,6 +353,8 @@ class VisionState:
             "image_count": len(prepared_items),
             "profile": profile,
             "cache_hit": all(hit for _prepared, hit in prepared_items),
+            "capture_count": self.capture_count - capture_before,
+            "capture_reuse_count": self.capture_reuse_count - reuse_before,
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
             "adaptive_poll_ms": self._adaptive_poll(poll_ms)[0],
         }
@@ -379,6 +385,8 @@ class VisionState:
         with self._lock:
             self.last_activity = time.time()
             self.request_count += 1
+            capture_before = self.capture_count
+            reuse_before = self.capture_reuse_count
             profile = str(request.get("profile") or "balanced").lower()
             if profile not in {"fast", "balanced", "precise"}:
                 profile = "balanced"
@@ -469,6 +477,8 @@ class VisionState:
         with self._lock:
             self.last_activity = time.time()
             self.request_count += 1
+            capture_before = self.capture_count
+            reuse_before = self.capture_reuse_count
             image_path = str(request.get("image") or "")
             profile = str(request.get("profile") or "balanced").lower()
             if profile not in {"fast", "balanced", "precise"}:
@@ -497,6 +507,8 @@ class VisionState:
                     started,
                     context,
                     cache_ms,
+                    capture_before,
+                    reuse_before,
                 )
             prepared, cache_hit = self._template(image_path, profile)
             self._modules()
@@ -544,6 +556,8 @@ class VisionState:
                             "height": height,
                             "profile": profile,
                             "cache_hit": cache_hit,
+                            "capture_count": self.capture_count - capture_before,
+                            "capture_reuse_count": self.capture_reuse_count - reuse_before,
                             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
                         }
                 if timeout_ms <= 0 or time.perf_counter() >= deadline:
@@ -558,6 +572,8 @@ class VisionState:
                 "best_score": round(best_score, 6),
                 "profile": profile,
                 "cache_hit": cache_hit,
+                "capture_count": self.capture_count - capture_before,
+                "capture_reuse_count": self.capture_reuse_count - reuse_before,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
                 "adaptive_poll_ms": self._adaptive_poll(poll_ms)[0],
             }

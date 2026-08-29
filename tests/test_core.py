@@ -200,10 +200,23 @@ class EngineBehaviorTests(unittest.TestCase):
                     "profile": "fast",
                 }
             )
+            reused = state.search(
+                {
+                    "images": ["first.png", "second.png"],
+                    "regions": [[100, 200, 900, 800]],
+                    "threshold": 0.8,
+                    "timeout": 0,
+                    "profile": "fast",
+                }
+            )
         self.assertEqual([(100, 200, 900, 800)], captures)
         self.assertTrue(result["found"])
         self.assertEqual(2, result["match_index"])
         self.assertEqual((126, 223), (result["x"], result["y"]))
+        self.assertEqual(1, result["capture_count"])
+        self.assertEqual(0, result["capture_reuse_count"])
+        self.assertEqual(0, reused["capture_count"])
+        self.assertEqual(1, reused["capture_reuse_count"])
 
     def test_vision_engine_reuses_recent_frame_for_same_context_only(self) -> None:
         import vision_engine
@@ -3082,7 +3095,7 @@ class UiSmokeTests(unittest.TestCase):
             (repository.exports_dir / "execution_trace.log").write_text(
                 "2026-08-29 13:00:00.100|1|START|OCR 인식|\n"
                 "2026-08-29 13:00:00.250|1|SUCCESS|OCR 인식|\n"
-                "2026-08-29 13:00:00.251|1|DETAIL|OCR 인식|text=3; confidence=0.98; var:count=3\n"
+                "2026-08-29 13:00:00.251|1|DETAIL|OCR 인식|text=3; confidence=0.98; var:count=3; captures=2; capture_reuse=1\n"
                 "2026-08-29 13:00:00.252|0|RESOURCE|프로세스 자원|cpu=12.5; cpu_avg=8.2; cpu_max=12.5; memory_mb=44.1; memory_max_mb=47.3\n",
                 encoding="utf-8",
             )
@@ -3098,6 +3111,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIn("평균", dialog.performance_summary.text())
             self.assertIn("CPU 평균 8.2%", dialog.performance_summary.text())
             self.assertIn("메모리 최대 47.3 MB", dialog.performance_summary.text())
+            self.assertIn("실행 캡처 2회/재사용 1회", dialog.performance_summary.text())
             self.assertIn("1번 노드 반복 횟수 → 3", dialog._variable_impact("count", "3"))
             self.assertIn("조건 성립", dialog._variable_impact("count", "3"))
             dialog.debug_control_buttons[0].click()

@@ -2620,6 +2620,8 @@ def render_image_search(
         lines.append(f"{indent}    FoundScaleY := (SourceImageH > 0 ? FoundImageH / SourceImageH : 1.0)")
         lines.append(f'{indent}    VisionElapsed := VisionEngine_ParseField(VisionResp, "elapsed_ms")')
         lines.append(f'{indent}    VisionCacheHit := VisionEngine_ParseField(VisionResp, "cache_hit")')
+        lines.append(f'{indent}    VisionCaptures := VisionEngine_ParseField(VisionResp, "capture_count")')
+        lines.append(f'{indent}    VisionCaptureReuses := VisionEngine_ParseField(VisionResp, "capture_reuse_count")')
         if len(multi_image_vars) > 1:
             lines.append(
                 f'{indent}    Log("vision engine multi hit: " . VisionElapsed . "ms cache=" . VisionCacheHit . " confidence=" . OpenCvBestScore . " match=" . MatchedImageIndex)'
@@ -2634,6 +2636,8 @@ def render_image_search(
         lines.append(f"{indent}{{")
         lines.append(f'{indent}    OpenCvBestScore := VisionEngine_ParseField(VisionResp, "best_score")')
         lines.append(f'{indent}    VisionElapsed := VisionEngine_ParseField(VisionResp, "elapsed_ms")')
+        lines.append(f'{indent}    VisionCaptures := VisionEngine_ParseField(VisionResp, "capture_count")')
+        lines.append(f'{indent}    VisionCaptureReuses := VisionEngine_ParseField(VisionResp, "capture_reuse_count")')
         lines.append(
             f'{indent}    Log("vision engine not found: " . VisionElapsed . "ms best=" . OpenCvBestScore)'
         )
@@ -2645,8 +2649,16 @@ def render_image_search(
         lines.append(f'Log("image search start: {alias} | engine=opencv{multi_suffix} | " . ImagePath)')
         lines.append('OpenCvErrorCode := ""')
         lines.append('OpenCvErrorDetail := ""')
+        lines.append('VisionElapsed := 0')
+        lines.append('VisionCacheHit := 0')
+        lines.append('VisionCaptures := 0')
+        lines.append('VisionCaptureReuses := 0')
     else:
         lines.append(f'Log("image search start: {alias} | engine=ahk | " . ImageSpec)')
+        lines.append('VisionElapsed := 0')
+        lines.append('VisionCacheHit := 0')
+        lines.append('VisionCaptures := 0')
+        lines.append('VisionCaptureReuses := 0')
     # Never let a failed/invalid search reuse coordinates from an earlier
     # attempt. Empty coordinates are especially dangerous because AHK treats
     # them as the current mouse position in MouseClick.
@@ -4397,7 +4409,7 @@ def render_macro_script(
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
             if action == "image_search":
                 lines.append(
-                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; confidence=" . OpenCvBestScore . "; x=" . FoundX . "; y=" . FoundY . "; scale=" . Round(FoundScaleX, 3) . "x" . Round(FoundScaleY, 3) . "; elapsed_ms=" . VisionElapsed . "; cache=" . VisionCacheHit)'
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; confidence=" . OpenCvBestScore . "; x=" . FoundX . "; y=" . FoundY . "; scale=" . Round(FoundScaleX, 3) . "x" . Round(FoundScaleY, 3) . "; elapsed_ms=" . VisionElapsed . "; cache=" . VisionCacheHit . "; captures=" . VisionCaptures . "; capture_reuse=" . VisionCaptureReuses)'
                 )
             else:
                 store_var = normalize_variable_name(step.get("store_var"))

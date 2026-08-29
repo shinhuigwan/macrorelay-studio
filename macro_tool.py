@@ -2834,16 +2834,19 @@ def render_image_search(
             act_window = click_info.get("window")
             act_exe = click_info.get("window_exe")
             if act_window or act_exe:
-                lines.append(f'    ActiveHwnd := WinExist("{act_window or "A"}")')
-                if act_exe:
-                    lines.append("    if !ActiveHwnd")
-                    lines.append("    {")
-                    lines.append(f'        ActiveHwnd := WinExist("ahk_exe {act_exe}")')
-                    lines.append("    }")
-                lines.append("    if (ActiveHwnd)")
+                lines.append("    if (!MacroDryRun)")
                 lines.append("    {")
-                lines.append("        WinActivate, ahk_id %ActiveHwnd%")
-                lines.append("        WinWaitActive, ahk_id %ActiveHwnd%, , 0.5")
+                lines.append(f'        ActiveHwnd := WinExist("{act_window or "A"}")')
+                if act_exe:
+                    lines.append("        if !ActiveHwnd")
+                    lines.append("        {")
+                    lines.append(f'            ActiveHwnd := WinExist("ahk_exe {act_exe}")')
+                    lines.append("        }")
+                lines.append("        if (ActiveHwnd)")
+                lines.append("        {")
+                lines.append("            WinActivate, ahk_id %ActiveHwnd%")
+                lines.append("            WinWaitActive, ahk_id %ActiveHwnd%, , 0.5")
+                lines.append("        }")
                 lines.append("    }")
         use_mouse_coord_override = mode != "inactive"
         if use_mouse_coord_override:
@@ -2889,7 +2892,7 @@ def render_image_search(
         if click_image and click_offset:
             between_click_delay = max(0, int(click_info.get("between_click_delay", 80) or 0))
             if between_click_delay:
-                lines.append(f"    Sleep, {between_click_delay}")
+                lines.append(f"    if (!MacroDryRun)\n        Sleep, {between_click_delay}")
         if click_offset:
             if len(asset_files) > 1 and asset_offsets:
                 lines.append('    Log("image offset click: base x=" . MatchedOffsetX . " y=" . MatchedOffsetY . " scale=" . Round(FoundScaleX, 3) . "," . Round(FoundScaleY, 3))')
@@ -2902,7 +2905,7 @@ def render_image_search(
             lines.append('    Log("image click skipped: center and offset are both disabled")')
         else:
             total_points = int(click_image) + int(click_offset)
-            lines.append(f'    Log("click executed: {alias} points={total_points}")')
+            lines.append(f'    Log((MacroDryRun ? "dry-run click predicted: " : "click executed: ") . "{ahk_quote(str(alias))} points={total_points}")')
         keys = click_info.get("keys")
         if keys:
             key_mode = str(click_info.get("key_mode") or ("inactive" if mode == "inactive" else "active")).lower()
@@ -2919,15 +2922,20 @@ def render_image_search(
                     lines.append("    {")
                     lines.append(f'        KeyTargetHwnd := WinExist("ahk_exe {window_exe}")')
                     lines.append("    }")
-                lines.append("    if (KeyTargetHwnd)")
+                lines.append("    if (MacroDryRun)")
+                lines.append('        Log("dry-run image keys suppressed: " . KeyPayload)')
+                lines.append("    else if (KeyTargetHwnd)")
                 lines.append("        ControlSend,, %KeyPayload%, ahk_id %KeyTargetHwnd%")
                 lines.append("    else")
                 lines.append("        SendInput, %KeyPayload%")
             else:
-                lines.append("    SendInput, %KeyPayload%")
+                lines.append("    if (MacroDryRun)")
+                lines.append('        Log("dry-run image keys suppressed: " . KeyPayload)')
+                lines.append("    else")
+                lines.append("        SendInput, %KeyPayload%")
         sleep_after = step.get("sleep_after")
         if sleep_after:
-            lines.append(f"    Sleep, {sleep_after}")
+            lines.append(f"    if (!MacroDryRun)\n        Sleep, {sleep_after}")
         if use_mouse_coord_override:
             lines.append("    CoordMode, Mouse, %MacroMouseCoordMode%")
     lines.append("}")
@@ -3140,17 +3148,23 @@ def render_ocr(step: Dict[str, Any]) -> List[str]:
                 f'{ocr_cmd_var} .= " --left {int(region[0])} --top {int(region[1])} --right {int(region[2])} --bottom {int(region[3])}"'
             )
     if output_path:
-        lines.append(f'{ocr_cmd_var} .= " --also-output ""{cmd_quote(output_path)}"""')
-        lines.append(f'{ocr_cmd_var} .= " --also-format ""{cmd_quote(output_format)}"""')
-        lines.append(f'{ocr_cmd_var} .= " --also-append {"1" if output_append else "0"}"')
+        lines.append("if (!MacroDryRun)")
+        lines.append("{")
+        lines.append(f'    {ocr_cmd_var} .= " --also-output ""{cmd_quote(output_path)}"""')
+        lines.append(f'    {ocr_cmd_var} .= " --also-format ""{cmd_quote(output_format)}"""')
+        lines.append(f'    {ocr_cmd_var} .= " --also-append {"1" if output_append else "0"}"')
+        lines.append("}")
     if excel_mode and excel_mode != "none":
-        lines.append(f'{ocr_cmd_var} .= " --excel-mode ""{cmd_quote(excel_mode)}"""')
+        lines.append("if (!MacroDryRun)")
+        lines.append("{")
+        lines.append(f'    {ocr_cmd_var} .= " --excel-mode ""{cmd_quote(excel_mode)}"""')
         if excel_path:
-            lines.append(f'{ocr_cmd_var} .= " --excel-path ""{cmd_quote(excel_path)}"""')
+            lines.append(f'    {ocr_cmd_var} .= " --excel-path ""{cmd_quote(excel_path)}"""')
         if excel_sheet:
-            lines.append(f'{ocr_cmd_var} .= " --excel-sheet ""{cmd_quote(excel_sheet)}"""')
+            lines.append(f'    {ocr_cmd_var} .= " --excel-sheet ""{cmd_quote(excel_sheet)}"""')
         if excel_cell:
-            lines.append(f'{ocr_cmd_var} .= " --excel-cell ""{cmd_quote(excel_cell)}"""')
+            lines.append(f'    {ocr_cmd_var} .= " --excel-cell ""{cmd_quote(excel_cell)}"""')
+        lines.append("}")
     lines.append(
         f'{ocr_cmd_var} .= " --output " . __q . {ocr_path_var} . __q . " --output-format ""txt"" --append 0"'
     )
@@ -3596,6 +3610,8 @@ def render_ocr_engine(step: Dict[str, Any]) -> List[str]:
     # Handle table storage (reuse existing pattern from render_ocr)
     table_name = step.get("table")
     if table_name:
+        lines.append("if (!MacroDryRun)")
+        lines.append("{")
         # Copy the table storage logic from render_ocr
         table_row = step.get("table_row")
         table_col = step.get("table_col")
@@ -3633,6 +3649,9 @@ def render_ocr_engine(step: Dict[str, Any]) -> List[str]:
                 lines.append(f'Table_Set("{ahk_quote(str(table_name))}", {int(table_row)}, {table_col_index}, OCR_LastText)')
         else:
             lines.append(f'Table_Add("{ahk_quote(str(table_name))}", OCR_LastText)')
+        lines.append("}")
+        lines.append("else")
+        lines.append('    Log("dry-run OCR table output suppressed")')
     
     # Handle output path (existing feature)
     output_path = str(step.get("output_path", ""))
@@ -3641,10 +3660,12 @@ def render_ocr_engine(step: Dict[str, Any]) -> List[str]:
         output_append = bool(step.get("output_append", True))
         # File output is handled by legacy path; for engine path write directly
         lines.extend([
-            f'if (OCR_LastText != "") {{',
+            f'if (!MacroDryRun and OCR_LastText != "") {{',
             f'    __out_path := "{ahk_quote(output_path)}"',
             f'    FileAppend, %OCR_LastText%`n, %__out_path%',
             '}',
+            'else if (MacroDryRun)',
+            '    Log("dry-run OCR file output suppressed")',
         ])
     
     # Excel output

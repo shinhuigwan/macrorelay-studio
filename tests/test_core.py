@@ -1084,6 +1084,47 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("dry-run action suppressed: type_text", script)
         self.assertIn("dry-run action suppressed: run_program", script)
 
+    def test_dry_run_suppresses_image_keys_activation_and_ocr_outputs(self) -> None:
+        macro = {
+            "name": "safe-dry-run",
+            "steps": [
+                {
+                    "action": "image_search",
+                    "asset": "target",
+                    "engine": "ahk",
+                    "click": {"click_image": True, "window": "대상 창", "keys": "secret"},
+                },
+                {
+                    "action": "ocr",
+                    "ocr_action": "extract_number",
+                    "engine_preference": "auto",
+                    "table": "results",
+                    "table_row": 1,
+                    "table_col": "A",
+                    "output_path": "C:/temp/ocr.csv",
+                },
+            ],
+        }
+        script = self.engine.render_macro_script(macro, {"target": {"file": "assets/target.png"}})
+        self.assertIn("dry-run image keys suppressed", script)
+        self.assertIn("if (!MacroDryRun)\n    {\n        ActiveHwnd", script)
+        self.assertIn("dry-run OCR table output suppressed", script)
+        self.assertIn("dry-run OCR file output suppressed", script)
+        self.assertIn('SetLastClick(', script)
+        legacy = "\n".join(
+            self.engine.render_ocr(
+                {
+                    "mode": "region",
+                    "region": [0, 0, 100, 100],
+                    "output_path": "C:/temp/legacy.csv",
+                    "excel_mode": "file",
+                    "excel_path": "C:/temp/legacy.xlsx",
+                }
+            )
+        )
+        self.assertIn('if (!MacroDryRun)\n{\n    __ocr_cmd .= " --also-output', legacy)
+        self.assertIn('if (!MacroDryRun)\n{\n    __ocr_cmd .= " --excel-mode', legacy)
+
     def test_vault_node_loads_secret_at_runtime_without_embedding_value(self) -> None:
         script = self.engine.render_macro_script(
             {"name": "vault", "steps": [{"action": "vault_get", "name": "login_password", "secret": "main_password"}]}, {}

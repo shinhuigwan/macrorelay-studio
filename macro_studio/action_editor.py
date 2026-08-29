@@ -90,6 +90,8 @@ class SearchableAssetCombo(QtWidgets.QComboBox):
 class MultiAssetPicker(QtWidgets.QWidget):
     """Compact searchable checklist used by one-node multi image search."""
 
+    offset_edited = QtCore.Signal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
@@ -182,6 +184,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
         current = list(self._offsets.get(alias, [0, 0]))
         current[axis] = int(value)
         self._offsets[alias] = current
+        self.offset_edited.emit()
 
     def _filter(self, query: str) -> None:
         for index in range(self.list.count()):
@@ -1217,6 +1220,17 @@ class ActionEditor(QtWidgets.QWidget):
             offset_editor = self.widgets[action].get("click.offset")
             if isinstance(offset_toggle, QtWidgets.QCheckBox) and isinstance(offset_editor, OffsetEditor):
                 offset_editor.offset_picked.connect(lambda toggle=offset_toggle: toggle.setChecked(True))
+            multi_picker = self.widgets[action].get("assets")
+            if isinstance(offset_toggle, QtWidgets.QCheckBox) and isinstance(multi_picker, MultiAssetPicker):
+                click_enabled = self.widgets[action].get("click_enabled")
+                click_image = self.widgets[action].get("click.click_image")
+                def enable_multi_offset_click() -> None:
+                    offset_toggle.setChecked(True)
+                    if isinstance(click_enabled, QtWidgets.QCheckBox):
+                        click_enabled.setChecked(True)
+                    if isinstance(click_image, QtWidgets.QCheckBox):
+                        click_image.setChecked(False)
+                multi_picker.offset_edited.connect(enable_multi_offset_click)
             asset = self.widgets[action].get("asset")
             if isinstance(asset, QtWidgets.QComboBox):
                 asset.currentIndexChanged.connect(self._update_offset_preview)

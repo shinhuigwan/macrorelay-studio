@@ -21,6 +21,8 @@ from .inactive_click_lab import HandlePointPicker, InactiveClickLabDialog
 from .node_editor import NodeCanvas
 from .repository import MacroRepository
 from .theme import COLORS
+from .trigger_dialog import EventTriggerDialog
+from .macro_test_cases import MacroTestCaseDialog, run_test_cases
 from .validation import ProjectValidator
 from .widgets import Card, PageHeader, WheelSafeSpinBox, danger_button, primary_button
 
@@ -617,6 +619,12 @@ class BuilderPage(QtWidgets.QWidget):
         recovery_action = self.node_more_menu.addAction("복구 실행 설정")
         recovery_action.setToolTip("연속 실패 자동 정지와 체크포인트 재개 정책을 설정합니다.")
         recovery_action.triggered.connect(self._configure_recovery_engine)
+        trigger_action = self.node_more_menu.addAction("이벤트 자동 실행 설정")
+        trigger_action.setToolTip("프로그램·창·이미지·OCR·시간 조건으로 현재 매크로를 자동 실행합니다.")
+        trigger_action.triggered.connect(self._configure_event_triggers)
+        test_cases_action = self.node_more_menu.addAction("매크로 테스트 케이스")
+        test_cases_action.setToolTip("이미지·OCR·변수 입력에 대한 기대 경로를 저장하고 업데이트 후 자동 회귀 검사합니다.")
+        test_cases_action.triggered.connect(self._open_macro_test_cases)
         self.node_more_menu.addSeparator()
         save_block_action = self.node_more_menu.addAction("선택 노드를 블록으로 저장")
         save_block_action.setToolTip("선택한 노드 묶음을 다른 매크로에서 재사용합니다.")
@@ -2213,7 +2221,11 @@ class BuilderPage(QtWidgets.QWidget):
         self.repository.save_macro(self.current_name, self.current_macro)
         self._last_persisted_macro = current
         self.macro_title.setText(f"{self.current_name}  ·  {len(self.current_macro.get('steps') or [])}단계")
-        self.status.emit(message)
+        regressions = [item for item in run_test_cases(self.current_macro) if not item.passed]
+        if regressions:
+            self.status.emit(f"{message} · 회귀 테스트 {len(regressions)}개 실패 — 테스트 케이스를 확인하세요.")
+        else:
+            self.status.emit(message)
         self.edit_committed.emit()
         self._update_history_buttons()
         self._data_change_timer.start()
@@ -2447,6 +2459,33 @@ class BuilderPage(QtWidgets.QWidget):
             meta.pop("failure_streak_limit", None)
         self.current_macro["meta"] = meta
         self._persist("복구 실행 설정을 저장했습니다.")
+
+    def _configure_event_triggers(self) -> None:
+        if not self.current_name or self.current_macro is None:
+            self.status.emit("설정할 매크로를 먼저 선택하세요.")
+            return
+        triggers = self.current_macro.get("triggers") if isinstance(self.current_macro.get("triggers"), list) else []
+        dialog = EventTriggerDialog(self.repository, triggers, self)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        if dialog.triggers:
+            self.current_macro["triggers"] = dialog.triggers
+        else:
+            self.current_macro.pop("triggers", None)
+        self._persist(f"이벤트 자동 실행 조건 {len(dialog.triggers)}개를 저장했습니다.")
+
+    def _open_macro_test_cases(self) -> None:
+        if not self.current_name or self.current_macro is None:
+            self.status.emit("테스트할 매크로를 먼저 선택하세요.")
+            return
+        dialog = MacroTestCaseDialog(self.current_macro, self)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        if dialog.cases:
+            self.current_macro["test_cases"] = dialog.cases
+        else:
+            self.current_macro.pop("test_cases", None)
+        self._persist(f"매크로 테스트 케이스 {len(dialog.cases)}개를 저장했습니다.")
 
     def _open_current_export(self) -> None:
         if not self.current_name:

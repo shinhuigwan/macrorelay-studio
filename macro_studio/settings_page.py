@@ -50,6 +50,7 @@ class SettingsPage(QtWidgets.QWidget):
         self.tabs.addTab(self._build_issues_tab(), "프로젝트 진단")
         self.tabs.addTab(self._build_environment_tab(), "실행 환경")
         self.tabs.addTab(self._build_components_tab(), "구성요소 설치")
+        self.tabs.addTab(self._build_vault_tab(), "보안 보관함")
         self.remote_tab_index = self.tabs.addTab(self._build_remote_tab(), "모바일 원격")
         self.tabs.addTab(self._build_storage_tab(), "저장 공간")
         root.addWidget(self.tabs, 1)
@@ -217,6 +218,61 @@ class SettingsPage(QtWidgets.QWidget):
         layout.addWidget(notice)
         layout.addWidget(self.storage_table, 1)
         return page
+
+    def _build_vault_tab(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        notice = QtWidgets.QLabel(
+            "아이디·비밀번호·API 키는 Windows 사용자 계정 DPAPI로 암호화됩니다. 매크로 JSON에는 보관함 항목 이름만 저장합니다. "
+            "매크로에서는 '보안 보관함 값 불러오기' 노드로 변수에 넣으세요."
+        )
+        notice.setObjectName("Muted"); notice.setWordWrap(True); layout.addWidget(notice)
+        self.vault_table = QtWidgets.QTableWidget(0, 1)
+        self.vault_table.setHorizontalHeaderLabels(["보관함 항목 이름"])
+        self.vault_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.vault_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.vault_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.vault_table, 1)
+        row = QtWidgets.QHBoxLayout()
+        add = primary_button("＋ 새 보안 값")
+        update = QtWidgets.QPushButton("선택 값 변경")
+        remove = QtWidgets.QPushButton("선택 삭제")
+        add.clicked.connect(lambda: self._edit_vault_secret(False))
+        update.clicked.connect(lambda: self._edit_vault_secret(True))
+        remove.clicked.connect(self._delete_vault_secret)
+        row.addWidget(add); row.addWidget(update); row.addWidget(remove); row.addStretch(1); layout.addLayout(row)
+        return page
+
+    def _refresh_vault(self) -> None:
+        names = self.repository.credential_vault().names()
+        self.vault_table.setRowCount(len(names))
+        for row, name in enumerate(names):
+            self.vault_table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
+
+    def _edit_vault_secret(self, existing: bool) -> None:
+        row = self.vault_table.currentRow()
+        current = self.vault_table.item(row, 0).text() if existing and row >= 0 and self.vault_table.item(row, 0) else ""
+        dialog = QtWidgets.QDialog(self); dialog.setWindowTitle("보안 값 변경" if existing else "새 보안 값"); dialog.setMinimumWidth(480)
+        layout = QtWidgets.QVBoxLayout(dialog); form = QtWidgets.QFormLayout()
+        name = QtWidgets.QLineEdit(current); name.setReadOnly(existing)
+        value = QtWidgets.QLineEdit(); value.setEchoMode(QtWidgets.QLineEdit.Password); value.setPlaceholderText("값은 화면과 JSON에 표시되지 않습니다.")
+        confirm = QtWidgets.QLineEdit(); confirm.setEchoMode(QtWidgets.QLineEdit.Password)
+        form.addRow("항목 이름", name); form.addRow("보안 값", value); form.addRow("보안 값 확인", confirm); layout.addLayout(form)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.Accepted: return
+        if not name.text().strip() or value.text() != confirm.text() or not value.text():
+            QtWidgets.QMessageBox.warning(self, "입력 확인", "이름과 같은 보안 값을 두 번 입력하세요."); return
+        try: self.repository.credential_vault().set(name.text().strip(), value.text())
+        except Exception as exc: QtWidgets.QMessageBox.warning(self, "보관함 저장 실패", str(exc)); return
+        value.clear(); confirm.clear(); self._refresh_vault(); self.status.emit("보안 값을 Windows 암호화 보관함에 저장했습니다.")
+
+    def _delete_vault_secret(self) -> None:
+        row = self.vault_table.currentRow()
+        if row < 0 or not self.vault_table.item(row, 0): return
+        name = self.vault_table.item(row, 0).text()
+        if QtWidgets.QMessageBox.question(self, "보안 값 삭제", f"'{name}'을(를) 삭제할까요?") != QtWidgets.QMessageBox.Yes: return
+        self.repository.credential_vault().delete(name); self._refresh_vault()
 
     def _build_remote_tab(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -398,6 +454,7 @@ class SettingsPage(QtWidgets.QWidget):
         self._refresh_issues()
         self._refresh_environment()
         self._refresh_components()
+        self._refresh_vault()
         self._refresh_storage()
         self.status.emit("프로젝트 점검을 완료했습니다.")
 

@@ -307,6 +307,7 @@ ACTION_LABELS = {
     "table_excel_read": "Excel 읽기",
     "table_excel_write": "Excel 쓰기",
     "set_var": "변수 설정",
+    "vault_get": "보안 보관함 값 불러오기",
     "calc_var": "변수 계산",
     "coord_mode": "좌표 기준 변경",
     "call_submacro": "서브매크로 호출",
@@ -573,6 +574,10 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
     "table_excel_read": [],
     "table_excel_write": [],
     "set_var": [FieldSpec("name", "변수 이름", "text", "value"), FieldSpec("value", "값", "text", "")],
+    "vault_get": [
+        FieldSpec("name", "저장할 변수 이름", "text", "secret_value"),
+        FieldSpec("secret", "보관함 항목 이름", "text", "", placeholder="설정 > 보안 보관함에 저장한 이름"),
+    ],
     "calc_var": [
         FieldSpec("name", "결과 변수", "text", "value"),
         FieldSpec("expr", "수식", "text", "", placeholder="예: price * 1.1"),

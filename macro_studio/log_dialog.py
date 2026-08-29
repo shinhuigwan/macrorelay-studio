@@ -330,6 +330,7 @@ class MacroLogDialog(QtWidgets.QDialog):
         open_rows: dict[int, int] = {}
         variables: dict[str, str] = {}
         captures: list[str] = []
+        resource_samples: list[dict[str, float]] = []
         for raw in raw_lines:
             parts = raw.split("|", 4)
             if len(parts) != 5:
@@ -341,6 +342,19 @@ class MacroLogDialog(QtWidgets.QDialog):
                 continue
             status = status_text.strip().upper()
             stamp = self._parse_trace_timestamp(stamp_text)
+            if status == "RESOURCE":
+                fields: dict[str, float] = {}
+                for token in detail.split(";"):
+                    if "=" not in token:
+                        continue
+                    key, value = token.strip().split("=", 1)
+                    try:
+                        fields[key.strip()] = float(value.strip())
+                    except ValueError:
+                        continue
+                if fields:
+                    resource_samples.append(fields)
+                continue
             if status == "START" and step > 0:
                 rows.append(
                     {"step": step, "label": label, "status": "RUNNING", "start": stamp, "duration": 0, "detail": ""}
@@ -431,8 +445,43 @@ class MacroLogDialog(QtWidgets.QDialog):
             if slowest
             else "분석할 완료 노드가 없습니다."
         )
+        image_durations: dict[str, list[float]] = {}
+        ocr_engines: dict[str, list[bool]] = {}
+        for row in rows:
+            detail = str(row.get("detail") or "")
+            fields: dict[str, str] = {}
+            for token in detail.split(";"):
+                if "=" in token:
+                    key, value = token.strip().split("=", 1); fields[key.strip()] = value.strip()
+            if fields.get("image"):
+                image_durations.setdefault(fields["image"], []).append(float(fields.get("elapsed_ms") or row.get("duration") or 0))
+            if fields.get("engine"):
+                ocr_engines.setdefault(fields["engine"], []).append(str(row.get("status") or "") == "SUCCESS")
+        image_text = ""
+        if image_durations:
+            slow_image, durations = max(image_durations.items(), key=lambda item: sum(item[1]) / max(1, len(item[1])))
+            image_text = f" · 이미지 {slow_image} 평균 {sum(durations) / len(durations):.0f} ms"
+        ocr_text = ""
+        if ocr_engines:
+            ocr_text = " · OCR " + ", ".join(f"{engine} {sum(values) / len(values):.0%}" for engine, values in sorted(ocr_engines.items()))
+        capture_text = ""
+        try:
+            from vision_engine import send_request
+            vision = send_request(9235, {"cmd": "status"}, timeout=0.12)
+            capture_count = int(vision.get("capture_count") or 0)
+            reuse_count = int(vision.get("capture_reuse_count") or 0)
+            capture_text = f" · 캡처 {capture_count}회/재사용 {reuse_count}회"
+        except Exception:
+            pass
+        resource_text = ""
+        if resource_samples:
+            latest = resource_samples[-1]
+            resource_text = (
+                f" · CPU 평균 {latest.get('cpu_avg', 0):.1f}%/최대 {latest.get('cpu_max', 0):.1f}%"
+                f" · 메모리 최대 {latest.get('memory_max_mb', latest.get('memory_mb', 0)):.1f} MB"
+            )
         self.performance_summary.setText(
-            f"{slow_text}  ·  전체 {total_runs}회  ·  실패 {total_failures}회 ({total_failures / max(1, total_runs):.0%})"
+            f"{slow_text} · 전체 {total_runs}회 · 실패 {total_failures}회 ({total_failures / max(1, total_runs):.0%}){image_text}{ocr_text}{capture_text}{resource_text}"
         )
         current = next((row for row in reversed(rows) if row.get("status") == "RUNNING"), None)
         if current is not None:

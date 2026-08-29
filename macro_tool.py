@@ -37,6 +37,7 @@ ACTIONS = [
     "type_text",
     "wait",
     "set_var",
+    "vault_get",
     "coord_mode",
     "run_program",
     "terminate_program",
@@ -267,6 +268,8 @@ def debug_variable_names(steps: Iterable[Dict[str, Any]]) -> List[str]:
         action = str(step.get("action") or "")
         candidates: List[Any] = [step.get("repeat_var")]
         if action in {"set_var", "calc_var"}:
+            candidates.append(step.get("name") or step.get("var"))
+        if action == "vault_get":
             candidates.append(step.get("name") or step.get("var"))
         if action == "ocr":
             candidates.append(step.get("store_var"))
@@ -1286,6 +1289,34 @@ def render_calc_var(step: Dict[str, Any]) -> List[str]:
             value_token = str(value)
         return [f"{name} := {name} {op} {value_token}"]
     return ["; calc_var skipped, no expr"]
+
+
+def render_vault_get(step: Dict[str, Any]) -> List[str]:
+    variable = normalize_variable_name(step.get("name") or step.get("var"))
+    secret_name = str(step.get("secret") or "").strip()
+    if not variable or not secret_name:
+        return ['SetRunResult("FAILED", "VAULT_CONFIG_INVALID", "보안 보관함 변수 또는 이름이 비어 있습니다.")', "Return"]
+    safe_secret = ahk_quote(secret_name)
+    return [
+        '__vault_script := A_ScriptDir . "\\vault_runtime.py"',
+        'if !FileExist(__vault_script)',
+        '    __vault_script := A_ScriptDir . "\\..\\vault_runtime.py"',
+        '__vault_root := A_ScriptDir',
+        'if !FileExist(__vault_root . "\\.vault\\index.json")',
+        '    __vault_root := A_ScriptDir . "\\.."',
+        '__vault_out := A_Temp . "\\macrorelay-vault-" . A_TickCount . ".txt"',
+        'FileDelete, %__vault_out%',
+        f'__vault_cmd := """" . PythonExe . """ """ . __vault_script . """ --root """ . __vault_root . """ --name ""{safe_secret}"" --out """ . __vault_out . """"',
+        'RunWait, %__vault_cmd%, , Hide',
+        'if (ErrorLevel or !FileExist(__vault_out))',
+        '{',
+        f'    SetRunResult("FAILED", "VAULT_READ_FAILED", "보안 보관함 값을 읽지 못했습니다: {safe_secret}")',
+        '    Return',
+        '}',
+        f'FileRead, {variable}, %__vault_out%',
+        'FileDelete, %__vault_out%',
+        f'Log("vault variable loaded: {variable}=[protected]")',
+    ]
 
 
 def render_subflow_assignments(mapping: Any, output: bool = False) -> List[str]:
@@ -3957,6 +3988,8 @@ def render_step(
         return render_table_excel_write(step)
     if action == "set_var":
         return render_set_var(step)
+    if action == "vault_get":
+        return render_vault_get(step)
     if action == "calc_var":
         return render_calc_var(step)
     if action == "run_program":
@@ -4324,7 +4357,7 @@ def render_macro_script(
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
             if action == "image_search":
                 lines.append(
-                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; confidence=" . OpenCvBestScore . "; x=" . FoundX . "; y=" . FoundY . "; scale=" . Round(FoundScaleX, 3) . "x" . Round(FoundScaleY, 3))'
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; confidence=" . OpenCvBestScore . "; x=" . FoundX . "; y=" . FoundY . "; scale=" . Round(FoundScaleX, 3) . "x" . Round(FoundScaleY, 3) . "; elapsed_ms=" . VisionElapsed . "; cache=" . VisionCacheHit)'
                 )
             else:
                 store_var = normalize_variable_name(step.get("store_var"))

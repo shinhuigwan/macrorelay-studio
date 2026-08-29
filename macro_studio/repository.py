@@ -900,6 +900,12 @@ class MacroRepository:
                     source = self.root / module_name
                     if source.is_file():
                         shutil.copy2(source, staging / module_name)
+            if requirements.get("vault"):
+                source = self.root / "vault_runtime.py"
+                if not source.is_file():
+                    raise FileNotFoundError("보안 보관함 실행 파일(vault_runtime.py)을 찾을 수 없습니다.")
+                shutil.copy2(source, staging / source.name)
+                self._copy_portable_vault(staging, steps)
             manifest = {
                 "format": 1,
                 "macro": name,
@@ -1233,7 +1239,8 @@ internal static class Program
         excel_file = bool(excel_steps) or any(str(step.get("excel_mode") or "none").casefold() == "file" for step in ocr_steps)
         excel_com = any(str(step.get("excel_mode") or "").casefold() in {"active", "com"} for step in excel_steps + ocr_steps)
         remote_notify = "remote_notify" in actions
-        python_needed = opencv or bool(ocr_steps) or browser or bool(excel_steps) or remote_notify
+        vault = "vault_get" in actions
+        python_needed = opencv or bool(ocr_steps) or browser or bool(excel_steps) or remote_notify or vault
         packages: set[str] = set()
         imports: set[str] = set()
         features = ["AutoHotkey EXE"]
@@ -1309,6 +1316,12 @@ internal static class Program
         if remote_notify:
             features.append("MacroRelay 모바일 알림")
             notes.append("모바일 알림은 해당 PC에서 생성한 remote_config.json 연결 설정이 필요합니다.")
+        if vault:
+            features.append("Windows 보안 보관함")
+            notes.append(
+                "보안 값은 평문이 아닌 Windows DPAPI 암호문으로 포함됩니다. 만든 Windows 사용자와 PC에서만 복호화되며, "
+                "다른 PC에서는 Studio 보안 보관함에 같은 이름의 값을 다시 등록한 뒤 내보내야 합니다."
+            )
         return {
             "python": python_needed,
             "packages": packages,
@@ -1320,7 +1333,33 @@ internal static class Program
             "tesseract": bool(ocr_steps),
             "ocr_engine": ocr_engine_needed,
             "remote_notify": remote_notify,
+            "vault": vault,
         }
+
+    def _copy_portable_vault(self, destination: Path, steps: list[dict[str, Any]]) -> None:
+        names = {
+            str(step.get("secret") or "").strip()
+            for step in steps
+            if isinstance(step, dict) and step.get("action") == "vault_get" and str(step.get("secret") or "").strip()
+        }
+        try:
+            index = self._read_json(self.root / ".vault" / "index.json", {})
+        except (OSError, ValueError):
+            index = {}
+        missing = sorted(name for name in names if not isinstance(index, dict) or not index.get(name))
+        if missing:
+            raise RuntimeError("보안 보관함에 값이 없습니다: " + ", ".join(missing))
+        vault_root = destination / ".vault"
+        vault_root.mkdir(parents=True, exist_ok=True)
+        portable_index: dict[str, str] = {}
+        for name in sorted(names, key=str.casefold):
+            filename = str(index[name])
+            source = self.root / ".vault" / filename
+            if not source.is_file():
+                raise RuntimeError(f"보안 보관함 암호문 파일이 없습니다: {name}")
+            shutil.copy2(source, vault_root / filename)
+            portable_index[name] = filename
+        self._write_json(vault_root / "index.json", portable_index)
 
     def _copy_portable_python(self, destination: Path) -> str:
         candidates = [Path(sys.executable).resolve().parent, Path(sys.base_prefix).resolve()]

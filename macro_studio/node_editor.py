@@ -29,6 +29,7 @@ ACTION_STYLES: dict[str, tuple[str, str]] = {
     "calc_var": ("CALC", "#C47CFF"),
     "coord_mode": ("COORD", "#9DA7BA"),
     "call_submacro": ("MACRO", "#7C6CFF"),
+    "vault_get": ("VAULT", "#5ED3A6"),
     "run_program": ("RUN", "#35C89A"),
     "terminate_program": ("STOP", "#F06A78"),
 }
@@ -39,7 +40,7 @@ ACTION_TITLES = {
     "table_store": "테이블 저장", "table_copy": "테이블 복사", "table_paste": "테이블 붙여넣기",
     "table_excel_read": "Excel 읽기", "table_excel_write": "Excel 쓰기", "flow_control": "반복 이동",
     "text_condition": "텍스트 조건", "set_var": "변수 설정", "calc_var": "변수 계산", "coord_mode": "좌표 기준",
-    "call_submacro": "서브매크로", "run_program": "프로그램 실행", "terminate_program": "프로그램 종료",
+    "call_submacro": "서브매크로", "vault_get": "보안 값", "run_program": "프로그램 실행", "terminate_program": "프로그램 종료",
 }
 
 

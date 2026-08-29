@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from .repository import MacroRepository
 from .settings_page import SettingsPage
 from .shortcuts import STUDIO_SHORTCUT_SPECS
 from .theme import COLORS
+from .trigger_engine import EventTriggerEngine
 
 
 NAV_ITEMS = [
@@ -51,10 +54,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_variable_paths: dict[int, Path] = {}
         self._run_trace_paths: dict[int, Path] = {}
         self._trace_signatures: dict[int, tuple[int, int]] = {}
+        self._run_resource_stats: dict[int, dict[str, float]] = {}
         self._failure_capture_steps: set[tuple[int, int]] = set()
         self._run_monitor = QtCore.QTimer(self)
         self._run_monitor.setInterval(100)
         self._run_monitor.timeout.connect(self._poll_running_macros)
+        self._event_trigger_engine = EventTriggerEngine(repository)
+        self._event_trigger_queue: list[tuple[str, str]] = []
+        self._event_trigger_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="macrorelay-trigger")
+        self._event_trigger_future: Future[list[tuple[str, str]]] | None = None
+        self._event_trigger_timer = QtCore.QTimer(self)
+        self._event_trigger_timer.setInterval(1000)
+        self._event_trigger_timer.timeout.connect(self._poll_event_triggers)
         self.setWindowTitle("MacroRelay Studio")
         self.setMinimumSize(1120, 700)
         self.resize(1780, 980)
@@ -89,6 +100,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, _label in NAV_ITEMS:
             self.stack.addWidget(self.pages[key])
         self._connect_pages()
+        self._event_trigger_timer.start()
         self._studio_shortcuts: list[QtGui.QShortcut] = []
         self._fixed_record_stop_shortcut = QtGui.QShortcut(QtGui.QKeySequence("F10"), self)
         self._fixed_record_stop_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
@@ -490,6 +502,29 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._track_macro_process(name, process)
 
+    def _poll_event_triggers(self) -> None:
+        future = self._event_trigger_future
+        if future is None:
+            self._event_trigger_future = self._event_trigger_executor.submit(self._event_trigger_engine.poll)
+            return
+        if not future.done():
+            return
+        self._event_trigger_future = None
+        try:
+            fired = future.result()
+        except Exception as exc:
+            self._append_run_log(f"이벤트 트리거 확인 실패 | {exc}", "ERROR")
+            return
+        for item in fired:
+            if item not in self._event_trigger_queue:
+                self._event_trigger_queue.append(item)
+                self._append_run_log(f"이벤트 트리거 감지 | {item[0]} | {item[1]}")
+        if self._running_macro_processes or not self._event_trigger_queue:
+            return
+        name, kind = self._event_trigger_queue.pop(0)
+        self._append_run_log(f"이벤트 자동 실행 | {name} | {kind}")
+        self.run_macro(name)
+
     @QtCore.Slot(str, int)
     def run_macro_step(self, name: str, step_index: int) -> None:
         if self._running_macro_processes:
@@ -553,6 +588,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 progress_path if isinstance(progress_path, Path) else None,
                 click_path if isinstance(click_path, Path) else None,
             )
+            self._run_resource_stats[pid] = {"last": 0.0, "cpu_total": 0.0, "samples": 0.0, "cpu_max": 0.0, "memory_max": 0.0}
             if isinstance(control_path, Path):
                 self._run_control_paths[pid] = control_path
             if isinstance(trace_path, Path):
@@ -612,6 +648,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_variable_paths.pop(pid, None)
             self._run_trace_paths.pop(pid, None)
             self._trace_signatures.pop(pid, None)
+            self._run_resource_stats.pop(pid, None)
             self._failure_capture_steps = {key for key in self._failure_capture_steps if key[0] != pid}
             self._append_run_log(f"사용자 정지 완료 | {name} | PID {pid}", "WARN")
             stopped += 1
@@ -703,6 +740,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             self._set_running_node(name, self._read_macro_progress(progress_path))
             self._update_execution_trace(pid, name)
+            self._sample_run_resources(pid)
             click_found = self._update_recent_click_preview(pid, click_path)
             if return_code is None:
                 continue
@@ -741,10 +779,41 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_variable_paths.pop(pid, None)
             self._run_trace_paths.pop(pid, None)
             self._trace_signatures.pop(pid, None)
+            self._run_resource_stats.pop(pid, None)
             self._failure_capture_steps = {key for key in self._failure_capture_steps if key[0] != pid}
         if not self._running_macro_processes:
             self._run_monitor.stop()
         self._update_macro_run_state()
+
+    def _sample_run_resources(self, pid: int) -> None:
+        stats = self._run_resource_stats.get(pid)
+        if stats is None:
+            return
+        now = time.monotonic()
+        if now - stats.get("last", 0.0) < 1.0:
+            return
+        stats["last"] = now
+        try:
+            import psutil  # type: ignore
+
+            process = psutil.Process(pid)
+            processes = [process, *process.children(recursive=True)]
+            cpu = sum(item.cpu_percent(interval=None) for item in processes if item.is_running())
+            memory = sum(item.memory_info().rss for item in processes if item.is_running()) / (1024 * 1024)
+        except Exception:
+            return
+        stats["samples"] = stats.get("samples", 0.0) + 1.0
+        stats["cpu_total"] = stats.get("cpu_total", 0.0) + cpu
+        stats["cpu_max"] = max(stats.get("cpu_max", 0.0), cpu)
+        stats["memory_max"] = max(stats.get("memory_max", 0.0), memory)
+        average = stats["cpu_total"] / max(1.0, stats["samples"])
+        self._append_trace_event(
+            pid,
+            0,
+            "RESOURCE",
+            "프로세스 자원",
+            f"cpu={cpu:.2f}; cpu_avg={average:.2f}; cpu_max={stats['cpu_max']:.2f}; memory_mb={memory:.2f}; memory_max_mb={stats['memory_max']:.2f}",
+        )
 
     def _set_running_node(self, display_name: str, step: int) -> None:
         builder = self.pages.get("builder")
@@ -947,6 +1016,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._run_monitor.stop()
+        self._event_trigger_timer.stop()
+        if self._event_trigger_future is not None:
+            self._event_trigger_future.cancel()
+        self._event_trigger_executor.shutdown(wait=False, cancel_futures=True)
         shutdown_automation = getattr(self.pages.get("builder"), "shutdown_automation", None)
         if callable(shutdown_automation):
             shutdown_automation()

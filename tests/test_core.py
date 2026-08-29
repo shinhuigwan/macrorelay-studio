@@ -1050,6 +1050,15 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("dry-run action suppressed: type_text", script)
         self.assertIn("dry-run action suppressed: run_program", script)
 
+    def test_vault_node_loads_secret_at_runtime_without_embedding_value(self) -> None:
+        script = self.engine.render_macro_script(
+            {"name": "vault", "steps": [{"action": "vault_get", "name": "login_password", "secret": "main_password"}]}, {}
+        )
+        self.assertIn("vault_runtime.py", script)
+        self.assertIn('FileRead, login_password, %__vault_out%', script)
+        self.assertIn('Log("vault variable loaded: login_password=[protected]")', script)
+        self.assertNotIn("actual-password", script)
+
     def test_generated_macro_can_apply_debug_variable_overrides(self) -> None:
         macro = {
             "name": "variable-debug",
@@ -1142,6 +1151,92 @@ class CredentialVaultTests(unittest.TestCase):
             self.assertNotIn(b"very-secret-value", encrypted_files[0].read_bytes())
             vault.delete("telegram_token")
             self.assertEqual([], vault.names())
+
+
+class EventTriggerTests(unittest.TestCase):
+    def test_process_start_fires_only_on_state_transition(self) -> None:
+        from macro_studio.repository import MacroRepository
+        from macro_studio.trigger_engine import EventTriggerEngine
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("event-macro")
+            payload = repository.load_macro("event-macro")
+            payload["triggers"] = [{"type": "process_start", "process": "sample.exe", "enabled": True, "interval": 1}]
+            repository.save_macro("event-macro", payload)
+            engine = EventTriggerEngine(repository)
+            with mock.patch.object(engine, "_process_names", side_effect=[set(), {"sample.exe"}, {"sample.exe"}]):
+                self.assertEqual([], engine.poll())
+                engine.last_checks.clear()
+                self.assertEqual([("event-macro", "process_start")], engine.poll())
+                engine.last_checks.clear()
+                self.assertEqual([], engine.poll())
+
+    def test_process_stop_does_not_fire_for_initial_absent_baseline(self) -> None:
+        from macro_studio.repository import MacroRepository
+        from macro_studio.trigger_engine import EventTriggerEngine
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("stop-event")
+            payload = repository.load_macro("stop-event")
+            payload["triggers"] = [{"type": "process_stop", "process": "sample.exe", "enabled": True, "interval": 1}]
+            repository.save_macro("stop-event", payload)
+            engine = EventTriggerEngine(repository)
+            with mock.patch.object(engine, "_process_names", side_effect=[set(), {"sample.exe"}, set()]):
+                self.assertEqual([], engine.poll())
+                engine.last_checks.clear()
+                self.assertEqual([], engine.poll())
+                engine.last_checks.clear()
+                self.assertEqual([("stop-event", "process_stop")], engine.poll())
+
+    def test_event_trigger_dialog_round_trip(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.repository import MacroRepository
+        from macro_studio.trigger_dialog import EventTriggerDialog
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = EventTriggerDialog(MacroRepository(Path(directory)), [], None)
+            dialog.type_combo.setCurrentIndex(dialog.type_combo.findData("window_appears"))
+            dialog.target_edit.setText("로그인")
+            dialog._add()
+            self.assertEqual("window_appears", dialog.triggers[0]["type"])
+            self.assertEqual("로그인", dialog.triggers[0]["title"])
+            dialog.close()
+        app.processEvents()
+
+
+class MacroTestCaseTests(unittest.TestCase):
+    def test_image_failure_route_prevents_click_and_ocr_variable_controls_repeat(self) -> None:
+        from macro_studio.macro_test_cases import simulate_macro
+
+        macro = {
+            "steps": [
+                {"action": "image_search", "asset": "A", "on_success": 2, "on_fail": 3},
+                {"action": "mouse_click", "on_success": 4},
+                {"action": "ocr", "store_var": "run_count", "on_success": 4},
+                {"action": "wait", "duration": 10, "repeat_var": "$run_count"},
+            ]
+        }
+        case = {
+            "name": "실패 경로와 OCR 반복",
+            "fixtures": {"images": {"A": False}, "ocr": {"3": "3"}},
+            "expect": {"visited": [1, 3, 4, 4, 4], "repeat": {"4": 3}, "next_by_step": {"1": 3}, "click_count": 0},
+        }
+        result = simulate_macro(macro, case)
+        self.assertTrue(result.passed, result.messages)
+        self.assertEqual(0, result.predicted_clicks)
+
+    def test_regression_reports_wrong_expected_route(self) -> None:
+        from macro_studio.macro_test_cases import simulate_macro
+
+        result = simulate_macro(
+            {"steps": [{"action": "image_search", "asset": "A", "on_success": 2}, {"action": "wait"}]},
+            {"name": "잘못된 기대값", "fixtures": {"images": {"A": True}}, "expect": {"next_by_step": {"1": 3}}},
+        )
+        self.assertFalse(result.passed)
+        self.assertIn("예상 3", result.messages[0])
 
 
 class DiagnosticBundleTests(unittest.TestCase):
@@ -1600,6 +1695,33 @@ class ProjectDataTests(unittest.TestCase):
         self.assertIn("cv2", requirements["packages"])
         self.assertIn("numpy", requirements["packages"])
         self.assertIn("mss", requirements["packages"])
+
+    def test_portable_vault_requirement_uses_python_without_plaintext_packages(self) -> None:
+        from macro_studio.repository import MacroRepository
+
+        requirements = MacroRepository._portable_requirements(
+            [{"action": "vault_get", "secret": "login-password", "name": "password"}]
+        )
+        self.assertTrue(requirements["python"])
+        self.assertTrue(requirements["vault"])
+        self.assertEqual(set(), requirements["packages"])
+        self.assertIn("Windows 보안 보관함", requirements["features"])
+
+    def test_copy_portable_vault_copies_only_referenced_ciphertext(self) -> None:
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            repository.credential_vault().set("used", "secret-one")
+            repository.credential_vault().set("unused", "secret-two")
+            destination = root / "portable"
+            destination.mkdir()
+            repository._copy_portable_vault(destination, [{"action": "vault_get", "secret": "used"}])
+            index = json.loads((destination / ".vault" / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(["used"], list(index))
+            self.assertTrue((destination / ".vault" / index["used"]).is_file())
+            self.assertNotIn(b"secret-one", (destination / ".vault" / index["used"]).read_bytes())
 
     def test_export_runtime_mode_switches_image_engine_and_blocks_python_only_actions(self) -> None:
         import macro_tool
@@ -2885,7 +3007,8 @@ class UiSmokeTests(unittest.TestCase):
             (repository.exports_dir / "execution_trace.log").write_text(
                 "2026-08-29 13:00:00.100|1|START|OCR 인식|\n"
                 "2026-08-29 13:00:00.250|1|SUCCESS|OCR 인식|\n"
-                "2026-08-29 13:00:00.251|1|DETAIL|OCR 인식|text=3; confidence=0.98; var:count=3\n",
+                "2026-08-29 13:00:00.251|1|DETAIL|OCR 인식|text=3; confidence=0.98; var:count=3\n"
+                "2026-08-29 13:00:00.252|0|RESOURCE|프로세스 자원|cpu=12.5; cpu_avg=8.2; cpu_max=12.5; memory_mb=44.1; memory_max_mb=47.3\n",
                 encoding="utf-8",
             )
             host = Host()
@@ -2898,6 +3021,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("3", dialog.variable_table.item(0, 1).text())
             self.assertEqual(1, dialog.performance_table.rowCount())
             self.assertIn("평균", dialog.performance_summary.text())
+            self.assertIn("CPU 평균 8.2%", dialog.performance_summary.text())
+            self.assertIn("메모리 최대 47.3 MB", dialog.performance_summary.text())
             self.assertIn("1번 노드 반복 횟수 → 3", dialog._variable_impact("count", "3"))
             self.assertIn("조건 성립", dialog._variable_impact("count", "3"))
             dialog.debug_control_buttons[0].click()

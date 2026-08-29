@@ -1034,6 +1034,40 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("login_message := child_message", script)
         self.assertIn("login_success := 1", script)
 
+    def test_subflow_unhandled_child_failures_exit_through_parent_failure_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            macro_dir = Path(directory)
+            child = {
+                "name": "로그인 처리",
+                "steps": [
+                    {"action": "image_search", "asset": "id-field", "abort_on_fail": True},
+                    {"action": "ocr", "store_var": "code"},
+                ],
+            }
+            (macro_dir / "로그인 처리.json").write_text(json.dumps(child, ensure_ascii=False), encoding="utf-8")
+            parent = [
+                {
+                    "action": "call_submacro",
+                    "macro": "로그인 처리",
+                    "result_var": "login_success",
+                    "on_success": 2,
+                    "on_fail": 3,
+                },
+                {"action": "wait", "duration": 10},
+                {"action": "wait", "duration": 20},
+            ]
+            with mock.patch.object(self.engine, "MACRO_DIR", macro_dir):
+                expanded = self.engine._expand_macro_steps(parent)
+                script = self.engine.render_macro_script({"steps": parent}, {})
+        self.assertEqual(4, len(expanded))
+        self.assertEqual(4, expanded[0]["on_fail"])
+        self.assertEqual(4, expanded[1]["on_fail"])
+        self.assertEqual(3, expanded[1]["on_success"])
+        self.assertFalse(expanded[0]["abort_on_fail"])
+        self.assertEqual("login_success", expanded[0]["_subflow_failure_result_var"])
+        self.assertIn("login_success := 0", script)
+        self.assertIn("Goto, Step4", script)
+
     def test_dry_run_suppresses_mutating_actions_and_reports_prediction(self) -> None:
         macro = {
             "name": "dry-run",

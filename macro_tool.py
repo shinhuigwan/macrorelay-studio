@@ -1254,6 +1254,8 @@ def render_text_condition(step: Dict[str, Any], step_index: int) -> List[str]:
         if on_no_match_delay > 0:
             lines.append(f"    Sleep, {on_no_match_delay}")
         lines.append(f"    Goto, Step{on_no_match}")
+    elif bool(step.get("_subflow_abort_on_fail")):
+        lines.append("    Return")
     lines.append("}")
     return lines
 
@@ -1355,7 +1357,7 @@ def render_subflow_success(step: Dict[str, Any]) -> List[str]:
 
 
 def render_subflow_failure(step: Dict[str, Any]) -> List[str]:
-    result_var = normalize_variable_name(step.get("_subflow_result_var"))
+    result_var = normalize_variable_name(step.get("_subflow_failure_result_var") or step.get("_subflow_result_var"))
     return [f"{result_var} := 0"] if result_var else []
 
 
@@ -4123,6 +4125,11 @@ def _expand_macro_steps(
             expanded.append(prepared)
             continue
         offset = parent_starts[parent_index] - 1
+        outer_success = int(source.get("on_success") or 0)
+        outer_fail = int(source.get("on_fail") or 0)
+        success_target = mapped_parent_target(outer_success) if outer_success else 0
+        fail_target = mapped_parent_target(outer_fail) if outer_fail else parent_starts.get(parent_index + 1, 0)
+        result_var = normalize_variable_name(source.get("result_var"))
         for child_index, child in enumerate(chunk, start=1):
             prepared = remap_step_targets(child, lambda value, base=offset: int(value) + base)
             prepared["_source_step_index"] = parent_index
@@ -4132,19 +4139,31 @@ def _expand_macro_steps(
                 prepared["label"] = f"{parent_label} › {child_label}"
                 if isinstance(source.get("inputs"), dict):
                     prepared["_subflow_inputs"] = dict(source["inputs"])
+            action = str(prepared.get("action") or "")
+            child_fail_field = "on_no_match" if action == "text_condition" else "on_fail"
+            try:
+                has_internal_fail = int(prepared.get(child_fail_field) or 0) > 0
+            except (TypeError, ValueError):
+                has_internal_fail = False
+            if action in {"image_search", "ocr", "text_condition"} and not has_internal_fail:
+                if fail_target:
+                    prepared[child_fail_field] = fail_target
+                else:
+                    prepared["_subflow_abort_on_fail"] = True
+                if action == "image_search":
+                    # Route through the shared failure block so the parent
+                    # result variable and failure output are both applied.
+                    prepared["abort_on_fail"] = False
+                if result_var:
+                    prepared["_subflow_failure_result_var"] = result_var
             if child_index == len(chunk):
                 if isinstance(source.get("outputs"), dict):
                     prepared["_subflow_outputs"] = dict(source["outputs"])
-                result_var = normalize_variable_name(source.get("result_var"))
                 if result_var:
                     prepared["_subflow_result_var"] = result_var
             expanded.append(prepared)
-        outer_success = int(source.get("on_success") or 0)
-        outer_fail = int(source.get("on_fail") or 0)
-        if expanded and outer_success:
-            expanded[-1]["on_success"] = mapped_parent_target(outer_success)
-        if expanded and outer_fail:
-            expanded[-1]["on_fail"] = mapped_parent_target(outer_fail)
+        if expanded and success_target:
+            expanded[-1]["on_success"] = success_target
     return expanded
 
 
@@ -4427,6 +4446,8 @@ def render_macro_script(
                 if on_fail_delay > 0:
                     lines.append(f"    Sleep, {on_fail_delay}")
                 lines.append(f"    Goto, Step{on_fail}")
+            elif bool(step.get("_subflow_abort_on_fail")):
+                lines.append("    Return")
             elif count >= total_steps:
                 lines.append("    Return")
             lines.append("}")

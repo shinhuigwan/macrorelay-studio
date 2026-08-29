@@ -149,6 +149,8 @@ class EngineBehaviorTests(unittest.TestCase):
             "engine": "ahk",
             "regions": [[0, 0, 800, 600]],
             "confidence": 82,
+            "asset_offsets": {"first": [12, -8], "second": [-30, 44]},
+            "click": {"click_offset": True, "click_image": False, "offset": [0, 0]},
         }
         script = "\n".join(
             self.engine.render_image_search(
@@ -161,6 +163,11 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("MultiImagePath2", script)
         self.assertIn("multi=2", script)
         self.assertIn('MatchedImageIndex := VisionEngine_ParseField(VisionResp, "match_index")', script)
+        self.assertIn("if (MatchedImageIndex = 1)", script)
+        self.assertIn("MatchedOffsetX := 12", script)
+        self.assertIn("MatchedOffsetY := 44", script)
+        self.assertIn("ClickX := FoundX + Round(MatchedOffsetX * FoundScaleX)", script)
+        self.assertIn("ClickY := FoundY + Round(MatchedOffsetY * FoundScaleY)", script)
         self.assertNotIn("engine=ahk", script)
 
     def test_vision_engine_multi_search_captures_region_once_and_selects_best(self) -> None:
@@ -1909,6 +1916,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("image_search", steps[0]["action"])
             self.assertEqual("opencv", steps[0]["engine"])
             self.assertEqual(2, len(steps[0]["assets"]))
+            self.assertEqual(set(steps[0]["assets"]), set(steps[0]["asset_offsets"]))
             self.assertIn("멀티 이미지 서치", steps[0]["label"])
             dialog.close()
         app.processEvents()
@@ -2403,7 +2411,9 @@ class UiSmokeTests(unittest.TestCase):
             builder.node_canvas.show_image_preview(entries, QtCore.QPoint(100, 100))
             app.processEvents()
             self.assertTrue(builder.node_canvas._preview_popup.isVisible())
-            self.assertFalse(builder.node_canvas._preview_popup.image.pixmap().isNull())
+            popup_pixmap = builder.node_canvas._preview_popup.image.pixmap()
+            self.assertFalse(popup_pixmap.isNull())
+            self.assertLessEqual(builder.node_canvas._preview_popup.width(), popup_pixmap.width() + 28)
             self.assertIn("2개", builder.node_canvas._preview_popup.title.text())
             builder.node_canvas.hide_image_preview()
             window.close()
@@ -2646,8 +2656,10 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(["첫 이미지", "둘째 이미지"], picker.value())
             self.assertEqual(["첫 이미지", "둘째 이미지"], picker.preview_aliases)
             self.assertTrue(picker.preview_scroll.isVisibleTo(editor))
+            picker.set_offsets({"첫 이미지": [18, -7], "둘째 이미지": [-24, 35]})
             step = editor.build_step()
             self.assertEqual(["첫 이미지", "둘째 이미지"], step["assets"])
+            self.assertEqual({"첫 이미지": [18, -7], "둘째 이미지": [-24, 35]}, step["asset_offsets"])
             self.assertEqual("opencv", step["engine"])
             editor.close()
         app.processEvents()

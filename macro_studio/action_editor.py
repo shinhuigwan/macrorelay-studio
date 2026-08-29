@@ -120,7 +120,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
         self.preview_scroll.setWidgetResizable(True)
         self.preview_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.preview_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.preview_scroll.setFixedHeight(112)
+        self.preview_scroll.setFixedHeight(154)
         self.preview_body = QtWidgets.QWidget()
         self.preview_layout = QtWidgets.QHBoxLayout(self.preview_body)
         self.preview_layout.setContentsMargins(4, 4, 4, 4)
@@ -130,6 +130,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
         self.preview_scroll.setVisible(False)
         layout.addWidget(self.preview_scroll)
         self._preview_paths: dict[str, Path] = {}
+        self._offsets: dict[str, list[int]] = {}
         self.preview_aliases: list[str] = []
 
     def set_options(self, values: list[str], preview_paths: dict[str, Path | None] | None = None) -> None:
@@ -166,6 +167,22 @@ class MultiAssetPicker(QtWidgets.QWidget):
             if self.list.item(index).checkState() == QtCore.Qt.Checked
         ]
 
+    def set_offsets(self, values: Any) -> None:
+        self._offsets = {}
+        if isinstance(values, dict):
+            for alias, offset in values.items():
+                if isinstance(offset, (list, tuple)) and len(offset) >= 2:
+                    self._offsets[str(alias)] = [int(offset[0] or 0), int(offset[1] or 0)]
+        self._refresh_previews()
+
+    def offsets(self) -> dict[str, list[int]]:
+        return {alias: list(self._offsets.get(alias, [0, 0])) for alias in self.value()}
+
+    def _set_offset_axis(self, alias: str, axis: int, value: int) -> None:
+        current = list(self._offsets.get(alias, [0, 0]))
+        current[axis] = int(value)
+        self._offsets[alias] = current
+
     def _filter(self, query: str) -> None:
         for index in range(self.list.count()):
             item = self.list.item(index)
@@ -197,17 +214,34 @@ class MultiAssetPicker(QtWidgets.QWidget):
             if pixmap.isNull():
                 continue
             card = QtWidgets.QWidget()
-            card.setFixedWidth(106)
+            card.setFixedWidth(150)
             card_layout = QtWidgets.QVBoxLayout(card)
             card_layout.setContentsMargins(2, 2, 2, 2)
             card_layout.setSpacing(2)
             image = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
-            image.setFixedSize(100, 66)
+            image.setFixedSize(144, 68)
             image.setPixmap(pixmap.scaled(image.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
             name = QtWidgets.QLabel(alias, alignment=QtCore.Qt.AlignCenter)
             name.setToolTip(alias)
             card_layout.addWidget(image)
             card_layout.addWidget(name)
+            offset_row = QtWidgets.QHBoxLayout()
+            offset_row.setSpacing(3)
+            current_offset = self._offsets.get(alias, [0, 0])
+            for axis, label_text in enumerate(("X", "Y")):
+                spin = WheelSafeSpinBox()
+                spin.setRange(-5000, 5000)
+                spin.setValue(int(current_offset[axis] or 0))
+                spin.setFixedWidth(58)
+                spin.setToolTip(f"{alias} 검색 성공 시 {label_text} 클릭 오프셋")
+                spin.valueChanged.connect(
+                    lambda value, selected_alias=alias, selected_axis=axis: self._set_offset_axis(
+                        selected_alias, selected_axis, value
+                    )
+                )
+                offset_row.addWidget(QtWidgets.QLabel(label_text))
+                offset_row.addWidget(spin)
+            card_layout.addLayout(offset_row)
             self.preview_layout.addWidget(card)
             self.preview_aliases.append(alias)
         self.preview_layout.addStretch(1)
@@ -1892,6 +1926,9 @@ class ActionEditor(QtWidgets.QWidget):
             value = get_path(normalized, spec.key, spec.default)
             self._set_widget_value(self.widgets[action][spec.key], spec, value)
         if action == "image_search":
+            picker = self.widgets[action].get("assets")
+            if isinstance(picker, MultiAssetPicker):
+                picker.set_offsets(normalized.get("asset_offsets") or {})
             self._update_offset_preview()
 
     def build_step(self) -> dict[str, Any]:
@@ -1917,8 +1954,12 @@ class ActionEditor(QtWidgets.QWidget):
                 payload["assets"] = list(dict.fromkeys(multi_assets))
                 payload["asset"] = payload["assets"][0]
                 payload["engine"] = "opencv"
+                picker = self.widgets[action].get("assets")
+                if isinstance(picker, MultiAssetPicker):
+                    payload["asset_offsets"] = picker.offsets()
             else:
                 payload.pop("assets", None)
+                payload.pop("asset_offsets", None)
             click_enabled = bool(payload.pop("click_enabled", False))
             region2 = payload.pop("region2", None)
             region = payload.get("region")

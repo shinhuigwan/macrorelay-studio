@@ -1975,6 +1975,14 @@ def render_image_search(
     if primary_alias and primary_alias not in aliases:
         aliases.insert(0, primary_alias)
     alias = aliases[0] if aliases else primary_alias
+    raw_asset_offsets = step.get("asset_offsets") if isinstance(step.get("asset_offsets"), dict) else {}
+    asset_offsets: list[list[int]] = []
+    for candidate_alias in aliases:
+        value = raw_asset_offsets.get(candidate_alias)
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            asset_offsets.append([int(value[0] or 0), int(value[1] or 0)])
+        else:
+            asset_offsets.append([0, 0])
     found_var = f"__step_found_{step_index}"
     if not alias:
         return [
@@ -2619,11 +2627,27 @@ def render_image_search(
             if engine == "opencv":
                 info_use["_offset_scale_x"] = "FoundScaleX"
                 info_use["_offset_scale_y"] = "FoundScaleY"
+            if offset_override is None and len(asset_files) > 1 and asset_offsets:
+                info_use["_offset_expr_x"] = "MatchedOffsetX"
+                info_use["_offset_expr_y"] = "MatchedOffsetY"
             if mode == "inactive":
                 lines.extend(f"    {line}" for line in render_inactive_click_from_hit(info_use))
             else:
                 lines.extend(f"    {line}" for line in render_click_from_hit(info_use))
         effective_offset = (offset_values + [0, 0])[:2]
+        if len(asset_files) > 1 and asset_offsets:
+            lines.append(f"    MatchedOffsetX := {int(effective_offset[0] or 0)}")
+            lines.append(f"    MatchedOffsetY := {int(effective_offset[1] or 0)}")
+            for match_index, (offset_x, offset_y) in enumerate(asset_offsets, start=1):
+                prefix = "if" if match_index == 1 else "else if"
+                lines.append(f"    {prefix} (MatchedImageIndex = {match_index})")
+                lines.append("    {")
+                lines.append(f"        MatchedOffsetX := {offset_x}")
+                lines.append(f"        MatchedOffsetY := {offset_y}")
+                lines.append("    }")
+            lines.append(
+                '    Log("multi image offset: match=" . MatchedImageIndex . " x=" . MatchedOffsetX . " y=" . MatchedOffsetY)'
+            )
         if click_image:
             lines.append('    Log("image center click: enabled")')
             emit_click(click_info, [0, 0])
@@ -2632,9 +2656,12 @@ def render_image_search(
             if between_click_delay:
                 lines.append(f"    Sleep, {between_click_delay}")
         if click_offset:
-            lines.append(
-                f'    Log("image offset click: base x={int(effective_offset[0] or 0)} y={int(effective_offset[1] or 0)} scale=" . Round(FoundScaleX, 3) . "," . Round(FoundScaleY, 3))'
-            )
+            if len(asset_files) > 1 and asset_offsets:
+                lines.append('    Log("image offset click: base x=" . MatchedOffsetX . " y=" . MatchedOffsetY . " scale=" . Round(FoundScaleX, 3) . "," . Round(FoundScaleY, 3))')
+            else:
+                lines.append(
+                    f'    Log("image offset click: base x={int(effective_offset[0] or 0)} y={int(effective_offset[1] or 0)} scale=" . Round(FoundScaleX, 3) . "," . Round(FoundScaleY, 3))'
+                )
             emit_click(click_info)
         if not click_image and not click_offset:
             lines.append('    Log("image click skipped: center and offset are both disabled")')
@@ -3421,8 +3448,10 @@ def render_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
         offset_x, offset_y = (offsets + [0, 0])[:2]
         scale_x = str(click_info.get("_offset_scale_x") or "")
         scale_y = str(click_info.get("_offset_scale_y") or "")
-        x_expr = ahk_scaled_expression("FoundX", offset_x, scale_x)
-        y_expr = ahk_scaled_expression("FoundY", offset_y, scale_y)
+        offset_expr_x = str(click_info.get("_offset_expr_x") or "")
+        offset_expr_y = str(click_info.get("_offset_expr_y") or "")
+        x_expr = f"FoundX + Round({offset_expr_x} * {scale_x or '1.0'})" if offset_expr_x else ahk_scaled_expression("FoundX", offset_x, scale_x)
+        y_expr = f"FoundY + Round({offset_expr_y} * {scale_y or '1.0'})" if offset_expr_y else ahk_scaled_expression("FoundY", offset_y, scale_y)
     lines = [
         f"ClickX := {x_expr}",
         f"ClickY := {y_expr}",
@@ -3468,10 +3497,14 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     offset_x, offset_y = (offsets + [0, 0])[:2]
     scale_x = str(click_info.get("_offset_scale_x") or "")
     scale_y = str(click_info.get("_offset_scale_y") or "")
+    offset_expr_x = str(click_info.get("_offset_expr_x") or "")
+    offset_expr_y = str(click_info.get("_offset_expr_y") or "")
     lines = []
-    if offset_x or offset_y:
-        lines.append(f"FoundClickX := {ahk_scaled_expression('FoundX', offset_x, scale_x)}")
-        lines.append(f"FoundClickY := {ahk_scaled_expression('FoundY', offset_y, scale_y)}")
+    if offset_x or offset_y or offset_expr_x or offset_expr_y:
+        x_value = f"FoundX + Round({offset_expr_x} * {scale_x or '1.0'})" if offset_expr_x else ahk_scaled_expression("FoundX", offset_x, scale_x)
+        y_value = f"FoundY + Round({offset_expr_y} * {scale_y or '1.0'})" if offset_expr_y else ahk_scaled_expression("FoundY", offset_y, scale_y)
+        lines.append(f"FoundClickX := {x_value}")
+        lines.append(f"FoundClickY := {y_value}")
         x_expr = "FoundClickX"
         y_expr = "FoundClickY"
     else:

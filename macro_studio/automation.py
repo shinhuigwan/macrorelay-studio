@@ -1983,6 +1983,11 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             aliases = [str(member.get("asset") or "") for member in members if str(member.get("asset") or "")]
             primary["assets"] = list(dict.fromkeys(aliases))
             primary["asset"] = primary["assets"][0]
+            primary["asset_offsets"] = {
+                str(member.get("asset")): list((member.get("click") or {}).get("offset") or [0, 0])[:2]
+                for member in members
+                if str(member.get("asset") or "") and isinstance(member.get("click"), dict)
+            }
             primary["engine"] = "opencv"
             primary["label"] = f"멀티 이미지 서치 {len(primary['assets'])}개"
             primary["_recording_mode"] = "action"

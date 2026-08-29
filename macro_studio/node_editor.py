@@ -207,9 +207,9 @@ class ImagePreviewPopup(QtWidgets.QFrame):
         self.title = QtWidgets.QLabel()
         self.title.setStyleSheet("font-weight:800;")
         self.image = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
-        self.image.setMinimumSize(260, 150)
         self.detail = QtWidgets.QLabel()
         self.detail.setObjectName("Muted")
+        self.detail.setWordWrap(True)
         layout.addWidget(self.title)
         layout.addWidget(self.image)
         layout.addWidget(self.detail)
@@ -221,7 +221,9 @@ class ImagePreviewPopup(QtWidgets.QFrame):
             return
         if len(loaded) == 1:
             alias, pixmap = loaded[0]
-            shown = pixmap.scaled(360, 240, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            shown = QtGui.QPixmap(pixmap)
+            if shown.width() > 360 or shown.height() > 240:
+                shown = shown.scaled(360, 240, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
             self.title.setText(alias or "이미지 서치")
             self.detail.setText(f"{pixmap.width()} × {pixmap.height()} · 이미지 서치 원본")
         else:
@@ -251,8 +253,10 @@ class ImagePreviewPopup(QtWidgets.QFrame):
                 painter.drawText(cell.adjusted(6, cell.height() - 24, -6, -3), QtCore.Qt.AlignCenter, text)
             painter.end()
             self.title.setText(f"멀티 이미지 서치 · {len(loaded)}개")
-            self.detail.setText("정확도가 가장 높은 이미지가 선택됩니다 · " + ", ".join(alias for alias, _ in loaded))
+            self.detail.setText("정확도가 가장 높은 이미지가 선택됩니다.")
         self.image.setPixmap(shown)
+        self.image.setFixedSize(shown.size())
+        self.detail.setFixedWidth(max(180, shown.width()))
         self.adjustSize()
         target = screen_pos + QtCore.QPoint(18, 18)
         screen = QtGui.QGuiApplication.screenAt(screen_pos) or QtGui.QGuiApplication.primaryScreen()

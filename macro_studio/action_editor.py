@@ -57,6 +57,9 @@ class SearchableAssetCombo(QtWidgets.QComboBox):
         super().__init__(parent)
         self.setEditable(True)
         self.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.setIconSize(QtCore.QSize(46, 32))
+        self.view().setIconSize(QtCore.QSize(46, 32))
+        self.view().setUniformItemSizes(True)
         self.proxy = KoreanContainsProxyModel(self)
         self.proxy.setSourceModel(self.model())
         self.asset_completer = QtWidgets.QCompleter(self.proxy, self)
@@ -86,6 +89,28 @@ class SearchableAssetCombo(QtWidgets.QComboBox):
             return "" if data is None else str(data)
         return self.currentText().strip()
 
+    def set_asset_options(self, values: list[str], preview_paths: dict[str, Path | None]) -> None:
+        previous = self.selected_value()
+        self.clear()
+        self.addItem("선택 안 함", "")
+        for value in values:
+            path = preview_paths.get(value)
+            icon = QtGui.QIcon()
+            if path is not None and Path(path).is_file():
+                pixmap = QtGui.QPixmap(str(path))
+                if not pixmap.isNull():
+                    icon = QtGui.QIcon(
+                        pixmap.scaled(92, 64, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                    )
+            self.addItem(icon, value, value)
+            index = self.count() - 1
+            self.setItemData(index, value, QtCore.Qt.ToolTipRole)
+            self.setItemData(index, QtCore.QSize(0, 40), QtCore.Qt.SizeHintRole)
+        index = self.findData(previous)
+        if index < 0:
+            index = self.findText(previous)
+        self.setCurrentIndex(max(index, 0))
+
 
 class MultiAssetPicker(QtWidgets.QWidget):
     """Compact searchable checklist used by one-node multi image search."""
@@ -104,6 +129,8 @@ class MultiAssetPicker(QtWidgets.QWidget):
         self.list = QtWidgets.QListWidget()
         self.list.setMinimumHeight(145)
         self.list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.list.setIconSize(QtCore.QSize(54, 38))
+        self.list.setUniformItemSizes(True)
         self.list.itemChanged.connect(lambda _item: self._update_count())
         controls = QtWidgets.QHBoxLayout()
         select_visible = QtWidgets.QPushButton("검색 결과 모두 선택")
@@ -148,6 +175,17 @@ class MultiAssetPicker(QtWidgets.QWidget):
             item = QtWidgets.QListWidgetItem(str(value))
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
             item.setCheckState(QtCore.Qt.Checked if value in selected else QtCore.Qt.Unchecked)
+            item.setSizeHint(QtCore.QSize(0, 44))
+            path = self._preview_paths.get(str(value))
+            if path is not None:
+                pixmap = QtGui.QPixmap(str(path))
+                if not pixmap.isNull():
+                    item.setIcon(
+                        QtGui.QIcon(
+                            pixmap.scaled(108, 76, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                        )
+                    )
+            item.setToolTip(str(value))
             self.list.addItem(item)
         self._update_count()
 
@@ -226,7 +264,8 @@ class MultiAssetPicker(QtWidgets.QWidget):
             image = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
             image.setFixedSize(144, 68)
             image.setPixmap(pixmap.scaled(image.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
-            name = QtWidgets.QLabel(alias, alignment=QtCore.Qt.AlignCenter)
+            shown_name = QtGui.QFontMetrics(card.font()).elidedText(alias, QtCore.Qt.ElideMiddle, 142)
+            name = QtWidgets.QLabel(shown_name, alignment=QtCore.Qt.AlignCenter)
             name.setToolTip(alias)
             card_layout.addWidget(image)
             card_layout.addWidget(name)
@@ -2072,6 +2111,7 @@ class ActionEditor(QtWidgets.QWidget):
 
     def refresh_sources(self) -> None:
         assets = list(self.repository.load_assets())
+        asset_paths = {alias: self.repository.asset_path(alias) for alias in assets}
         macros = [summary.name for summary in self.repository.list_macros()]
         tables = list(self.repository.load_tables())
         for action, specs in ACTION_FIELDS.items():
@@ -2082,10 +2122,10 @@ class ActionEditor(QtWidgets.QWidget):
                     continue
                 combo = self.widgets[action].get(spec.key)
                 if isinstance(combo, MultiAssetPicker):
-                    combo.set_options(
-                        assets,
-                        {alias: self.repository.asset_path(alias) for alias in assets},
-                    )
+                    combo.set_options(assets, asset_paths)
+                    continue
+                if isinstance(combo, SearchableAssetCombo):
+                    combo.set_asset_options(assets, asset_paths)
                     continue
                 if not isinstance(combo, QtWidgets.QComboBox):
                     continue

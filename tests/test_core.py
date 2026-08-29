@@ -2661,7 +2661,11 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIsInstance(picker, MultiAssetPicker)
             self.assertEqual(["첫 이미지", "둘째 이미지"], picker.value())
             self.assertEqual(["첫 이미지", "둘째 이미지"], picker.preview_aliases)
+            self.assertFalse(picker.list.item(0).icon().isNull())
+            self.assertGreaterEqual(picker.list.item(0).sizeHint().height(), 44)
             self.assertTrue(picker.preview_scroll.isVisibleTo(editor))
+            single_picker = editor.widgets["image_search"]["asset"]
+            self.assertFalse(single_picker.itemIcon(single_picker.findData("첫 이미지")).isNull())
             offset_editor = editor.widgets["image_search"]["click.offset"]
             self.assertTrue(offset_editor.asset_row.isVisibleTo(editor))
             self.assertEqual({"첫 이미지", "둘째 이미지"}, set(offset_editor.asset_buttons))

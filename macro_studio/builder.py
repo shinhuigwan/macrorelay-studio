@@ -2442,12 +2442,13 @@ class BuilderPage(QtWidgets.QWidget):
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.verticalHeader().setVisible(False)
-        current_steps = len((self.current_macro or {}).get("steps") or [])
         for row, version in enumerate(versions):
             modified = version["modified"].strftime("%Y-%m-%d %H:%M:%S")
             step_count = int(version.get("steps") or 0)
-            delta = step_count - current_steps
-            comparison = "동일한 노드 수" if delta == 0 else f"노드 {abs(delta)}개 {'많음' if delta > 0 else '적음'}"
+            comparison = self._version_diff_summary(
+                (version.get("payload") or {}).get("steps") or [],
+                (self.current_macro or {}).get("steps") or [],
+            )
             channel = "안정" if str(version.get("channel") or "test") == "stable" else "테스트"
             for column, value in enumerate((modified, channel, str(step_count), comparison, str(version.get("description") or ""))):
                 table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
@@ -2486,6 +2487,26 @@ class BuilderPage(QtWidgets.QWidget):
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.refresh(self.current_name)
             self.status.emit(f"'{self.current_name}' 이전 버전을 복구했습니다. 복구 전 상태도 버전 기록에 남겼습니다.")
+
+    @staticmethod
+    def _version_diff_summary(old_steps: list[Any], current_steps: list[Any]) -> str:
+        shared = min(len(old_steps), len(current_steps))
+        changed = sum(
+            1
+            for index in range(shared)
+            if json.dumps(old_steps[index], ensure_ascii=False, sort_keys=True)
+            != json.dumps(current_steps[index], ensure_ascii=False, sort_keys=True)
+        )
+        added = max(0, len(current_steps) - len(old_steps))
+        removed = max(0, len(old_steps) - len(current_steps))
+        parts = []
+        if changed:
+            parts.append(f"변경 {changed}")
+        if added:
+            parts.append(f"현재에 추가 {added}")
+        if removed:
+            parts.append(f"현재에서 삭제 {removed}")
+        return " · ".join(parts) if parts else "노드 내용 동일"
 
     def _set_current_release_channel(self, channel: str) -> None:
         if not self.current_name:

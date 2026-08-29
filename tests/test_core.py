@@ -1373,23 +1373,32 @@ class ProjectDataTests(unittest.TestCase):
             self.assertTrue(any(path.name.startswith("before-restore-") for path in repository.list_asset_versions(alias)))
 
     def test_macro_version_history_can_restore_without_losing_current_state(self) -> None:
+        from PySide6 import QtGui
         from macro_studio.repository import MacroRepository
 
         with tempfile.TemporaryDirectory() as directory:
             repository = MacroRepository(Path(directory))
             repository.create_macro("versioned")
+            original_image = QtGui.QImage(9, 9, QtGui.QImage.Format_ARGB32)
+            original_image.fill(QtGui.QColor("#2468AC"))
+            asset = repository.add_asset_image(original_image, "versioned-asset")
             first = repository.load_macro("versioned")
-            first["steps"] = [{"action": "wait", "duration": 100}]
+            first["steps"] = [{"action": "image_search", "asset": asset}]
             repository.save_macro("versioned", first)
             second = repository.load_macro("versioned")
             second["steps"].append({"action": "wait", "duration": 200})
             repository.save_macro("versioned", second)
+            changed_image = QtGui.QImage(9, 9, QtGui.QImage.Format_ARGB32)
+            changed_image.fill(QtGui.QColor("#EE4422"))
+            self.assertTrue(changed_image.save(str(repository.asset_path(asset)), "PNG"))
             repository.set_macro_release_channel("versioned", "stable")
             self.assertEqual("stable", repository.load_macro("versioned")["meta"]["release_channel"])
             versions = repository.list_macro_versions("versioned")
             one_step = next(item for item in versions if item["steps"] == 1)
             repository.restore_macro_version("versioned", one_step["path"])
             self.assertEqual(1, len(repository.load_macro("versioned")["steps"]))
+            restored_image = QtGui.QImage(str(repository.asset_path(asset)))
+            self.assertEqual(QtGui.QColor("#2468AC"), restored_image.pixelColor(3, 3))
             self.assertTrue(any(item["steps"] == 2 for item in repository.list_macro_versions("versioned")))
 
     def test_portable_export_creates_folder_zip_manifest_without_overwrite(self) -> None:

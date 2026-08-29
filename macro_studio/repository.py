@@ -220,9 +220,46 @@ class MacroRepository:
         target = self.history_dir / path.stem / f"{stamp}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
+        try:
+            payload = self._read_json(path, {})
+        except (OSError, ValueError):
+            payload = {}
+        aliases: list[str] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                alias = value.get("asset")
+                if isinstance(alias, str) and alias.strip() and alias not in aliases:
+                    aliases.append(alias)
+                if isinstance(value.get("assets"), list):
+                    for item in value["assets"]:
+                        key = str(item).strip()
+                        if key and key not in aliases:
+                            aliases.append(key)
+                for nested in value.values():
+                    collect(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    collect(nested)
+
+        collect(payload.get("steps") if isinstance(payload, dict) else [])
+        if aliases:
+            snapshot_dir = target.with_suffix(".assets")
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            manifest: dict[str, str] = {}
+            for alias in aliases:
+                source = self.asset_path(alias)
+                if source is None:
+                    continue
+                filename = f"{self.safe_name(alias)}{source.suffix.lower()}"
+                shutil.copy2(source, snapshot_dir / filename)
+                manifest[alias] = filename
+            if manifest:
+                self._write_json(snapshot_dir / "index.json", manifest)
         backups = sorted(target.parent.glob("*.json"), key=lambda item: item.stat().st_mtime)
         for stale in backups[:-20]:
             stale.unlink(missing_ok=True)
+            shutil.rmtree(stale.with_suffix(".assets"), ignore_errors=True)
 
     def list_macro_versions(self, name: str) -> list[dict[str, Any]]:
         history_root = (self.history_dir / self.safe_name(name)).resolve()
@@ -263,7 +300,48 @@ class MacroRepository:
             raise ValueError("선택한 버전 기록의 형식이 올바르지 않습니다.")
         payload = deepcopy(payload)
         payload["name"] = name
-        return self.save_macro(name, payload)
+        restored = self.save_macro(name, payload)
+        self._restore_macro_asset_snapshot(source)
+        return restored
+
+    def _restore_macro_asset_snapshot(self, version_path: Path) -> None:
+        snapshot_dir = version_path.with_suffix(".assets")
+        manifest = self._read_json(snapshot_dir / "index.json", {}) if snapshot_dir.is_dir() else {}
+        if not isinstance(manifest, dict):
+            return
+        index = self.load_assets()
+        changed = False
+        for alias, filename in manifest.items():
+            source = (snapshot_dir / str(filename)).resolve()
+            try:
+                source.relative_to(snapshot_dir.resolve())
+            except ValueError:
+                continue
+            if not source.is_file():
+                continue
+            metadata = index.get(alias) if isinstance(index.get(alias), dict) else None
+            if metadata is not None:
+                target = (self.root / str(metadata.get("file") or "")).resolve()
+                try:
+                    target.relative_to(self.assets_dir.resolve())
+                except ValueError:
+                    continue
+            else:
+                target = self.assets_dir / f"{self.safe_name(str(alias))}{source.suffix.lower()}"
+                metadata = {"file": str(target.relative_to(self.root)), "source": "macro-version-restore"}
+                index[str(alias)] = metadata
+            if target.is_file():
+                history = self.history_dir / "assets" / self.safe_name(str(alias))
+                history.mkdir(parents=True, exist_ok=True)
+                backup = history / f"before-macro-restore-{datetime.now():%Y%m%d-%H%M%S-%f}{target.suffix}"
+                shutil.copy2(target, backup)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            metadata["size"] = target.stat().st_size
+            metadata["updated_at"] = datetime.utcnow().isoformat() + "Z"
+            changed = True
+        if changed:
+            self._write_json(self.assets_index_path, index)
 
     def set_macro_release_channel(self, name: str, channel: str) -> Path:
         normalized = str(channel or "test").strip().casefold()

@@ -320,6 +320,17 @@ ACTION_LABELS = {
 
 ACTION_FIELDS: dict[str, list[FieldSpec]] = {
     "mouse_click": [
+        FieldSpec(
+            "coordinate_scope",
+            "좌표 기준",
+            "choice",
+            "screen",
+            options=choice(("화면 절대 좌표", "screen"), ("대상 프로그램 기준 · 위치가 변해도 유지", "client")),
+            tooltip="프로그램 기준은 대상 창의 클라이언트 왼쪽 위를 0,0으로 저장합니다.",
+        ),
+        FieldSpec("window", "대상 창", "text", "", placeholder="프로그램 기준 좌표에서 자동 설정"),
+        FieldSpec("window_exe", "대상 프로그램", "text", "", placeholder="예: notepad.exe"),
+        FieldSpec("window_hwnd", "현재 창 핸들", "text", "", tooltip="현재 실행 중인 창을 우선 찾고, 창을 다시 열면 프로그램 이름으로 자동 재탐색합니다."),
         FieldSpec("x", "X 좌표", "int", 0, -100_000, 100_000),
         FieldSpec("y", "Y 좌표", "int", 0, -100_000, 100_000),
         FieldSpec("button", "마우스 버튼", "choice", "Left", options=choice(("왼쪽", "Left"), ("오른쪽", "Right"), ("가운데", "Middle"), ("휠 위", "WheelUp"), ("휠 아래", "WheelDown"))),
@@ -607,6 +618,7 @@ class WindowPickerDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.window_token = ""
         self.exe_name = ""
+        self.window_hwnd = 0
         self._ignored_hwnds = set(ignored_hwnds or ())
         self._point = QtCore.QPoint()
         self._highlight_hwnd = 0
@@ -663,6 +675,7 @@ class WindowPickerDialog(QtWidgets.QDialog):
             hwnd = self._highlight_hwnd or self._window_under_point(self._point)[0]
             if hwnd:
                 root = int(user32.GetAncestor(hwnd, 2) or hwnd)  # GA_ROOT
+                self.window_hwnd = root
                 self.window_token = f"ahk_id 0x{root:X}"
                 pid = wintypes.DWORD()
                 user32.GetWindowThreadProcessId(root, ctypes.byref(pid))
@@ -678,10 +691,25 @@ class WindowPickerDialog(QtWidgets.QDialog):
         except Exception:
             self.window_token = ""
             self.exe_name = ""
+            self.window_hwnd = 0
         if self.window_token:
             self.accept()
         else:
             self.reject()
+
+    def selected_screen_point(self) -> QtCore.QPoint:
+        return QtCore.QPoint(self._point)
+
+    def selected_client_point(self) -> QtCore.QPoint | None:
+        if not self.window_hwnd:
+            return None
+        try:
+            point = wintypes.POINT(self._point.x(), self._point.y())
+            if ctypes.windll.user32.ScreenToClient(self.window_hwnd, ctypes.byref(point)):
+                return QtCore.QPoint(int(point.x), int(point.y))
+        except Exception:
+            pass
+        return None
 
     def _window_under_point(self, position: QtCore.QPoint) -> tuple[int, QtCore.QRect]:
         try:
@@ -1482,6 +1510,7 @@ class ActionEditor(QtWidgets.QWidget):
         buttons: list[tuple[str, Any]] = []
         if action in {"mouse_click", "inactive_click"}:
             buttons.append(("⌖ 좌표 선택 · 클릭/F4 저장", lambda: self._capture_cursor(action)))
+            buttons.append(("◎ 프로그램 기준 좌표 · 대상 위치 클릭", lambda: self._capture_program_cursor(action)))
         if action == "image_search":
             buttons.extend(
                 [
@@ -1493,6 +1522,7 @@ class ActionEditor(QtWidgets.QWidget):
                     ("◎ 대상 창", lambda: self._pick_window(action, "window")),
                     ("▣ 대상 프로그램", lambda: self._pick_window(action, "program")),
                     ("설정 검사", self._diagnose_image_search),
+                    ("▤ 이미지 서치 테스트 센터", self._open_image_search_test_center),
                 ]
             )
         elif action == "ocr":
@@ -1510,6 +1540,24 @@ class ActionEditor(QtWidgets.QWidget):
             button.clicked.connect(callback)
             layout.addWidget(button, index // 3, index % 3)
         return group
+
+    def _open_image_search_test_center(self) -> None:
+        from .image_search_test import ImageSearchTestDialog
+
+        step = self.build_step()
+        dialog = ImageSearchTestDialog(self.repository, step, self.window())
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        applied = dict(dialog.applied_settings)
+        for key, value in applied.items():
+            self._set_field_value("image_search", key, value)
+        if applied:
+            summary = " · ".join(f"{key}={value}" for key, value in applied.items())
+            QtWidgets.QToolTip.showText(
+                QtGui.QCursor.pos(),
+                f"테스트 추천값을 적용했습니다.\n{summary}",
+                self,
+            )
 
     def _set_field_value(self, action: str, key: str, value: Any) -> None:
         widget = self.widgets.get(action, {}).get(key)
@@ -1541,6 +1589,32 @@ class ActionEditor(QtWidgets.QWidget):
         if accepted:
             self._set_field_value(action, "x", picker.point.x())
             self._set_field_value(action, "y", picker.point.y())
+            if action == "mouse_click":
+                self._set_field_value(action, "coordinate_scope", "screen")
+
+    def _capture_program_cursor(self, action: str) -> None:
+        """Bind one clicked point to its target application's client area."""
+        if action not in {"mouse_click", "inactive_click"}:
+            return
+        hosts = self._hide_host_windows()
+        picker = WindowPickerDialog(ignored_hwnds=self._host_hwnds(hosts))
+        accepted = picker.exec() == QtWidgets.QDialog.Accepted
+        client_point = picker.selected_client_point() if accepted else None
+        self._restore_host_windows(hosts)
+        if not accepted or client_point is None:
+            return
+        self._set_field_value(action, "x", client_point.x())
+        self._set_field_value(action, "y", client_point.y())
+        self._set_field_value(action, "window", picker.window_token)
+        self._set_field_value(action, "window_exe", picker.exe_name)
+        if action == "mouse_click":
+            self._set_field_value(action, "coordinate_scope", "client")
+            self._set_field_value(action, "window_hwnd", picker.window_hwnd)
+        QtWidgets.QToolTip.showText(
+            QtGui.QCursor.pos(),
+            f"{picker.exe_name or picker.window_token} 기준 X {client_point.x()}, Y {client_point.y()} 저장",
+            self,
+        )
 
     def capture_current_coordinates(self) -> bool:
         if self.current_action not in {"mouse_click", "inactive_click"}:

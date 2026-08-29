@@ -11,6 +11,17 @@ from .repository import MacroRepository
 from .widgets import Card, PageHeader, danger_button, primary_button
 
 
+CHOSEONG = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+
+
+def _initials(text: str) -> str:
+    result: list[str] = []
+    for character in text:
+        code = ord(character) - 0xAC00
+        result.append(CHOSEONG[code // 588] if 0 <= code < 11172 else character.casefold())
+    return "".join(result)
+
+
 class AssetsPage(QtWidgets.QWidget):
     data_changed = QtCore.Signal()
     status = QtCore.Signal(str)
@@ -21,7 +32,8 @@ class AssetsPage(QtWidgets.QWidget):
         self.repository = repository
         self.current_alias = ""
         self.current_path: Path | None = None
-        self._loaded_signature: tuple[int, int] | None = None
+        self._analysis: dict = {}
+        self._loaded_signature: tuple[int, int, int, int] | None = None
         self._thumbnail_queue: list[tuple[QtWidgets.QListWidgetItem, Path]] = []
         self._thumbnail_cache: dict[str, tuple[int, QtGui.QIcon]] = {}
         self._thumbnail_timer = QtCore.QTimer(self)
@@ -34,7 +46,7 @@ class AssetsPage(QtWidgets.QWidget):
 
         toolbar = QtWidgets.QHBoxLayout()
         self.search_edit = QtWidgets.QLineEdit()
-        self.search_edit.setPlaceholderText("이미지 이름 검색")
+        self.search_edit.setPlaceholderText("이름·태그·그룹 검색 (한글 초성 가능)")
         self.search_edit.textChanged.connect(self._filter)
         add_btn = primary_button("＋ 이미지 추가")
         add_btn.clicked.connect(self._add)
@@ -51,6 +63,30 @@ class AssetsPage(QtWidgets.QWidget):
         for widget in (self.search_edit, add_btn, capture_btn, edit_btn, sync_btn, folder_btn, archive_btn):
             toolbar.addWidget(widget, 1 if widget is self.search_edit else 0)
         root.addLayout(toolbar)
+
+        management = QtWidgets.QHBoxLayout()
+        self.filter_combo = QtWidgets.QComboBox()
+        for label, value in (
+            ("전체 이미지", "all"),
+            ("사용 중", "used"),
+            ("미사용", "unused"),
+            ("완전 중복", "duplicate"),
+            ("파일 없음", "missing"),
+        ):
+            self.filter_combo.addItem(label, value)
+        self.filter_combo.currentIndexChanged.connect(lambda _index: self._filter(self.search_edit.text()))
+        self.group_combo = QtWidgets.QComboBox()
+        self.group_combo.addItem("모든 그룹", "")
+        self.group_combo.currentIndexChanged.connect(lambda _index: self._filter(self.search_edit.text()))
+        organize_btn = QtWidgets.QPushButton("폴더·태그 지정")
+        organize_btn.clicked.connect(self._organize_selected)
+        self.analysis_label = QtWidgets.QLabel()
+        self.analysis_label.setObjectName("Muted")
+        management.addWidget(self.filter_combo)
+        management.addWidget(self.group_combo)
+        management.addWidget(organize_btn)
+        management.addWidget(self.analysis_label, 1)
+        root.addLayout(management)
 
         splitter = QtWidgets.QSplitter()
         splitter.setChildrenCollapsible(False)
@@ -102,17 +138,37 @@ class AssetsPage(QtWidgets.QWidget):
         if self.asset_list.count() and signature == self._loaded_signature:
             self._filter(self.search_edit.text())
             return
+        index = self.repository.load_assets()
+        self._analysis = self.repository.analyze_assets()
+        selected_group = str(self.group_combo.currentData() or "")
+        groups = sorted(
+            {str(metadata.get("group") or "").strip() for metadata in index.values() if isinstance(metadata, dict)} - {""},
+            key=str.casefold,
+        )
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem("모든 그룹", "")
+        for group in groups:
+            self.group_combo.addItem(f"폴더 · {group}", group)
+        group_index = self.group_combo.findData(selected_group)
+        self.group_combo.setCurrentIndex(max(0, group_index))
+        self.group_combo.blockSignals(False)
         previous = self.current_alias
         scroll_value = self.asset_list.verticalScrollBar().value()
         self._thumbnail_timer.stop()
         self._thumbnail_queue.clear()
         self.asset_list.clear()
-        for alias, metadata in sorted(self.repository.load_assets().items(), key=lambda item: item[0].casefold()):
+        for alias, metadata in sorted(index.items(), key=lambda item: item[0].casefold()):
             path = (self.repository.root / str(metadata.get("file") or "")).resolve()
-            item = QtWidgets.QListWidgetItem(alias)
+            group = str(metadata.get("group") or "").strip()
+            tags = [str(value) for value in metadata.get("tags") or [] if str(value).strip()]
+            suffix = f"\n{group}" if group else (f"\n#{tags[0]}" if tags else "")
+            item = QtWidgets.QListWidgetItem(alias + suffix)
             item.setData(QtCore.Qt.UserRole, alias)
             item.setData(QtCore.Qt.UserRole + 1, str(path))
-            item.setToolTip(str(path))
+            item.setData(QtCore.Qt.UserRole + 2, {"group": group, "tags": tags})
+            references = self._analysis.get("references", {}).get(alias, [])
+            item.setToolTip(f"{path}\n사용 매크로: {', '.join(references) if references else '없음'}")
             if path.exists():
                 cache = self._thumbnail_cache.get(str(path))
                 modified = path.stat().st_mtime_ns
@@ -131,14 +187,19 @@ class AssetsPage(QtWidgets.QWidget):
             self.asset_list.setCurrentRow(0)
         if self._thumbnail_queue:
             self._thumbnail_timer.start(0)
+        total = len(index)
+        unused = len(self._analysis.get("unused") or [])
+        duplicates = len(self._analysis.get("duplicate_aliases") or [])
+        self.analysis_label.setText(f"전체 {total} · 미사용 {unused} · 중복 {duplicates}")
         QtCore.QTimer.singleShot(0, lambda value=scroll_value: self.asset_list.verticalScrollBar().setValue(value))
 
-    def _asset_signature(self) -> tuple[int, int]:
+    def _asset_signature(self) -> tuple[int, int, int, int]:
         try:
             stat = self.repository.assets_index_path.stat()
-            return stat.st_mtime_ns, stat.st_size
+            macro_stats = [path.stat() for path in self.repository.macros_dir.glob("*.json") if path.is_file()]
+            return stat.st_mtime_ns, stat.st_size, len(macro_stats), max((item.st_mtime_ns for item in macro_stats), default=0)
         except OSError:
-            return 0, 0
+            return 0, 0, 0, 0
 
     def _load_thumbnail_batch(self) -> None:
         for _ in range(min(3, len(self._thumbnail_queue))):
@@ -164,9 +225,29 @@ class AssetsPage(QtWidgets.QWidget):
 
     def _filter(self, text: str) -> None:
         query = text.strip().casefold()
+        mode = str(self.filter_combo.currentData() or "all")
+        group_filter = str(self.group_combo.currentData() or "")
+        references = self._analysis.get("references") or {}
+        unused = set(self._analysis.get("unused") or [])
+        duplicates = set(self._analysis.get("duplicate_aliases") or [])
+        missing = set(self._analysis.get("missing") or [])
         for index in range(self.asset_list.count()):
             item = self.asset_list.item(index)
-            item.setHidden(bool(query and query not in item.text().casefold()))
+            alias = str(item.data(QtCore.Qt.UserRole) or "")
+            metadata = item.data(QtCore.Qt.UserRole + 2) or {}
+            group = str(metadata.get("group") or "")
+            tags = " ".join(str(value) for value in metadata.get("tags") or [])
+            searchable = f"{alias} {group} {tags}".casefold()
+            matches_text = not query or query in searchable or query in _initials(searchable)
+            matches_group = not group_filter or group == group_filter
+            matches_mode = {
+                "all": True,
+                "used": bool(references.get(alias)),
+                "unused": alias in unused,
+                "duplicate": alias in duplicates,
+                "missing": alias in missing,
+            }.get(mode, True)
+            item.setHidden(not (matches_text and matches_group and matches_mode))
 
     def _select(self, current, _previous) -> None:
         if not current:
@@ -188,7 +269,12 @@ class AssetsPage(QtWidgets.QWidget):
             size = self.current_path.stat().st_size if self.current_path.exists() else 0
             dimensions = f"{image.width()} × {image.height()} px · {size / 1024:.1f} KB{alpha}"
         self.alias_label.setText(self.current_alias)
-        self.info_label.setText(dimensions)
+        metadata = current.data(QtCore.Qt.UserRole + 2) or {}
+        group = str(metadata.get("group") or "미분류")
+        tags = ", ".join(str(value) for value in metadata.get("tags") or []) or "없음"
+        references = self._analysis.get("references", {}).get(self.current_alias, [])
+        usage = ", ".join(references) if references else "미사용 이미지"
+        self.info_label.setText(f"{dimensions}\n폴더: {group} · 태그: {tags}\n사용 매크로: {usage}")
         self.path_label.setText(str(self.current_path))
 
     def _add(self) -> None:
@@ -267,6 +353,39 @@ class AssetsPage(QtWidgets.QWidget):
 
     def _open_folder(self) -> None:
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self.repository.assets_dir.resolve())))
+
+    def _organize_selected(self) -> None:
+        aliases = [str(item.data(QtCore.Qt.UserRole) or "") for item in self.asset_list.selectedItems()]
+        if not aliases and self.current_alias:
+            aliases = [self.current_alias]
+        aliases = [alias for alias in aliases if alias]
+        if not aliases:
+            self.status.emit("폴더나 태그를 지정할 이미지를 선택하세요.")
+            return
+        index = self.repository.load_assets()
+        first = index.get(aliases[0]) if isinstance(index.get(aliases[0]), dict) else {}
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"이미지 {len(aliases)}개 분류")
+        dialog.setMinimumWidth(430)
+        layout = QtWidgets.QFormLayout(dialog)
+        group_edit = QtWidgets.QLineEdit(str(first.get("group") or ""))
+        group_edit.setPlaceholderText("예: 로그인, 전투, 공통 버튼")
+        tags_edit = QtWidgets.QLineEdit(", ".join(str(value) for value in first.get("tags") or []))
+        tags_edit.setPlaceholderText("쉼표로 구분: 버튼, 파란색, 확인")
+        layout.addRow("폴더", group_edit)
+        layout.addRow("태그", tags_edit)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        tags = [value.strip() for value in tags_edit.text().split(",") if value.strip()]
+        self.repository.update_asset_organization(aliases, group_edit.text(), tags)
+        self._loaded_signature = None
+        self.refresh()
+        self.data_changed.emit()
+        self.status.emit(f"이미지 {len(aliases)}개의 폴더·태그를 저장했습니다.")
 
     def _archive(self) -> None:
         self._archive_selected(confirm=True)

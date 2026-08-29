@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -20,6 +21,7 @@ from .inactive_click_lab import HandlePointPicker, InactiveClickLabDialog
 from .node_editor import NodeCanvas
 from .repository import MacroRepository
 from .theme import COLORS
+from .validation import ProjectValidator
 from .widgets import Card, PageHeader, WheelSafeSpinBox, danger_button, primary_button
 
 
@@ -479,8 +481,8 @@ class BuilderPage(QtWidgets.QWidget):
         self.stop_button.setToolTip("현재 Studio에서 실행한 매크로와 이미지 검색 하위 프로세스를 즉시 중단")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._stop_running_macros)
-        log_btn = QtWidgets.QPushButton("▤ 로그")
-        log_btn.setToolTip("실행·종료·오류와 단계별 로그 보기")
+        log_btn = QtWidgets.QPushButton("▤ 실행 디버거")
+        log_btn.setToolTip("노드별 성공·실패·시간·이미지/OCR 결과·변수와 실행 제어 보기")
         log_btn.clicked.connect(self._open_logs)
         diagnose_btn = QtWidgets.QPushButton("✓ 자동 진단")
         diagnose_btn.setToolTip("연결·이미지·대상 창·실행 가능성을 검사하고 수정 제안")
@@ -604,6 +606,9 @@ class BuilderPage(QtWidgets.QWidget):
         save_block_action.triggered.connect(self._save_selected_block)
         add_block_action = self.node_more_menu.addAction("저장된 블록 추가")
         add_block_action.triggered.connect(self._insert_automation_block)
+        version_action = self.node_more_menu.addAction("버전 기록·복구")
+        version_action.setToolTip("자동 저장된 이전 버전을 확인하고 현재 매크로로 복구합니다.")
+        version_action.triggered.connect(self._open_version_history)
         self.node_more_button.setMenu(self.node_more_menu)
         header.addWidget(self.macro_title)
         header.addStretch(1)
@@ -1757,6 +1762,12 @@ class BuilderPage(QtWidgets.QWidget):
         if index > 0:
             self.status.emit(f"{index}번 노드를 실행하고 있습니다.")
 
+    def set_execution_states(self, states: dict[int, dict[str, Any]]) -> None:
+        self.node_canvas.set_execution_states(states)
+
+    def clear_execution_states(self) -> None:
+        self.node_canvas.clear_execution_states()
+
     def set_macro_running(self, running: bool) -> None:
         self.run_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
@@ -2281,8 +2292,21 @@ class BuilderPage(QtWidgets.QWidget):
         if issues:
             message = "\n".join(f"• {issue}" for issue in issues)
             QtWidgets.QMessageBox.warning(self, "실행 전 설정 확인", message)
-            self.status.emit("이미지 서치 설정이 올바르지 않아 실행하지 않았습니다.")
+            self.status.emit("실행 전 검사에서 오류가 발견되어 실행하지 않았습니다.")
             return
+        warnings = list(getattr(self, "_last_execution_warnings", []))
+        if warnings:
+            message = "실행은 가능하지만 확인이 필요한 항목입니다.\n\n" + "\n".join(f"• {warning}" for warning in warnings)
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "실행 전 주의 사항",
+                message + "\n\n계속 실행할까요?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                self.status.emit("사용자가 실행 전 주의 사항을 확인하고 실행을 취소했습니다.")
+                return
         self.status.emit(f"'{self.current_name}' 실행을 요청했습니다. 로그 버튼에서 진행 상태를 확인할 수 있습니다.")
         self.run_macro.emit(self.current_name)
 
@@ -2298,18 +2322,98 @@ class BuilderPage(QtWidgets.QWidget):
 
     def _execution_issues(self) -> list[str]:
         issues: list[str] = []
+        warnings: list[str] = []
+        validator = ProjectValidator(self.repository)
+        try:
+            validation_issues = [item for item in validator.validate() if item.macro == self.current_name]
+        except Exception as exc:
+            validation_issues = []
+            warnings.append(f"프로젝트 검사 일부를 완료하지 못했습니다: {exc}")
+        for item in validation_issues:
+            prefix = f"{item.step}번 " if item.step else ""
+            detail = f" · {item.detail}" if item.detail else ""
+            message = f"{prefix}{item.title}{detail}"
+            if item.severity == "error":
+                issues.append(message)
+            else:
+                warnings.append(message)
         for index, step in enumerate((self.current_macro or {}).get("steps") or [], start=1):
             if not isinstance(step, dict) or step.get("action") != "image_search":
                 continue
-            alias = str(step.get("asset") or "").strip()
-            if not alias or self.repository.asset_path(alias) is None:
-                issues.append(f"{index}번 이미지 서치: 검색 이미지가 선택되지 않았습니다.")
             if str(step.get("engine") or "ahk").lower() == "opencv":
                 try:
                     self.repository._ensure_opencv_runtime()
                 except Exception as exc:
                     issues.append(f"{index}번 이미지 서치: OpenCV 실행 환경을 사용할 수 없습니다. {exc}")
-        return issues
+        self._last_execution_warnings = list(dict.fromkeys(warnings))
+        return list(dict.fromkeys(issues))
+
+    def _open_version_history(self) -> None:
+        if not self.current_name:
+            self.status.emit("버전 기록을 볼 매크로를 먼저 선택하세요.")
+            return
+        versions = self.repository.list_macro_versions(self.current_name)
+        if not versions:
+            QtWidgets.QMessageBox.information(
+                self,
+                "버전 기록",
+                "아직 이전 버전이 없습니다. 매크로를 수정해 저장하면 변경 전 상태가 자동 보관됩니다.",
+            )
+            return
+        dialog = QtWidgets.QDialog(self.window())
+        dialog.setWindowTitle(f"버전 기록 · {self.current_name}")
+        dialog.resize(760, 520)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        hint = QtWidgets.QLabel("복구해도 현재 상태가 새 버전으로 먼저 백업되므로 다시 되돌릴 수 있습니다.")
+        hint.setObjectName("Muted")
+        layout.addWidget(hint)
+        table = QtWidgets.QTableWidget(len(versions), 4)
+        table.setHorizontalHeaderLabels(["저장 시각", "노드", "현재와 비교", "설명"])
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        current_steps = len((self.current_macro or {}).get("steps") or [])
+        for row, version in enumerate(versions):
+            modified = version["modified"].strftime("%Y-%m-%d %H:%M:%S")
+            step_count = int(version.get("steps") or 0)
+            delta = step_count - current_steps
+            comparison = "동일한 노드 수" if delta == 0 else f"노드 {abs(delta)}개 {'많음' if delta > 0 else '적음'}"
+            for column, value in enumerate((modified, str(step_count), comparison, str(version.get("description") or ""))):
+                table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+        table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        table.selectRow(0)
+        layout.addWidget(table, 1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.RestoreDefaults | QtWidgets.QDialogButtonBox.Close)
+        restore_button = buttons.button(QtWidgets.QDialogButtonBox.RestoreDefaults)
+        restore_button.setText("선택 버전 복구")
+        buttons.rejected.connect(dialog.reject)
+
+        def restore_selected() -> None:
+            row = table.currentRow()
+            if not 0 <= row < len(versions):
+                return
+            answer = QtWidgets.QMessageBox.question(
+                dialog,
+                "선택 버전 복구",
+                f"{table.item(row, 0).text()} 버전으로 복구할까요?\n현재 상태는 자동 백업됩니다.",
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+            try:
+                self.repository.restore_macro_version(self.current_name, Path(versions[row]["path"]))
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dialog, "복구 실패", str(exc))
+                return
+            dialog.accept()
+
+        restore_button.clicked.connect(restore_selected)
+        layout.addWidget(buttons)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            self.refresh(self.current_name)
+            self.status.emit(f"'{self.current_name}' 이전 버전을 복구했습니다. 복구 전 상태도 버전 기록에 남겼습니다.")
 
     def _open_logs(self) -> None:
         if self._log_dialog is not None and self._log_dialog.isVisible():

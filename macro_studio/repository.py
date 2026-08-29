@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -223,6 +224,46 @@ class MacroRepository:
         for stale in backups[:-20]:
             stale.unlink(missing_ok=True)
 
+    def list_macro_versions(self, name: str) -> list[dict[str, Any]]:
+        history_root = (self.history_dir / self.safe_name(name)).resolve()
+        versions: list[dict[str, Any]] = []
+        if not history_root.is_dir():
+            return versions
+        for path in sorted(history_root.glob("*.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True):
+            try:
+                payload = self._read_json(path, {})
+                if not isinstance(payload, dict):
+                    continue
+                modified = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+            except (OSError, ValueError):
+                continue
+            versions.append(
+                {
+                    "path": path,
+                    "modified": modified,
+                    "steps": len(payload.get("steps") or []),
+                    "description": str(payload.get("description") or ""),
+                    "payload": payload,
+                }
+            )
+        return versions
+
+    def restore_macro_version(self, name: str, version_path: Path) -> Path:
+        history_root = (self.history_dir / self.safe_name(name)).resolve()
+        source = version_path.resolve()
+        try:
+            source.relative_to(history_root)
+        except ValueError as exc:
+            raise ValueError("해당 매크로의 버전 기록 밖에 있는 파일은 복구할 수 없습니다.") from exc
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        payload = self._read_json(source, {})
+        if not isinstance(payload, dict) or not isinstance(payload.get("steps"), list):
+            raise ValueError("선택한 버전 기록의 형식이 올바르지 않습니다.")
+        payload = deepcopy(payload)
+        payload["name"] = name
+        return self.save_macro(name, payload)
+
     def save_macro(self, name: str, payload: dict[str, Any]) -> Path:
         path = self.macro_path(name)
         self._backup_macro(path)
@@ -351,6 +392,81 @@ class MacroRepository:
             metadata["size"] = path.stat().st_size
             metadata["updated_at"] = datetime.utcnow().isoformat() + "Z"
             self._write_json(self.assets_index_path, index)
+
+    def update_asset_organization(self, aliases: Iterable[str], group: str = "", tags: Iterable[str] = ()) -> None:
+        index = self.load_assets()
+        normalized_tags = list(dict.fromkeys(str(value).strip() for value in tags if str(value).strip()))
+        target_group = str(group or "").strip()
+        changed = False
+        for alias in aliases:
+            metadata = index.get(str(alias))
+            if not isinstance(metadata, dict):
+                continue
+            if target_group:
+                metadata["group"] = target_group
+            else:
+                metadata.pop("group", None)
+            if normalized_tags:
+                metadata["tags"] = normalized_tags
+            else:
+                metadata.pop("tags", None)
+            changed = True
+        if changed:
+            self._write_json(self.assets_index_path, index)
+
+    def analyze_assets(self) -> dict[str, Any]:
+        """Return macro references, missing files and exact duplicate groups."""
+        index = self.load_assets()
+        references: dict[str, list[str]] = {alias: [] for alias in index}
+
+        def walk(value: Any, macro_name: str) -> None:
+            if isinstance(value, dict):
+                asset = value.get("asset")
+                if isinstance(asset, str) and asset in references and macro_name not in references[asset]:
+                    references[asset].append(macro_name)
+                assets = value.get("assets")
+                if isinstance(assets, list):
+                    for alias in assets:
+                        key = str(alias)
+                        if key in references and macro_name not in references[key]:
+                            references[key].append(macro_name)
+                for nested in value.values():
+                    walk(nested, macro_name)
+            elif isinstance(value, list):
+                for nested in value:
+                    walk(nested, macro_name)
+
+        for summary in self.list_macros():
+            try:
+                walk(self.load_macro(summary.name).get("steps") or [], summary.name)
+            except (OSError, ValueError):
+                continue
+
+        missing: list[str] = []
+        by_digest: dict[str, list[str]] = {}
+        for alias, metadata in index.items():
+            path = (self.root / str(metadata.get("file") or "")).resolve() if isinstance(metadata, dict) else None
+            if path is None or not path.is_file():
+                missing.append(alias)
+                continue
+            digest = hashlib.sha256()
+            try:
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError:
+                missing.append(alias)
+                continue
+            by_digest.setdefault(digest.hexdigest(), []).append(alias)
+        duplicates = [aliases for aliases in by_digest.values() if len(aliases) > 1]
+        duplicate_aliases = sorted(alias for group in duplicates for alias in group)
+        return {
+            "references": references,
+            "unused": sorted(alias for alias, macros in references.items() if not macros),
+            "missing": sorted(missing),
+            "duplicates": duplicates,
+            "duplicate_aliases": duplicate_aliases,
+        }
 
     def sync_assets(self) -> int:
         index = self.load_assets()
@@ -1256,12 +1372,15 @@ internal static class Program
         result_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.txt"
         progress_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.progress.txt"
         click_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.click.txt"
+        control_path = result_dir / f"{self.safe_name(name)}-{uuid.uuid4().hex}.control.txt"
         trace_path = self.exports_dir / "execution_trace.log"
         trace_path.write_text("", encoding="utf-8")
+        control_path.write_text("RUN", encoding="utf-8")
         environment["MACRORELAY_RESULT_FILE"] = str(result_path)
         environment["MACRORELAY_PROGRESS_FILE"] = str(progress_path)
         environment["MACRORELAY_CLICK_FILE"] = str(click_path)
         environment["MACRORELAY_TRACE_FILE"] = str(trace_path)
+        environment["MACRORELAY_CONTROL_FILE"] = str(control_path)
         executable = self._read_text_path("ahk_path.txt")
         if not executable or not executable.exists():
             raise FileNotFoundError("AutoHotkey 실행 파일을 찾을 수 없습니다.")
@@ -1271,6 +1390,7 @@ internal static class Program
         process.macrorelay_progress_path = progress_path  # type: ignore[attr-defined]
         process.macrorelay_click_path = click_path  # type: ignore[attr-defined]
         process.macrorelay_trace_path = trace_path  # type: ignore[attr-defined]
+        process.macrorelay_control_path = control_path  # type: ignore[attr-defined]
         return process
 
     def _ensure_ocr_runtime(self) -> tuple[Path, Path]:

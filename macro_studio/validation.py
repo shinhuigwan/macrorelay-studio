@@ -81,7 +81,11 @@ class ProjectValidator:
                     primary = str(step.get("asset") or "")
                     if primary and primary not in aliases:
                         aliases.insert(0, primary)
-                    for alias in aliases or [primary]:
+                    if not aliases:
+                        issues.append(
+                            Issue("error", "이미지 누락", "검색 이미지가 선택되지 않았습니다.", summary.name, index)
+                        )
+                    for alias in aliases:
                         metadata = assets.get(alias)
                         if not isinstance(metadata, dict):
                             issues.append(Issue("error", "이미지 누락", f"'{alias}' 이미지 별칭이 없습니다.", summary.name, index))
@@ -102,6 +106,37 @@ class ProjectValidator:
                                 index,
                             )
                         )
+                    if str(step.get("region_mode") or "screen") in {"window", "client"} and not (
+                        str(step.get("region_window") or "").strip()
+                        or str(step.get("region_window_exe") or "").strip()
+                    ):
+                        issues.append(
+                            Issue("error", "이미지 검색 대상 창 누락", "창/클라이언트 범위에는 대상 프로그램이 필요합니다.", summary.name, index)
+                        )
+                if action == "ocr":
+                    region = step.get("region")
+                    if str(step.get("mode") or "region") == "region" and self._region_is_invalid(region):
+                        issues.append(Issue("error", "OCR 영역 오류", "OCR 인식 영역의 너비와 높이를 확인하세요.", summary.name, index))
+                    if str(step.get("ocr_action") or "extract") in {"find_text", "find_click", "find_click_offset"} and not str(
+                        step.get("find_text") or ""
+                    ).strip():
+                        issues.append(Issue("error", "OCR 검색어 누락", "찾을 텍스트를 입력하세요.", summary.name, index))
+                if action == "mouse_click" and str(step.get("coordinate_scope") or "screen") == "client" and not (
+                    str(step.get("window") or "").strip() or str(step.get("window_exe") or "").strip()
+                ):
+                    issues.append(Issue("error", "프로그램 기준 좌표 대상 누락", "대상 프로그램을 다시 지정하세요.", summary.name, index))
+                if action == "inactive_click" and not (
+                    str(step.get("window") or "").strip() or str(step.get("window_exe") or "").strip()
+                ):
+                    issues.append(Issue("error", "비활성 클릭 대상 누락", "대상 창 또는 프로그램을 지정하세요.", summary.name, index))
+                if action == "call_submacro":
+                    target_macro = str(step.get("macro") or "").strip()
+                    if not target_macro:
+                        issues.append(Issue("error", "서브플로우 누락", "호출할 매크로를 선택하세요.", summary.name, index))
+                    elif not self.repository.macro_path(target_macro).is_file():
+                        issues.append(Issue("error", "서브플로우 파일 누락", f"'{target_macro}' 매크로를 찾을 수 없습니다.", summary.name, index))
+                    elif target_macro == summary.name:
+                        issues.append(Issue("error", "서브플로우 순환 호출", "매크로가 자기 자신을 호출할 수 없습니다.", summary.name, index))
                 table = str(step.get("table") or "")
                 if table and table not in tables:
                     issues.append(Issue("error", "데이터 테이블 누락", f"'{table}' 테이블이 없습니다.", summary.name, index))

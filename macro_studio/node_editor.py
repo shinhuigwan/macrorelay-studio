@@ -351,6 +351,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
         badge, accent = ACTION_STYLES.get(action, ("STEP", COLORS["muted"]))
         selected = self.isSelected()
         running = self.index == self.canvas.active_step
+        execution = self.canvas.execution_states.get(self.index, {})
+        execution_status = str(execution.get("status") or "").upper()
         candidate_position = self.canvas.start_candidate_position(self.index)
         lod = max(0.01, option.levelOfDetailFromTransform(painter.worldTransform()))
         font_boost = min(2.5, max(1.0, 0.82 / lod))
@@ -361,6 +363,10 @@ class NodeItem(QtWidgets.QGraphicsObject):
         border_color = (
             "#38E7FF"
             if running
+            else COLORS["success"]
+            if execution_status == "SUCCESS"
+            else COLORS["danger"]
+            if execution_status == "FAIL"
             else COLORS["accent"]
             if selected
             else COLORS["warning"]
@@ -428,6 +434,9 @@ class NodeItem(QtWidgets.QGraphicsObject):
             detail += f"  ·  연결 {success_delay}ms"
         if candidate_position:
             detail = f"시작 검색 {candidate_position[0]}/{candidate_position[1]} · 미탐지 시 다음 후보"
+        if execution_status in {"SUCCESS", "FAIL"}:
+            duration = int(execution.get("duration_ms") or 0)
+            detail = f"{'성공' if execution_status == 'SUCCESS' else '실패'} · {duration} ms"
         if not compact:
             detail_font = QtGui.QFont("Malgun Gothic")
             detail_font.setPointSizeF(8 * font_boost)
@@ -459,6 +468,20 @@ class NodeItem(QtWidgets.QGraphicsObject):
             painter.setFont(running_font)
             painter.setPen(QtGui.QColor("#061116"))
             painter.drawText(QtCore.QRectF(168, 92, 84, 22), QtCore.Qt.AlignCenter, "실행 중")
+        elif execution_status in {"SUCCESS", "FAIL"}:
+            painter.setPen(QtCore.Qt.NoPen)
+            result_color = QtGui.QColor(COLORS["success"] if execution_status == "SUCCESS" else COLORS["danger"])
+            painter.setBrush(result_color)
+            painter.drawRoundedRect(QtCore.QRectF(168, 92, 84, 22), 7, 7)
+            result_font = QtGui.QFont("Malgun Gothic", 8)
+            result_font.setBold(True)
+            painter.setFont(result_font)
+            painter.setPen(QtGui.QColor("#07110E" if execution_status == "SUCCESS" else "#18070B"))
+            painter.drawText(
+                QtCore.QRectF(168, 92, 84, 22),
+                QtCore.Qt.AlignCenter,
+                f"{'성공' if execution_status == 'SUCCESS' else '실패'} {int(execution.get('duration_ms') or 0)}ms",
+            )
 
     def itemChange(self, change, value):
         result = super().itemChange(change, value)
@@ -864,6 +887,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.start_candidates: list[int] = []
         self.end_step = 0
         self.active_step = 0
+        self.execution_states: dict[int, dict[str, Any]] = {}
         self._temp_edge: QtWidgets.QGraphicsPathItem | None = None
         self._temp_start = QtCore.QPointF()
         self.rubber_selecting = False
@@ -951,6 +975,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.suspended = True
         self.hide_image_preview()
         self.active_step = 0
+        self.execution_states = {}
         self.scene.clear()
         self.macro = macro or {}
         self.steps = list(self.macro.get("steps") or [])
@@ -1034,6 +1059,21 @@ class NodeCanvas(QtWidgets.QWidget):
         if current is not None:
             current.setZValue(20)
             current.update()
+
+    def set_execution_states(self, states: dict[int, dict[str, Any]]) -> None:
+        previous = set(self.execution_states)
+        self.execution_states = {
+            int(index): dict(value)
+            for index, value in states.items()
+            if int(index) in self.nodes and isinstance(value, dict)
+        }
+        for index in previous | set(self.execution_states):
+            node = self.nodes.get(index)
+            if node is not None:
+                node.update()
+
+    def clear_execution_states(self) -> None:
+        self.set_execution_states({})
 
     def begin_rubber_selection(self) -> None:
         self.rubber_selecting = True

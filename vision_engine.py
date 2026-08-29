@@ -304,6 +304,97 @@ class VisionState:
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
         }
 
+    def benchmark(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Capture every region once and report a comparable result per template."""
+        started = time.perf_counter()
+        with self._lock:
+            self.last_activity = time.time()
+            self.request_count += 1
+            profile = str(request.get("profile") or "balanced").lower()
+            if profile not in {"fast", "balanced", "precise"}:
+                profile = "balanced"
+            threshold = max(0.5, min(0.99, float(request.get("threshold") or 0.86)))
+            regions = self._regions(request.get("regions"))
+            raw_images = request.get("images")
+            image_paths = list(
+                dict.fromkeys(str(value) for value in raw_images if str(value).strip())
+            ) if isinstance(raw_images, list) else []
+            if not image_paths:
+                single = str(request.get("image") or "").strip()
+                image_paths = [single] if single else []
+            if not image_paths:
+                raise ValueError("at least one search image is required")
+            prepared_items = [self._template(path, profile) for path in image_paths]
+            self._modules()
+            frames: list[tuple[tuple[int, int, int, int], Any]] = []
+            for region in regions:
+                left, top, right, bottom = region
+                frame = search.capture_region(left, top, right, bottom, self._grabber or None)
+                if frame is not None:
+                    frames.append((region, frame))
+            if not frames:
+                raise RuntimeError("screen capture failed for every search region")
+            results: list[dict[str, Any]] = []
+            for image_index, (prepared, cache_hit) in enumerate(prepared_items, start=1):
+                item_started = time.perf_counter()
+                best_score = 0.0
+                best_hit: tuple[float, int, int, int, int] | None = None
+                for (left, top, _right, _bottom), frame in frames:
+                    match, score = self._match(frame, prepared, threshold, profile)
+                    best_score = max(best_score, float(score))
+                    if match is None:
+                        continue
+                    confidence, location, width, height = match
+                    hit = (
+                        float(confidence),
+                        left + int(location[0]) + int(width) // 2,
+                        top + int(location[1]) + int(height) // 2,
+                        int(width),
+                        int(height),
+                    )
+                    if best_hit is None or hit[0] > best_hit[0]:
+                        best_hit = hit
+                canvas_width, canvas_height = prepared.get("canvas_size") or (
+                    int(prepared["template"].shape[1]),
+                    int(prepared["template"].shape[0]),
+                )
+                result: dict[str, Any] = {
+                    "index": image_index,
+                    "image": str(prepared["path"]),
+                    "found": best_hit is not None,
+                    "score": round(best_hit[0] if best_hit else best_score, 6),
+                    "best_score": round(best_score, 6),
+                    "source_width": int(canvas_width),
+                    "source_height": int(canvas_height),
+                    "cache_hit": bool(cache_hit),
+                    "elapsed_ms": round((time.perf_counter() - item_started) * 1000, 2),
+                }
+                if best_hit is not None:
+                    confidence, center_x, center_y, width, height = best_hit
+                    result.update(
+                        {
+                            "confidence": round(confidence, 6),
+                            "x": center_x,
+                            "y": center_y,
+                            "width": width,
+                            "height": height,
+                            "scale_x": round(width / max(1, int(canvas_width)), 4),
+                            "scale_y": round(height / max(1, int(canvas_height)), 4),
+                        }
+                    )
+                results.append(result)
+            found_results = [item for item in results if item.get("found")]
+            selected = max(found_results, key=lambda item: (float(item.get("score") or 0), -int(item["index"]))) if found_results else None
+            return {
+                "ok": True,
+                "profile": profile,
+                "threshold": threshold,
+                "capture_count": len(frames),
+                "results": results,
+                "selected_index": int(selected["index"]) if selected else 0,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            }
+
     def search(self, request: dict[str, Any]) -> dict[str, Any]:
         started = time.perf_counter()
         with self._lock:
@@ -437,6 +528,8 @@ class VisionHandler(socketserver.StreamRequestHandler):
                 response = self.server.state.status()
             elif command == "search":
                 response = self.server.state.search(request)
+            elif command == "benchmark":
+                response = self.server.state.benchmark(request)
             elif command == "shutdown":
                 response = {"ok": True, "status": "shutting_down"}
                 self.server.should_stop = True

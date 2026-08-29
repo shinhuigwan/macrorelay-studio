@@ -954,8 +954,47 @@ class EngineBehaviorTests(unittest.TestCase):
         macro = {"name": "trace", "steps": [{"action": "wait", "duration": 10, "label": "짧은 대기"}]}
         script = self.engine.render_macro_script(macro, {})
         self.assertIn("MACRORELAY_TRACE_FILE", script)
+        self.assertIn("MACRORELAY_CONTROL_FILE", script)
+        self.assertIn("DebugCheckpoint(1)", script)
+        self.assertIn('if (command = "STEP")', script)
         self.assertIn('TraceStep(1, "짧은 대기", "START")', script)
         self.assertIn('TraceStep(1, "짧은 대기", "SUCCESS")', script)
+
+
+    def test_vision_benchmark_captures_each_region_once_and_ranks_images(self):
+        import vision_engine
+
+        state = vision_engine.VisionState()
+        prepared = {
+            "a.png": ({"path": "a.png", "template": SimpleNamespace(shape=(20, 30)), "canvas_size": (30, 20)}, False),
+            "b.png": ({"path": "b.png", "template": SimpleNamespace(shape=(20, 30)), "canvas_size": (30, 20)}, True),
+        }
+        capture = mock.Mock(side_effect=["frame-one", "frame-two"])
+
+        def match(_frame, item, _threshold, _profile):
+            if item["path"] == "a.png":
+                return (0.88, (4, 6), 30, 20), 0.88
+            return (0.94, (10, 12), 36, 24), 0.94
+
+        with mock.patch.object(state, "_template", side_effect=lambda path, _profile: prepared[path]), mock.patch.object(
+            state, "_modules", return_value=(object(), object(), object())
+        ), mock.patch.object(state, "_match", side_effect=match), mock.patch.object(
+            vision_engine.search, "capture_region", capture
+        ):
+            report = state.benchmark(
+                {
+                    "images": ["a.png", "b.png"],
+                    "regions": [[0, 0, 100, 100], [100, 0, 200, 100]],
+                    "threshold": 0.8,
+                    "profile": "balanced",
+                }
+            )
+
+        self.assertEqual(2, capture.call_count, "이미지 수와 무관하게 검색 영역마다 한 번만 캡처해야 합니다.")
+        self.assertEqual(2, report["capture_count"])
+        self.assertEqual(2, report["selected_index"])
+        self.assertAlmostEqual(0.94, report["results"][1]["score"])
+        self.assertAlmostEqual(1.2, report["results"][1]["scale_x"])
 
 
 class DiagnosticBundleTests(unittest.TestCase):
@@ -1082,6 +1121,29 @@ class ProjectDataTests(unittest.TestCase):
             self.assertIn("데이터 테이블 누락", titles)
             self.assertIn("검색 영역이 한 점입니다", titles)
 
+    def test_preflight_reports_window_ocr_and_subflow_configuration_errors(self) -> None:
+        from macro_studio.repository import MacroRepository
+        from macro_studio.validation import ProjectValidator
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("preflight")
+            payload = repository.load_macro("preflight")
+            payload["steps"] = [
+                {"action": "mouse_click", "coordinate_scope": "client", "x": 5, "y": 7},
+                {"action": "inactive_click", "x": 2, "y": 3},
+                {"action": "ocr", "mode": "region", "region": [10, 10, 10, 30], "ocr_action": "find_text"},
+                {"action": "call_submacro", "macro": "없는 흐름"},
+            ]
+            repository.save_macro("preflight", payload)
+            issues = ProjectValidator(repository).validate()
+            titles = {issue.title for issue in issues if issue.severity == "error"}
+            self.assertIn("프로그램 기준 좌표 대상 누락", titles)
+            self.assertIn("비활성 클릭 대상 누락", titles)
+            self.assertIn("OCR 영역 오류", titles)
+            self.assertIn("OCR 검색어 누락", titles)
+            self.assertIn("서브플로우 파일 누락", titles)
+
     def test_automation_blocks_round_trip(self) -> None:
         from macro_studio.repository import MacroRepository
 
@@ -1201,6 +1263,50 @@ class ProjectDataTests(unittest.TestCase):
             repository.assign_macro_group(["second"], "업무")
             self.assertEqual(["first", "second"], [item.name for item in repository.list_macros()])
             self.assertEqual("업무", repository.load_macro_tags()["second"])
+
+    def test_asset_analysis_reports_usage_duplicates_and_organization(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            image = QtGui.QImage(12, 10, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#216DD8"))
+            first = repository.add_asset_image(image, "로그인버튼")
+            second_source = Path(directory) / "duplicate.png"
+            self.assertTrue(image.save(str(second_source), "PNG"))
+            second = repository.add_asset(second_source, "복제버튼")
+            repository.create_macro("로그인")
+            payload = repository.load_macro("로그인")
+            payload["steps"] = [{"action": "image_search", "asset": first}]
+            repository.save_macro("로그인", payload)
+            repository.update_asset_organization([first], "로그인", ["버튼", "파란색"])
+
+            report = repository.analyze_assets()
+            metadata = repository.load_assets()[first]
+            self.assertEqual(["로그인"], report["references"][first])
+            self.assertIn(second, report["unused"])
+            self.assertEqual({first, second}, set(report["duplicate_aliases"]))
+            self.assertEqual("로그인", metadata["group"])
+            self.assertEqual(["버튼", "파란색"], metadata["tags"])
+
+    def test_macro_version_history_can_restore_without_losing_current_state(self) -> None:
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("versioned")
+            first = repository.load_macro("versioned")
+            first["steps"] = [{"action": "wait", "duration": 100}]
+            repository.save_macro("versioned", first)
+            second = repository.load_macro("versioned")
+            second["steps"].append({"action": "wait", "duration": 200})
+            repository.save_macro("versioned", second)
+            versions = repository.list_macro_versions("versioned")
+            one_step = next(item for item in versions if item["steps"] == 1)
+            repository.restore_macro_version("versioned", one_step["path"])
+            self.assertEqual(1, len(repository.load_macro("versioned")["steps"]))
+            self.assertTrue(any(item["steps"] == 2 for item in repository.list_macro_versions("versioned")))
 
     def test_portable_export_creates_folder_zip_manifest_without_overwrite(self) -> None:
         from macro_studio.repository import MacroRepository
@@ -2218,6 +2324,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIn("종료 노드로 지정", menu_labels)
             self.assertIn("선택 노드를 블록으로 저장", menu_labels)
             self.assertIn("저장된 블록 추가", menu_labels)
+            self.assertIn("버전 기록·복구", menu_labels)
             window.close()
 
     def test_start_search_group_and_selected_success_node_insertion(self) -> None:
@@ -2449,6 +2556,11 @@ class UiSmokeTests(unittest.TestCase):
             app.processEvents()
             self.assertEqual(2, builder.node_canvas.active_step)
             self.assertEqual(20, builder.node_canvas.nodes[2].zValue())
+            builder.set_execution_states(
+                {1: {"status": "SUCCESS", "duration_ms": 14}, 2: {"status": "FAIL", "duration_ms": 31}}
+            )
+            self.assertEqual("SUCCESS", builder.node_canvas.execution_states[1]["status"])
+            self.assertEqual(31, builder.node_canvas.execution_states[2]["duration_ms"])
             self.assertGreaterEqual(window.minimumWidth(), 1120)
             self.assertIn(window.nav_buttons["builder"].parentWidget().width(), {74, 260})
             self.assertTrue(builder.run_button.isVisible())
@@ -2476,9 +2588,17 @@ class UiSmokeTests(unittest.TestCase):
             builder = window.pages["builder"]
             builder.refresh("stop-loop")
             process = FakeProcess()
+            process.macrorelay_control_path = root / "control.txt"
+            process.macrorelay_control_path.write_text("RUN", encoding="utf-8")
             window._track_macro_process("stop-loop", process)
             self.assertFalse(builder.run_button.isEnabled())
             self.assertTrue(builder.stop_button.isEnabled())
+            window.pause_running_macros()
+            self.assertEqual("PAUSE", process.macrorelay_control_path.read_text(encoding="utf-8"))
+            window.step_running_macros()
+            self.assertEqual("STEP", process.macrorelay_control_path.read_text(encoding="utf-8"))
+            window.resume_running_macros()
+            self.assertEqual("RUN", process.macrorelay_control_path.read_text(encoding="utf-8"))
             with mock.patch.object(window, "_terminate_macro_process") as terminate:
                 builder.stop_button.click()
             terminate.assert_called_once_with(process.pid, process)
@@ -2487,6 +2607,54 @@ class UiSmokeTests(unittest.TestCase):
             self.assertFalse(builder.stop_button.isEnabled())
             self.assertFalse(window._run_monitor.isActive())
             window.close()
+        app.processEvents()
+
+    def test_execution_debugger_parses_timeline_variables_and_controls(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.log_dialog import MacroLogDialog
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+        class Host(QtWidgets.QWidget):
+            def __init__(self) -> None:
+                super().__init__()
+                self._running_macro_processes = {1: object()}
+                self.commands: list[str] = []
+
+            def pause_running_macros(self) -> None:
+                self.commands.append("PAUSE")
+
+            def step_running_macros(self) -> None:
+                self.commands.append("STEP")
+
+            def resume_running_macros(self) -> None:
+                self.commands.append("RUN")
+
+            def stop_running_macros(self) -> None:
+                self.commands.append("STOP")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.exports_dir.mkdir(parents=True, exist_ok=True)
+            (repository.exports_dir / "execution_trace.log").write_text(
+                "2026-08-29 13:00:00.100|1|START|OCR 인식|\n"
+                "2026-08-29 13:00:00.250|1|SUCCESS|OCR 인식|\n"
+                "2026-08-29 13:00:00.251|1|DETAIL|OCR 인식|text=3; confidence=0.98; var:count=3\n",
+                encoding="utf-8",
+            )
+            host = Host()
+            dialog = MacroLogDialog(repository, host)
+            dialog.refresh(force=True)
+            self.assertEqual(1, dialog.timeline_table.rowCount())
+            self.assertEqual("성공", dialog.timeline_table.item(0, 2).text())
+            self.assertEqual("150 ms", dialog.timeline_table.item(0, 3).text())
+            self.assertEqual("count", dialog.variable_table.item(0, 0).text())
+            self.assertEqual("3", dialog.variable_table.item(0, 1).text())
+            dialog.debug_control_buttons[0].click()
+            self.assertEqual(["PAUSE"], host.commands)
+            dialog.close()
+            host.close()
         app.processEvents()
 
     def test_saved_node_graph_positions_are_restored(self) -> None:
@@ -2566,6 +2734,7 @@ class UiSmokeTests(unittest.TestCase):
             image_buttons = [button.text() for button in editor.pages["image_search"].findChildren(QtWidgets.QPushButton)]
             self.assertFalse(any("핸들 실험실" in text for text in inactive_buttons))
             self.assertFalse(any("핸들 실험실" in text for text in image_buttons))
+            self.assertIn("▤ 이미지 서치 테스트 센터", image_buttons)
             self.assertIn("command", editor.widgets["run_program"])
             self.assertEqual("이미지 서치", ACTION_LABELS["image_search"])
             editor.load_step(
@@ -2686,6 +2855,33 @@ class UiSmokeTests(unittest.TestCase):
             editor.load_step(step)
             offset_editor._select_multi_asset("둘째 이미지")
             self.assertEqual([-24, 35], offset_editor.value())
+            editor.close()
+        app.processEvents()
+
+    def test_mouse_click_editor_round_trips_program_relative_coordinates(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.action_editor import ActionEditor
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            editor = ActionEditor(MacroRepository(Path(directory)))
+            editor.load_step(
+                {
+                    "action": "mouse_click",
+                    "coordinate_scope": "client",
+                    "window": "ahk_id 0xBEEF",
+                    "window_exe": "sample.exe",
+                    "window_hwnd": 48879,
+                    "x": 73,
+                    "y": 149,
+                }
+            )
+            step = editor.build_step()
+            self.assertEqual("client", step["coordinate_scope"])
+            self.assertEqual("sample.exe", step["window_exe"])
+            self.assertEqual("48879", step["window_hwnd"])
+            self.assertEqual((73, 149), (step["x"], step["y"]))
             editor.close()
         app.processEvents()
 

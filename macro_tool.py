@@ -318,6 +318,7 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "EnvGet, MacroRunProgressFile, MACRORELAY_PROGRESS_FILE",
         "EnvGet, MacroRunClickFile, MACRORELAY_CLICK_FILE",
         "EnvGet, MacroRunTraceFile, MACRORELAY_TRACE_FILE",
+        "EnvGet, MacroRunControlFile, MACRORELAY_CONTROL_FILE",
         'MacroRunStatus := "RUNNING"',
         "SetRunProgress(step) {",
         "    global MacroRunProgressFile",
@@ -353,7 +354,36 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "    StringReplace, cleanDetail, cleanDetail, `r, %A_Space%, All",
         "    StringReplace, cleanDetail, cleanDetail, `n, %A_Space%, All",
         "    FormatTime, traceStamp,, yyyy-MM-dd HH:mm:ss",
+        '    traceStamp .= "." . SubStr("00" . A_MSec, -2)',
         '    FileAppend, % traceStamp . "|" . step . "|" . status . "|" . cleanLabel . "|" . cleanDetail . "`n", %MacroRunTraceFile%, UTF-8',
+        "}",
+        "DebugCheckpoint(step) {",
+        "    global MacroRunControlFile",
+        "    if (MacroRunControlFile = \"\")",
+        "        return",
+        "    Loop",
+        "    {",
+        "        command := \"RUN\"",
+        "        if FileExist(MacroRunControlFile)",
+        "            FileRead, command, %MacroRunControlFile%",
+        "        StringReplace, command, command, `r, , All",
+        "        StringReplace, command, command, `n, , All",
+        "        StringUpper, command, command",
+        "        if (command = \"STOP\")",
+        "        {",
+        '            SetRunResult("FAILED", "USER_STOPPED", "사용자가 실행을 중단했습니다.")',
+        "            ExitApp, 3",
+        "        }",
+        "        if (command = \"STEP\")",
+        "        {",
+        "            FileDelete, %MacroRunControlFile%",
+        '            FileAppend, PAUSE, %MacroRunControlFile%, UTF-8',
+        "            return",
+        "        }",
+        "        if (command != \"PAUSE\")",
+        "            return",
+        "        Sleep, 60",
+        "    }",
         "}",
         "MacroRelayFinalize(exitReason, exitCode) {",
         "    global MacroRunStatus",
@@ -2429,6 +2459,7 @@ def render_image_search(
     # them as the current mouse position in MouseClick.
     lines.append('FoundX := ""')
     lines.append('FoundY := ""')
+    lines.append(f'MatchedImageName := "{ahk_quote(alias)}"')
     if len(asset_files) > 1:
         lines.append("MatchedImageIndex := 0")
     if engine == "opencv":
@@ -2593,6 +2624,10 @@ def render_image_search(
     lines.append("else")
     lines.append("{")
     lines.append(f"    {found_var} := 1")
+    for match_index, candidate_alias in enumerate(aliases, start=1):
+        prefix = "if" if match_index == 1 else "else if"
+        lines.append(f"    {prefix} (MatchedImageIndex = {match_index})")
+        lines.append(f'        MatchedImageName := "{ahk_quote(candidate_alias)}"')
     lines.append(f'    Log("image found on screen: {alias} at " . FoundX . "," . FoundY)')
     lines.append('    Log("image detected scale: x=" . Round(FoundScaleX, 3) . " y=" . Round(FoundScaleY, 3))')
     if click_info:
@@ -3893,6 +3928,7 @@ def render_macro_script(
 
         lines.append(f"; Step {count}: {label}")
         lines.append(f"Step{count}:")
+        lines.append(f"DebugCheckpoint({count})")
         lines.append(f"SetRunProgress({count})")
         lines.append(f'Log("step start: {count} | {ahk_quote(str(label))}")')
         lines.append(f'TraceStep({count}, "{ahk_quote(str(label))}", "START")')
@@ -3942,6 +3978,16 @@ def render_macro_script(
             lines.append(f"if ({found_var})")
             lines.append("{")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
+            if action == "image_search":
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; confidence=" . OpenCvBestScore . "; x=" . FoundX . "; y=" . FoundY . "; scale=" . Round(FoundScaleX, 3) . "x" . Round(FoundScaleY, 3))'
+                )
+            else:
+                store_var = normalize_variable_name(step.get("store_var"))
+                variable_detail = f' . "; var:{store_var}=" . {store_var}' if store_var else ""
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "text=" . OCR_LastText . "; confidence=" . OCR_LastConfidence . "; engine=" . OCR_LastEngine{variable_detail})'
+                )
             if has_repeat:
                 lines.append(f"    if (__rep{count} < {repeat_limit})")
                 lines.append("    {")
@@ -3969,6 +4015,14 @@ def render_macro_script(
             lines.append("else")
             lines.append("{")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "FAIL")')
+            if action == "image_search":
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; best_confidence=" . OpenCvBestScore . "; result=not_found")'
+                )
+            else:
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "text=" . OCR_LastText . "; confidence=" . OCR_LastConfidence . "; engine=" . OCR_LastEngine)'
+                )
             if has_repeat:
                 lines.append(f"    if (__rep{count} < {repeat_limit})")
                 lines.append("    {")
@@ -4009,6 +4063,12 @@ def render_macro_script(
             lines.append(f"Goto, Step{on_success}")
         elif action != "flow_control":
             lines.append(f'TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
+            if action in {"set_var", "calc_var"}:
+                variable = normalize_variable_name(step.get("name"))
+                if variable:
+                    lines.append(
+                        f'TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "var:{variable}=" . {variable})'
+                    )
             lines.extend(render_edge_conditions(step, count, "success"))
             if count >= total_steps:
                 lines.append("Return")

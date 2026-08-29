@@ -46,6 +46,10 @@ class MainWindow(QtWidgets.QMainWindow):
             int, tuple[str, object, Path | None, Path | None, Path | None]
         ] = {}
         self._seen_click_traces: dict[int, str] = {}
+        self._run_control_paths: dict[int, Path] = {}
+        self._run_trace_paths: dict[int, Path] = {}
+        self._trace_signatures: dict[int, tuple[int, int]] = {}
+        self._failure_capture_steps: set[tuple[int, int]] = set()
         self._run_monitor = QtCore.QTimer(self)
         self._run_monitor.setInterval(100)
         self._run_monitor.timeout.connect(self._poll_running_macros)
@@ -500,6 +504,8 @@ class MainWindow(QtWidgets.QMainWindow):
             result_path = getattr(process, "macrorelay_result_path", None)
             progress_path = getattr(process, "macrorelay_progress_path", None)
             click_path = getattr(process, "macrorelay_click_path", None)
+            control_path = getattr(process, "macrorelay_control_path", None)
+            trace_path = getattr(process, "macrorelay_trace_path", None)
             self._running_macro_processes[pid] = (
                 name,
                 process,
@@ -507,6 +513,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 progress_path if isinstance(progress_path, Path) else None,
                 click_path if isinstance(click_path, Path) else None,
             )
+            if isinstance(control_path, Path):
+                self._run_control_paths[pid] = control_path
+            if isinstance(trace_path, Path):
+                self._run_trace_paths[pid] = trace_path
+            builder = self.pages.get("builder")
+            clear_states = getattr(builder, "clear_execution_states", None)
+            if callable(clear_states):
+                clear_states()
             if not self._run_monitor.isActive():
                 self._run_monitor.start()
         self._update_macro_run_state()
@@ -552,11 +566,52 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_running_node(name, 0)
             self._running_macro_processes.pop(pid, None)
             self._seen_click_traces.pop(pid, None)
+            self._run_control_paths.pop(pid, None)
+            self._run_trace_paths.pop(pid, None)
+            self._trace_signatures.pop(pid, None)
+            self._failure_capture_steps = {key for key in self._failure_capture_steps if key[0] != pid}
             self._append_run_log(f"사용자 정지 완료 | {name} | PID {pid}", "WARN")
             stopped += 1
         self._run_monitor.stop()
         self._update_macro_run_state()
         self.show_status(f"실행 중인 매크로 {stopped}개를 정지했습니다.")
+
+    def _set_debug_command(self, command: str) -> bool:
+        command = str(command or "").strip().upper()
+        if command not in {"RUN", "PAUSE", "STEP", "STOP"} or not self._running_macro_processes:
+            return False
+        written = False
+        for path in self._run_control_paths.values():
+            try:
+                path.write_text(command, encoding="utf-8")
+                written = True
+            except OSError:
+                continue
+        return written
+
+    @QtCore.Slot()
+    def pause_running_macros(self) -> None:
+        if self._set_debug_command("PAUSE"):
+            self.show_status("다음 노드 실행 전에 일시정지합니다.")
+            self._append_run_log("디버거 일시정지 요청")
+        else:
+            self.show_status("일시정지할 매크로가 없습니다.")
+
+    @QtCore.Slot()
+    def step_running_macros(self) -> None:
+        if self._set_debug_command("STEP"):
+            self.show_status("다음 노드 한 단계만 실행합니다.")
+            self._append_run_log("디버거 한 단계 실행 요청")
+        else:
+            self.show_status("한 단계 실행할 매크로가 없습니다.")
+
+    @QtCore.Slot()
+    def resume_running_macros(self) -> None:
+        if self._set_debug_command("RUN"):
+            self.show_status("매크로 실행을 재개합니다.")
+            self._append_run_log("디버거 실행 재개 요청")
+        else:
+            self.show_status("재개할 매크로가 없습니다.")
 
     def _update_macro_run_state(self) -> None:
         builder = self.pages.get("builder")
@@ -576,6 +631,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 finished.append(pid)
                 continue
             self._set_running_node(name, self._read_macro_progress(progress_path))
+            self._update_execution_trace(pid, name)
             click_found = self._update_recent_click_preview(pid, click_path)
             if return_code is None:
                 continue
@@ -591,6 +647,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 level,
             )
             if status == "FAILED":
+                if not any(key[0] == pid for key in self._failure_capture_steps):
+                    failure_capture = self._capture_failure_screen(name)
+                    if failure_capture is not None:
+                        self._append_trace_event(pid, 0, "CAPTURE", "실패 화면", str(failure_capture))
+                        self._append_run_log(f"실패 화면 저장 | {failure_capture}", "ERROR")
                 self.show_status(f"'{name}' 실행 실패 · {detail} · 로그를 확인하세요.")
             elif status == "PARTIAL":
                 self.show_status(f"'{name}' 일부 완료 · {detail}")
@@ -605,6 +666,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for pid in finished:
             self._running_macro_processes.pop(pid, None)
             self._seen_click_traces.pop(pid, None)
+            self._run_control_paths.pop(pid, None)
+            self._run_trace_paths.pop(pid, None)
+            self._trace_signatures.pop(pid, None)
+            self._failure_capture_steps = {key for key in self._failure_capture_steps if key[0] != pid}
         if not self._running_macro_processes:
             self._run_monitor.stop()
         self._update_macro_run_state()
@@ -632,12 +697,111 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._seen_click_traces.get(pid) == raw:
             return True
         self._seen_click_traces[pid] = raw
+        step = self._read_macro_progress(
+            self._running_macro_processes.get(pid, ("", None, None, None, None))[3]
+            if pid in self._running_macro_processes
+            else None
+        )
+        self._append_trace_event(pid, step, "DETAIL", "실제 클릭", f"click_x={x}; click_y={y}; kind={kind.strip()}")
         pixmap = self._capture_click_area(x, y)
         builder = self.pages.get("builder")
         show_preview = getattr(builder, "show_recent_click_preview", None)
         if pixmap is not None and callable(show_preview):
             show_preview(pixmap, x, y, kind.strip())
         return True
+
+    def _append_trace_event(self, pid: int, step: int, status: str, label: str, detail: str) -> None:
+        path = self._run_trace_paths.get(pid)
+        if path is None:
+            return
+        clean_label = str(label).replace("|", "/").replace("\n", " ")
+        clean_detail = str(detail).replace("|", "/").replace("\n", " ")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{timestamp}|{int(step)}|{status}|{clean_label}|{clean_detail}\n")
+        except OSError:
+            pass
+
+    def _update_execution_trace(self, pid: int, display_name: str) -> None:
+        path = self._run_trace_paths.get(pid)
+        if path is None or not path.is_file():
+            return
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            if self._trace_signatures.get(pid) == signature:
+                return
+            self._trace_signatures[pid] = signature
+            lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        except OSError:
+            return
+        starts: dict[int, datetime] = {}
+        states: dict[int, dict[str, object]] = {}
+        newly_failed: list[int] = []
+        for raw in lines:
+            parts = raw.split("|", 4)
+            if len(parts) != 5:
+                continue
+            stamp_text, step_text, status, _label, detail = parts
+            try:
+                step = int(step_text)
+                stamp = datetime.fromisoformat(stamp_text)
+            except (TypeError, ValueError):
+                continue
+            if step <= 0:
+                continue
+            normalized = status.strip().upper()
+            if normalized == "START":
+                starts[step] = stamp
+                states[step] = {"status": "RUNNING", "duration_ms": 0, "detail": ""}
+            elif normalized in {"SUCCESS", "FAIL"}:
+                started = starts.get(step, stamp)
+                states[step] = {
+                    "status": normalized,
+                    "duration_ms": max(0, round((stamp - started).total_seconds() * 1000)),
+                    "detail": states.get(step, {}).get("detail", ""),
+                }
+                if normalized == "FAIL" and (pid, step) not in self._failure_capture_steps:
+                    newly_failed.append(step)
+            elif normalized == "DETAIL":
+                state = states.setdefault(step, {"status": "RUNNING", "duration_ms": 0, "detail": ""})
+                state["detail"] = detail
+        builder = self.pages.get("builder")
+        macro_name = str(display_name).split(" · ", 1)[0]
+        if str(getattr(builder, "current_name", "")) != macro_name:
+            return
+        setter = getattr(builder, "set_execution_states", None)
+        if callable(setter):
+            setter(states)
+        for step in newly_failed:
+            self._failure_capture_steps.add((pid, step))
+            failure_capture = self._capture_failure_screen(f"{display_name}-node-{step}")
+            if failure_capture is not None:
+                self._append_trace_event(pid, step, "CAPTURE", "실패 화면", str(failure_capture))
+                self._append_run_log(f"{step}번 노드 실패 화면 저장 | {failure_capture}", "ERROR")
+
+    def _capture_failure_screen(self, name: str) -> Path | None:
+        screens = QtGui.QGuiApplication.screens()
+        if not screens:
+            return None
+        geometry = QtCore.QRect()
+        for screen in screens:
+            geometry = geometry.united(screen.geometry())
+        if not geometry.isValid():
+            return None
+        canvas = QtGui.QPixmap(geometry.size())
+        canvas.fill(QtGui.QColor("#000000"))
+        painter = QtGui.QPainter(canvas)
+        for screen in screens:
+            shot = screen.grabWindow(0)
+            painter.drawPixmap(screen.geometry().topLeft() - geometry.topLeft(), shot)
+        painter.end()
+        folder = self.repository.exports_dir / "failure_captures"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        destination = folder / f"{stamp}-{self.repository.safe_name(name)}.png"
+        return destination if canvas.save(str(destination), "PNG") else None
 
     @staticmethod
     def _capture_click_area(x: int, y: int) -> QtGui.QPixmap | None:

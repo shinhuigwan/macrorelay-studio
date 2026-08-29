@@ -2210,8 +2210,14 @@ class UiSmokeTests(unittest.TestCase):
                 builder.inactive_handle_lab_btn.geometry().right(),
             )
             self.assertIn("▶ 선택 단계 테스트", labels)
-            self.assertIn("블록 저장", labels)
-            self.assertIn("＋ 블록 추가", labels)
+            self.assertIn("⧉ 노드 복제", labels)
+            self.assertNotIn("노드 보관", labels)
+            menu_labels = {action.text() for action in builder.node_more_menu.actions()}
+            self.assertIn("순차 연결", menu_labels)
+            self.assertIn("시작 노드로 지정", menu_labels)
+            self.assertIn("종료 노드로 지정", menu_labels)
+            self.assertIn("선택 노드를 블록으로 저장", menu_labels)
+            self.assertIn("저장된 블록 추가", menu_labels)
             window.close()
 
     def test_start_search_group_and_selected_success_node_insertion(self) -> None:
@@ -2658,11 +2664,12 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(picker.preview_scroll.isVisibleTo(editor))
             offset_editor = editor.widgets["image_search"]["click.offset"]
             self.assertTrue(offset_editor.asset_row.isVisibleTo(editor))
-            self.assertEqual(2, offset_editor.asset_selector.count())
-            offset_editor.asset_selector.setCurrentIndex(offset_editor.asset_selector.findData("둘째 이미지"))
+            self.assertEqual({"첫 이미지", "둘째 이미지"}, set(offset_editor.asset_buttons))
+            offset_editor._select_multi_asset("둘째 이미지")
             offset_editor.canvas.set_offset(-24, 35)
-            self.assertIn("둘째 이미지", offset_editor.asset_selector.currentText())
-            offset_editor.asset_selector.setCurrentIndex(offset_editor.asset_selector.findData("첫 이미지"))
+            self.assertTrue(offset_editor.asset_buttons["둘째 이미지"].isChecked())
+            self.assertIn("X -24 · Y +35", offset_editor.asset_buttons["둘째 이미지"].text())
+            offset_editor._select_multi_asset("첫 이미지")
             offset_editor.canvas.set_offset(21, -7)
             self.assertTrue(editor.widgets["image_search"]["click.click_offset"].isChecked())
             self.assertTrue(editor.widgets["image_search"]["click_enabled"].isChecked())
@@ -2673,7 +2680,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(step["click"]["click_offset"])
             self.assertEqual("opencv", step["engine"])
             editor.load_step(step)
-            offset_editor.asset_selector.setCurrentIndex(offset_editor.asset_selector.findData("둘째 이미지"))
+            offset_editor._select_multi_asset("둘째 이미지")
             self.assertEqual([-24, 35], offset_editor.value())
             editor.close()
         app.processEvents()

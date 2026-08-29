@@ -977,6 +977,19 @@ class OffsetCanvas(QtWidgets.QWidget):
         )
 
 
+class HorizontalWheelScrollArea(QtWidgets.QScrollArea):
+    """Use the mouse wheel to move a compact horizontal thumbnail strip."""
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        bar = self.horizontalScrollBar()
+        delta = event.angleDelta().y() or event.angleDelta().x()
+        if delta:
+            bar.setValue(bar.value() - round(delta / 120) * 170)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+
 class OffsetEditor(QtWidgets.QWidget):
     offset_picked = QtCore.Signal()
     multi_offset_edited = QtCore.Signal()
@@ -989,15 +1002,51 @@ class OffsetEditor(QtWidgets.QWidget):
         self.canvas = OffsetCanvas()
         self._multi_paths: dict[str, Path] = {}
         self._multi_offsets: dict[str, list[int]] = {}
+        self._active_alias = ""
+        self.asset_buttons: dict[str, QtWidgets.QToolButton] = {}
         self._switching_asset = False
         self.asset_row = QtWidgets.QWidget()
-        asset_layout = QtWidgets.QHBoxLayout(self.asset_row)
+        asset_layout = QtWidgets.QVBoxLayout(self.asset_row)
         asset_layout.setContentsMargins(0, 0, 0, 0)
-        asset_layout.addWidget(QtWidgets.QLabel("오프셋 설정 이미지"))
-        self.asset_selector = QtWidgets.QComboBox()
-        self.asset_selector.setMinimumWidth(240)
-        asset_layout.addWidget(self.asset_selector, 1)
-        asset_layout.addWidget(QtWidgets.QLabel("이미지를 바꾸면 각 클릭점이 따로 저장됩니다."))
+        asset_layout.setSpacing(5)
+        asset_header = QtWidgets.QHBoxLayout()
+        asset_title = QtWidgets.QLabel("오프셋 설정 이미지")
+        asset_title.setStyleSheet("font-weight: 700;")
+        asset_hint = QtWidgets.QLabel("이미지를 눌러 각각의 클릭점을 설정하세요 · Alt+←/→")
+        asset_hint.setObjectName("Muted")
+        asset_header.addWidget(asset_title)
+        asset_header.addSpacing(8)
+        asset_header.addWidget(asset_hint)
+        asset_header.addStretch(1)
+        asset_layout.addLayout(asset_header)
+        asset_strip = QtWidgets.QHBoxLayout()
+        asset_strip.setContentsMargins(0, 0, 0, 0)
+        asset_strip.setSpacing(5)
+        self.asset_previous = QtWidgets.QToolButton()
+        self.asset_previous.setText("‹")
+        self.asset_previous.setToolTip("이전 이미지 (Alt+←)")
+        self.asset_previous.setFixedSize(30, 112)
+        self.asset_previous.clicked.connect(lambda: self._select_relative_asset(-1))
+        self.asset_next = QtWidgets.QToolButton()
+        self.asset_next.setText("›")
+        self.asset_next.setToolTip("다음 이미지 (Alt+→)")
+        self.asset_next.setFixedSize(30, 112)
+        self.asset_next.clicked.connect(lambda: self._select_relative_asset(1))
+        self.asset_scroll = HorizontalWheelScrollArea()
+        self.asset_scroll.setWidgetResizable(False)
+        self.asset_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.asset_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.asset_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.asset_scroll.setFixedHeight(112)
+        self.asset_body = QtWidgets.QWidget()
+        self.asset_cards_layout = QtWidgets.QHBoxLayout(self.asset_body)
+        self.asset_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.asset_cards_layout.setSpacing(7)
+        self.asset_scroll.setWidget(self.asset_body)
+        asset_strip.addWidget(self.asset_previous)
+        asset_strip.addWidget(self.asset_scroll, 1)
+        asset_strip.addWidget(self.asset_next)
+        asset_layout.addLayout(asset_strip)
         self.asset_row.setVisible(False)
         self.label = QtWidgets.QLabel("이미지 중심")
         self.label.setObjectName("Muted")
@@ -1044,7 +1093,10 @@ class OffsetEditor(QtWidgets.QWidget):
         self.range_combo.currentIndexChanged.connect(self._change_view_range)
         self.zoom_combo.currentIndexChanged.connect(self._change_preview_zoom)
         self.canvas.offset_changed.connect(self._store_active_multi_offset)
-        self.asset_selector.currentIndexChanged.connect(self._switch_multi_asset)
+        self.previous_asset_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Alt+Left"), self)
+        self.next_asset_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Alt+Right"), self)
+        self.previous_asset_shortcut.activated.connect(lambda: self._select_relative_asset(-1))
+        self.next_asset_shortcut.activated.connect(lambda: self._select_relative_asset(1))
 
     def set_value(self, value: Any) -> None:
         values = value if isinstance(value, (list, tuple)) else [0, 0]
@@ -1059,45 +1111,118 @@ class OffsetEditor(QtWidgets.QWidget):
         self.canvas.set_preview(path)
 
     def set_multi_assets(self, entries: list[tuple[str, Path]], offsets: dict[str, list[int]]) -> None:
-        previous = str(self.asset_selector.currentData() or "")
+        previous = self._active_alias
         self._multi_paths = {alias: Path(path) for alias, path in entries}
         self._multi_offsets = {
             alias: list(offsets.get(alias, [0, 0]))[:2]
             for alias, _path in entries
         }
-        blocker = QtCore.QSignalBlocker(self.asset_selector)
-        self.asset_selector.clear()
-        for alias, _path in entries:
-            self.asset_selector.addItem(alias, alias)
-        index = self.asset_selector.findData(previous)
-        self.asset_selector.setCurrentIndex(index if index >= 0 else 0)
-        del blocker
+        self._rebuild_asset_cards()
         self.asset_row.setVisible(len(entries) > 1)
-        self._switch_multi_asset(self.asset_selector.currentIndex())
+        aliases = list(self._multi_paths)
+        self._select_multi_asset(previous if previous in self._multi_paths else (aliases[0] if aliases else ""))
 
     def clear_multi_assets(self) -> None:
         self._multi_paths = {}
         self._multi_offsets = {}
+        self._active_alias = ""
+        self._clear_asset_cards()
         self.asset_row.setVisible(False)
 
     def multi_offsets(self) -> dict[str, list[int]]:
         return {alias: list(value) for alias, value in self._multi_offsets.items()}
 
-    def _switch_multi_asset(self, _index: int) -> None:
-        alias = str(self.asset_selector.currentData() or "")
+    def _clear_asset_cards(self) -> None:
+        while self.asset_cards_layout.count():
+            item = self.asset_cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.asset_buttons = {}
+
+    def _rebuild_asset_cards(self) -> None:
+        self._clear_asset_cards()
+        for alias, path in self._multi_paths.items():
+            button = QtWidgets.QToolButton()
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
+            button.setFixedSize(154, 106)
+            button.setIconSize(QtCore.QSize(136, 64))
+            button.setCursor(QtCore.Qt.PointingHandCursor)
+            button.setStyleSheet(
+                "QToolButton { color:#DCE6F3; background:#111722; border:1px solid #334158;"
+                " border-radius:8px; padding:4px; }"
+                "QToolButton:hover { background:#172130; border-color:#5D718C; }"
+                "QToolButton:checked { background:#142B35; border:3px solid #36DCE8; padding:2px; }"
+            )
+            pixmap = QtGui.QPixmap(str(path))
+            if not pixmap.isNull():
+                shown = pixmap.scaled(136, 64, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                button.setIcon(QtGui.QIcon(shown))
+            button.clicked.connect(lambda _checked=False, name=alias: self._select_multi_asset(name))
+            self.asset_cards_layout.addWidget(button)
+            self.asset_buttons[alias] = button
+            self._refresh_asset_card(alias)
+        self.asset_cards_layout.addStretch(1)
+        width = max(1, len(self.asset_buttons) * 161)
+        self.asset_body.setMinimumWidth(width)
+        self.asset_body.resize(width, 106)
+        enabled = len(self.asset_buttons) > 1
+        self.asset_previous.setEnabled(enabled)
+        self.asset_next.setEnabled(enabled)
+
+    @staticmethod
+    def _offset_summary(offset: list[int]) -> str:
+        x, y = (list(offset) + [0, 0])[:2]
+        if not x and not y:
+            return "중앙"
+        return f"X {int(x):+d} · Y {int(y):+d}"
+
+    def _refresh_asset_card(self, alias: str) -> None:
+        button = self.asset_buttons.get(alias)
+        if button is None:
+            return
+        offset = self._multi_offsets.get(alias, [0, 0])
+        configured = bool(int(offset[0] or 0) or int(offset[1] or 0))
+        name = QtGui.QFontMetrics(button.font()).elidedText(alias, QtCore.Qt.ElideRight, 138)
+        summary = self._offset_summary(offset)
+        button.setText(f"{name}\n{'✓ ' if configured else ''}{summary}")
+        button.setToolTip(f"{alias}\n클릭 위치: {summary}")
+
+    def _select_multi_asset(self, alias: str) -> None:
         if not alias or alias not in self._multi_paths:
             return
+        self._active_alias = alias
         self._switching_asset = True
         self.canvas.set_preview(self._multi_paths[alias])
         self.set_value(self._multi_offsets.get(alias, [0, 0]))
         self._switching_asset = False
+        for name, button in self.asset_buttons.items():
+            blocker = QtCore.QSignalBlocker(button)
+            button.setChecked(name == alias)
+            del blocker
+        button = self.asset_buttons.get(alias)
+        if button is not None:
+            self.asset_scroll.ensureWidgetVisible(button, 8, 0)
+
+    def _select_relative_asset(self, delta: int) -> None:
+        aliases = list(self._multi_paths)
+        if len(aliases) < 2:
+            return
+        try:
+            current = aliases.index(self._active_alias)
+        except ValueError:
+            current = 0
+        self._select_multi_asset(aliases[(current + delta) % len(aliases)])
 
     def _store_active_multi_offset(self, x: int, y: int) -> None:
         if self._switching_asset:
             return
-        alias = str(self.asset_selector.currentData() or "")
+        alias = self._active_alias
         if alias and alias in self._multi_paths:
             self._multi_offsets[alias] = [int(x), int(y)]
+            self._refresh_asset_card(alias)
             self.multi_offset_edited.emit()
 
     def _pick_from_screen(self) -> None:

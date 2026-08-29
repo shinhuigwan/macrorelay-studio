@@ -4429,6 +4429,12 @@ class RemoteFeatureTests(unittest.TestCase):
             migrated = load_config(root)
             self.assertTrue(migrated["enabled"])
             self.assertEqual("https://relay.example.workers.dev", migrated["relay_url"])
+            self.assertEqual("secret", migrated["device_secret"])
+            saved = json.loads((root / "remote_config.json").read_text(encoding="utf-8"))
+            self.assertNotIn("device_secret", saved)
+            from macro_studio.credential_vault import CredentialVault
+
+            self.assertEqual("secret", CredentialVault(root).get("macrorelay.remote.device_secret"))
 
     def test_remote_controller_recognizes_only_loopback_relay_as_local(self):
         from macro_studio.remote import RemoteController

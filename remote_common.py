@@ -16,6 +16,26 @@ from typing import Any
 
 
 DEFAULT_RELAY_URL = "http://127.0.0.1:8765"
+REMOTE_SECRET_NAME = "macrorelay.remote.device_secret"
+
+
+def _vault_secret(root: Path, value: str | None = None) -> str:
+    """Read/write the remote device secret using the Studio DPAPI vault.
+
+    The import remains optional because remote_common.py is also copied into
+    lightweight notification bundles. Studio installations on Windows always
+    have the vault module and therefore never need the plaintext fallback.
+    """
+    try:
+        from macro_studio.credential_vault import CredentialVault
+
+        vault = CredentialVault(root)
+        if value is not None:
+            vault.set(REMOTE_SECRET_NAME, value)
+            return value
+        return vault.get(REMOTE_SECRET_NAME)
+    except Exception:
+        return ""
 
 
 def bundled_cloud_url(root: Path | None = None) -> str:
@@ -49,7 +69,8 @@ def default_config() -> dict[str, Any]:
 
 
 def load_config(root: Path | None = None, create: bool = True) -> dict[str, Any]:
-    path = config_path(root)
+    root_path = (root or Path(__file__).resolve().parent).resolve()
+    path = config_path(root_path)
     payload: dict[str, Any] = {}
     if path.is_file():
         try:
@@ -59,10 +80,26 @@ def load_config(root: Path | None = None, create: bool = True) -> dict[str, Any]
         except (OSError, ValueError):
             payload = {}
     changed = False
-    for key, value in default_config().items():
+    defaults = default_config()
+    generated_secret = str(defaults.pop("device_secret"))
+    for key, value in defaults.items():
         if key not in payload:
             payload[key] = value
             changed = True
+    plaintext_secret = str(payload.pop("device_secret", "") or "").strip()
+    secured_secret = _vault_secret(root_path)
+    if not secured_secret:
+        secured_secret = plaintext_secret or generated_secret
+        if create and _vault_secret(root_path, secured_secret):
+            changed = True
+        elif plaintext_secret:
+            # Non-Windows/standalone compatibility fallback. Studio on
+            # Windows never takes this branch because DPAPI is available.
+            payload["device_secret"] = plaintext_secret
+    elif plaintext_secret:
+        # Existing plaintext configuration has now been migrated.
+        changed = True
+    payload["device_secret"] = secured_secret
     cloud_url = bundled_cloud_url(root)
     configured_url = str(payload.get("relay_url") or "").rstrip("/")
     if payload.get("prefer_cloud", True) and cloud_url and configured_url in {"", DEFAULT_RELAY_URL}:
@@ -75,12 +112,17 @@ def load_config(root: Path | None = None, create: bool = True) -> dict[str, Any]
 
 
 def save_config(payload: dict[str, Any], root: Path | None = None) -> Path:
-    path = config_path(root)
+    root_path = (root or Path(__file__).resolve().parent).resolve()
+    path = config_path(root_path)
+    stored = dict(payload)
+    secret = str(stored.pop("device_secret", "") or "").strip()
+    if secret and not _vault_secret(root_path, secret):
+        stored["device_secret"] = secret
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            json.dump(stored, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
         os.replace(temp_name, path)
     except Exception:

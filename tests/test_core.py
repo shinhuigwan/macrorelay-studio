@@ -1127,6 +1127,23 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertAlmostEqual(1.2, report["results"][1]["scale_x"])
 
 
+class CredentialVaultTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows DPAPI required")
+    def test_secret_round_trip_is_encrypted_on_disk(self) -> None:
+        from macro_studio.credential_vault import CredentialVault
+
+        with tempfile.TemporaryDirectory() as directory:
+            vault = CredentialVault(Path(directory))
+            vault.set("telegram_token", "very-secret-value")
+            self.assertEqual(["telegram_token"], vault.names())
+            self.assertEqual("very-secret-value", vault.get("telegram_token"))
+            encrypted_files = list((Path(directory) / ".vault").glob("*.bin"))
+            self.assertEqual(1, len(encrypted_files))
+            self.assertNotIn(b"very-secret-value", encrypted_files[0].read_bytes())
+            vault.delete("telegram_token")
+            self.assertEqual([], vault.names())
+
+
 class DiagnosticBundleTests(unittest.TestCase):
     def setUp(self) -> None:
         import macro_tool
@@ -2879,6 +2896,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("150 ms", dialog.timeline_table.item(0, 3).text())
             self.assertEqual("count", dialog.variable_table.item(0, 0).text())
             self.assertEqual("3", dialog.variable_table.item(0, 1).text())
+            self.assertEqual(1, dialog.performance_table.rowCount())
+            self.assertIn("평균", dialog.performance_summary.text())
             self.assertIn("1번 노드 반복 횟수 → 3", dialog._variable_impact("count", "3"))
             self.assertIn("조건 성립", dialog._variable_impact("count", "3"))
             dialog.debug_control_buttons[0].click()

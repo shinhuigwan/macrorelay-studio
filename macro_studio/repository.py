@@ -92,6 +92,11 @@ class MacroRepository:
     def macro_path(self, name: str) -> Path:
         return self.macros_dir / f"{self.safe_name(name)}.json"
 
+    def credential_vault(self):
+        from .credential_vault import CredentialVault
+
+        return CredentialVault(self.root)
+
     def list_macros(self) -> list[MacroSummary]:
         summaries: list[MacroSummary] = []
         for path in self.macros_dir.glob("*.json"):

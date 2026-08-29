@@ -94,6 +94,22 @@ class MacroLogDialog(QtWidgets.QDialog):
         debugger_split.addWidget(self.variable_table)
         debugger_split.setSizes([680, 240])
         debugger_layout.addWidget(debugger_split)
+        performance_box = QtWidgets.QGroupBox("성능 분석")
+        performance_layout = QtWidgets.QVBoxLayout(performance_box)
+        self.performance_summary = QtWidgets.QLabel("실행 데이터가 쌓이면 느린 노드와 실패율을 분석합니다.")
+        self.performance_summary.setObjectName("Muted")
+        self.performance_summary.setWordWrap(True)
+        self.performance_table = QtWidgets.QTableWidget(0, 6)
+        self.performance_table.setHorizontalHeaderLabels(["노드", "동작", "실행", "평균", "최대", "실패율"])
+        self.performance_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.performance_table.verticalHeader().setVisible(False)
+        for column in (0, 2, 3, 4, 5):
+            self.performance_table.horizontalHeader().setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeToContents)
+        self.performance_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.performance_table.setMaximumHeight(170)
+        performance_layout.addWidget(self.performance_summary)
+        performance_layout.addWidget(self.performance_table)
+        debugger_layout.addWidget(performance_box)
         root.addWidget(debugger, 1)
 
         controls = QtWidgets.QHBoxLayout()
@@ -384,6 +400,40 @@ class MacroLogDialog(QtWidgets.QDialog):
         for row_index, (name, value) in enumerate(sorted(variables.items())):
             self.variable_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(name))
             self.variable_table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(value))
+        aggregates: dict[tuple[int, str], dict[str, int]] = {}
+        for row in rows:
+            status = str(row.get("status") or "")
+            if status == "RUNNING":
+                continue
+            key = (int(row.get("step") or 0), str(row.get("label") or ""))
+            item = aggregates.setdefault(key, {"count": 0, "total": 0, "max": 0, "fail": 0})
+            duration = int(row.get("duration") or 0)
+            item["count"] += 1
+            item["total"] += duration
+            item["max"] = max(item["max"], duration)
+            item["fail"] += int(status == "FAIL")
+        ranked = sorted(aggregates.items(), key=lambda entry: entry[1]["total"] / max(1, entry[1]["count"]), reverse=True)
+        self.performance_table.setRowCount(len(ranked))
+        for row_index, ((step, label), item) in enumerate(ranked):
+            average = round(item["total"] / max(1, item["count"]))
+            failure_rate = item["fail"] / max(1, item["count"])
+            values = [str(step), label, str(item["count"]), f"{average} ms", f"{item['max']} ms", f"{failure_rate:.0%}"]
+            for column, value in enumerate(values):
+                cell = QtWidgets.QTableWidgetItem(value)
+                if column == 5 and failure_rate > 0:
+                    cell.setForeground(QtGui.QColor(COLORS["danger"]))
+                self.performance_table.setItem(row_index, column, cell)
+        total_runs = sum(item["count"] for item in aggregates.values())
+        total_failures = sum(item["fail"] for item in aggregates.values())
+        slowest = ranked[0] if ranked else None
+        slow_text = (
+            f"가장 느린 노드: {slowest[0][0]}번 {slowest[0][1]} · 평균 {round(slowest[1]['total'] / max(1, slowest[1]['count']))} ms"
+            if slowest
+            else "분석할 완료 노드가 없습니다."
+        )
+        self.performance_summary.setText(
+            f"{slow_text}  ·  전체 {total_runs}회  ·  실패 {total_failures}회 ({total_failures / max(1, total_runs):.0%})"
+        )
         current = next((row for row in reversed(rows) if row.get("status") == "RUNNING"), None)
         if current is not None:
             self.debug_status.setText(f"● {current['step']}번 노드 실행 중 · {current['label']}")

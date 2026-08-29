@@ -76,6 +76,10 @@ class VisionState:
         self.cache_limit = max(4, int(cache_limit))
         self.cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self.last_hits: dict[str, tuple[int, int, int, int]] = {}
+        self.frame_cache: OrderedDict[tuple[Any, ...], tuple[float, Any]] = OrderedDict()
+        self.frame_cache_limit = 12
+        self.capture_count = 0
+        self.capture_reuse_count = 0
         self.started = time.time()
         self.last_activity = self.started
         self.request_count = 0
@@ -83,6 +87,7 @@ class VisionState:
         self._cv2 = None
         self._np = None
         self._grabber = None
+        self._psutil = None
 
     def _modules(self):
         if self._cv2 is None or self._np is None:
@@ -102,6 +107,44 @@ class VisionState:
             except Exception:
                 self._grabber = False
         return self._cv2, self._np
+
+    def _capture(
+        self,
+        region: tuple[int, int, int, int],
+        context: str = "screen",
+        cache_ms: int = 45,
+    ) -> tuple[Any, bool]:
+        key = (*region, str(context or "screen"))
+        now = time.perf_counter()
+        cached = self.frame_cache.get(key)
+        if cached is not None and cache_ms > 0 and (now - cached[0]) * 1000 <= cache_ms:
+            self.frame_cache.move_to_end(key)
+            self.capture_reuse_count += 1
+            return cached[1], True
+        left, top, right, bottom = region
+        frame = search.capture_region(left, top, right, bottom, self._grabber or None)
+        self.capture_count += 1
+        if frame is not None:
+            self.frame_cache[key] = (now, frame)
+            while len(self.frame_cache) > self.frame_cache_limit:
+                self.frame_cache.popitem(last=False)
+        return frame, False
+
+    def _adaptive_poll(self, poll_ms: int) -> tuple[int, float]:
+        cpu = 0.0
+        try:
+            if self._psutil is None:
+                import psutil  # type: ignore
+
+                self._psutil = psutil
+            cpu = float(self._psutil.cpu_percent(interval=None))
+        except Exception:
+            self._psutil = False
+        if cpu >= 85:
+            return max(poll_ms, int(poll_ms * 1.8)), cpu
+        if cpu >= 70:
+            return max(poll_ms, int(poll_ms * 1.35)), cpu
+        return poll_ms, cpu
 
     def _template(self, image_path: str, profile: str) -> tuple[dict[str, Any], bool]:
         cv2, np = self._modules()
@@ -203,9 +246,11 @@ class VisionState:
         prepared: dict[str, Any],
         threshold: float,
         profile: str,
+        context: str = "screen",
+        cache_ms: int = 45,
     ):
         left, top, right, bottom = region
-        frame = search.capture_region(left, top, right, bottom, self._grabber or None)
+        frame, _reused = self._capture(region, context, cache_ms)
         if frame is None:
             return None, 0.0
         match, score = self._match(frame, prepared, threshold, profile)
@@ -229,6 +274,8 @@ class VisionState:
         timeout_ms: int,
         poll_ms: int,
         started: float,
+        context: str = "screen",
+        cache_ms: int = 45,
     ) -> dict[str, Any]:
         prepared_items: list[tuple[dict[str, Any], bool]] = [
             self._template(path, profile) for path in image_paths
@@ -242,7 +289,7 @@ class VisionState:
             for left, top, right, bottom in regions:
                 # Capture each region once, then compare every registered
                 # template against that immutable frame.
-                frame = search.capture_region(left, top, right, bottom, self._grabber or None)
+                frame, _reused = self._capture((left, top, right, bottom), context, cache_ms)
                 if frame is None:
                     continue
                 for index, (prepared, _cache_hit) in enumerate(prepared_items):
@@ -291,7 +338,8 @@ class VisionState:
                 }
             if timeout_ms <= 0 or time.perf_counter() >= deadline:
                 break
-            remaining = max(0.0, poll_ms / 1000.0 - (time.perf_counter() - cycle_started))
+            adaptive_poll, cpu = self._adaptive_poll(poll_ms)
+            remaining = max(0.0, adaptive_poll / 1000.0 - (time.perf_counter() - cycle_started))
             if remaining:
                 time.sleep(remaining)
         return {
@@ -301,6 +349,27 @@ class VisionState:
             "image_count": len(prepared_items),
             "profile": profile,
             "cache_hit": all(hit for _prepared, hit in prepared_items),
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "adaptive_poll_ms": self._adaptive_poll(poll_ms)[0],
+        }
+
+    def preload(self, request: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        profile = str(request.get("profile") or "balanced").lower()
+        raw_images = request.get("images")
+        images = [str(value) for value in raw_images if str(value).strip()] if isinstance(raw_images, list) else []
+        loaded = 0
+        hits = 0
+        with self._lock:
+            self.last_activity = time.time()
+            for path in dict.fromkeys(images):
+                _prepared, cache_hit = self._template(path, profile)
+                loaded += 1
+                hits += int(cache_hit)
+        return {
+            "ok": True,
+            "loaded": loaded,
+            "already_cached": hits,
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
         }
 
@@ -407,6 +476,8 @@ class VisionState:
             threshold = max(0.5, min(0.99, float(request.get("threshold") or 0.86)))
             timeout_ms = max(0, int(request.get("timeout") or 0))
             poll_ms = max(10, int(request.get("poll") or 60))
+            cache_ms = max(0, min(250, int(request.get("capture_cache_ms") or 45)))
+            context = str(request.get("capture_context") or request.get("window") or "screen")
             regions = self._regions(request.get("regions"))
             raw_images = request.get("images")
             image_paths = list(
@@ -424,6 +495,8 @@ class VisionState:
                     timeout_ms,
                     poll_ms,
                     started,
+                    context,
+                    cache_ms,
                 )
             prepared, cache_hit = self._template(image_path, profile)
             self._modules()
@@ -455,7 +528,7 @@ class VisionState:
                     if region in seen:
                         continue
                     seen.add(region)
-                    match, score = self._search_region(region, prepared, threshold, profile)
+                    match, score = self._search_region(region, prepared, threshold, profile, context, cache_ms)
                     best_score = max(best_score, score)
                     if match is not None:
                         confidence, center_x, center_y, width, height = match
@@ -475,7 +548,8 @@ class VisionState:
                         }
                 if timeout_ms <= 0 or time.perf_counter() >= deadline:
                     break
-                remaining = max(0.0, poll_ms / 1000.0 - (time.perf_counter() - cycle_started))
+                adaptive_poll, cpu = self._adaptive_poll(poll_ms)
+                remaining = max(0.0, adaptive_poll / 1000.0 - (time.perf_counter() - cycle_started))
                 if remaining:
                     time.sleep(remaining)
             return {
@@ -485,6 +559,7 @@ class VisionState:
                 "profile": profile,
                 "cache_hit": cache_hit,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                "adaptive_poll_ms": self._adaptive_poll(poll_ms)[0],
             }
 
     def status(self) -> dict[str, Any]:
@@ -495,6 +570,9 @@ class VisionState:
             "idle_seconds": round(time.time() - self.last_activity, 1),
             "request_count": self.request_count,
             "template_cache_count": len(self.cache),
+            "frame_cache_count": len(self.frame_cache),
+            "capture_count": self.capture_count,
+            "capture_reuse_count": self.capture_reuse_count,
         }
 
     def close(self) -> None:
@@ -528,6 +606,8 @@ class VisionHandler(socketserver.StreamRequestHandler):
                 response = self.server.state.status()
             elif command == "search":
                 response = self.server.state.search(request)
+            elif command == "preload":
+                response = self.server.state.preload(request)
             elif command == "benchmark":
                 response = self.server.state.benchmark(request)
             elif command == "shutdown":

@@ -183,6 +183,12 @@ class MainWindow(QtWidgets.QMainWindow):
             step_signal = getattr(page, "run_macro_step", None)
             if step_signal is not None:
                 step_signal.connect(self.run_macro_step)
+            resume_step_signal = getattr(page, "run_macro_from_step", None)
+            if resume_step_signal is not None:
+                resume_step_signal.connect(self.run_macro_from_step)
+            dry_run_signal = getattr(page, "run_macro_dry_run", None)
+            if dry_run_signal is not None:
+                dry_run_signal.connect(self.run_macro_dry_run)
             changed = getattr(page, "data_changed", None)
             if changed is not None:
                 changed.connect(self.refresh_all)
@@ -499,9 +505,40 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._track_macro_process(display_name, process)
 
+    @QtCore.Slot(str, int)
+    def run_macro_from_step(self, name: str, step_index: int) -> None:
+        if self._running_macro_processes:
+            self.show_status("이미 매크로가 실행 중입니다. 먼저 ■ 정지를 눌러 주세요.")
+            return
+        self._append_run_log(f"선택 노드부터 실행 요청 | {name} | {step_index}번")
+        try:
+            process = self.repository.run_macro_from_step(name, step_index)
+        except Exception as exc:
+            self._append_run_log(f"선택 노드부터 실행 실패 | {name} | {exc}", "ERROR")
+            QtWidgets.QMessageBox.warning(self, "실행 실패", str(exc))
+            return
+        self._track_macro_process(name, process)
+
+    @QtCore.Slot(str)
+    def run_macro_dry_run(self, name: str) -> None:
+        if self._running_macro_processes:
+            self.show_status("이미 매크로가 실행 중입니다. 먼저 ■ 정지를 눌러 주세요.")
+            return
+        self._append_run_log(f"드라이런 요청 | {name}")
+        try:
+            process = self.repository.run_macro_dry_run(name)
+        except Exception as exc:
+            self._append_run_log(f"드라이런 실패 | {name} | {exc}", "ERROR")
+            QtWidgets.QMessageBox.warning(self, "드라이런 실패", str(exc))
+            return
+        self._track_macro_process(f"{name} · 드라이런", process)
+
     def _track_macro_process(self, name: str, process: object) -> None:
         pid = int(getattr(process, "pid", 0) or 0)
         self._append_run_log(f"프로세스 시작 | {name} | PID {pid}")
+        resume_step = int(getattr(process, "macrorelay_resume_step", 0) or 0)
+        if resume_step > 0:
+            self._append_run_log(f"체크포인트 자동 재개 | {name} | {resume_step}번 노드", "WARN")
         if pid:
             result_path = getattr(process, "macrorelay_result_path", None)
             progress_path = getattr(process, "macrorelay_progress_path", None)

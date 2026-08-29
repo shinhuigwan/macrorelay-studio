@@ -4,9 +4,11 @@ import json
 import hashlib
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
@@ -1524,7 +1526,42 @@ internal static class Program
         engine = self.engine()
         script = self.exports_dir / f".{self.safe_name(name)}-run.ahk"
         engine.export_macro_payload(payload, script)
-        return self._launch_macro_payload(name, payload, script)
+        return self._launch_macro_payload(name, payload, script, checkpoint_name=name, resume=True)
+
+    def run_macro_from_step(self, name: str, step_index: int) -> subprocess.Popen[Any]:
+        """Run the real macro from a selected source node and keep normal flow afterwards."""
+        payload = deepcopy(self.load_macro(name))
+        steps = payload.get("steps") or []
+        if not 1 <= int(step_index) <= len(steps):
+            raise IndexError(f"재개할 {step_index}번 단계를 찾을 수 없습니다.")
+        payload["graph_start_step"] = int(step_index)
+        engine = self.engine()
+        script = self.exports_dir / f".{self.safe_name(name)}-resume-{int(step_index)}.ahk"
+        engine.export_macro_payload(payload, script)
+        return self._launch_macro_payload(name, payload, script, checkpoint_name=name, resume=False)
+
+    def run_macro_dry_run(self, name: str) -> subprocess.Popen[Any]:
+        payload = deepcopy(self.load_macro(name))
+        engine = self.engine()
+        script = self.exports_dir / f".{self.safe_name(name)}-dry-run.ahk"
+        engine.export_macro_payload(payload, script)
+        return self._launch_macro_payload(f"{name} · 드라이런", payload, script, resume=False, dry_run=True)
+
+    def checkpoint_path(self, name: str) -> Path:
+        path = self.exports_dir / ".checkpoints" / f"{self.safe_name(name)}.checkpoint"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def saved_checkpoint(self, name: str) -> int:
+        path = self.checkpoint_path(name)
+        try:
+            value = int(path.read_text(encoding="utf-8-sig").strip())
+        except (OSError, ValueError):
+            return 0
+        return max(0, value)
+
+    def clear_checkpoint(self, name: str) -> None:
+        self.checkpoint_path(name).unlink(missing_ok=True)
 
     def run_macro_step(self, name: str, step_index: int) -> subprocess.Popen[Any]:
         payload = deepcopy(self.load_macro(name))
@@ -1537,19 +1574,33 @@ internal static class Program
         engine = self.engine()
         script = self.exports_dir / f".{self.safe_name(name)}-step-{int(step_index)}-test.ahk"
         engine.export_macro_payload(payload, script)
-        return self._launch_macro_payload(f"{name} · {step_index}번 단계", payload, script)
+        return self._launch_macro_payload(f"{name} · {step_index}번 단계", payload, script, resume=False)
 
-    def _launch_macro_payload(self, name: str, payload: dict[str, Any], script: Path) -> subprocess.Popen[Any]:
+    def _launch_macro_payload(
+        self,
+        name: str,
+        payload: dict[str, Any],
+        script: Path,
+        *,
+        checkpoint_name: str | None = None,
+        resume: bool = False,
+        dry_run: bool = False,
+    ) -> subprocess.Popen[Any]:
         environment = os.environ.copy()
         has_opencv = any(
             step.get("action") == "image_search" and str(step.get("engine") or "ahk").lower() == "opencv"
             for step in payload.get("steps", [])
         )
         has_ocr = any(step.get("action") == "ocr" for step in payload.get("steps", []))
+        runtime_python: Path | None = None
+        runtime_packages: Path | None = None
         if has_opencv or has_ocr:
             python, packages = self._ensure_ocr_runtime() if has_ocr else self._ensure_opencv_runtime()
+            runtime_python, runtime_packages = python, packages
             environment["MACRORELAY_PYTHON_EXE"] = str(python)
             environment["MACRORELAY_PYTHON_PACKAGES"] = str(packages)
+        if has_opencv and runtime_python is not None and runtime_packages is not None:
+            self._preload_vision_templates(payload, runtime_python, runtime_packages)
         result_dir = self.exports_dir / ".run_results"
         result_dir.mkdir(parents=True, exist_ok=True)
         for stale in sorted(result_dir.glob("*.txt"), key=lambda item: item.stat().st_mtime, reverse=True)[99:]:
@@ -1569,6 +1620,15 @@ internal static class Program
         environment["MACRORELAY_TRACE_FILE"] = str(trace_path)
         environment["MACRORELAY_CONTROL_FILE"] = str(control_path)
         environment["MACRORELAY_VARIABLE_FILE"] = str(variable_path)
+        if dry_run:
+            environment["MACRORELAY_DRY_RUN"] = "1"
+        checkpoint_path: Path | None = None
+        if checkpoint_name:
+            checkpoint_path = self.checkpoint_path(checkpoint_name)
+            environment["MACRORELAY_CHECKPOINT_FILE"] = str(checkpoint_path)
+            resume_step = self.saved_checkpoint(checkpoint_name) if resume else 0
+            if resume_step > 0:
+                environment["MACRORELAY_RESUME_STEP"] = str(resume_step)
         executable = self._read_text_path("ahk_path.txt")
         if not executable or not executable.exists():
             raise FileNotFoundError("AutoHotkey 실행 파일을 찾을 수 없습니다.")
@@ -1580,7 +1640,64 @@ internal static class Program
         process.macrorelay_trace_path = trace_path  # type: ignore[attr-defined]
         process.macrorelay_control_path = control_path  # type: ignore[attr-defined]
         process.macrorelay_variable_path = variable_path  # type: ignore[attr-defined]
+        process.macrorelay_checkpoint_path = checkpoint_path  # type: ignore[attr-defined]
+        process.macrorelay_resume_step = int(environment.get("MACRORELAY_RESUME_STEP", "0") or 0)  # type: ignore[attr-defined]
+        process.macrorelay_dry_run = bool(dry_run)  # type: ignore[attr-defined]
         return process
+
+    @staticmethod
+    def _vision_request(payload: dict[str, Any], timeout: float = 1.5) -> dict[str, Any]:
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        with socket.create_connection(("127.0.0.1", 9235), timeout=timeout) as client:
+            client.sendall(data)
+            client.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        result = json.loads(b"".join(chunks).decode("utf-8", errors="replace") or "{}")
+        return result if isinstance(result, dict) else {}
+
+    def _preload_vision_templates(self, payload: dict[str, Any], python: Path, packages: Path) -> None:
+        aliases: list[str] = []
+        for step in payload.get("steps") or []:
+            if not isinstance(step, dict) or step.get("action") != "image_search":
+                continue
+            values = step.get("assets") if isinstance(step.get("assets"), list) else []
+            values = [step.get("asset"), *values]
+            aliases.extend(str(value) for value in values if str(value or "").strip())
+        images = [str(path) for alias in dict.fromkeys(aliases) if (path := self.asset_path(alias)) is not None]
+        if not images:
+            return
+        try:
+            status = self._vision_request({"cmd": "status"}, timeout=0.25)
+        except (OSError, ValueError, json.JSONDecodeError):
+            status = {}
+        if not status.get("ok"):
+            script = self.root / "vision_engine.py"
+            if not script.is_file():
+                return
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(packages)
+            subprocess.Popen(
+                [str(python), str(script), "--server", "--port", "9235", "--idle-timeout", "600"],
+                env=environment,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            for _attempt in range(25):
+                time.sleep(0.04)
+                try:
+                    status = self._vision_request({"cmd": "status"}, timeout=0.15)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if status.get("ok"):
+                    break
+        try:
+            self._vision_request({"cmd": "preload", "images": images, "profile": "fast"}, timeout=5.0)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return
 
     def _ensure_ocr_runtime(self) -> tuple[Path, Path]:
         """Select one ABI-compatible Python environment for the OCR server."""

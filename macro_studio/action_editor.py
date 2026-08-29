@@ -370,6 +370,16 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("confidence", "일치 신뢰도", "int", 86, 50, 99, tooltip="OpenCV에서 사용하는 최소 일치율입니다."),
         FieldSpec("timeout", "검색 제한 시간", "duration", 1200, 0, 600_000),
         FieldSpec("poll_delay", "검색 반복 간격", "duration", 35, 10, 60_000),
+        FieldSpec(
+            "capture_cache_ms",
+            "연속 노드 화면 재사용",
+            "duration",
+            45,
+            0,
+            250,
+            tooltip="같은 창·같은 범위를 매우 짧은 간격으로 다시 검색할 때 캡처를 재사용합니다. 대상 창이 바뀌면 자동 분리됩니다.",
+            section="성능 최적화",
+        ),
         FieldSpec("trans", "투명색", "text", "", placeholder="예: FFFFFF"),
         FieldSpec("region_mode", "범위 기준", "choice", "screen", options=choice(("전체 화면 · 모든 모니터", "screen"), ("창", "window"), ("클라이언트", "client")), section="검색 범위"),
         FieldSpec("region_coords", "좌표 해석", "choice", "screen", options=choice(("화면 절대 좌표", "screen"), ("대상 기준 상대 좌표", "relative")), section="검색 범위"),
@@ -570,7 +580,36 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("value", "연산 값", "text", ""),
     ],
     "coord_mode": [FieldSpec("mode", "좌표 기준", "choice", "Screen", options=choice(("전체 화면", "Screen"), ("창", "Window"), ("클라이언트", "Client")))],
-    "call_submacro": [FieldSpec("macro", "호출할 매크로", "macro", "")],
+    "call_submacro": [
+        FieldSpec("macro", "호출할 매크로", "macro", ""),
+        FieldSpec(
+            "inputs_text",
+            "입력 변수 전달",
+            "multiline",
+            "",
+            placeholder="예: id=$account_id\npassword=$account_password",
+            tooltip="자식변수=값 또는 자식변수=$부모변수 형식으로 한 줄씩 입력합니다.",
+            section="입출력",
+        ),
+        FieldSpec(
+            "outputs_text",
+            "출력 변수 반환",
+            "multiline",
+            "",
+            placeholder="예: login_message=$child_message",
+            tooltip="부모변수=$자식변수 형식으로 한 줄씩 입력합니다.",
+            section="입출력",
+        ),
+        FieldSpec(
+            "result_var",
+            "성공 여부 변수",
+            "text",
+            "",
+            placeholder="예: login_success",
+            tooltip="서브플로우 성공 시 1, 실패 시 0이 저장됩니다.",
+            section="입출력",
+        ),
+    ],
     "flow_control": [
         FieldSpec("repeat_count", "이동 반복 횟수", "int", 0, 0, 999_999, tooltip="0이면 항상 이동합니다."),
         FieldSpec("jump_to", "이동할 노드", "int", 1, 1, 999_999),
@@ -2171,6 +2210,8 @@ class ActionEditor(QtWidgets.QWidget):
             target.setToolTip(spec.tooltip)
         if spec.placeholder and isinstance(target, QtWidgets.QLineEdit):
             target.setPlaceholderText(spec.placeholder)
+        elif spec.placeholder and isinstance(target, QtWidgets.QPlainTextEdit):
+            target.setPlaceholderText(spec.placeholder)
         return widget
 
     @staticmethod
@@ -2234,6 +2275,11 @@ class ActionEditor(QtWidgets.QWidget):
         if action == "text_condition":
             needles = normalized.get("needles")
             normalized["needles_text"] = ", ".join(str(item) for item in needles) if isinstance(needles, list) else str(needles or "")
+        if action == "call_submacro":
+            for field, text_field in (("inputs", "inputs_text"), ("outputs", "outputs_text")):
+                mapping = normalized.get(field)
+                if isinstance(mapping, dict):
+                    normalized[text_field] = "\n".join(f"{key}={value}" for key, value in mapping.items())
         for spec in ACTION_FIELDS.get(action, []):
             if spec.key in COMMON_FIELD_KEYS:
                 continue
@@ -2323,6 +2369,22 @@ class ActionEditor(QtWidgets.QWidget):
                 payload["needles"] = [item.strip() for item in text.split(",") if item.strip()]
             else:
                 payload.pop("needles", None)
+        if action == "call_submacro":
+            for text_field, field in (("inputs_text", "inputs"), ("outputs_text", "outputs")):
+                raw = str(payload.pop(text_field, "") or "")
+                mapping: dict[str, str] = {}
+                for line in raw.replace(";", "\n").splitlines():
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip().lstrip("$")
+                    value = value.strip()
+                    if key and value:
+                        mapping[key] = value
+                if mapping:
+                    payload[field] = mapping
+                else:
+                    payload.pop(field, None)
         return payload
 
     def _set_widget_value(self, widget: QtWidgets.QWidget, spec: FieldSpec, value: Any) -> None:

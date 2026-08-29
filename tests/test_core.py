@@ -205,6 +205,24 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertEqual(2, result["match_index"])
         self.assertEqual((126, 223), (result["x"], result["y"]))
 
+    def test_vision_engine_reuses_recent_frame_for_same_context_only(self) -> None:
+        import vision_engine
+
+        state = vision_engine.VisionState()
+        captures = mock.Mock(side_effect=["first-frame", "second-frame"])
+        with mock.patch.object(vision_engine.search, "capture_region", captures):
+            first, reused_first = state._capture((0, 0, 100, 100), "window:A", 100)
+            second, reused_second = state._capture((0, 0, 100, 100), "window:A", 100)
+            third, reused_third = state._capture((0, 0, 100, 100), "window:B", 100)
+        self.assertEqual("first-frame", first)
+        self.assertEqual("first-frame", second)
+        self.assertEqual("second-frame", third)
+        self.assertFalse(reused_first)
+        self.assertTrue(reused_second)
+        self.assertFalse(reused_third)
+        self.assertEqual(2, captures.call_count)
+        self.assertEqual(1, state.capture_reuse_count)
+
     def test_image_search_uses_centered_single_click_and_optimized_opencv(self) -> None:
         step = {
             "action": "image_search",
@@ -959,6 +977,78 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn('if (command = "STEP")', script)
         self.assertIn('TraceStep(1, "짧은 대기", "START")', script)
         self.assertIn('TraceStep(1, "짧은 대기", "SUCCESS")', script)
+
+    def test_recovery_engine_renders_retry_checkpoint_and_failure_limit(self) -> None:
+        macro = {
+            "name": "recoverable",
+            "meta": {"failure_streak_limit": 3},
+            "steps": [
+                {
+                    "action": "image_search",
+                    "asset": "missing",
+                    "node_retry_count": 2,
+                    "node_retry_delay": 125,
+                    "on_fail": 2,
+                },
+                {"action": "wait", "duration": 10},
+            ],
+        }
+        script = self.engine.render_macro_script(macro, {})
+        self.assertIn("MACRORELAY_CHECKPOINT_FILE", script)
+        self.assertIn("MacroFailureLimit := 3", script)
+        self.assertIn("checkpoint resume: step", script)
+        self.assertIn("if (__node_retry_1 < 2)", script)
+        self.assertIn("Sleep, 125", script)
+        self.assertIn("MarkStepFailure(1)", script)
+        self.assertIn("Goto, Step2", script)
+
+    def test_subflow_inputs_outputs_and_result_variable_are_rendered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            macro_dir = Path(directory)
+            child = {
+                "name": "로그인 처리",
+                "steps": [
+                    {"action": "set_var", "name": "child_message", "value": "ok"},
+                    {"action": "wait", "duration": 10},
+                ],
+            }
+            (macro_dir / "로그인 처리.json").write_text(
+                json.dumps(child, ensure_ascii=False), encoding="utf-8"
+            )
+            parent = {
+                "name": "parent",
+                "steps": [
+                    {
+                        "action": "call_submacro",
+                        "macro": "로그인 처리",
+                        "inputs": {"id": "$account_id", "password": "secret"},
+                        "outputs": {"login_message": "$child_message"},
+                        "result_var": "login_success",
+                    }
+                ],
+            }
+            with mock.patch.object(self.engine, "MACRO_DIR", macro_dir):
+                script = self.engine.render_macro_script(parent, {})
+        self.assertIn("id := account_id", script)
+        self.assertIn('password := "secret"', script)
+        self.assertIn("login_message := child_message", script)
+        self.assertIn("login_success := 1", script)
+
+    def test_dry_run_suppresses_mutating_actions_and_reports_prediction(self) -> None:
+        macro = {
+            "name": "dry-run",
+            "steps": [
+                {"action": "mouse_click", "x": 120, "y": 240},
+                {"action": "type_text", "text": "unsafe"},
+                {"action": "run_program", "command": "notepad.exe"},
+            ],
+        }
+        script = self.engine.render_macro_script(macro, {})
+        self.assertIn("MACRORELAY_DRY_RUN", script)
+        self.assertIn("if (MacroDryRun)", script)
+        self.assertIn('SetLastClick(120, 240, "dry-run-screen")', script)
+        self.assertIn("dry-run action suppressed: type_text", script)
+        self.assertIn("dry-run action suppressed: run_program", script)
 
     def test_generated_macro_can_apply_debug_variable_overrides(self) -> None:
         macro = {

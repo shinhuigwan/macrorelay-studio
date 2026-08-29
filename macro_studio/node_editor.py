@@ -972,7 +972,10 @@ class NodeCanvas(QtWidgets.QWidget):
         if action in {"run_program", "terminate_program"}:
             return str(step.get("path") or step.get("process") or action)
         if action == "call_submacro":
-            return f"더블클릭해서 열기 · {step.get('macro') or '선택 필요'}"
+            inputs = step.get("inputs") if isinstance(step.get("inputs"), dict) else {}
+            result = str(step.get("result_var") or "").strip()
+            signature = ", ".join(inputs) if inputs else "입력 없음"
+            return f"{step.get('macro') or '선택 필요'}({signature})" + (f" → {result}" if result else "")
         return action or "단계"
 
     def set_macro(self, macro: dict[str, Any] | None, selected: int = 0) -> None:

@@ -396,6 +396,8 @@ class BuilderPage(QtWidgets.QWidget):
     status = QtCore.Signal(str)
     run_macro = QtCore.Signal(str)
     run_macro_step = QtCore.Signal(str, int)
+    run_macro_from_step = QtCore.Signal(str, int)
+    run_macro_dry_run = QtCore.Signal(str)
     stop_macros = QtCore.Signal()
     open_export = QtCore.Signal(str)
     edit_committed = QtCore.Signal()
@@ -478,6 +480,9 @@ class BuilderPage(QtWidgets.QWidget):
         self.run_button = QtWidgets.QPushButton("▶ 실행")
         self.run_button.setToolTip("현재 편집 중인 단계를 저장한 뒤 매크로 실행")
         self.run_button.clicked.connect(self._run_current)
+        self.dry_run_button = QtWidgets.QPushButton("▷ 드라이런")
+        self.dry_run_button.setToolTip("클릭·입력·프로그램 실행 없이 이미지/OCR/조건과 다음 흐름만 시뮬레이션")
+        self.dry_run_button.clicked.connect(self._run_dry_run)
         self.stop_button = danger_button("■ 정지")
         self.stop_button.setToolTip("현재 Studio에서 실행한 매크로와 이미지 검색 하위 프로세스를 즉시 중단")
         self.stop_button.setEnabled(False)
@@ -492,6 +497,7 @@ class BuilderPage(QtWidgets.QWidget):
         toolbar_top.addWidget(duplicate_btn)
         toolbar_top.addWidget(archive_btn)
         toolbar_top.addStretch(1)
+        toolbar_top.addWidget(self.dry_run_button)
         toolbar_top.addWidget(self.run_button)
         toolbar_top.addWidget(self.stop_button)
         toolbar_top.addWidget(log_btn)
@@ -603,8 +609,14 @@ class BuilderPage(QtWidgets.QWidget):
         sequential_action.triggered.connect(self._connect_sequentially)
         start_action = self.node_more_menu.addAction("시작 노드로 지정")
         start_action.triggered.connect(lambda: self._set_graph_marker("start"))
+        resume_action = self.node_more_menu.addAction("선택 노드부터 실제 실행")
+        resume_action.setToolTip("선택 노드부터 이어지는 전체 흐름을 실제로 실행합니다.")
+        resume_action.triggered.connect(self._run_from_selected_step)
         end_action = self.node_more_menu.addAction("종료 노드로 지정")
         end_action.triggered.connect(lambda: self._set_graph_marker("end"))
+        recovery_action = self.node_more_menu.addAction("복구 실행 설정")
+        recovery_action.setToolTip("연속 실패 자동 정지와 체크포인트 재개 정책을 설정합니다.")
+        recovery_action.triggered.connect(self._configure_recovery_engine)
         self.node_more_menu.addSeparator()
         save_block_action = self.node_more_menu.addAction("선택 노드를 블록으로 저장")
         save_block_action.setToolTip("선택한 노드 묶음을 다른 매크로에서 재사용합니다.")
@@ -711,6 +723,8 @@ class BuilderPage(QtWidgets.QWidget):
         self.fail_spin = WheelSafeSpinBox()
         self.success_delay_spin = WheelSafeSpinBox()
         self.fail_delay_spin = WheelSafeSpinBox()
+        self.node_retry_spin = WheelSafeSpinBox()
+        self.node_retry_delay_spin = WheelSafeSpinBox()
         self.delay_spin = WheelSafeSpinBox()
         for spin in (self.success_spin, self.fail_spin):
             spin.setRange(0, 999)
@@ -720,6 +734,10 @@ class BuilderPage(QtWidgets.QWidget):
         for spin in (self.success_delay_spin, self.fail_delay_spin, self.delay_spin):
             spin.setRange(0, 600_000)
             spin.setSuffix(" ms")
+        self.node_retry_spin.setRange(0, 100)
+        self.node_retry_spin.setSuffix("회")
+        self.node_retry_delay_spin.setRange(10, 600_000)
+        self.node_retry_delay_spin.setSuffix(" ms")
         form.addRow("액션", self.inspector_action)
         form.addRow("표시 이름", self.label_edit)
         form.addRow("단계 반복", self.repeat_spin)
@@ -728,6 +746,8 @@ class BuilderPage(QtWidgets.QWidget):
         form.addRow("성공 이동 전 대기", self.success_delay_spin)
         form.addRow("실패 시 이동", self.fail_spin)
         form.addRow("실패 이동 전 대기", self.fail_delay_spin)
+        form.addRow("실패 시 재시도", self.node_retry_spin)
+        form.addRow("재시도 간격", self.node_retry_delay_spin)
         form.addRow("완료 후 대기", self.delay_spin)
 
         self.action_editor = ActionEditor(self.repository, card)
@@ -826,6 +846,8 @@ class BuilderPage(QtWidgets.QWidget):
             ("on_fail", self.fail_spin.value(), 0),
             ("on_success_delay", self.success_delay_spin.value(), 0),
             ("on_fail_delay", self.fail_delay_spin.value(), 0),
+            ("node_retry_count", self.node_retry_spin.value(), 0),
+            ("node_retry_delay", self.node_retry_delay_spin.value(), 250),
             ("sleep_after", self.delay_spin.value(), 0),
         )
         for key, value, default in values:
@@ -951,6 +973,8 @@ class BuilderPage(QtWidgets.QWidget):
         self.fail_spin.setValue(int(step.get("on_fail") or 0))
         self.success_delay_spin.setValue(int(step.get("on_success_delay") or 0))
         self.fail_delay_spin.setValue(int(step.get("on_fail_delay") or 0))
+        self.node_retry_spin.setValue(int(step.get("node_retry_count") or 0))
+        self.node_retry_delay_spin.setValue(max(10, int(step.get("node_retry_delay") or 250)))
         self.delay_spin.setValue(int(step.get("sleep_after") or 0))
 
     def refresh(self, select_name: str | None = None) -> None:
@@ -1147,7 +1171,12 @@ class BuilderPage(QtWidgets.QWidget):
         if action in {"table_copy", "table_paste"}:
             return str(step.get("table") or "테이블 선택 필요")
         if action == "call_submacro":
-            return f"서브플로우 · {step.get('macro') or '선택 필요'}"
+            inputs = step.get("inputs") if isinstance(step.get("inputs"), dict) else {}
+            outputs = step.get("outputs") if isinstance(step.get("outputs"), dict) else {}
+            signature = ", ".join(inputs) if inputs else "입력 없음"
+            result = str(step.get("result_var") or "").strip()
+            suffix = f" → {result}" if result else (f" → 출력 {len(outputs)}개" if outputs else "")
+            return f"서브플로우 · {step.get('macro') or '선택 필요'}({signature}){suffix}"
         return str(action or "단계")
 
     def _select_step(self, row: int, _column: int, _old_row: int, _old_column: int) -> None:
@@ -1806,6 +1835,7 @@ class BuilderPage(QtWidgets.QWidget):
 
     def set_macro_running(self, running: bool) -> None:
         self.run_button.setEnabled(not running)
+        self.dry_run_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
 
     def _stop_running_macros(self) -> None:
@@ -2345,6 +2375,78 @@ class BuilderPage(QtWidgets.QWidget):
                 return
         self.status.emit(f"'{self.current_name}' 실행을 요청했습니다. 로그 버튼에서 진행 상태를 확인할 수 있습니다.")
         self.run_macro.emit(self.current_name)
+
+    def _run_from_selected_step(self) -> None:
+        if not self.current_name or self.current_macro is None:
+            self.status.emit("실행할 매크로를 먼저 선택하세요.")
+            return
+        index = self.node_canvas.selected_index()
+        if index <= 0:
+            row = self.steps_table.currentRow()
+            index = row + 1 if row >= 0 else 0
+        if index <= 0:
+            self.status.emit("다시 시작할 노드를 선택하세요.")
+            return
+        self._save_step()
+        self.status.emit(f"'{self.current_name}'을(를) {index}번 노드부터 실행합니다.")
+        self.run_macro_from_step.emit(self.current_name, index)
+
+    def _run_dry_run(self) -> None:
+        if not self.current_name:
+            self.status.emit("시뮬레이션할 매크로를 먼저 선택하세요.")
+            return
+        row = self.steps_table.currentRow()
+        if row >= 0:
+            self._save_step()
+        self.status.emit(f"'{self.current_name}' 드라이런을 시작합니다. 실제 클릭과 입력은 발생하지 않습니다.")
+        self.run_macro_dry_run.emit(self.current_name)
+
+    def _configure_recovery_engine(self) -> None:
+        if not self.current_name or self.current_macro is None:
+            self.status.emit("설정할 매크로를 먼저 선택하세요.")
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("복구 가능한 실행 엔진")
+        dialog.setMinimumWidth(500)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        note = QtWidgets.QLabel(
+            "정상 완료 전에는 마지막 성공 노드의 다음 위치를 저장합니다. Studio나 대상 프로그램이 종료된 뒤 "
+            "다시 실행하면 해당 위치에서 자동 재개됩니다."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QtWidgets.QFormLayout()
+        limit = WheelSafeSpinBox()
+        limit.setRange(0, 999)
+        limit.setSpecialValueText("사용 안 함")
+        limit.setSuffix("회")
+        meta = self.current_macro.get("meta") if isinstance(self.current_macro.get("meta"), dict) else {}
+        limit.setValue(int(meta.get("failure_streak_limit") or self.current_macro.get("failure_streak_limit") or 0))
+        form.addRow("연속 실패 자동 정지", limit)
+        layout.addLayout(form)
+        current = self.repository.saved_checkpoint(self.current_name)
+        checkpoint = QtWidgets.QLabel(
+            f"저장된 재개 지점: {current}번 노드" if current else "저장된 재개 지점: 없음"
+        )
+        checkpoint.setObjectName("Muted")
+        layout.addWidget(checkpoint)
+        clear_btn = QtWidgets.QPushButton("저장된 재개 지점 지우기")
+        clear_btn.setEnabled(current > 0)
+        clear_btn.clicked.connect(lambda: (self.repository.clear_checkpoint(self.current_name), checkpoint.setText("저장된 재개 지점: 없음"), clear_btn.setEnabled(False)))
+        layout.addWidget(clear_btn)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        meta = dict(meta)
+        if limit.value():
+            meta["failure_streak_limit"] = limit.value()
+        else:
+            meta.pop("failure_streak_limit", None)
+        self.current_macro["meta"] = meta
+        self._persist("복구 실행 설정을 저장했습니다.")
 
     def _open_current_export(self) -> None:
         if not self.current_name:

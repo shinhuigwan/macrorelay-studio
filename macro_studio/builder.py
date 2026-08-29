@@ -248,11 +248,12 @@ class ActionEditorDialog(QtWidgets.QDialog):
     def __init__(self, repository: MacroRepository, step: dict[str, Any], parent=None) -> None:
         super().__init__(parent)
         action = str(step.get("action") or "wait")
-        self.setWindowTitle(f"{ACTION_LABELS.get(action, action)} · 상세 설정")
+        action_name = "멀티 이미지 서치" if action == "image_search" and len(step.get("assets") or []) > 1 else ACTION_LABELS.get(action, action)
+        self.setWindowTitle(f"{action_name} · 상세 설정")
         self.resize(780, 780)
         self.setMinimumSize(660, 620)
         layout = QtWidgets.QVBoxLayout(self)
-        title = QtWidgets.QLabel(ACTION_LABELS.get(action, action))
+        title = QtWidgets.QLabel(action_name)
         title.setStyleSheet("font-size:17pt; font-weight:800;")
         hint = QtWidgets.QLabel("긴 설정을 넓은 창에서 편집합니다. '설정 저장'을 누르면 단계와 매크로 파일에 즉시 반영됩니다.")
         hint.setObjectName("Muted")
@@ -889,7 +890,8 @@ class BuilderPage(QtWidgets.QWidget):
             details = [f"선택자: {step.get('selector') or '미입력'}", f"동작: {step.get('browser_action') or 'click'}"]
         else:
             details = [self._step_summary(step)]
-        self.action_summary_label.setText(ACTION_LABELS.get(action, action) + "\n" + "  ·  ".join(str(item) for item in details))
+        action_name = "멀티 이미지 서치" if action == "image_search" and len(step.get("assets") or []) > 1 else ACTION_LABELS.get(action, action)
+        self.action_summary_label.setText(action_name + "\n" + "  ·  ".join(str(item) for item in details))
 
     def capture_current_action_coordinates(self) -> None:
         if self.action_editor.capture_current_coordinates():
@@ -1116,7 +1118,8 @@ class BuilderPage(QtWidgets.QWidget):
     def _step_summary(step: dict[str, Any]) -> str:
         action = step.get("action")
         if action == "image_search":
-            return str(step.get("asset") or "이미지 선택 필요")
+            assets = step.get("assets") if isinstance(step.get("assets"), list) else []
+            return f"멀티 이미지 서치 · {len(assets)}개" if len(assets) > 1 else str(step.get("asset") or "이미지 선택 필요")
         if action == "type_text":
             text = str(step.get("text") or "")
             return text[:30] or "텍스트 입력"

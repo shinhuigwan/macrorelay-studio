@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 from pathlib import Path
 from typing import Any
 
@@ -213,13 +214,45 @@ class ImagePreviewPopup(QtWidgets.QFrame):
         layout.addWidget(self.image)
         layout.addWidget(self.detail)
 
-    def show_image(self, path: Path, alias: str, screen_pos: QtCore.QPoint) -> None:
-        pixmap = QtGui.QPixmap(str(path))
-        if pixmap.isNull():
+    def show_images(self, entries: list[tuple[str, Path]], screen_pos: QtCore.QPoint) -> None:
+        loaded = [(alias, QtGui.QPixmap(str(path))) for alias, path in entries]
+        loaded = [(alias, pixmap) for alias, pixmap in loaded if not pixmap.isNull()]
+        if not loaded:
             return
-        self.title.setText(alias or path.stem)
-        self.image.setPixmap(pixmap.scaled(360, 240, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
-        self.detail.setText(f"{pixmap.width()} × {pixmap.height()} · 이미지 서치 원본")
+        if len(loaded) == 1:
+            alias, pixmap = loaded[0]
+            shown = pixmap.scaled(360, 240, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            self.title.setText(alias or "이미지 서치")
+            self.detail.setText(f"{pixmap.width()} × {pixmap.height()} · 이미지 서치 원본")
+        else:
+            columns = min(4, max(2, math.ceil(math.sqrt(len(loaded)))))
+            rows = math.ceil(len(loaded) / columns)
+            cell_width = max(112, min(190, 680 // columns))
+            cell_height = max(92, min(150, 470 // rows))
+            shown = QtGui.QPixmap(columns * cell_width, rows * cell_height)
+            shown.fill(QtGui.QColor("#0D1119"))
+            painter = QtGui.QPainter(shown)
+            painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+            font = QtGui.QFont("Malgun Gothic", 8)
+            painter.setFont(font)
+            for index, (alias, pixmap) in enumerate(loaded):
+                row, column = divmod(index, columns)
+                cell = QtCore.QRect(column * cell_width + 4, row * cell_height + 4, cell_width - 8, cell_height - 8)
+                painter.setPen(QtGui.QPen(QtGui.QColor("#354056"), 1))
+                painter.setBrush(QtGui.QColor("#151B25"))
+                painter.drawRoundedRect(cell, 7, 7)
+                image_rect = cell.adjusted(6, 6, -6, -27)
+                scaled = pixmap.scaled(image_rect.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                x = image_rect.center().x() - scaled.width() // 2
+                y = image_rect.center().y() - scaled.height() // 2
+                painter.drawPixmap(x, y, scaled)
+                painter.setPen(QtGui.QColor("#E9EDF5"))
+                text = QtGui.QFontMetrics(font).elidedText(alias, QtCore.Qt.ElideRight, cell.width() - 12)
+                painter.drawText(cell.adjusted(6, cell.height() - 24, -6, -3), QtCore.Qt.AlignCenter, text)
+            painter.end()
+            self.title.setText(f"멀티 이미지 서치 · {len(loaded)}개")
+            self.detail.setText("정확도가 가장 높은 이미지가 선택됩니다 · " + ", ".join(alias for alias, _ in loaded))
+        self.image.setPixmap(shown)
         self.adjustSize()
         target = screen_pos + QtCore.QPoint(18, 18)
         screen = QtGui.QGuiApplication.screenAt(screen_pos) or QtGui.QGuiApplication.primaryScreen()
@@ -233,16 +266,15 @@ class ImagePreviewPopup(QtWidgets.QFrame):
 
 
 class NodeImagePreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
-    def __init__(self, canvas: "NodeCanvas", alias: str, path: Path | None, parent=None) -> None:
-        super().__init__("▧", parent)
+    def __init__(self, canvas: "NodeCanvas", entries: list[tuple[str, Path]], parent=None) -> None:
+        super().__init__("▦" if len(entries) > 1 else "▧", parent)
         self.canvas = canvas
-        self.alias = alias
-        self.path = path
+        self.entries = entries
         self.setAcceptHoverEvents(True)
 
     def hoverEnterEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
-        if self.path is not None:
-            self.canvas.show_image_preview(self.path, self.alias, event.screenPos())
+        if self.entries:
+            self.canvas.show_image_preview(self.entries, event.screenPos())
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
@@ -259,6 +291,11 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.index = index
         self.step = step
         self.canvas = canvas
+        self.display_title = (
+            "멀티 이미지 서치"
+            if str(step.get("action") or "") == "image_search" and len(step.get("assets") or []) > 1
+            else ACTION_TITLES.get(str(step.get("action") or "step"), str(step.get("action") or "step"))
+        )
         self.setFlags(
             QtWidgets.QGraphicsItem.ItemIsMovable
             | QtWidgets.QGraphicsItem.ItemIsSelectable
@@ -272,9 +309,13 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.fail_port.setPos(self.WIDTH, 101)
         self.preview_badge: NodeImagePreviewBadge | None = None
         if str(step.get("action") or "") == "image_search":
-            alias = str(step.get("asset") or "").strip()
-            preview_path = canvas.asset_preview_path(alias)
-            badge = NodeImagePreviewBadge(canvas, alias, preview_path, self)
+            aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
+            primary = str(step.get("asset") or "").strip()
+            if primary and primary not in aliases:
+                aliases.insert(0, primary)
+            aliases = list(dict.fromkeys(aliases))
+            entries = [(alias, path) for alias in aliases if (path := canvas.asset_preview_path(alias)) is not None]
+            badge = NodeImagePreviewBadge(canvas, entries, self)
             font = QtGui.QFont("Segoe UI Symbol", 12)
             font.setBold(True)
             badge.setFont(font)
@@ -282,15 +323,14 @@ class NodeItem(QtWidgets.QGraphicsObject):
             badge.setPos(243, 7)
             badge.setZValue(8)
             badge.setCursor(QtCore.Qt.PointingHandCursor)
-            if preview_path is not None:
-                uri = preview_path.as_uri()
+            if entries:
+                names = ", ".join(html.escape(alias) for alias, _path in entries)
                 badge.setToolTip(
-                    f"<b>{html.escape(alias or '이미지 서치')}</b><br>"
-                    f"<img src=\"{html.escape(uri)}\" width=\"240\"><br>"
-                    "이미지 서치 원본 미리보기"
+                    f"<b>{'멀티 이미지 서치' if len(entries) > 1 else '이미지 서치'}</b><br>"
+                    f"{names}<br>커서를 올리면 {'전체 이미지' if len(entries) > 1 else '원본'}를 확인합니다."
                 )
             else:
-                badge.setToolTip(f"{html.escape(alias or '이미지 미선택')} · 미리보기 파일을 찾을 수 없습니다.")
+                badge.setToolTip("이미지 미선택 · 미리보기 파일을 찾을 수 없습니다.")
             self.preview_badge = badge
 
     def boundingRect(self) -> QtCore.QRectF:
@@ -303,7 +343,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
         _widget=None,
     ) -> None:
         action = str(self.step.get("action") or "step")
-        action_title = ACTION_TITLES.get(action, action)
+        action_title = self.display_title
         badge, accent = ACTION_STYLES.get(action, ("STEP", COLORS["muted"]))
         selected = self.isSelected()
         running = self.index == self.canvas.active_step
@@ -559,18 +599,39 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
 
     def _clear_waypoint_handles(self) -> None:
         for handle in self._waypoint_handles:
-            if handle.scene() is not None:
-                handle.scene().removeItem(handle)
+            try:
+                scene = handle.scene()
+                if scene is not None:
+                    scene.removeItem(handle)
+            except RuntimeError:
+                # Qt may already have deleted child handles together with an
+                # edge. Treat the stale Python wrapper as cleared as well.
+                continue
         self._waypoint_handles = []
 
     def _sync_waypoint_handles(self) -> None:
         if self._handle_dragging:
             return
-        self._clear_waypoint_handles()
         if not self.isSelected() or self.scene() is None:
+            self._clear_waypoint_handles()
             return
         points = self.manual_points or [self.path().pointAtPercent(0.5)]
         seed = not bool(self.manual_points)
+        valid_handles: list[EdgeWaypointHandle] = []
+        for handle in self._waypoint_handles:
+            try:
+                handle.scene()
+                valid_handles.append(handle)
+            except RuntimeError:
+                continue
+        self._waypoint_handles = valid_handles
+        if len(self._waypoint_handles) == len(points):
+            for index, (handle, point) in enumerate(zip(self._waypoint_handles, points)):
+                handle.index = index
+                handle.seed = seed and index == 0
+                handle.setPos(point)
+            return
+        self._clear_waypoint_handles()
         for index, point in enumerate(points):
             handle = EdgeWaypointHandle(self, index, seed=seed and index == 0)
             handle.setPos(point)
@@ -950,8 +1011,8 @@ class NodeCanvas(QtWidgets.QWidget):
         path = self._asset_preview_paths.get(str(alias))
         return path if path is not None and path.is_file() else None
 
-    def show_image_preview(self, path: Path, alias: str, screen_pos: QtCore.QPoint) -> None:
-        self._preview_popup.show_image(path, alias, screen_pos)
+    def show_image_preview(self, entries: list[tuple[str, Path]], screen_pos: QtCore.QPoint) -> None:
+        self._preview_popup.show_images(entries, screen_pos)
 
     def hide_image_preview(self) -> None:
         self._preview_popup.hide()

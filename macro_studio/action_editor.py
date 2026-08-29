@@ -116,9 +116,29 @@ class MultiAssetPicker(QtWidgets.QWidget):
         layout.addWidget(self.search)
         layout.addWidget(self.list)
         layout.addLayout(controls)
+        self.preview_scroll = QtWidgets.QScrollArea()
+        self.preview_scroll.setWidgetResizable(True)
+        self.preview_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.preview_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.preview_scroll.setFixedHeight(112)
+        self.preview_body = QtWidgets.QWidget()
+        self.preview_layout = QtWidgets.QHBoxLayout(self.preview_body)
+        self.preview_layout.setContentsMargins(4, 4, 4, 4)
+        self.preview_layout.setSpacing(7)
+        self.preview_layout.addStretch(1)
+        self.preview_scroll.setWidget(self.preview_body)
+        self.preview_scroll.setVisible(False)
+        layout.addWidget(self.preview_scroll)
+        self._preview_paths: dict[str, Path] = {}
+        self.preview_aliases: list[str] = []
 
-    def set_options(self, values: list[str]) -> None:
+    def set_options(self, values: list[str], preview_paths: dict[str, Path | None] | None = None) -> None:
         selected = set(self.value())
+        self._preview_paths = {
+            str(alias): Path(path)
+            for alias, path in (preview_paths or {}).items()
+            if path is not None and Path(path).is_file()
+        }
         self.list.clear()
         for value in values:
             item = QtWidgets.QListWidgetItem(str(value))
@@ -160,6 +180,38 @@ class MultiAssetPicker(QtWidgets.QWidget):
 
     def _update_count(self) -> None:
         self.count_label.setText(f"{len(self.value())}개 선택")
+        self._refresh_previews()
+
+    def _refresh_previews(self) -> None:
+        while self.preview_layout.count():
+            item = self.preview_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.preview_aliases = []
+        for alias in self.value():
+            path = self._preview_paths.get(alias)
+            if path is None:
+                continue
+            pixmap = QtGui.QPixmap(str(path))
+            if pixmap.isNull():
+                continue
+            card = QtWidgets.QWidget()
+            card.setFixedWidth(106)
+            card_layout = QtWidgets.QVBoxLayout(card)
+            card_layout.setContentsMargins(2, 2, 2, 2)
+            card_layout.setSpacing(2)
+            image = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
+            image.setFixedSize(100, 66)
+            image.setPixmap(pixmap.scaled(image.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+            name = QtWidgets.QLabel(alias, alignment=QtCore.Qt.AlignCenter)
+            name.setToolTip(alias)
+            card_layout.addWidget(image)
+            card_layout.addWidget(name)
+            self.preview_layout.addWidget(card)
+            self.preview_aliases.append(alias)
+        self.preview_layout.addStretch(1)
+        self.preview_scroll.setVisible(bool(self.preview_aliases))
 
 
 @dataclass(frozen=True)
@@ -1796,7 +1848,10 @@ class ActionEditor(QtWidgets.QWidget):
                     continue
                 combo = self.widgets[action].get(spec.key)
                 if isinstance(combo, MultiAssetPicker):
-                    combo.set_options(assets)
+                    combo.set_options(
+                        assets,
+                        {alias: self.repository.asset_path(alias) for alias in assets},
+                    )
                     continue
                 if not isinstance(combo, QtWidgets.QComboBox):
                     continue

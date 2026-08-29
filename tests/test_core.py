@@ -2376,14 +2376,16 @@ class UiSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repository = MacroRepository(root)
-            source = root / "preview.png"
-            image = QtGui.QImage(64, 40, QtGui.QImage.Format_RGB32)
-            image.fill(QtGui.QColor("#4D9FFF"))
-            self.assertTrue(image.save(str(source)))
-            alias = repository.add_asset(source, "preview")
+            aliases = []
+            for index, colour in enumerate(("#4D9FFF", "#35C89A"), start=1):
+                source = root / f"preview-{index}.png"
+                image = QtGui.QImage(64, 40, QtGui.QImage.Format_RGB32)
+                image.fill(QtGui.QColor(colour))
+                self.assertTrue(image.save(str(source)))
+                aliases.append(repository.add_asset(source, f"preview-{index}"))
             repository.create_macro("preview-node")
             payload = repository.load_macro("preview-node")
-            payload["steps"] = [{"action": "image_search", "asset": alias}]
+            payload["steps"] = [{"action": "image_search", "asset": aliases[0], "assets": aliases}]
             repository.save_macro("preview-node", payload)
             _created_app, window = create_app(root)
             window.show()
@@ -2391,11 +2393,18 @@ class UiSmokeTests(unittest.TestCase):
             builder.refresh("preview-node")
             badge = builder.node_canvas.nodes[1].preview_badge
             self.assertIsNotNone(badge)
-            self.assertIn("<img", badge.toolTip())
-            builder.node_canvas.show_image_preview(repository.asset_path(alias), alias, QtCore.QPoint(100, 100))
+            self.assertEqual("멀티 이미지 서치", builder.node_canvas.nodes[1].display_title)
+            self.assertIn("멀티 이미지 서치", builder._step_summary(payload["steps"][0]))
+            builder._update_action_summary(payload["steps"][0])
+            self.assertTrue(builder.action_summary_label.text().startswith("멀티 이미지 서치"))
+            self.assertEqual("▦", badge.text())
+            self.assertIn("전체 이미지", badge.toolTip())
+            entries = [(alias, repository.asset_path(alias)) for alias in aliases]
+            builder.node_canvas.show_image_preview(entries, QtCore.QPoint(100, 100))
             app.processEvents()
             self.assertTrue(builder.node_canvas._preview_popup.isVisible())
             self.assertFalse(builder.node_canvas._preview_popup.image.pixmap().isNull())
+            self.assertIn("2개", builder.node_canvas._preview_popup.title.text())
             builder.node_canvas.hide_image_preview()
             window.close()
         app.processEvents()
@@ -2635,6 +2644,8 @@ class UiSmokeTests(unittest.TestCase):
             picker = editor.widgets["image_search"]["assets"]
             self.assertIsInstance(picker, MultiAssetPicker)
             self.assertEqual(["첫 이미지", "둘째 이미지"], picker.value())
+            self.assertEqual(["첫 이미지", "둘째 이미지"], picker.preview_aliases)
+            self.assertTrue(picker.preview_scroll.isVisibleTo(editor))
             step = editor.build_step()
             self.assertEqual(["첫 이미지", "둘째 이미지"], step["assets"])
             self.assertEqual("opencv", step["engine"])
@@ -3077,6 +3088,11 @@ class UiSmokeTests(unittest.TestCase):
         app.processEvents()
         self.assertIn("1:success:2:-1", canvas.manual_routes)
         self.assertFalse(edge._waypoint_handles[0].seed)
+        edge.setSelected(False)
+        app.processEvents()
+        edge.setSelected(True)
+        app.processEvents()
+        self.assertEqual(1, len(edge._waypoint_handles))
         canvas.close()
 
     def test_manual_edge_routes_follow_node_reindex_and_drop_deleted_links(self) -> None:

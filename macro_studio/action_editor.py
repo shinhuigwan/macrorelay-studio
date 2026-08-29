@@ -91,6 +91,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
     """Compact searchable checklist used by one-node multi image search."""
 
     offset_edited = QtCore.Signal()
+    selection_changed = QtCore.Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -122,7 +123,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
         self.preview_scroll.setWidgetResizable(True)
         self.preview_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.preview_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.preview_scroll.setFixedHeight(154)
+        self.preview_scroll.setFixedHeight(112)
         self.preview_body = QtWidgets.QWidget()
         self.preview_layout = QtWidgets.QHBoxLayout(self.preview_body)
         self.preview_layout.setContentsMargins(4, 4, 4, 4)
@@ -201,6 +202,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
     def _update_count(self) -> None:
         self.count_label.setText(f"{len(self.value())}개 선택")
         self._refresh_previews()
+        self.selection_changed.emit()
 
     def _refresh_previews(self) -> None:
         while self.preview_layout.count():
@@ -228,23 +230,6 @@ class MultiAssetPicker(QtWidgets.QWidget):
             name.setToolTip(alias)
             card_layout.addWidget(image)
             card_layout.addWidget(name)
-            offset_row = QtWidgets.QHBoxLayout()
-            offset_row.setSpacing(3)
-            current_offset = self._offsets.get(alias, [0, 0])
-            for axis, label_text in enumerate(("X", "Y")):
-                spin = WheelSafeSpinBox()
-                spin.setRange(-5000, 5000)
-                spin.setValue(int(current_offset[axis] or 0))
-                spin.setFixedWidth(58)
-                spin.setToolTip(f"{alias} 검색 성공 시 {label_text} 클릭 오프셋")
-                spin.valueChanged.connect(
-                    lambda value, selected_alias=alias, selected_axis=axis: self._set_offset_axis(
-                        selected_alias, selected_axis, value
-                    )
-                )
-                offset_row.addWidget(QtWidgets.QLabel(label_text))
-                offset_row.addWidget(spin)
-            card_layout.addLayout(offset_row)
             self.preview_layout.addWidget(card)
             self.preview_aliases.append(alias)
         self.preview_layout.addStretch(1)
@@ -994,6 +979,7 @@ class OffsetCanvas(QtWidgets.QWidget):
 
 class OffsetEditor(QtWidgets.QWidget):
     offset_picked = QtCore.Signal()
+    multi_offset_edited = QtCore.Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1001,6 +987,18 @@ class OffsetEditor(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(7)
         self.canvas = OffsetCanvas()
+        self._multi_paths: dict[str, Path] = {}
+        self._multi_offsets: dict[str, list[int]] = {}
+        self._switching_asset = False
+        self.asset_row = QtWidgets.QWidget()
+        asset_layout = QtWidgets.QHBoxLayout(self.asset_row)
+        asset_layout.setContentsMargins(0, 0, 0, 0)
+        asset_layout.addWidget(QtWidgets.QLabel("오프셋 설정 이미지"))
+        self.asset_selector = QtWidgets.QComboBox()
+        self.asset_selector.setMinimumWidth(240)
+        asset_layout.addWidget(self.asset_selector, 1)
+        asset_layout.addWidget(QtWidgets.QLabel("이미지를 바꾸면 각 클릭점이 따로 저장됩니다."))
+        self.asset_row.setVisible(False)
         self.label = QtWidgets.QLabel("이미지 중심")
         self.label.setObjectName("Muted")
         self.range_combo = QtWidgets.QComboBox()
@@ -1036,6 +1034,7 @@ class OffsetEditor(QtWidgets.QWidget):
         value_row.addWidget(self.y_spin)
         value_row.addWidget(pick_points)
         value_row.addWidget(reset)
+        layout.addWidget(self.asset_row)
         layout.addLayout(view_row)
         layout.addWidget(self.canvas)
         layout.addLayout(value_row)
@@ -1044,6 +1043,8 @@ class OffsetEditor(QtWidgets.QWidget):
         self.y_spin.valueChanged.connect(self._sync_from_inputs)
         self.range_combo.currentIndexChanged.connect(self._change_view_range)
         self.zoom_combo.currentIndexChanged.connect(self._change_preview_zoom)
+        self.canvas.offset_changed.connect(self._store_active_multi_offset)
+        self.asset_selector.currentIndexChanged.connect(self._switch_multi_asset)
 
     def set_value(self, value: Any) -> None:
         values = value if isinstance(value, (list, tuple)) else [0, 0]
@@ -1056,6 +1057,48 @@ class OffsetEditor(QtWidgets.QWidget):
 
     def set_preview(self, path: Path | None) -> None:
         self.canvas.set_preview(path)
+
+    def set_multi_assets(self, entries: list[tuple[str, Path]], offsets: dict[str, list[int]]) -> None:
+        previous = str(self.asset_selector.currentData() or "")
+        self._multi_paths = {alias: Path(path) for alias, path in entries}
+        self._multi_offsets = {
+            alias: list(offsets.get(alias, [0, 0]))[:2]
+            for alias, _path in entries
+        }
+        blocker = QtCore.QSignalBlocker(self.asset_selector)
+        self.asset_selector.clear()
+        for alias, _path in entries:
+            self.asset_selector.addItem(alias, alias)
+        index = self.asset_selector.findData(previous)
+        self.asset_selector.setCurrentIndex(index if index >= 0 else 0)
+        del blocker
+        self.asset_row.setVisible(len(entries) > 1)
+        self._switch_multi_asset(self.asset_selector.currentIndex())
+
+    def clear_multi_assets(self) -> None:
+        self._multi_paths = {}
+        self._multi_offsets = {}
+        self.asset_row.setVisible(False)
+
+    def multi_offsets(self) -> dict[str, list[int]]:
+        return {alias: list(value) for alias, value in self._multi_offsets.items()}
+
+    def _switch_multi_asset(self, _index: int) -> None:
+        alias = str(self.asset_selector.currentData() or "")
+        if not alias or alias not in self._multi_paths:
+            return
+        self._switching_asset = True
+        self.canvas.set_preview(self._multi_paths[alias])
+        self.set_value(self._multi_offsets.get(alias, [0, 0]))
+        self._switching_asset = False
+
+    def _store_active_multi_offset(self, x: int, y: int) -> None:
+        if self._switching_asset:
+            return
+        alias = str(self.asset_selector.currentData() or "")
+        if alias and alias in self._multi_paths:
+            self._multi_offsets[alias] = [int(x), int(y)]
+            self.multi_offset_edited.emit()
 
     def _pick_from_screen(self) -> None:
         picker = OffsetPointPickerDialog(self.window())
@@ -1231,6 +1274,9 @@ class ActionEditor(QtWidgets.QWidget):
                     if isinstance(click_image, QtWidgets.QCheckBox):
                         click_image.setChecked(False)
                 multi_picker.offset_edited.connect(enable_multi_offset_click)
+                if isinstance(offset_editor, OffsetEditor):
+                    offset_editor.multi_offset_edited.connect(enable_multi_offset_click)
+                multi_picker.selection_changed.connect(self._update_offset_preview)
             asset = self.widgets[action].get("asset")
             if isinstance(asset, QtWidgets.QComboBox):
                 asset.currentIndexChanged.connect(self._update_offset_preview)
@@ -1779,9 +1825,24 @@ class ActionEditor(QtWidgets.QWidget):
     def _update_offset_preview(self) -> None:
         widgets = self.widgets.get("image_search", {})
         combo = widgets.get("asset")
+        picker = widgets.get("assets")
         editor = widgets.get("click.offset")
         if not isinstance(combo, QtWidgets.QComboBox) or not isinstance(editor, OffsetEditor):
             return
+        if isinstance(picker, MultiAssetPicker):
+            aliases = picker.value()
+            if len(aliases) > 1:
+                existing = editor.multi_offsets()
+                offsets = picker.offsets()
+                offsets.update({alias: value for alias, value in existing.items() if alias in aliases})
+                entries = [
+                    (alias, path)
+                    for alias in aliases
+                    if (path := self.repository.asset_path(alias)) is not None
+                ]
+                editor.set_multi_assets(entries, offsets)
+                return
+        editor.clear_multi_assets()
         alias = str(combo.currentData() or combo.currentText() or "")
         editor.set_preview(self.repository.asset_path(alias) if alias else None)
 
@@ -1941,6 +2002,9 @@ class ActionEditor(QtWidgets.QWidget):
             self._set_widget_value(self.widgets[action][spec.key], spec, value)
         if action == "image_search":
             picker = self.widgets[action].get("assets")
+            offset_editor = self.widgets[action].get("click.offset")
+            if isinstance(offset_editor, OffsetEditor):
+                offset_editor.clear_multi_assets()
             if isinstance(picker, MultiAssetPicker):
                 picker.set_offsets(normalized.get("asset_offsets") or {})
             self._update_offset_preview()
@@ -1970,7 +2034,12 @@ class ActionEditor(QtWidgets.QWidget):
                 payload["engine"] = "opencv"
                 picker = self.widgets[action].get("assets")
                 if isinstance(picker, MultiAssetPicker):
-                    payload["asset_offsets"] = picker.offsets()
+                    offset_editor = self.widgets[action].get("click.offset")
+                    if isinstance(offset_editor, OffsetEditor):
+                        payload["asset_offsets"] = offset_editor.multi_offsets()
+                        picker.set_offsets(payload["asset_offsets"])
+                    else:
+                        payload["asset_offsets"] = picker.offsets()
             else:
                 payload.pop("assets", None)
                 payload.pop("asset_offsets", None)

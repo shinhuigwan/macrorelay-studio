@@ -2057,7 +2057,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertFalse(_is_unconfigured_template_step(starter))
 
     def test_recorded_image_strategy_uses_click_time_sample(self) -> None:
-        from PySide6 import QtCore, QtGui, QtWidgets
+        from PySide6 import QtCore, QtGui, QtTest, QtWidgets
         from macro_studio.automation import RecordingReviewDialog
         from macro_studio.repository import MacroRepository
 
@@ -2164,7 +2164,7 @@ class UiSmokeTests(unittest.TestCase):
         app.processEvents()
 
     def test_recorded_image_crop_uses_adjustable_click_center_area(self) -> None:
-        from PySide6 import QtCore, QtGui, QtWidgets
+        from PySide6 import QtCore, QtGui, QtTest, QtWidgets
         from macro_studio.automation import RecordedImageCropDialog, RecordingReviewDialog
         from macro_studio.image_editor import ScreenCaptureDialog
         from macro_studio.repository import MacroRepository
@@ -2197,6 +2197,17 @@ class UiSmokeTests(unittest.TestCase):
         )
         self.assertEqual(70, resized.left())
         self.assertEqual(selection.right(), resized.right())
+        quick_picker = ScreenCaptureDialog(
+            QtGui.QPixmap.fromImage(image), QtCore.QRect(0, 0, image.width(), image.height()), accept_on_release=True
+        )
+        accepted: list[bool] = []
+        quick_picker.accepted.connect(lambda: accepted.append(True))
+        quick_picker.show()
+        QtTest.QTest.mousePress(quick_picker.canvas, QtCore.Qt.LeftButton, pos=QtCore.QPoint(20, 20))
+        QtTest.QTest.mouseMove(quick_picker.canvas, QtCore.QPoint(180, 120))
+        QtTest.QTest.mouseRelease(quick_picker.canvas, QtCore.Qt.LeftButton, pos=QtCore.QPoint(180, 120))
+        app.processEvents()
+        self.assertTrue(accepted)
         crop_dialog.close()
 
         with tempfile.TemporaryDirectory() as directory:
@@ -4631,6 +4642,25 @@ class AIAutomationTests(unittest.TestCase):
             targets = json.loads((stage / "targets.json").read_text(encoding="utf-8"))
             self.assertTrue(targets[0]["reacquire_each_run"])
             self.assertEqual("browser.exe", targets[0]["exe"])
+
+    def test_ai_execution_condition_exposes_cutout_editor_after_capture(self) -> None:
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.ai_recording import AIExecutionConditionDialog
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            dialog = AIExecutionConditionDialog(repository, [], None)
+            dialog.auto_radio.setChecked(True)
+            self.assertTrue(dialog.edit_button.isVisibleTo(dialog))
+            self.assertFalse(dialog.edit_button.isEnabled())
+            image = QtGui.QImage(80, 50, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#44CDB8"))
+            dialog.trigger_image = image
+            dialog.edit_button.setEnabled(True)
+            self.assertEqual("✨ 누끼·상세 편집", dialog.edit_button.text())
+            dialog.close()
 
     def test_ai_image_appear_trigger_is_packaged_and_materialized_for_client_watch(self) -> None:
         from PySide6 import QtGui, QtWidgets

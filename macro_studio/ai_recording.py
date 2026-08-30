@@ -12,14 +12,15 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .ai_automation import AIRecordingPackageBuilder, load_ai_recording
 from .automation import RecordingBar, SmartRecordingController
-from .image_editor import ScreenCaptureDialog, capture_virtual_desktop
+from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
 
 
 class AIExecutionConditionDialog(QtWidgets.QDialog):
     """Simple post-recording choice; trigger mechanics stay hidden."""
 
-    def __init__(self, events: list[dict], parent=None) -> None:
+    def __init__(self, repository, events: list[dict], parent=None) -> None:
         super().__init__(parent)
+        self.repository = repository
         self.events = events
         self.trigger_image = QtGui.QImage()
         self.trigger_scene = QtGui.QImage()
@@ -42,10 +43,15 @@ class AIExecutionConditionDialog(QtWidgets.QDialog):
         capture_row = QtWidgets.QHBoxLayout()
         self.capture_button = QtWidgets.QPushButton("⌖ 화면에서 지정")
         self.capture_button.clicked.connect(self._capture_trigger)
+        self.edit_button = QtWidgets.QPushButton("✨ 누끼·상세 편집")
+        self.edit_button.setEnabled(False)
+        self.edit_button.setToolTip("자동 누끼, 색상 제거, 투명화 붓과 자르기로 시작 화면 이미지를 정리합니다.")
+        self.edit_button.clicked.connect(self._edit_trigger_image)
         self.capture_status = QtWidgets.QLabel("시작 화면을 지정하세요.")
         self.capture_status.setObjectName("Muted")
         capture_row.addSpacing(24)
         capture_row.addWidget(self.capture_button)
+        capture_row.addWidget(self.edit_button)
         capture_row.addWidget(self.capture_status, 1)
         condition_layout.addLayout(capture_row)
         self.preview = QtWidgets.QLabel()
@@ -84,27 +90,41 @@ class AIExecutionConditionDialog(QtWidgets.QDialog):
     def _sync_mode(self) -> None:
         enabled = self.auto_radio.isChecked()
         self.capture_button.setVisible(enabled)
+        self.edit_button.setVisible(enabled)
         self.capture_status.setVisible(enabled)
         self.preview.setVisible(enabled)
 
     def _capture_trigger(self) -> None:
         parent = self.parentWidget()
+        parent_was_visible = bool(parent is not None and parent.isVisible())
+        image = QtGui.QImage()
+        screen_rect = QtCore.QRect()
+        pixmap = QtGui.QPixmap()
+        geometry = QtCore.QRect()
         self.hide()
-        if parent is not None:
+        if parent_was_visible:
             parent.hide()
-        wait = QtCore.QEventLoop(self)
-        QtCore.QTimer.singleShot(220, wait.quit)
-        wait.exec()
-        pixmap, geometry = capture_virtual_desktop()
-        picker = ScreenCaptureDialog(pixmap, geometry)
-        accepted = picker.exec() == QtWidgets.QDialog.Accepted
-        image = picker.captured_image() if accepted else QtGui.QImage()
-        screen_rect = picker.selected_screen_rect() if accepted else QtCore.QRect()
-        if parent is not None:
-            parent.show()
-            parent.raise_()
-        self.show()
-        self.raise_()
+        try:
+            wait = QtCore.QEventLoop(self)
+            QtCore.QTimer.singleShot(120, wait.quit)
+            wait.exec()
+            pixmap, geometry = capture_virtual_desktop()
+            if pixmap.isNull():
+                QtWidgets.QMessageBox.warning(None, "화면 캡처", "화면 이미지를 가져오지 못했습니다.")
+                return
+            picker = ScreenCaptureDialog(pixmap, geometry, accept_on_release=True)
+            accepted = picker.exec() == QtWidgets.QDialog.Accepted
+            image = picker.captured_image() if accepted else QtGui.QImage()
+            screen_rect = picker.selected_screen_rect() if accepted else QtCore.QRect()
+            picker.deleteLater()
+        finally:
+            if parent_was_visible and parent is not None:
+                parent.show()
+                parent.raise_()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self.setFocus(QtCore.Qt.ActiveWindowFocusReason)
         if image.isNull():
             return
         self.trigger_image = image
@@ -121,6 +141,7 @@ class AIExecutionConditionDialog(QtWidgets.QDialog):
             560, 108, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
         )
         self.preview.setPixmap(preview)
+        self.edit_button.setEnabled(True)
         if self.trigger_window:
             label = str(self.trigger_window.get("exe") or self.trigger_window.get("title") or "대상 프로그램")
             self.capture_status.setText(f"✓ 시작 화면 이미지 준비 완료 · {label}")
@@ -128,6 +149,34 @@ class AIExecutionConditionDialog(QtWidgets.QDialog):
         else:
             self.capture_status.setText("⚠ 대상 프로그램 확인 필요 · 다시 지정해 주세요")
             self.capture_status.setStyleSheet("color:#FFB35C; font-weight:700;")
+
+    def _edit_trigger_image(self) -> None:
+        if self.trigger_image.isNull():
+            QtWidgets.QMessageBox.information(self, "이미지 상세 편집", "먼저 화면에서 시작 이미지를 지정하세요.")
+            return
+        edit_root = self.repository.root / ".automation" / "trigger-edits"
+        edit_root.mkdir(parents=True, exist_ok=True)
+        temporary = edit_root / f"trigger-{uuid.uuid4().hex}.png"
+        if not self.trigger_image.save(str(temporary), "PNG"):
+            QtWidgets.QMessageBox.warning(self, "이미지 상세 편집", "임시 편집 이미지를 만들지 못했습니다.")
+            return
+        dialog = ImageEditorDialog(temporary, "AI 시작 화면", self.repository.history_dir, self)
+        dialog.setWindowTitle("시작 화면 · 누끼 및 상세 편집")
+        result = dialog.exec()
+        if result == QtWidgets.QDialog.Accepted:
+            edited = QtGui.QImage(str(temporary))
+            if not edited.isNull():
+                self.trigger_image = edited.convertToFormat(QtGui.QImage.Format_ARGB32)
+                preview = QtGui.QPixmap.fromImage(self.trigger_image).scaled(
+                    560, 108, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+                )
+                self.preview.setPixmap(preview)
+                self.capture_status.setText("✓ 누끼·상세 편집 적용 완료")
+                self.capture_status.setStyleSheet("color:#65E0B5; font-weight:700;")
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _window_at(self, point: QtCore.QPoint) -> dict:
         candidates: list[dict] = []
@@ -333,7 +382,7 @@ class AIRecordingController(SmartRecordingController):
             self.deleteLater()
             return
         video = self._encode_video()
-        condition_dialog = AIExecutionConditionDialog(events, self.host)
+        condition_dialog = AIExecutionConditionDialog(self.repository, events, self.host)
         accepted = condition_dialog.exec() == QtWidgets.QDialog.Accepted
         trigger_config = condition_dialog.configuration() if accepted else {"type": "manual"}
         try:

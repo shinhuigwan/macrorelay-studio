@@ -103,9 +103,17 @@ class PrecisionImageView(QtWidgets.QLabel):
 class ScreenCaptureDialog(QtWidgets.QDialog):
     """Full-screen region picker backed by a captured screen pixmap."""
 
-    def __init__(self, pixmap: QtGui.QPixmap, geometry: QtCore.QRect, parent=None) -> None:
+    def __init__(
+        self,
+        pixmap: QtGui.QPixmap,
+        geometry: QtCore.QRect,
+        parent=None,
+        *,
+        accept_on_release: bool = False,
+    ) -> None:
         super().__init__(parent)
         self._source = pixmap
+        self._accept_on_release = bool(accept_on_release)
         self._origin: QtCore.QPoint | None = None
         self._selection = QtCore.QRect()
         self._drag_mode = ""
@@ -123,7 +131,12 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         self.canvas.installEventFilter(self)
         layout.addWidget(self.canvas)
         self.rubber = SelectionRubberBand(self.canvas)
-        self.hint = QtWidgets.QLabel("드래그 지정 · 내부 드래그 이동 · 가장자리/모서리 크기 조절 · Enter 저장", self)
+        hint_text = (
+            "드래그를 놓으면 바로 저장 · Esc 취소"
+            if self._accept_on_release
+            else "드래그 지정 · 내부 드래그 이동 · 가장자리/모서리 크기 조절 · Enter 저장"
+        )
+        self.hint = QtWidgets.QLabel(hint_text, self)
         self.hint.setStyleSheet(
             "background:rgba(12,14,20,220); color:white; padding:10px 16px; "
             "border:1px solid #59637A; border-radius:8px; font-weight:700;"
@@ -242,6 +255,8 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
                 self._drag_mode = ""
                 mode = self._hit_test(self._selection, event.position().toPoint())
                 self.canvas.setCursor(self._cursor_for_mode(mode))
+                if self._accept_on_release and self._selection.width() >= 4 and self._selection.height() >= 4:
+                    QtCore.QTimer.singleShot(0, self.accept)
                 return True
             if event.type() == QtCore.QEvent.MouseButtonDblClick and self._selection.width() >= 4:
                 self.accept()

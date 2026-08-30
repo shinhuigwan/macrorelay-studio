@@ -361,7 +361,7 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
             "asset_ref": "recorded-image-001",
             "params": {"confidence": 86, "timeout": 1200, "click_enabled": True},
             "on_success": "end", "on_fail": "end", "retry_count": 2, "retry_delay": 250,
-            "needs_setup": ["verify_inactive_click"],
+            "needs_setup": [],
             "source_evidence": {"timeline_id": "click-001", "frame": "frames/step-001-before.png"},
         }],
         "setup_requirements": [],
@@ -371,15 +371,17 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 첨부된 AI 녹화 패키지 `{package_id}`를 분석하십시오. 이 패키지에는 사용자가 수행한 동작의 비식별 타임라인, 대상 프로그램 정보, 원본 PNG 이미지 후보와 선택적 동작 영상이 들어 있습니다.
 
 중요 규칙:
-1. 지금 즉시 JSON을 만들지 마십시오.
-2. 패키지를 먼저 분석하고, 영상과 기록만으로 확정할 수 없는 필수 질문을 번호 목록으로 한 번에 질문하십시오.
-3. 반복·종료 조건, 이미지 실패 재시도, 성공·실패 분기, 로그인 성공 판정, 예외 상황, 보안 보관함, 실패 알림을 확인하십시오. 이미 자료로 명확한 항목은 다시 묻지 마십시오.
-4. manifest.json에 실행 조건이 있으면 그 값을 그대로 `triggers`에 보존하고 시작 조건을 다시 질문하지 마십시오. `failure_policy`가 있으면 각 이미지 검색 단계의 재시도와 최종 실패 흐름에 반영하십시오.
-5. 사용자의 답변을 받은 뒤에만 JSON을 생성하십시오.
-6. 추측하지 마십시오. 확정되지 않은 값은 해당 노드의 `needs_setup` 배열과 최상위 `setup_requirements`에 기록하십시오.
-7. 아이디·비밀번호·API 키를 평문으로 넣지 마십시오. 민감 입력은 `vault_get` 노드와 보안 보관함 이름으로만 참조하십시오.
-8. 임의 Python, AutoHotkey, PowerShell, 셸 코드를 생성하지 마십시오. 허용 액션만 사용하십시오.
-9. 마지막 답변에는 설명과 JSON을 분리하고, JSON은 하나의 완전한 코드 블록으로 출력하십시오.
+1. 사용자가 평소처럼 수행한 기록을 그대로 자동화하는 것이 기본 목적입니다. 흐름이 명확하면 질문하지 말고 즉시 JSON을 만드십시오.
+2. 기본값은 1회 실행 후 종료, 이미지 검색 3회 재시도, 재시도 간격 500ms, 최종 실패 시 정지, 알림 없음입니다. 이 기본값을 확인 질문으로 되묻지 마십시오.
+3. 녹화에 문자 입력 이벤트가 없으면 이미 채워진 값 또는 프로그램의 자동 완성을 사용한 것입니다. ID·비밀번호 입력 노드를 새로 만들거나 보안 값 질문을 하지 마십시오.
+4. F8 중요 화면 표시가 있으면 시작·성공·실패 판정 후보로 우선 사용하십시오. 표시가 없으면 마지막 동작 뒤 안정된 화면을 성공 후보로 사용하되, 성공 판정이 없어도 1회 흐름은 만들 수 있습니다.
+5. 같은 exe와 창 class를 가진 제목 변화는 하나의 대상 프로그램으로 합치고, 실행할 때마다 현재 창과 핸들을 다시 찾도록 하십시오.
+6. 이미지 후보·검색 범위·클릭 위치·클릭 방식은 패키지 메타데이터의 자동 선택값을 사용하십시오. 비활성 클릭은 `click.mode=inactive`, `method=auto`로 만들고 별도 확인 질문을 만들지 마십시오.
+7. manifest.json의 실행 조건과 failure_policy는 그대로 보존하십시오. 시작 조건을 다시 질문하지 마십시오.
+8. 정말로 매크로를 만들 수 없는 단 하나의 정보만 누락된 경우에만 질문하십시오. 여러 질문을 나열하지 말고 한 번에 하나만 질문하십시오. 그 외 불확실성은 안전한 기본값과 `needs_setup`으로 처리한 초안을 즉시 만드십시오.
+9. 아이디·비밀번호·API 키를 평문으로 넣지 마십시오. 녹화에 실제 민감 입력 동작이 있을 때만 `vault_get`과 보안 보관함 이름을 사용하십시오.
+10. 임의 Python, AutoHotkey, PowerShell, 셸 코드를 생성하지 마십시오. 허용 액션만 사용하십시오.
+11. 마지막 답변에는 설명과 JSON을 분리하고, JSON은 하나의 완전한 코드 블록으로 출력하십시오.
 
 스키마 버전은 `{AI_SCHEMA_VERSION}`입니다. 최상위 필수 키는 `schema_version`, `source_package_id`, `name`, `description`, `targets`, `assets`, `variables`, `triggers`, `steps`, `setup_requirements`입니다.
 
@@ -397,7 +399,7 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 허용 액션:
 {', '.join(sorted(ALLOWED_ACTIONS))}
 
-이미지 클릭은 기본적으로 `image_search`와 `click.mode=inactive`를 제안하되, `inactive_click_verified`가 false이면 `verify_inactive_click`을 needs_setup에 남기십시오. 검색 범위는 대상 프로그램의 클라이언트 상대 좌표를 우선 사용하십시오.
+이미지 클릭은 기본적으로 `image_search`, `click.mode=inactive`, `click.method=auto`를 사용하십시오. 검색 범위는 대상 프로그램의 클라이언트 상대 좌표를 우선 사용하며 클릭 오프셋은 선택된 PNG 후보의 값을 그대로 사용하십시오.
 """
 
 
@@ -470,6 +472,7 @@ class AIRecordingPackageBuilder:
         video_path: Path | None = None,
         package_id: str | None = None,
         trigger_config: dict[str, Any] | None = None,
+        video_segments: list[dict[str, int]] | None = None,
     ) -> tuple[Path, Path]:
         trigger_config = trigger_config or {}
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -480,6 +483,7 @@ class AIRecordingPackageBuilder:
         (stage / "frames").mkdir(parents=True, exist_ok=True)
         (stage / "asset-candidates").mkdir(parents=True, exist_ok=True)
         (stage / "trigger-assets").mkdir(parents=True, exist_ok=True)
+        (stage / "marker-assets").mkdir(parents=True, exist_ok=True)
 
         targets, target_lookup = self._targets(events)
         timeline: list[dict[str, Any]] = []
@@ -487,6 +491,7 @@ class AIRecordingPackageBuilder:
         contact_rows: list[tuple[str, QtGui.QImage, str]] = []
         text_group = 0
         click_number = 0
+        marker_number = 0
         previous_time = 0
         sensitive_regions = list(
             dict.fromkeys(
@@ -504,6 +509,37 @@ class AIRecordingPackageBuilder:
             window = event.get("window") if isinstance(event.get("window"), dict) else {}
             target_id = target_lookup.get(self._target_key(window), "")
             event_type = str(event.get("type") or "")
+            if event_type == "capture":
+                marker_number += 1
+                marker_image = _decode_image(event.get("image_sample_bmp"))
+                if not marker_image.isNull():
+                    relative = f"marker-assets/marker-{marker_number:03d}.png"
+                    marker_image.save(str(stage / relative), "PNG")
+                    marker_id = f"marker-{marker_number:03d}"
+                    assets.append({
+                        "id": marker_id,
+                        "label": f"사용자 중요 화면 {marker_number}",
+                        "target_ref": target_id,
+                        "required": False,
+                        "purpose": "important_screen_marker",
+                        "candidate": relative,
+                        "selected_candidate": relative,
+                        "readiness": "ready",
+                        "validation": {"image_ready": True, "search_verified": True},
+                        "needs_setup": [],
+                    })
+                    timeline.append({
+                        "id": marker_id,
+                        "t": current_time,
+                        "delay_from_previous_ms": max(0, current_time - previous_time),
+                        "type": "important_screen_marker",
+                        "asset_ref": marker_id,
+                        "target_ref": target_id,
+                        "screen_rect": list(event.get("selected_screen_rect") or [])[:4],
+                    })
+                    contact_rows.append((marker_id, marker_image, "F8 중요 화면"))
+                    previous_time = current_time
+                continue
             if event_type == "key":
                 token = str(event.get("token") or "")
                 character = str(event.get("char") or "")
@@ -618,6 +654,7 @@ class AIRecordingPackageBuilder:
         _write_json(stage / "timeline.json", timeline)
         _write_json(stage / "targets.json", targets)
         _write_json(stage / "asset-manifest.json", {"assets": assets})
+        _write_json(stage / "video-segments.json", {"segments": video_segments or []})
         self._write_contact_sheet(stage / "contact-sheet.png", contact_rows)
         if video_path is not None and video_path.is_file():
             shutil.copy2(video_path, stage / "recording.mp4")
@@ -639,6 +676,8 @@ class AIRecordingPackageBuilder:
                 "retry_count": 3, "retry_delay": 500, "after_failure": "stop", "notify": False,
             }),
             "video_available": (stage / "recording.mp4").is_file(),
+            "video_mode": "action_windows",
+            "video_segment_count": len(video_segments or []),
             "text_policy": "All printable keyboard input is redacted. ChatGPT must ask for a vault name or value classification.",
             "image_policy": "Lossless native PNG candidates only; video frames are never used as search templates.",
         }
@@ -736,15 +775,29 @@ class AIRecordingPackageBuilder:
     def _targets(self, events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[tuple[str, str, str], str]]:
         targets: list[dict[str, Any]] = []
         lookup: dict[tuple[str, str, str], str] = {}
+        grouped: dict[tuple[str, ...], dict[str, Any]] = {}
         for event in events:
             window = event.get("window") if isinstance(event.get("window"), dict) else {}
             key = self._target_key(window)
             if not any(key) or key in lookup:
                 continue
+            exe, window_class, title = key
+            group_key: tuple[str, ...] = ("app", exe, window_class) if exe and window_class else ("window", *key)
+            existing = grouped.get(group_key)
+            if existing is not None:
+                target_id = str(existing.get("id") or "")
+                lookup[key] = target_id
+                titles = existing.setdefault("observed_titles", [])
+                raw_title = str(window.get("title") or "")
+                if raw_title and raw_title not in titles:
+                    titles.append(raw_title)
+                if len(titles) > 1:
+                    existing["title"] = ""
+                    existing["window_token"] = _window_token({"exe": window.get("exe"), "class": window.get("class")})
+                continue
             target_id = f"target-{len(targets) + 1:02d}"
             lookup[key] = target_id
-            targets.append(
-                {
+            target = {
                     "id": target_id,
                     "label": str(window.get("exe") or window.get("title") or f"대상 {len(targets) + 1}"),
                     "exe": str(window.get("exe") or ""),
@@ -764,9 +817,11 @@ class AIRecordingPackageBuilder:
                     "coordinate_base": "client",
                     "reacquire_each_run": True,
                     "inactive_click_verified": False,
-                    "needs_setup": ["verify_inactive_click"],
+                    "needs_setup": [],
+                    "observed_titles": [str(window.get("title") or "")] if str(window.get("title") or "") else [],
                 }
-            )
+            targets.append(target)
+            grouped[group_key] = target
         return targets, lookup
 
     def _write_click_images(
@@ -1059,7 +1114,37 @@ def materialize_ai_document(
     issues = validate_ai_document(payload)
     if any(issue.severity == "error" for issue in issues):
         return {}, issues
-    targets, target_lookup = _items_by_id(payload.get("targets"))
+    raw_targets, _raw_target_lookup = _items_by_id(payload.get("targets"))
+    targets: list[dict[str, Any]] = []
+    target_lookup: dict[str, dict[str, Any]] = {}
+    target_id_remap: dict[str, str] = {}
+    grouped_targets: dict[tuple[str, ...], dict[str, Any]] = {}
+    for source in raw_targets:
+        target = deepcopy(source)
+        target_id = str(target.get("id") or "")
+        exe = str(target.get("exe") or "").strip().casefold()
+        window_class = str(target.get("class") or "").strip().casefold()
+        title = str(target.get("title") or "").strip().casefold()
+        group_key: tuple[str, ...] = ("app", exe, window_class) if exe and window_class else ("window", exe, window_class, title)
+        existing = grouped_targets.get(group_key)
+        if existing is None:
+            target["needs_setup"] = [
+                value for value in target.get("needs_setup") or [] if value != "verify_inactive_click"
+            ]
+            targets.append(target)
+            grouped_targets[group_key] = target
+            target_lookup[target_id] = target
+            target_id_remap[target_id] = target_id
+            continue
+        target_lookup[target_id] = existing
+        target_id_remap[target_id] = str(existing.get("id") or target_id)
+        if str(existing.get("title") or "") != str(target.get("title") or ""):
+            existing["title"] = ""
+            if existing.get("class") and existing.get("exe"):
+                existing["window_token"] = f"ahk_class {existing['class']} ahk_exe {existing['exe']}"
+        existing["inactive_click_verified"] = bool(
+            existing.get("inactive_click_verified") or target.get("inactive_click_verified")
+        )
     assets, asset_lookup = _items_by_id(payload.get("assets"))
     asset_aliases: dict[str, str] = {}
     asset_states: dict[str, dict[str, Any]] = {}
@@ -1113,7 +1198,7 @@ def materialize_ai_document(
         step_id = str(raw.get("id") or "")
         action = str(raw.get("action") or "")
         step = _merge_safe_step(action, raw)
-        target_ref = str(raw.get("target_ref") or "")
+        target_ref = target_id_remap.get(str(raw.get("target_ref") or ""), str(raw.get("target_ref") or ""))
         target = target_lookup.get(target_ref, {})
         window_token = str(target.get("window_token") or "")
         exe = str(target.get("exe") or "")
@@ -1171,8 +1256,9 @@ def materialize_ai_document(
             step["capture_mode"] = "client"
             step["coord_base"] = "client"
             step["window_title"] = window_token
-        if target and not bool(target.get("inactive_click_verified")) and action in {"image_search", "inactive_click", "type_text"}:
-            step.setdefault("needs_setup", []).append("verify_inactive_click")
+        # The runtime's automatic click method reacquires the current target
+        # every run. A manual handle-lab profile remains an optional advanced
+        # override; it must not block an otherwise usable AI draft.
         for edge in ("on_success", "on_fail"):
             target_id = str(raw.get(edge) or "")
             if target_id in index_by_id:
@@ -1235,7 +1321,9 @@ def materialize_ai_document(
         if kind not in {"image_appear", "image_appears"}:
             continue
         params = raw_trigger.get("params") if isinstance(raw_trigger.get("params"), dict) else {}
-        target_ref = str(raw_trigger.get("target_ref") or "")
+        target_ref = target_id_remap.get(
+            str(raw_trigger.get("target_ref") or ""), str(raw_trigger.get("target_ref") or "")
+        )
         target = target_lookup.get(target_ref, {})
         asset_ref = str(raw_trigger.get("asset_ref") or "")
         alias = asset_aliases.get(asset_ref, "")

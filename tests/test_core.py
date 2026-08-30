@@ -4622,6 +4622,7 @@ class AIAutomationTests(unittest.TestCase):
             expected = {
                 "prompt.txt", "schema.json", "manifest.json", "timeline.json", "targets.json", "recording.mp4",
                 "contact-sheet.png", "asset-manifest.json", "frames/step-001-before.png",
+                "video-segments.json",
                 "frames/step-001-after.png", "asset-candidates/click-001-button.png",
                 "asset-candidates/click-001-button-grayscale.png",
                 "asset-candidates/click-001-button-outline.png",
@@ -4637,8 +4638,9 @@ class AIAutomationTests(unittest.TestCase):
             self.assertIn("[REDACTED]", timeline_text)
             self.assertNotIn('"value": "P"', timeline_text)
             prompt = (stage / "prompt.txt").read_text(encoding="utf-8")
-            self.assertIn("지금 즉시 JSON을 만들지", prompt)
-            self.assertIn("사용자의 답변을 받은 뒤에만", prompt)
+            self.assertIn("흐름이 명확하면 질문하지 말고 즉시 JSON", prompt)
+            self.assertIn("1회 실행 후 종료", prompt)
+            self.assertIn("질문으로 되묻지", prompt)
             targets = json.loads((stage / "targets.json").read_text(encoding="utf-8"))
             self.assertTrue(targets[0]["reacquire_each_run"])
             self.assertEqual("browser.exe", targets[0]["exe"])
@@ -4661,6 +4663,48 @@ class AIAutomationTests(unittest.TestCase):
             dialog.edit_button.setEnabled(True)
             self.assertEqual("✨ 누끼·상세 편집", dialog.edit_button.text())
             dialog.close()
+
+    def test_ai_package_merges_title_changes_for_same_application_window(self) -> None:
+        from macro_studio.ai_automation import AIRecordingPackageBuilder
+
+        common = {"exe": "whale.exe", "class": "Chrome_WidgetWin_1"}
+        events = [
+            {"type": "mouse", "t": 10, "button": "WheelDown", "x": 10, "y": 10,
+             "window": {**common, "title": "NAVER - Whale"}},
+            {"type": "mouse", "t": 20, "button": "WheelDown", "x": 10, "y": 20,
+             "window": {**common, "title": "NAVER 로그인 - Whale"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            _archive, stage = AIRecordingPackageBuilder(Path(directory)).build(
+                events, package_id="merge-window-titles"
+            )
+            targets = json.loads((stage / "targets.json").read_text(encoding="utf-8"))
+            timeline = json.loads((stage / "timeline.json").read_text(encoding="utf-8"))
+        self.assertEqual(1, len(targets))
+        self.assertEqual("", targets[0]["title"])
+        self.assertIn("ahk_class Chrome_WidgetWin_1", targets[0]["window_token"])
+        self.assertEqual({"target-01"}, {item["target_ref"] for item in timeline})
+
+    def test_ai_package_preserves_f8_important_screen_as_png_marker(self) -> None:
+        from macro_studio.ai_automation import AIRecordingPackageBuilder
+
+        event = {
+            "type": "capture", "t": 120, "image_sample_bmp": self._sample_bmp(),
+            "selected_screen_rect": [10, 20, 360, 240],
+            "window": {"exe": "app.exe", "class": "AppWindow", "title": "작업"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            _archive, stage = AIRecordingPackageBuilder(Path(directory)).build(
+                [event], package_id="important-marker", video_segments=[{"start_ms": 0, "end_ms": 2000}]
+            )
+            timeline = json.loads((stage / "timeline.json").read_text(encoding="utf-8"))
+            assets = json.loads((stage / "asset-manifest.json").read_text(encoding="utf-8"))["assets"]
+            segments = json.loads((stage / "video-segments.json").read_text(encoding="utf-8"))["segments"]
+            marker_exists = (stage / "marker-assets" / "marker-001.png").is_file()
+        self.assertEqual("important_screen_marker", timeline[0]["type"])
+        self.assertEqual("important_screen_marker", assets[0]["purpose"])
+        self.assertEqual([{"start_ms": 0, "end_ms": 2000}], segments)
+        self.assertTrue(marker_exists)
 
     def test_ai_image_appear_trigger_is_packaged_and_materialized_for_client_watch(self) -> None:
         from PySide6 import QtGui, QtWidgets
@@ -4785,7 +4829,7 @@ class AIAutomationTests(unittest.TestCase):
             self.assertEqual("browser.exe", step["region_window_exe"])
             self.assertEqual("inactive", step["click"]["mode"])
             self.assertEqual([12, -4], step["click"]["offset"])
-            self.assertIn("verify_inactive_click", step["needs_setup"])
+            self.assertNotIn("verify_inactive_click", step["needs_setup"])
             asset_path = repository.asset_path(step["asset"])
             self.assertIsNotNone(asset_path)
             self.assertEqual(".png", asset_path.suffix.lower())
@@ -4870,6 +4914,40 @@ class AIAutomationTests(unittest.TestCase):
             self.assertEqual("", step["click"]["target_hwnd"])
             self.assertNotIn("verify_inactive_click", step["needs_setup"])
             self.assertTrue(dialog.macro["ai_setup"]["targets"][0]["inactive_click_verified"])
+            dialog.close()
+
+    def test_ai_setup_dialog_has_simple_three_step_flow_and_auto_resolves_safe_checks(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.ai_import_dialog import AIDraftSetupDialog
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            image = QtGui.QImage(40, 30, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#31C9B2"))
+            alias = repository.add_asset_image(image, "auto-image")
+            macro = {
+                "name": "간단 설정", "meta": {"ai_draft": True},
+                "steps": [{"action": "image_search", "asset": alias,
+                           "click": {"mode": "inactive"},
+                           "needs_setup": ["verify_search", "verify_inactive_click"],
+                           "_ai": {"target_ref": "target-a"}}],
+                "triggers": [{"id": "trigger-001", "type": "manual"}],
+                "ai_setup": {"targets": [{"id": "target-a", "exe": "app.exe",
+                                              "class": "AppWindow", "window_token": "ahk_exe app.exe"}],
+                             "assets": [], "requirements": ["종료 후 알림 여부를 정하세요"], "unresolved": []},
+            }
+            dialog = AIDraftSetupDialog(macro, repository)
+            self.assertEqual("1. 모두 자동 확인", dialog.auto_check.text())
+            self.assertEqual("2. 한 번 테스트", dialog.test_once.text())
+            self.assertEqual("3. 사용 시작", dialog.use_now.text())
+            self.assertFalse(dialog.advanced_panel.isVisible())
+            dialog._automatic_prepare()
+            self.assertEqual([], dialog.macro["steps"][0]["needs_setup"])
+            self.assertEqual([], dialog.macro["ai_setup"]["requirements"])
+            self.assertTrue(dialog.use_now.isEnabled())
             dialog.close()
 
     def test_naver_like_record_package_json_import_end_to_end(self) -> None:

@@ -195,8 +195,8 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
         self.macro = deepcopy(macro)
         self.repository = repository
         self.setWindowTitle("AI 매크로 확인")
-        self.resize(1280, 800)
-        self.setMinimumSize(1040, 680)
+        self.resize(1000, 520)
+        self.setMinimumSize(900, 430)
         root = QtWidgets.QVBoxLayout(self)
         header = QtWidgets.QHBoxLayout()
         self.title = QtWidgets.QLabel()
@@ -208,11 +208,44 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
         header.addWidget(self.readiness)
         root.addLayout(header)
         hint = QtWidgets.QLabel(
-            "한 화면에서 미완성 항목을 정리합니다. 화면 캡처·이미지 편집·핸들 시험처럼 실제 조작이 필요한 경우에만 별도 창이 열립니다."
+            "녹화 내용을 자동으로 정리합니다. 먼저 자동 확인을 누르고, 한 번 테스트한 뒤 사용을 시작하세요."
         )
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
         root.addWidget(hint)
+
+        self.simple_status = QtWidgets.QLabel()
+        self.simple_status.setWordWrap(True)
+        self.simple_status.setMinimumHeight(92)
+        self.simple_status.setStyleSheet(
+            "background:#111A27; border:1px solid #2B3B52; border-radius:10px; padding:14px; font-size:11pt;"
+        )
+        root.addWidget(self.simple_status)
+        quick = QtWidgets.QHBoxLayout()
+        self.auto_check = QtWidgets.QPushButton("1. 모두 자동 확인")
+        self.auto_check.setObjectName("Primary")
+        self.auto_check.setMinimumHeight(42)
+        self.auto_check.clicked.connect(self._automatic_prepare)
+        self.test_once = QtWidgets.QPushButton("2. 한 번 테스트")
+        self.test_once.setMinimumHeight(42)
+        self.test_once.clicked.connect(self.dry_run_requested.emit)
+        self.use_now = QtWidgets.QPushButton("3. 사용 시작")
+        self.use_now.setObjectName("Primary")
+        self.use_now.setMinimumHeight(42)
+        self.use_now.clicked.connect(self._complete)
+        quick.addWidget(self.auto_check, 1)
+        quick.addWidget(self.test_once, 1)
+        quick.addWidget(self.use_now, 1)
+        root.addLayout(quick)
+
+        self.advanced_toggle = QtWidgets.QPushButton("▸ 세부 내용·직접 수정")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.toggled.connect(self._toggle_advanced)
+        root.addWidget(self.advanced_toggle)
+        self.advanced_panel = QtWidgets.QWidget()
+        advanced_layout = QtWidgets.QVBoxLayout(self.advanced_panel)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        self.advanced_panel.setVisible(False)
         trigger_box = QtWidgets.QGroupBox("실행 조건")
         trigger_layout = QtWidgets.QHBoxLayout(trigger_box)
         self.trigger_status = QtWidgets.QLabel()
@@ -224,7 +257,7 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
         trigger_layout.addWidget(self.trigger_status, 1)
         trigger_layout.addWidget(self.trigger_capture)
         trigger_layout.addWidget(self.trigger_test)
-        root.addWidget(trigger_box)
+        advanced_layout.addWidget(trigger_box)
         target_box = QtWidgets.QGroupBox("대상 프로그램 프로필 · 실행할 때마다 현재 창과 핸들을 다시 탐색")
         target_layout = QtWidgets.QVBoxLayout(target_box)
         self.targets = QtWidgets.QTableWidget()
@@ -242,7 +275,7 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
         self.targets.setMaximumHeight(155)
         self.targets.doubleClicked.connect(lambda _index: self._edit_target_profile())
         target_layout.addWidget(self.targets)
-        root.addWidget(target_box)
+        advanced_layout.addWidget(target_box)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.steps = QtWidgets.QTableWidget()
         self.steps.setColumnCount(4)
@@ -265,7 +298,7 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
         self.gallery.setWordWrap(True)
         splitter.addWidget(self.gallery)
         splitter.setSizes([700, 500])
-        root.addWidget(splitter, 1)
+        advanced_layout.addWidget(splitter, 1)
 
         controls = QtWidgets.QGridLayout()
         buttons: list[tuple[str, Any]] = [
@@ -283,23 +316,141 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
             button = QtWidgets.QPushButton(label)
             button.clicked.connect(callback)
             controls.addWidget(button, index // 4, index % 4)
-        root.addLayout(controls)
+        advanced_layout.addLayout(controls)
+        root.addWidget(self.advanced_panel, 1)
         footer = QtWidgets.QHBoxLayout()
         close = QtWidgets.QPushButton("나중에 계속")
         close.clicked.connect(self.reject)
-        complete = QtWidgets.QPushButton("설정 완료")
-        complete.setObjectName("Primary")
-        complete.clicked.connect(self._complete)
         footer.addStretch(1)
         footer.addWidget(close)
-        footer.addWidget(complete)
         root.addLayout(footer)
         self._refresh()
 
+    def _toggle_advanced(self, visible: bool) -> None:
+        self.advanced_panel.setVisible(bool(visible))
+        self.advanced_toggle.setText("▾ 세부 내용·직접 수정" if visible else "▸ 세부 내용·직접 수정")
+        if visible:
+            self.setMinimumSize(1040, 680)
+            self.resize(max(self.width(), 1180), max(self.height(), 760))
+        else:
+            self.setMinimumSize(900, 430)
+            self.resize(max(860, min(self.width(), 1040)), 460)
+
+    def _automatic_prepare(self) -> None:
+        """Resolve safe package metadata without turning it into user questions."""
+        setup = self.macro.setdefault("ai_setup", {})
+        targets = setup.get("targets") if isinstance(setup.get("targets"), list) else []
+        merged: list[dict[str, Any]] = []
+        canonical_by_key: dict[tuple[str, ...], dict[str, Any]] = {}
+        remap: dict[str, str] = {}
+        for source in targets:
+            if not isinstance(source, dict):
+                continue
+            target = deepcopy(source)
+            old_id = str(target.get("id") or f"target-{len(merged) + 1:02d}")
+            exe = str(target.get("exe") or "").strip().casefold()
+            window_class = str(target.get("class") or "").strip().casefold()
+            title = str(target.get("title") or "").strip().casefold()
+            key: tuple[str, ...] = ("app", exe, window_class) if exe and window_class else ("window", exe, window_class, title)
+            existing = canonical_by_key.get(key)
+            if existing is None:
+                target["id"] = old_id
+                target["needs_setup"] = [
+                    value for value in target.get("needs_setup") or [] if value != "verify_inactive_click"
+                ]
+                merged.append(target)
+                canonical_by_key[key] = target
+                remap[old_id] = old_id
+                continue
+            canonical_id = str(existing.get("id") or old_id)
+            remap[old_id] = canonical_id
+            if str(existing.get("title") or "") != str(target.get("title") or ""):
+                existing["title"] = ""
+                if existing.get("class") and existing.get("exe"):
+                    existing["window_token"] = f"ahk_class {existing['class']} ahk_exe {existing['exe']}"
+            existing["inactive_click_verified"] = bool(
+                existing.get("inactive_click_verified") or target.get("inactive_click_verified")
+            )
+        setup["targets"] = merged
+
+        for trigger in self.macro.get("triggers") or []:
+            if not isinstance(trigger, dict):
+                continue
+            target_ref = str(trigger.get("target_ref") or "")
+            if target_ref in remap:
+                trigger["target_ref"] = remap[target_ref]
+            alias = str(trigger.get("asset") or "")
+            if alias and self.repository.asset_path(alias) is not None:
+                trigger["needs_setup"] = [
+                    value for value in trigger.get("needs_setup") or []
+                    if value not in {"verify_trigger_image", "capture_trigger_image"}
+                ]
+
+        image_checks = {"select_asset", "confirm_asset", "choose_or_confirm_candidate", "verify_search", "verify_inactive_click"}
+        unresolved: list[dict[str, Any]] = []
+        for index, step in enumerate(self.macro.get("steps") or [], start=1):
+            if not isinstance(step, dict):
+                continue
+            ai_meta = step.get("_ai") if isinstance(step.get("_ai"), dict) else {}
+            target_ref = str(ai_meta.get("target_ref") or "")
+            if target_ref in remap:
+                ai_meta["target_ref"] = remap[target_ref]
+            action = str(step.get("action") or "")
+            needs = [str(value) for value in step.get("needs_setup") or [] if str(value)]
+            if action == "image_search" and self.repository.asset_path(str(step.get("asset") or "")) is not None:
+                needs = [value for value in needs if value not in image_checks]
+                click = step.get("click") if isinstance(step.get("click"), dict) else {}
+                click.setdefault("mode", "inactive")
+                click.setdefault("method", "auto")
+                step["click"] = click
+            elif action in {"inactive_click", "type_text"}:
+                needs = [value for value in needs if value != "verify_inactive_click"]
+                step.setdefault("method", "auto")
+            step["needs_setup"] = list(dict.fromkeys(needs))
+            if step["needs_setup"]:
+                unresolved.append({"step": index, "id": str(ai_meta.get("source_id") or ""), "items": step["needs_setup"]})
+        setup["unresolved"] = unresolved
+
+        # Keep only information that cannot be inferred safely. Purpose,
+        # retry, completion and notification questions use documented defaults.
+        security_words = ("password", "secret", "credential", "api key", "vault", "비밀번호", "보안 보관함", "인증 값")
+        setup["requirements"] = [
+            value for value in (str(item).strip() for item in setup.get("requirements") or [])
+            if value and any(word in value.casefold() for word in security_words)
+        ]
+        for target in merged:
+            self._sync_target_profile(str(target.get("id") or ""), target)
+        self.auto_check.setText("자동 확인 다시 실행")
+        self._refresh()
+        _complete, _total, pending = ai_draft_readiness(self.macro)
+        if pending:
+            self.advanced_toggle.setChecked(True)
+        else:
+            self.advanced_toggle.setChecked(False)
+
     def _refresh(self) -> None:
         complete, total, pending = ai_draft_readiness(self.macro)
-        self.title.setText(f"{self.macro.get('name', 'AI 매크로')} · 준비도 {complete}/{total}")
-        self.readiness.setText("✓ 실행 준비 완료" if not pending else f"확인이 필요한 항목 {len(pending)}개 · " + ", ".join(pending))
+        self.title.setText(str(self.macro.get('name', 'AI 매크로')))
+        self.readiness.setText("✓ 사용 준비 완료" if not pending else "자동 확인 필요")
+        done = total - len(pending)
+        if pending:
+            self.simple_status.setText(
+                f"현재 자동 확인 {done}/{total}\n"
+                f"남은 항목: {', '.join(pending)}\n\n"
+                "아래 ‘모두 자동 확인’을 누르면 대상 프로그램·이미지·클릭 위치·노드 연결을 한 번에 정리합니다."
+            )
+            self.simple_status.setStyleSheet(
+                "background:#111A27; border:1px solid #7A5C28; border-radius:10px; padding:14px; font-size:11pt; color:#FFD27A;"
+            )
+        else:
+            self.simple_status.setText(
+                "✓ 대상 프로그램 자동 연결\n✓ 이미지와 클릭 위치 자동 설정\n✓ 실행 흐름 확인 완료\n\n"
+                "‘한 번 테스트’로 실제 동작을 확인하거나 바로 사용을 시작할 수 있습니다."
+            )
+            self.simple_status.setStyleSheet(
+                "background:#10251F; border:1px solid #2D806C; border-radius:10px; padding:14px; font-size:11pt; color:#79E2C1;"
+            )
+        self.use_now.setEnabled(not pending)
         trigger = self._automatic_trigger()
         if trigger is None:
             self.trigger_status.setText("✓ 내가 직접 실행")
@@ -324,12 +475,12 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
                 str(target.get("exe") or ""),
                 str(target.get("title") or target.get("window_token") or ""),
                 str(target.get("class") or ""),
-                "자동 확인 완료" if bool(target.get("inactive_click_verified")) else "확인 필요",
+                "자동" if not bool(target.get("inactive_click_verified")) else "핸들 시험 완료",
             ]
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
                 if column == 4:
-                    item.setForeground(QtGui.QColor("#65E0B5" if bool(target.get("inactive_click_verified")) else "#FFB35C"))
+                    item.setForeground(QtGui.QColor("#65E0B5"))
                 self.targets.setItem(row, column, item)
         steps = self.macro.get("steps") if isinstance(self.macro.get("steps"), list) else []
         self.steps.setRowCount(len(steps))

@@ -237,6 +237,11 @@ class AIRecordingController(SmartRecordingController):
         self._video_timer.setInterval(750)
         self._video_timer.timeout.connect(self._capture_video_frame)
         self._frame_index = 0
+        self._frame_ring: list[tuple[int, QtGui.QPixmap]] = []
+        self._saved_frame_times: set[int] = set()
+        self._last_action_time = -1
+        self._keep_video_until = -1
+        self._video_segments: list[dict[str, int]] = []
 
     def start(self) -> None:
         helper = self.repository.root / "smart_recorder.py"
@@ -255,7 +260,7 @@ class AIRecordingController(SmartRecordingController):
                 "--delay",
                 "2",
                 "--capture-vk",
-                "0",
+                str(0x77),
                 "--stop-vk",
                 str(0x79),
                 "--hold-vk",
@@ -274,13 +279,16 @@ class AIRecordingController(SmartRecordingController):
         self.process.errorOccurred.connect(self._process_error)
         self.bar = RecordingBar(self.host)
         self.bar.setWindowTitle("AI 자동 매크로 제작 녹화")
-        self.bar.label.setText("2초 후 자동 녹화 · 평소처럼 작업하세요 · F10 종료")
+        self.bar.label.setText("2초 후 자동 녹화 · 평소처럼 작업 · F8 중요 화면 · F10 종료")
         self.bar.mode_badge.setText("AI 자동")
         self.bar.set_gate_active(True)
+        self.bar.timer.stop()
+        self.bar.label.setText("2초 후 자동 녹화 · 평소처럼 작업 · F8 중요 화면 · F10 종료")
         self.bar.stop_requested.connect(self.stop)
-        self.bar.capture_requested.connect(lambda: None)
+        self.bar.capture_requested.connect(self.request_image_capture)
         self.bar.show()
         self.process.start()
+        self._capture_poll.start()
         self._video_timer.start()
 
     def _latest_key_time(self) -> int:
@@ -309,14 +317,11 @@ class AIRecordingController(SmartRecordingController):
         width = min(1280, pixmap.width())
         scaled = pixmap.scaledToWidth(width, QtCore.Qt.SmoothTransformation)
         elapsed = max(0, int(self.bar.elapsed.elapsed() - 2000) if self.bar is not None else 0)
-        # The package must never expose printable keyboard input. Conservatively
-        # redact the whole low-resolution video for five seconds after a key.
-        # Lossless click PNG candidates are stored separately and contain no
-        # recorded key values.
-        # Once printable input begins, keep the remainder of the low-resolution
-        # semantic video protected. The lossless click PNGs separately redact
-        # focused input rectangles while preserving nearby buttons.
-        if self._latest_key_time() >= 0:
+        # Protect only the short typing window. Later screens remain useful for
+        # understanding success/failure while printable key values themselves
+        # are never written to the timeline.
+        latest_key = self._latest_key_time()
+        if 0 <= elapsed - latest_key <= 5000:
             protected = QtGui.QPixmap(scaled.size())
             protected.fill(QtGui.QColor("#0B1018"))
             painter = QtGui.QPainter(protected)
@@ -325,9 +330,52 @@ class AIRecordingController(SmartRecordingController):
             painter.drawText(protected.rect(), QtCore.Qt.AlignCenter, "민감한 키 입력 구간 · 화면 보호")
             painter.end()
             scaled = protected
+        self._frame_ring.append((elapsed, scaled.copy()))
+        self._frame_ring = [(stamp, frame) for stamp, frame in self._frame_ring if stamp >= elapsed - 2200]
+        latest_action = self._latest_recorded_action_time()
+        if latest_action > self._last_action_time:
+            self._last_action_time = latest_action
+            start = max(0, latest_action - 2000)
+            end = latest_action + 2000
+            if self._video_segments and start <= self._video_segments[-1]["end_ms"] + 250:
+                self._video_segments[-1]["end_ms"] = max(self._video_segments[-1]["end_ms"], end)
+            else:
+                self._video_segments.append({"start_ms": start, "end_ms": end})
+            self._keep_video_until = max(self._keep_video_until, end)
+            self._flush_frame_ring()
+        elif elapsed <= self._keep_video_until:
+            self._save_video_frame(elapsed, scaled)
+
+    def _latest_recorded_action_time(self) -> int:
+        if not self.output.is_file():
+            return -1
+        try:
+            lines = self.output.read_text(encoding="utf-8-sig", errors="replace").splitlines()[-120:]
+        except OSError:
+            return -1
+        latest = -1
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(item, dict) and item.get("type") in {"mouse", "key", "mouse_drag", "capture_request"}:
+                latest = max(latest, int(item.get("t") or 0))
+        return latest
+
+    def _save_video_frame(self, elapsed: int, pixmap: QtGui.QPixmap) -> None:
+        if elapsed in self._saved_frame_times:
+            return
+        self._saved_frame_times.add(elapsed)
         self._frame_index += 1
         target = self.frame_dir / f"frame-{self._frame_index:06d}-{elapsed:09d}.jpg"
-        scaled.save(str(target), "JPG", 74)
+        pixmap.save(str(target), "JPG", 74)
+
+    def _flush_frame_ring(self) -> None:
+        for elapsed, pixmap in self._frame_ring:
+            if self._last_action_time >= 0 and elapsed > self._keep_video_until:
+                continue
+            self._save_video_frame(elapsed, pixmap)
 
     def _encode_video(self) -> Path | None:
         helper = self.repository.root / "ai_video.py"
@@ -360,15 +408,21 @@ class AIRecordingController(SmartRecordingController):
     def _process_error(self, error: QtCore.QProcess.ProcessError) -> None:
         if error == QtCore.QProcess.FailedToStart:
             self._video_timer.stop()
+            self._capture_poll.stop()
             self.failed.emit("AI 매크로 녹화 프로세스를 시작하지 못했습니다.")
 
     def _finished(self, exit_code: int, _status: QtCore.QProcess.ExitStatus) -> None:
         self._video_timer.stop()
+        self._capture_poll.stop()
+        self._flush_frame_ring()
         if self.bar is not None:
             self.bar.close()
             self.bar.deleteLater()
             self.bar = None
-        events = load_ai_recording(self.output)
+        events = sorted(
+            [*load_ai_recording(self.output), *self._manual_captures],
+            key=lambda item: int(item.get("t") or 0),
+        )
         try:
             self.output.unlink(missing_ok=True)
         except OSError:
@@ -387,7 +441,7 @@ class AIRecordingController(SmartRecordingController):
         trigger_config = condition_dialog.configuration() if accepted else {"type": "manual"}
         try:
             archive, stage = AIRecordingPackageBuilder(self.repository.root).build(
-                events, video, trigger_config=trigger_config
+                events, video, trigger_config=trigger_config, video_segments=self._video_segments
             )
         except Exception as exc:
             self.failed.emit(f"AI 분석 패키지 생성 실패: {exc}")

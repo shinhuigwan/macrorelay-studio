@@ -1561,8 +1561,12 @@ internal static class Program
     def _assert_real_run_ready(payload: dict[str, Any]) -> None:
         steps = payload.get("steps") if isinstance(payload.get("steps"), list) else []
         pending = [index for index, step in enumerate(steps, start=1) if isinstance(step, dict) and step.get("needs_setup")]
-        if bool((payload.get("meta") or {}).get("ai_draft")) or pending:
+        triggers = payload.get("triggers") if isinstance(payload.get("triggers"), list) else []
+        pending_trigger = any(isinstance(trigger, dict) and trigger.get("needs_setup") for trigger in triggers)
+        if bool((payload.get("meta") or {}).get("ai_draft")) or pending or pending_trigger:
             suffix = f" (미완성 노드: {', '.join(map(str, pending[:12]))})" if pending else ""
+            if pending_trigger:
+                suffix += " (시작 화면 확인 필요)"
             raise RuntimeError(
                 "미완성 AI 초안은 정식 실행할 수 없습니다. Builder의 '미완성 설정 계속하기'에서 설정을 완료하거나 "
                 f"드라이런·이 단계만 테스트를 사용하세요.{suffix}"

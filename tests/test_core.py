@@ -10,6 +10,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1242,6 +1243,36 @@ class CredentialVaultTests(unittest.TestCase):
 
 
 class EventTriggerTests(unittest.TestCase):
+    def test_image_trigger_waits_for_stability_and_rearms_after_disappear(self) -> None:
+        from macro_studio.repository import MacroRepository
+        from macro_studio.trigger_engine import EventTriggerEngine
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("screen-event")
+            payload = repository.load_macro("screen-event")
+            payload["triggers"] = [{
+                "type": "image_appears", "asset": "start", "enabled": True,
+                "interval": 0.5, "stable_ms": 500,
+            }]
+            repository.save_macro("screen-event", payload)
+            engine = EventTriggerEngine(repository)
+            key = "screen-event:0:image_appears"
+            with mock.patch.object(engine, "_image_matches", side_effect=[True, True, True, False, True, True]):
+                self.assertEqual([], engine.poll())
+                engine.pending_since[key] = time.monotonic() - 1
+                engine.last_checks.clear()
+                self.assertEqual([("screen-event", "image_appears")], engine.poll())
+                engine.last_checks.clear()
+                self.assertEqual([], engine.poll())
+                engine.last_checks.clear()
+                self.assertEqual([], engine.poll())
+                engine.last_checks.clear()
+                self.assertEqual([], engine.poll())
+                engine.pending_since[key] = time.monotonic() - 1
+                engine.last_checks.clear()
+                self.assertEqual([("screen-event", "image_appears")], engine.poll())
+
     def test_process_start_fires_only_on_state_transition(self) -> None:
         from macro_studio.repository import MacroRepository
         from macro_studio.trigger_engine import EventTriggerEngine
@@ -4600,6 +4631,59 @@ class AIAutomationTests(unittest.TestCase):
             targets = json.loads((stage / "targets.json").read_text(encoding="utf-8"))
             self.assertTrue(targets[0]["reacquire_each_run"])
             self.assertEqual("browser.exe", targets[0]["exe"])
+
+    def test_ai_image_appear_trigger_is_packaged_and_materialized_for_client_watch(self) -> None:
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.ai_automation import AIRecordingPackageBuilder, materialize_ai_document
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        window = {
+            "exe": "target.exe", "title": "대상", "class": "TargetWindow",
+            "window_rect": [100, 100, 900, 700], "client_origin": [108, 132], "client_size": [784, 560],
+        }
+        events = [{"type": "mouse", "t": 100, "button": "WheelDown", "x": 300, "y": 300, "window": window}]
+        trigger_image = QtGui.QImage(120, 70, QtGui.QImage.Format_ARGB32)
+        trigger_image.fill(QtGui.QColor("#46D5C1"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            _archive, stage = AIRecordingPackageBuilder(root).build(
+                events,
+                package_id="trigger-package",
+                trigger_config={
+                    "type": "image_appear", "image": trigger_image, "window": window,
+                    "failure_policy": {"retry_count": 3, "retry_delay": 500, "after_failure": "stop", "notify": False},
+                },
+            )
+            manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual("image_appear", manifest["trigger"]["type"])
+            self.assertEqual("target-01", manifest["trigger"]["target_ref"])
+            self.assertEqual("trigger-image-001", manifest["trigger"]["asset_ref"])
+            self.assertEqual(500, manifest["trigger"]["params"]["poll_interval"])
+            self.assertTrue((stage / "trigger-assets" / "trigger-001.png").is_file())
+            assets = json.loads((stage / "asset-manifest.json").read_text(encoding="utf-8"))["assets"]
+            trigger_asset = next(item for item in assets if item.get("purpose") == "trigger")
+            payload = {
+                "schema_version": "macrorelay-ai-1.0", "source_package_id": "trigger-package",
+                "name": "자동 시작", "description": "test",
+                "targets": json.loads((stage / "targets.json").read_text(encoding="utf-8")),
+                "assets": [{
+                    "id": trigger_asset["id"], "label": trigger_asset["label"],
+                    "target_ref": trigger_asset["target_ref"], "candidate": trigger_asset["selected_candidate"],
+                    "required": True, "purpose": "trigger",
+                }],
+                "variables": {}, "triggers": [manifest["trigger"]], "setup_requirements": [],
+                "steps": [{"id": "wait", "action": "wait", "params": {"duration": 10}, "on_success": "end"}],
+            }
+            macro, issues = materialize_ai_document(payload, repository, stage)
+            self.assertFalse([issue for issue in issues if issue.severity == "error"])
+            runtime = macro["triggers"][0]
+            self.assertEqual("image_appears", runtime["type"])
+            self.assertEqual("target_client", runtime["search_scope"])
+            self.assertEqual(0.5, runtime["interval"])
+            self.assertEqual([], runtime["needs_setup"])
+            self.assertIsNotNone(repository.asset_path(runtime["asset"]))
 
     def test_ai_validator_rejects_raw_code_unknown_edges_and_actions(self) -> None:
         from macro_studio.ai_automation import validate_ai_document

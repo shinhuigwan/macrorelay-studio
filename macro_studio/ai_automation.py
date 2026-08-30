@@ -17,6 +17,14 @@ from PySide6 import QtCore, QtGui
 
 AI_SCHEMA_VERSION = "macrorelay-ai-1.0"
 AI_PACKAGE_VERSION = "1.0"
+AI_TRIGGER_DEFAULTS = {
+    "poll_interval": 500,
+    "stable_ms": 500,
+    "search_scope": "target_client",
+    "multi_scale": True,
+    "fire_mode": "on_appear",
+    "rearm_mode": "after_disappear",
+}
 ALLOWED_ACTIONS = {
     "mouse_click",
     "inactive_click",
@@ -329,7 +337,8 @@ def load_ai_recording(path: Path) -> list[dict[str, Any]]:
     return coalesced
 
 
-def chatgpt_prompt(package_id: str) -> str:
+def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = None) -> str:
+    trigger_example = deepcopy(packaged_trigger) if packaged_trigger else {"id": "trigger-001", "type": "manual"}
     example = {
         "schema_version": AI_SCHEMA_VERSION,
         "source_package_id": package_id,
@@ -346,7 +355,7 @@ def chatgpt_prompt(package_id: str) -> str:
             "click_purpose": "버튼 클릭",
         }],
         "variables": {},
-        "triggers": [],
+        "triggers": [trigger_example],
         "steps": [{
             "id": "step-01", "action": "image_search", "target_ref": "target-01",
             "asset_ref": "recorded-image-001",
@@ -364,18 +373,21 @@ def chatgpt_prompt(package_id: str) -> str:
 중요 규칙:
 1. 지금 즉시 JSON을 만들지 마십시오.
 2. 패키지를 먼저 분석하고, 영상과 기록만으로 확정할 수 없는 필수 질문을 번호 목록으로 한 번에 질문하십시오.
-3. 반드시 시작 조건, 반복·종료 조건, 이미지 실패 재시도, 성공·실패 분기, 활성/비활성 클릭, 로그인 성공 판정, 예외 상황, 보안 보관함, 실패 알림을 확인하십시오. 이미 자료로 명확한 항목은 다시 묻지 마십시오.
-4. 사용자의 답변을 받은 뒤에만 JSON을 생성하십시오.
-5. 추측하지 마십시오. 확정되지 않은 값은 해당 노드의 `needs_setup` 배열과 최상위 `setup_requirements`에 기록하십시오.
-6. 아이디·비밀번호·API 키를 평문으로 넣지 마십시오. 민감 입력은 `vault_get` 노드와 보안 보관함 이름으로만 참조하십시오.
-7. 임의 Python, AutoHotkey, PowerShell, 셸 코드를 생성하지 마십시오. 허용 액션만 사용하십시오.
-8. 마지막 답변에는 설명과 JSON을 분리하고, JSON은 하나의 완전한 코드 블록으로 출력하십시오.
+3. 반복·종료 조건, 이미지 실패 재시도, 성공·실패 분기, 로그인 성공 판정, 예외 상황, 보안 보관함, 실패 알림을 확인하십시오. 이미 자료로 명확한 항목은 다시 묻지 마십시오.
+4. manifest.json에 실행 조건이 있으면 그 값을 그대로 `triggers`에 보존하고 시작 조건을 다시 질문하지 마십시오. `failure_policy`가 있으면 각 이미지 검색 단계의 재시도와 최종 실패 흐름에 반영하십시오.
+5. 사용자의 답변을 받은 뒤에만 JSON을 생성하십시오.
+6. 추측하지 마십시오. 확정되지 않은 값은 해당 노드의 `needs_setup` 배열과 최상위 `setup_requirements`에 기록하십시오.
+7. 아이디·비밀번호·API 키를 평문으로 넣지 마십시오. 민감 입력은 `vault_get` 노드와 보안 보관함 이름으로만 참조하십시오.
+8. 임의 Python, AutoHotkey, PowerShell, 셸 코드를 생성하지 마십시오. 허용 액션만 사용하십시오.
+9. 마지막 답변에는 설명과 JSON을 분리하고, JSON은 하나의 완전한 코드 블록으로 출력하십시오.
 
 스키마 버전은 `{AI_SCHEMA_VERSION}`입니다. 최상위 필수 키는 `schema_version`, `source_package_id`, `name`, `description`, `targets`, `assets`, `variables`, `triggers`, `steps`, `setup_requirements`입니다.
 
 각 target은 `id`, `label`, `exe`, `title`, `class`, `window_token`, `coordinate_base`, `inactive_click_verified`를 사용합니다. 과거 hwnd 숫자는 저장하지 마십시오.
 
 각 asset은 `id`, `label`, `target_ref`, `candidate`, `required`, `click_purpose`를 사용합니다. candidate는 asset-manifest.json에 있는 상대 PNG 경로만 사용하십시오.
+
+각 trigger는 `manual` 또는 `image_appear`만 사용합니다. `image_appear`는 패키지의 `target_ref`, `asset_ref`, `params`를 변경하지 마십시오.
 
 각 step은 `id`, `action`, 선택적 `params`, `target_ref`, `asset_ref`, `on_success`, `on_fail`, `retry_count`, `retry_delay`, `needs_setup`, `source_evidence`를 사용합니다. 노드 연결은 step id를 참조합니다.
 
@@ -408,7 +420,21 @@ def ai_schema_document() -> dict[str, Any]:
             "targets": {"type": "array", "items": {"type": "object", "required": ["id"], "properties": {"id": identifier}}},
             "assets": {"type": "array", "items": {"type": "object", "required": ["id"], "properties": {"id": identifier}}},
             "variables": {"type": ["object", "array"]},
-            "triggers": {"type": "array"},
+            "triggers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["id", "type"],
+                    "properties": {
+                        "id": identifier,
+                        "type": {"enum": ["manual", "image_appear"]},
+                        "target_ref": {"type": "string"},
+                        "asset_ref": {"type": "string"},
+                        "params": {"type": "object"},
+                        "needs_setup": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
             "steps": {
                 "type": "array", "minItems": 1,
                 "items": {
@@ -443,7 +469,9 @@ class AIRecordingPackageBuilder:
         events: list[dict[str, Any]],
         video_path: Path | None = None,
         package_id: str | None = None,
+        trigger_config: dict[str, Any] | None = None,
     ) -> tuple[Path, Path]:
+        trigger_config = trigger_config or {}
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         identifier = package_id or f"ai-{stamp}-{uuid.uuid4().hex[:8]}"
         stage = self.root / ".automation" / "ai-packages" / identifier
@@ -451,6 +479,7 @@ class AIRecordingPackageBuilder:
             shutil.rmtree(stage)
         (stage / "frames").mkdir(parents=True, exist_ok=True)
         (stage / "asset-candidates").mkdir(parents=True, exist_ok=True)
+        (stage / "trigger-assets").mkdir(parents=True, exist_ok=True)
 
         targets, target_lookup = self._targets(events)
         timeline: list[dict[str, Any]] = []
@@ -577,7 +606,13 @@ class AIRecordingPackageBuilder:
             timeline.append(row)
             previous_time = current_time
 
-        prompt = chatgpt_prompt(identifier)
+        packaged_trigger, trigger_asset = self._prepare_trigger(stage, trigger_config or {}, targets, target_lookup)
+        if trigger_asset:
+            assets.append(trigger_asset)
+            preview = QtGui.QImage(str(stage / str(trigger_asset["selected_candidate"])))
+            contact_rows.append(("실행 조건", preview, "특정 화면이 나타나면 자동 실행"))
+
+        prompt = chatgpt_prompt(identifier, packaged_trigger)
         (stage / "prompt.txt").write_text(prompt, encoding="utf-8")
         _write_json(stage / "schema.json", ai_schema_document())
         _write_json(stage / "timeline.json", timeline)
@@ -599,6 +634,10 @@ class AIRecordingPackageBuilder:
             "event_count": len(timeline),
             "target_count": len(targets),
             "asset_count": len(assets),
+            "trigger": packaged_trigger,
+            "failure_policy": deepcopy(trigger_config.get("failure_policy") or {
+                "retry_count": 3, "retry_delay": 500, "after_failure": "stop", "notify": False,
+            }),
             "video_available": (stage / "recording.mp4").is_file(),
             "text_policy": "All printable keyboard input is redacted. ChatGPT must ask for a vault name or value classification.",
             "image_policy": "Lossless native PNG candidates only; video frames are never used as search templates.",
@@ -620,6 +659,71 @@ class AIRecordingPackageBuilder:
             {"package_id": identifier, "stage": str(stage), "archive": str(archive), "prompt": str(stage / "prompt.txt")},
         )
         return archive, stage
+
+    def _prepare_trigger(
+        self,
+        stage: Path,
+        config: dict[str, Any],
+        targets: list[dict[str, Any]],
+        target_lookup: dict[tuple[str, str, str], str],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        if str(config.get("type") or "manual") != "image_appear":
+            return {"id": "trigger-001", "type": "manual"}, None
+        source = config.get("image")
+        image = source.copy() if isinstance(source, QtGui.QImage) else QtGui.QImage()
+        if image.isNull():
+            return {
+                "id": "trigger-001",
+                "type": "image_appear",
+                "params": deepcopy(AI_TRIGGER_DEFAULTS),
+                "needs_setup": ["capture_trigger_image"],
+            }, None
+        window = config.get("window") if isinstance(config.get("window"), dict) else {}
+        target_ref = target_lookup.get(self._target_key(window), "")
+        if not target_ref and len(targets) == 1:
+            target_ref = str(targets[0].get("id") or "")
+        candidate_path = "trigger-assets/trigger-001.png"
+        image.save(str(stage / candidate_path), "PNG")
+        raw_scene = config.get("scene")
+        scene = raw_scene.copy() if isinstance(raw_scene, QtGui.QImage) and not raw_scene.isNull() else image
+        score, matched_scale = _multiscale_search_score(scene, image)
+        ready = image.width() >= 8 and image.height() >= 8 and score >= 84 and bool(target_ref)
+        trigger_asset = {
+            "id": "trigger-image-001",
+            "label": "자동 실행 시작 화면",
+            "target_ref": target_ref,
+            "required": True,
+            "purpose": "trigger",
+            "candidate": candidate_path,
+            "selected_candidate": candidate_path,
+            "candidates": [{
+                "kind": "trigger",
+                "file": candidate_path,
+                "rect": [0, 0, image.width(), image.height()],
+                "validation_score": round(score, 2),
+                "matched_scale": round(matched_scale, 2),
+            }],
+            "readiness": "ready" if ready else "needs_review",
+            "validation": {
+                "image_ready": True,
+                "search_verified": ready,
+                "score": round(score, 2),
+                "matched_scale": round(matched_scale, 2),
+                "ambiguous": False,
+            },
+            "needs_setup": [] if ready else ["verify_trigger_image"],
+        }
+        params = deepcopy(AI_TRIGGER_DEFAULTS)
+        trigger = {
+            "id": "trigger-001",
+            "type": "image_appear",
+            "target_ref": target_ref,
+            "asset_ref": "trigger-image-001",
+            "params": params,
+        }
+        if not ready:
+            trigger["needs_setup"] = ["verify_trigger_image"]
+        return trigger, trigger_asset
 
     @staticmethod
     def _target_key(window: dict[str, Any]) -> tuple[str, str, str]:
@@ -854,6 +958,24 @@ def validate_ai_document(payload: Any) -> list[AIImportIssue]:
         issues.append(AIImportIssue("error", "duplicate_target_id", "대상 프로필 ID가 비어 있거나 중복되었습니다."))
     if len(asset_rows) != len(asset_lookup):
         issues.append(AIImportIssue("error", "duplicate_asset_id", "이미지 자산 ID가 비어 있거나 중복되었습니다."))
+    trigger_rows = payload.get("triggers") if isinstance(payload.get("triggers"), list) else []
+    if len(trigger_rows) > 1:
+        issues.append(AIImportIssue("error", "multiple_triggers", "현재 AI 자동 매크로는 실행 조건을 하나만 사용할 수 있습니다."))
+    for trigger in trigger_rows:
+        if not isinstance(trigger, dict):
+            issues.append(AIImportIssue("error", "trigger_type", "실행 조건 형식이 올바르지 않습니다."))
+            continue
+        kind = str(trigger.get("type") or "")
+        if kind not in {"manual", "image_appear", "image_appears"}:
+            issues.append(AIImportIssue("error", "unsupported_trigger", f"지원하지 않는 실행 조건: {kind or '(없음)'}"))
+            continue
+        if kind in {"image_appear", "image_appears"}:
+            target_ref = str(trigger.get("target_ref") or "")
+            asset_ref = str(trigger.get("asset_ref") or "")
+            if target_ref and target_ref not in target_lookup:
+                issues.append(AIImportIssue("error", "unknown_trigger_target", f"실행 조건 대상 `{target_ref}`를 찾을 수 없습니다."))
+            if not asset_ref or asset_ref not in asset_lookup:
+                issues.append(AIImportIssue("warning", "missing_trigger_asset", "시작 화면 이미지를 확인해야 합니다."))
     for step in steps:
         step_id = str(step.get("id") or "")
         action = str(step.get("action") or "")
@@ -1102,6 +1224,47 @@ def materialize_ai_document(
             clean_target.pop(key, None)
         clean_target["reacquire_each_run"] = True
         stored_targets.append(clean_target)
+    runtime_triggers: list[dict[str, Any]] = []
+    for raw_trigger in payload.get("triggers") if isinstance(payload.get("triggers"), list) else []:
+        if not isinstance(raw_trigger, dict):
+            continue
+        kind = str(raw_trigger.get("type") or "manual")
+        if kind == "manual":
+            runtime_triggers.append({"id": str(raw_trigger.get("id") or "trigger-001"), "type": "manual", "enabled": True})
+            continue
+        if kind not in {"image_appear", "image_appears"}:
+            continue
+        params = raw_trigger.get("params") if isinstance(raw_trigger.get("params"), dict) else {}
+        target_ref = str(raw_trigger.get("target_ref") or "")
+        target = target_lookup.get(target_ref, {})
+        asset_ref = str(raw_trigger.get("asset_ref") or "")
+        alias = asset_aliases.get(asset_ref, "")
+        asset_state = asset_states.get(asset_ref, {})
+        validation = asset_state.get("validation") if isinstance(asset_state.get("validation"), dict) else {}
+        needs = [str(value) for value in raw_trigger.get("needs_setup") or [] if str(value)]
+        if not alias or not bool(validation.get("search_verified", asset_state.get("search_verified", False))):
+            needs.append("verify_trigger_image")
+        runtime_triggers.append({
+            "id": str(raw_trigger.get("id") or "trigger-001"),
+            "type": "image_appears",
+            "enabled": True,
+            "asset": alias,
+            "asset_ref": asset_ref,
+            "target_ref": target_ref,
+            "window": str(target.get("window_token") or ""),
+            "window_exe": str(target.get("exe") or ""),
+            "search_scope": "target_client" if target else "screen",
+            "interval": max(0.5, int(params.get("poll_interval") or 500) / 1000.0),
+            "stable_ms": max(0, int(params.get("stable_ms") or 500)),
+            "multi_scale": bool(params.get("multi_scale", True)),
+            "fire_mode": "on_appear",
+            "rearm_mode": "after_disappear",
+            "threshold": max(0.5, min(0.99, float(params.get("threshold") or 0.86))),
+            "needs_setup": list(dict.fromkeys(needs)),
+        })
+    if not runtime_triggers:
+        runtime_triggers = [{"id": "trigger-001", "type": "manual", "enabled": True}]
+
     macro = {
         "name": str(payload.get("name") or "AI 자동화 초안").strip() or "AI 자동화 초안",
         "description": str(payload.get("description") or ""),
@@ -1117,7 +1280,7 @@ def materialize_ai_document(
             "ai_imported_at": datetime.now(timezone.utc).isoformat(),
         },
         "steps": steps,
-        "triggers": deepcopy(payload.get("triggers") if isinstance(payload.get("triggers"), list) else []),
+        "triggers": runtime_triggers,
         "variables": deepcopy(payload.get("variables") if isinstance(payload.get("variables"), (list, dict)) else {}),
         "ai_setup": {
             "targets": stored_targets,
@@ -1134,6 +1297,15 @@ def ai_draft_readiness(macro: dict[str, Any]) -> tuple[int, int, list[str]]:
     setup = macro.get("ai_setup") if isinstance(macro.get("ai_setup"), dict) else {}
     targets = setup.get("targets") if isinstance(setup.get("targets"), list) else []
     steps = macro.get("steps") if isinstance(macro.get("steps"), list) else []
+    triggers = macro.get("triggers") if isinstance(macro.get("triggers"), list) else []
+    automatic_triggers = [
+        trigger for trigger in triggers
+        if isinstance(trigger, dict) and str(trigger.get("type") or "") in {"image_appear", "image_appears"}
+    ]
+    checks.append((
+        "시작 화면",
+        all(str(trigger.get("asset") or "") and not trigger.get("needs_setup") for trigger in automatic_triggers),
+    ))
     target_actions = {"mouse_click", "inactive_click", "image_search", "type_text", "browser_action", "ocr", "run_program", "terminate_program"}
     needs_target = any(isinstance(step, dict) and step.get("action") in target_actions for step in steps)
     checks.append(("대상 프로그램", (not needs_target) or (bool(targets) and all(str(item.get("exe") or item.get("window_token") or "") for item in targets if isinstance(item, dict)))))

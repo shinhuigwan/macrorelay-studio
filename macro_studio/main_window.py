@@ -64,7 +64,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._event_trigger_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="macrorelay-trigger")
         self._event_trigger_future: Future[list[tuple[str, str]]] | None = None
         self._event_trigger_timer = QtCore.QTimer(self)
-        self._event_trigger_timer.setInterval(1000)
+        # Trigger entries apply their own low-frequency interval (500 ms for
+        # AI start-screen conditions). This short dispatcher tick avoids
+        # adding a full extra second of UI-side latency.
+        self._event_trigger_timer.setInterval(250)
         self._event_trigger_timer.timeout.connect(self._poll_event_triggers)
         self.setWindowTitle("MacroRelay Studio")
         self.setMinimumSize(1120, 700)

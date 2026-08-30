@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,27 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .ai_automation import AIImportIssue, ai_draft_readiness, validate_ai_document
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
 from .image_search_test import ImageSearchTestDialog
+
+
+_SETUP_LABELS = {
+    "select_asset": "이미지 선택",
+    "confirm_asset": "이미지 확인",
+    "choose_or_confirm_candidate": "이미지 확인",
+    "verify_search": "이미지 검색 확인",
+    "verify_trigger_image": "시작 화면 확인",
+    "capture_trigger_image": "시작 화면 지정",
+    "verify_inactive_click": "클릭 확인",
+    "provide_text_or_vault_reference": "입력 내용 설정",
+    "classify_sensitive_input": "입력 내용 보안 확인",
+    "confirm_program_command": "실행 프로그램 확인",
+    "confirm_loop_limit": "반복 횟수 확인",
+    "select_dpapi_vault_secret": "보안 값 선택",
+}
+
+
+def _friendly_setup(values: list[Any]) -> str:
+    labels = [_SETUP_LABELS.get(str(value), "추가 확인") for value in values if str(value)]
+    return ", ".join(dict.fromkeys(labels)) if labels else "—"
 
 
 def load_ai_json(path: Path) -> dict[str, Any]:
@@ -42,11 +64,11 @@ class AIImportPreviewDialog(QtWidgets.QDialog):
         self.repository = repository
         self.package_stage = package_stage
         self.issues = validate_ai_document(payload)
-        self.setWindowTitle("AI JSON 가져오기 검토")
+        self.setWindowTitle("AI 매크로 가져오기 검토")
         self.resize(1120, 760)
         self.setMinimumSize(900, 620)
         root = QtWidgets.QVBoxLayout(self)
-        title = QtWidgets.QLabel("AI 매크로 JSON 가져오기")
+        title = QtWidgets.QLabel("AI 매크로 가져오기")
         title.setStyleSheet("font-size:18pt; font-weight:800;")
         summary = QtWidgets.QLabel(
             f"{str(payload.get('name') or '이름 없음')} · 노드 {len(payload.get('steps') or [])}개 · "
@@ -55,6 +77,22 @@ class AIImportPreviewDialog(QtWidgets.QDialog):
         summary.setObjectName("Muted")
         root.addWidget(title)
         root.addWidget(summary)
+        raw_triggers = payload.get("triggers") if isinstance(payload.get("triggers"), list) else []
+        automatic = next(
+            (item for item in raw_triggers if isinstance(item, dict) and str(item.get("type") or "") in {"image_appear", "image_appears"}),
+            None,
+        )
+        trigger_ready = bool(automatic and str(automatic.get("asset_ref") or "") and not automatic.get("needs_setup"))
+        trigger_text = (
+            "실행 조건 · ✓ 특정 화면이 나타나면 자동 실행"
+            if trigger_ready else "실행 조건 · ⚠ 시작 화면 확인 필요"
+            if automatic else "실행 조건 · ✓ 내가 직접 실행"
+        )
+        trigger_label = QtWidgets.QLabel(trigger_text)
+        trigger_label.setStyleSheet(
+            "color:#65E0B5; font-weight:700;" if not automatic or trigger_ready else "color:#FFB35C; font-weight:700;"
+        )
+        root.addWidget(trigger_label)
         package_label = QtWidgets.QLabel(
             f"녹화 패키지: {package_stage}" if package_stage else "녹화 패키지를 찾지 못했습니다. 이미지 자산은 설정 필요 상태로 가져옵니다."
         )
@@ -136,7 +174,7 @@ class AIImportPreviewDialog(QtWidgets.QDialog):
         buttons = QtWidgets.QHBoxLayout()
         cancel = QtWidgets.QPushButton("취소")
         cancel.clicked.connect(self.reject)
-        self.import_button = QtWidgets.QPushButton("AI 초안으로 가져오기")
+        self.import_button = QtWidgets.QPushButton("확인용 매크로로 가져오기")
         self.import_button.setObjectName("Primary")
         self.import_button.setEnabled(not any(issue.severity == "error" for issue in self.issues))
         self.import_button.clicked.connect(self.accept)
@@ -156,7 +194,7 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.macro = deepcopy(macro)
         self.repository = repository
-        self.setWindowTitle("AI 초안 설정 마법사")
+        self.setWindowTitle("AI 매크로 확인")
         self.resize(1280, 800)
         self.setMinimumSize(1040, 680)
         root = QtWidgets.QVBoxLayout(self)
@@ -175,11 +213,23 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
         root.addWidget(hint)
+        trigger_box = QtWidgets.QGroupBox("실행 조건")
+        trigger_layout = QtWidgets.QHBoxLayout(trigger_box)
+        self.trigger_status = QtWidgets.QLabel()
+        self.trigger_status.setWordWrap(True)
+        self.trigger_capture = QtWidgets.QPushButton("시작 화면 다시 지정")
+        self.trigger_test = QtWidgets.QPushButton("검색 테스트")
+        self.trigger_capture.clicked.connect(self._capture_trigger_asset)
+        self.trigger_test.clicked.connect(self._test_trigger_asset)
+        trigger_layout.addWidget(self.trigger_status, 1)
+        trigger_layout.addWidget(self.trigger_capture)
+        trigger_layout.addWidget(self.trigger_test)
+        root.addWidget(trigger_box)
         target_box = QtWidgets.QGroupBox("대상 프로그램 프로필 · 실행할 때마다 현재 창과 핸들을 다시 탐색")
         target_layout = QtWidgets.QVBoxLayout(target_box)
         self.targets = QtWidgets.QTableWidget()
         self.targets.setColumnCount(5)
-        self.targets.setHorizontalHeaderLabels(["프로필", "실행 파일", "창 제목 규칙", "창 클래스", "비활성 클릭"])
+        self.targets.setHorizontalHeaderLabels(["프로필", "실행 파일", "창 제목 규칙", "창 클래스", "클릭 방식"])
         self.targets.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.targets.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.targets.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -226,8 +276,8 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
             ("화면에서 캡처", self._capture_asset),
             ("이미지 상세 편집", self._edit_asset),
             ("검색 테스트", self._test_asset),
-            ("비활성 클릭 시험", self._request_inactive_lab),
-            ("드라이런", self.dry_run_requested.emit),
+            ("클릭 확인", self._request_inactive_lab),
+            ("안전 확인 실행", self.dry_run_requested.emit),
         ]
         for index, (label, callback) in enumerate(buttons):
             button = QtWidgets.QPushButton(label)
@@ -248,8 +298,24 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
 
     def _refresh(self) -> None:
         complete, total, pending = ai_draft_readiness(self.macro)
-        self.title.setText(f"{self.macro.get('name', 'AI 초안')} · 준비도 {complete}/{total}")
-        self.readiness.setText("완료" if not pending else "설정 필요: " + ", ".join(pending))
+        self.title.setText(f"{self.macro.get('name', 'AI 매크로')} · 준비도 {complete}/{total}")
+        self.readiness.setText("✓ 실행 준비 완료" if not pending else f"확인이 필요한 항목 {len(pending)}개 · " + ", ".join(pending))
+        trigger = self._automatic_trigger()
+        if trigger is None:
+            self.trigger_status.setText("✓ 내가 직접 실행")
+            self.trigger_status.setStyleSheet("color:#65E0B5; font-weight:700;")
+            self.trigger_capture.setVisible(False)
+            self.trigger_test.setVisible(False)
+        else:
+            ready = bool(str(trigger.get("asset") or "")) and not bool(trigger.get("needs_setup"))
+            self.trigger_status.setText(
+                "✓ 특정 화면이 나타나면 자동 실행" if ready else "⚠ 시작 화면 확인 필요"
+            )
+            self.trigger_status.setStyleSheet(
+                "color:#65E0B5; font-weight:700;" if ready else "color:#FFB35C; font-weight:700;"
+            )
+            self.trigger_capture.setVisible(True)
+            self.trigger_test.setVisible(True)
         targets = (self.macro.get("ai_setup") or {}).get("targets") or []
         self.targets.setRowCount(len(targets))
         for row, target in enumerate(targets):
@@ -258,7 +324,7 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
                 str(target.get("exe") or ""),
                 str(target.get("title") or target.get("window_token") or ""),
                 str(target.get("class") or ""),
-                "검증 완료" if bool(target.get("inactive_click_verified")) else "시험 필요",
+                "자동 확인 완료" if bool(target.get("inactive_click_verified")) else "확인 필요",
             ]
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
@@ -273,7 +339,7 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
                 str(row + 1),
                 str(step.get("label") or step.get("action") or "") if isinstance(step, dict) else "",
                 "설정 필요" if needs else "준비 완료",
-                ", ".join(needs) if needs else "—",
+                _friendly_setup(needs),
             ]
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
@@ -308,6 +374,63 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
                 item.setToolTip("이미지를 연결하거나 캡처해야 합니다.")
             self.gallery.addItem(item)
         self.macro_changed.emit(deepcopy(self.macro))
+
+    def _automatic_trigger(self) -> dict[str, Any] | None:
+        for trigger in self.macro.get("triggers") or []:
+            if isinstance(trigger, dict) and str(trigger.get("type") or "") in {"image_appear", "image_appears"}:
+                return trigger
+        return None
+
+    def _capture_trigger_asset(self) -> None:
+        trigger = self._automatic_trigger()
+        if trigger is None:
+            return
+        host = self.window()
+        host.hide()
+        wait = QtCore.QEventLoop(self)
+        QtCore.QTimer.singleShot(220, wait.quit)
+        wait.exec()
+        pixmap, geometry = capture_virtual_desktop()
+        picker = ScreenCaptureDialog(pixmap, geometry)
+        accepted = picker.exec() == QtWidgets.QDialog.Accepted
+        image = picker.captured_image() if accepted else QtGui.QImage()
+        host.show()
+        host.raise_()
+        if image.isNull():
+            return
+        try:
+            alias = self.repository.add_asset_image(
+                image, f"AI-{self.macro.get('name', '초안')}-시작화면-{datetime.now():%Y%m%d-%H%M%S}"
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "시작 화면 저장 실패", str(exc))
+            return
+        trigger["asset"] = alias
+        trigger["needs_setup"] = ["verify_trigger_image"]
+        self._refresh()
+
+    def _test_trigger_asset(self) -> None:
+        trigger = self._automatic_trigger()
+        if trigger is None or not str(trigger.get("asset") or ""):
+            QtWidgets.QMessageBox.information(self, "검색 테스트", "먼저 시작 화면을 지정하세요.")
+            return
+        step = {
+            "action": "image_search",
+            "asset": str(trigger.get("asset") or ""),
+            "engine": "opencv",
+            "search_profile": "fast",
+            "confidence": round(float(trigger.get("threshold") or 0.86) * 100),
+            "timeout": 0,
+            "region_mode": "client" if trigger.get("search_scope") == "target_client" else "screen",
+            "region_coords": "relative" if trigger.get("search_scope") == "target_client" else "screen",
+            "region_window": str(trigger.get("window") or ""),
+            "region_window_exe": str(trigger.get("window_exe") or ""),
+            "click_enabled": False,
+        }
+        dialog = ImageSearchTestDialog(self.repository, step, self)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            trigger["needs_setup"] = []
+            self._refresh()
 
     def _selected_image_row(self) -> int:
         item = self.gallery.currentItem()
@@ -410,6 +533,13 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
         token = str(target.get("window_token") or "")
         exe = str(target.get("exe") or "")
         coordinate = str(target.get("coordinate_base") or "client")
+        for trigger in self.macro.get("triggers") or []:
+            if not isinstance(trigger, dict) or str(trigger.get("target_ref") or "") != target_id:
+                continue
+            if str(trigger.get("type") or "") in {"image_appear", "image_appears"}:
+                trigger["window"] = token
+                trigger["window_exe"] = exe
+                trigger["search_scope"] = "target_client" if coordinate == "client" else "screen"
         for step in self.macro.get("steps") or []:
             if not isinstance(step, dict) or str((step.get("_ai") or {}).get("target_ref") or "") != target_id:
                 continue

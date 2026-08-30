@@ -10,7 +10,7 @@ from .widgets import WheelSafeSpinBox, primary_button, danger_button
 
 class EventTriggerDialog(QtWidgets.QDialog):
     TYPES = (
-        ("프로그램 시작", "process_start"), ("프로그램 종료", "process_stop"),
+        ("직접 실행", "manual"), ("프로그램 시작", "process_start"), ("프로그램 종료", "process_stop"),
         ("창 나타남", "window_appears"), ("이미지 나타남", "image_appears"),
         ("OCR 숫자 조건", "ocr_threshold"), ("지정 시간·요일", "schedule"),
     )
@@ -88,7 +88,9 @@ class EventTriggerDialog(QtWidgets.QDialog):
         kind = str(self.type_combo.currentData() or "process_start")
         target = self.target_edit.text().strip()
         payload: dict[str, Any] = {"type": kind, "enabled": self.enabled_check.isChecked(), "interval": self.interval_spin.value()}
-        if kind.startswith("process_"):
+        if kind == "manual":
+            pass
+        elif kind.startswith("process_"):
             payload["process"] = target
         elif kind == "window_appears":
             payload["title"] = target
@@ -124,7 +126,7 @@ class EventTriggerDialog(QtWidgets.QDialog):
         self.table.setRowCount(len(self.triggers))
         for row, item in enumerate(self.triggers):
             kind = str(item.get("type") or "")
-            target = item.get("process") or item.get("title") or item.get("asset") or item.get("time") or f"{item.get('operator', '>=')} {item.get('value', 0)}"
+            target = "실행 버튼" if kind == "manual" else item.get("process") or item.get("title") or item.get("asset") or item.get("time") or f"{item.get('operator', '>=')} {item.get('value', 0)}"
             values = ["켜짐" if item.get("enabled", True) else "꺼짐", labels.get(kind, kind), str(target), f"{item.get('interval', 1)}초"]
             for column, value in enumerate(values): self.table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
         if self.triggers: self.table.selectRow(max(0, min(selected, len(self.triggers) - 1)))

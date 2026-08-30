@@ -8,11 +8,172 @@ import subprocess
 import sys
 import uuid
 
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from .ai_automation import AIRecordingPackageBuilder, load_ai_recording
 from .automation import RecordingBar, SmartRecordingController
-from .image_editor import capture_virtual_desktop
+from .image_editor import ScreenCaptureDialog, capture_virtual_desktop
+
+
+class AIExecutionConditionDialog(QtWidgets.QDialog):
+    """Simple post-recording choice; trigger mechanics stay hidden."""
+
+    def __init__(self, events: list[dict], parent=None) -> None:
+        super().__init__(parent)
+        self.events = events
+        self.trigger_image = QtGui.QImage()
+        self.trigger_scene = QtGui.QImage()
+        self.trigger_window: dict = {}
+        self.setWindowTitle("AI 자동 매크로 만들기")
+        self.setMinimumWidth(640)
+        root = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel("녹화가 끝났습니다")
+        title.setStyleSheet("font-size:18pt; font-weight:800;")
+        root.addWidget(title)
+        root.addWidget(QtWidgets.QLabel(f"✓ 작업 녹화 완료 · {len(events)}개 동작 기록됨"))
+
+        condition = QtWidgets.QGroupBox("1. 언제 실행할까요?")
+        condition_layout = QtWidgets.QVBoxLayout(condition)
+        self.manual_radio = QtWidgets.QRadioButton("내가 직접 실행")
+        self.auto_radio = QtWidgets.QRadioButton("특정 화면이 나타나면 자동 실행")
+        self.manual_radio.setChecked(True)
+        condition_layout.addWidget(self.manual_radio)
+        condition_layout.addWidget(self.auto_radio)
+        capture_row = QtWidgets.QHBoxLayout()
+        self.capture_button = QtWidgets.QPushButton("⌖ 화면에서 지정")
+        self.capture_button.clicked.connect(self._capture_trigger)
+        self.capture_status = QtWidgets.QLabel("시작 화면을 지정하세요.")
+        self.capture_status.setObjectName("Muted")
+        capture_row.addSpacing(24)
+        capture_row.addWidget(self.capture_button)
+        capture_row.addWidget(self.capture_status, 1)
+        condition_layout.addLayout(capture_row)
+        self.preview = QtWidgets.QLabel()
+        self.preview.setFixedHeight(120)
+        self.preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview.setStyleSheet("background:#0D131D; border:1px solid #29374A; border-radius:8px;")
+        condition_layout.addWidget(self.preview)
+        root.addWidget(condition)
+
+        failure = QtWidgets.QGroupBox("2. 못 찾았을 때")
+        failure_layout = QtWidgets.QGridLayout(failure)
+        self.retry = QtWidgets.QSpinBox()
+        self.retry.setRange(0, 20)
+        self.retry.setValue(3)
+        self.retry.setSuffix("회")
+        self.failure_stop = QtWidgets.QRadioButton("매크로 종료")
+        self.failure_restart = QtWidgets.QRadioButton("처음부터 다시 실행")
+        self.failure_stop.setChecked(True)
+        self.failure_notify = QtWidgets.QCheckBox("실패 시 알림")
+        failure_layout.addWidget(QtWidgets.QLabel("다시 시도"), 0, 0)
+        failure_layout.addWidget(self.retry, 0, 1)
+        failure_layout.addWidget(self.failure_stop, 1, 0, 1, 2)
+        failure_layout.addWidget(self.failure_restart, 2, 0, 1, 2)
+        failure_layout.addWidget(self.failure_notify, 3, 0, 1, 2)
+        root.addWidget(failure)
+
+        self.auto_radio.toggled.connect(self._sync_mode)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
+        create = buttons.addButton("AI 분석 패키지 생성", QtWidgets.QDialogButtonBox.AcceptRole)
+        create.setObjectName("Primary")
+        buttons.accepted.connect(self._accept_checked)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._sync_mode()
+
+    def _sync_mode(self) -> None:
+        enabled = self.auto_radio.isChecked()
+        self.capture_button.setVisible(enabled)
+        self.capture_status.setVisible(enabled)
+        self.preview.setVisible(enabled)
+
+    def _capture_trigger(self) -> None:
+        parent = self.parentWidget()
+        self.hide()
+        if parent is not None:
+            parent.hide()
+        wait = QtCore.QEventLoop(self)
+        QtCore.QTimer.singleShot(220, wait.quit)
+        wait.exec()
+        pixmap, geometry = capture_virtual_desktop()
+        picker = ScreenCaptureDialog(pixmap, geometry)
+        accepted = picker.exec() == QtWidgets.QDialog.Accepted
+        image = picker.captured_image() if accepted else QtGui.QImage()
+        screen_rect = picker.selected_screen_rect() if accepted else QtCore.QRect()
+        if parent is not None:
+            parent.show()
+            parent.raise_()
+        self.show()
+        self.raise_()
+        if image.isNull():
+            return
+        self.trigger_image = image
+        self.trigger_window = self._window_at(screen_rect.center())
+        scene_rect = QtCore.QRect()
+        origin = self.trigger_window.get("client_origin") if isinstance(self.trigger_window.get("client_origin"), list) else []
+        size = self.trigger_window.get("client_size") if isinstance(self.trigger_window.get("client_size"), list) else []
+        if len(origin) >= 2 and len(size) >= 2:
+            scene_rect = QtCore.QRect(
+                int(origin[0]) - geometry.left(), int(origin[1]) - geometry.top(), int(size[0]), int(size[1])
+            ).intersected(pixmap.rect())
+        self.trigger_scene = pixmap.toImage().copy(scene_rect) if scene_rect.isValid() else pixmap.toImage()
+        preview = QtGui.QPixmap.fromImage(image).scaled(
+            560, 108, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+        )
+        self.preview.setPixmap(preview)
+        if self.trigger_window:
+            label = str(self.trigger_window.get("exe") or self.trigger_window.get("title") or "대상 프로그램")
+            self.capture_status.setText(f"✓ 시작 화면 이미지 준비 완료 · {label}")
+            self.capture_status.setStyleSheet("color:#65E0B5; font-weight:700;")
+        else:
+            self.capture_status.setText("⚠ 대상 프로그램 확인 필요 · 다시 지정해 주세요")
+            self.capture_status.setStyleSheet("color:#FFB35C; font-weight:700;")
+
+    def _window_at(self, point: QtCore.QPoint) -> dict:
+        candidates: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for event in reversed(self.events):
+            window = event.get("window") if isinstance(event.get("window"), dict) else {}
+            key = (str(window.get("exe") or ""), str(window.get("class") or ""), str(window.get("title") or ""))
+            if not any(key) or key in seen:
+                continue
+            seen.add(key)
+            candidates.append(window)
+        for window in candidates:
+            origin = window.get("client_origin") if isinstance(window.get("client_origin"), list) else []
+            size = window.get("client_size") if isinstance(window.get("client_size"), list) else []
+            if len(origin) >= 2 and len(size) >= 2:
+                rect = QtCore.QRect(int(origin[0]), int(origin[1]), int(size[0]), int(size[1]))
+                if rect.contains(point):
+                    return dict(window)
+            values = window.get("window_rect") if isinstance(window.get("window_rect"), list) else []
+            if len(values) >= 4 and QtCore.QRect(
+                int(values[0]), int(values[1]), int(values[2]) - int(values[0]), int(values[3]) - int(values[1])
+            ).contains(point):
+                return dict(window)
+        return dict(candidates[0]) if len(candidates) == 1 else {}
+
+    def _accept_checked(self) -> None:
+        if self.auto_radio.isChecked() and (self.trigger_image.isNull() or not self.trigger_window):
+            QtWidgets.QMessageBox.information(self, "시작 화면", "자동 실행에 사용할 화면을 먼저 지정하세요.")
+            return
+        self.accept()
+
+    def configuration(self) -> dict:
+        config: dict = {
+            "type": "image_appear" if self.auto_radio.isChecked() else "manual",
+            "failure_policy": {
+                "retry_count": self.retry.value(),
+                "retry_delay": 500,
+                "after_failure": "restart" if self.failure_restart.isChecked() else "stop",
+                "notify": self.failure_notify.isChecked(),
+            },
+        }
+        if self.auto_radio.isChecked():
+            config.update({
+                "image": self.trigger_image.copy(), "scene": self.trigger_scene.copy(), "window": dict(self.trigger_window),
+            })
+        return config
 
 
 class AIRecordingController(SmartRecordingController):
@@ -172,8 +333,13 @@ class AIRecordingController(SmartRecordingController):
             self.deleteLater()
             return
         video = self._encode_video()
+        condition_dialog = AIExecutionConditionDialog(events, self.host)
+        accepted = condition_dialog.exec() == QtWidgets.QDialog.Accepted
+        trigger_config = condition_dialog.configuration() if accepted else {"type": "manual"}
         try:
-            archive, stage = AIRecordingPackageBuilder(self.repository.root).build(events, video)
+            archive, stage = AIRecordingPackageBuilder(self.repository.root).build(
+                events, video, trigger_config=trigger_config
+            )
         except Exception as exc:
             self.failed.emit(f"AI 분석 패키지 생성 실패: {exc}")
             shutil.rmtree(self.frame_dir, ignore_errors=True)

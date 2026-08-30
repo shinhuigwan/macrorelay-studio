@@ -21,6 +21,7 @@ class EventTriggerEngine:
         self.states: dict[str, bool] = {}
         self.last_checks: dict[str, float] = {}
         self.last_schedule: dict[str, str] = {}
+        self.pending_since: dict[str, float] = {}
 
     @staticmethod
     def _process_names() -> set[str]:
@@ -116,12 +117,27 @@ class EventTriggerEngine:
         path = self.repository.asset_path(alias) if alias else None
         if path is None or not self._start_engine("vision_engine.py", 9235):
             return False
-        region = self._screen_region(trigger.get("region"))
+        region = None
+        if str(trigger.get("search_scope") or "") == "target_client":
+            try:
+                from .image_search_test import resolve_test_regions
+
+                regions, _description = resolve_test_regions({
+                    "region_mode": "client",
+                    "region_coords": "relative",
+                    "region_window": str(trigger.get("window") or ""),
+                    "region_window_exe": str(trigger.get("window_exe") or ""),
+                })
+                region = regions[0] if regions else None
+            except Exception:
+                return False
+        if region is None:
+            region = self._screen_region(trigger.get("region"))
         if region is None:
             return False
         response = self._request(9235, {
             "cmd": "search", "image": str(path), "regions": [region], "threshold": float(trigger.get("threshold") or 0.86),
-            "profile": str(trigger.get("profile") or "fast"), "timeout": 0, "poll": 50,
+            "profile": str(trigger.get("profile") or ("balanced" if trigger.get("multi_scale", True) else "fast")), "timeout": 0, "poll": 50,
             "capture_context": f"trigger:{alias}",
         })
         return bool(response.get("ok") and response.get("found"))
@@ -152,13 +168,17 @@ class EventTriggerEngine:
         fired: list[tuple[str, str]] = []
         for summary in self.repository.list_macros():
             macro = self.repository.load_macro(summary.name)
+            if bool((macro.get("meta") or {}).get("ai_draft")):
+                continue
             triggers = macro.get("triggers") if isinstance(macro.get("triggers"), list) else []
             for index, trigger in enumerate(triggers):
-                if not isinstance(trigger, dict) or not trigger.get("enabled", True):
+                if not isinstance(trigger, dict) or not trigger.get("enabled", True) or trigger.get("needs_setup"):
                     continue
                 kind = str(trigger.get("type") or "")
+                if kind == "manual":
+                    continue
                 key = f"{summary.name}:{index}:{kind}"
-                interval = max(0.5, float(trigger.get("interval") or (3 if kind in {"image_appears", "ocr_threshold"} else 1)))
+                interval = max(0.5, float(trigger.get("interval") or (0.5 if kind in {"image_appear", "image_appears"} else 3 if kind == "ocr_threshold" else 1)))
                 if time.monotonic() - self.last_checks.get(key, 0) < interval:
                     continue
                 self.last_checks[key] = time.monotonic()
@@ -178,12 +198,21 @@ class EventTriggerEngine:
                     matched = now.weekday() in {int(day) for day in days} and now.strftime("%H:%M") == target and self.last_schedule.get(key) != slot
                     if matched:
                         self.last_schedule[key] = slot
-                elif kind == "image_appears":
+                elif kind in {"image_appear", "image_appears"}:
                     matched = self._image_matches(trigger)
                 elif kind == "ocr_threshold":
                     matched = self._ocr_matches(trigger)
                 initialized = key in self.states
                 previous = self.states.get(key, False)
+                stable_ms = max(0, int(trigger.get("stable_ms") or 0))
+                if matched and not previous and stable_ms:
+                    started = self.pending_since.setdefault(key, time.monotonic())
+                    if (time.monotonic() - started) * 1000 < stable_ms:
+                        continue
+                if not matched:
+                    self.pending_since.pop(key, None)
+                else:
+                    self.pending_since.pop(key, None)
                 self.states[key] = matched
                 # A stopped process is the normal baseline on first observation,
                 # not a stop event.  Other positive conditions may intentionally

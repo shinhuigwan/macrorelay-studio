@@ -4889,7 +4889,9 @@ class AIAutomationTests(unittest.TestCase):
         events = [{
             "type": "screen_verification", "t": 450, "x": 420, "y": 260,
             "client_x": 320, "client_y": 210, "event_id": "verify-raw-1",
-            "image_sample_bmp": self._sample_bmp(), "image_anchor": [180, 120],
+            "image_sample_bmp": self._sample_bmp(),
+            "image_previous_bmps": [self._sample_bmp(), self._sample_bmp()],
+            "image_anchor": [180, 120],
             "retry_from": "previous_action", "retry_count": 3,
             "window": {"exe": "whale.exe", "title": "로그인 완료", "class": "Chrome_WidgetWin_1"},
         }]
@@ -4903,6 +4905,8 @@ class AIAutomationTests(unittest.TestCase):
             self.assertEqual("screen_verification_marker", timeline[0]["type"])
             self.assertEqual(3, timeline[0]["retry_count"])
             self.assertEqual("screen_verification", assets[0]["purpose"])
+            self.assertEqual(2, assets[0]["validation"]["pre_action_frame_count"])
+            self.assertTrue(assets[0]["validation"]["recording_quality_verified"])
             self.assertIn("직전 실제 동작으로 돌아가", prompt)
             self.assertIn("작업 구분만을 위해 `flow_control`", prompt)
 
@@ -5315,7 +5319,9 @@ class AIAutomationTests(unittest.TestCase):
                 "steps": [{"action": "image_search", "asset": alias,
                            "click": {"mode": "inactive"},
                            "needs_setup": ["verify_search", "verify_inactive_click"],
-                           "_ai": {"target_ref": "target-a"}}],
+                           "_ai": {"target_ref": "target-a", "asset_validation": {
+                               "recording_quality_verified": True, "recording_quality_score": 72.0,
+                           }}}],
                 "triggers": [{"id": "trigger-001", "type": "manual"}],
                 "ai_setup": {"targets": [{"id": "target-a", "exe": "app.exe",
                                               "class": "AppWindow", "window_token": "ahk_exe app.exe"}],
@@ -5331,6 +5337,58 @@ class AIAutomationTests(unittest.TestCase):
             self.assertEqual([], dialog.macro["ai_setup"]["requirements"])
             self.assertTrue(dialog.use_now.isEnabled())
             dialog.close()
+
+    def test_ai_setup_does_not_auto_approve_low_quality_recording_asset(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.ai_import_dialog import AIDraftSetupDialog
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            image = QtGui.QImage(40, 30, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#202020"))
+            alias = repository.add_asset_image(image, "flat-image")
+            macro = {
+                "name": "검증 차단", "meta": {"ai_draft": True},
+                "steps": [{
+                    "action": "image_search", "asset": alias,
+                    "needs_setup": ["choose_or_confirm_candidate", "verify_search"],
+                    "_ai": {"asset_validation": {
+                        "recording_quality_verified": False, "recording_quality_score": 1.0,
+                    }},
+                }],
+                "triggers": [{"id": "trigger-001", "type": "manual"}],
+                "ai_setup": {"targets": [], "assets": [], "requirements": [], "unresolved": []},
+            }
+            dialog = AIDraftSetupDialog(macro, repository)
+            dialog._automatic_prepare()
+            self.assertIn("verify_search", dialog.macro["steps"][0]["needs_setup"])
+            self.assertFalse(dialog.use_now.isEnabled())
+            dialog.close()
+
+    def test_repository_repairs_legacy_ai_image_defaults(self) -> None:
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("legacy-ai")
+            macro = repository.load_macro("legacy-ai")
+            macro["meta"]["ai_schema_version"] = "macrorelay-ai-1.0"
+            macro["steps"] = [
+                {"action": "image_search", "engine": "ahk", "asset": "button"},
+                {"action": "screen_condition", "engine": "ahk", "click_enabled": True, "click": {"mode": "active"}},
+            ]
+            repository.save_macro("legacy-ai", macro)
+            repaired = repository.load_macro("legacy-ai")
+            self.assertEqual("opencv", repaired["steps"][0]["engine"])
+            self.assertEqual("balanced", repaired["steps"][0]["search_profile"])
+            self.assertTrue(repaired["steps"][0]["click_enabled"])
+            self.assertEqual("opencv", repaired["steps"][1]["engine"])
+            self.assertFalse(repaired["steps"][1]["click_enabled"])
+            self.assertNotIn("click", repaired["steps"][1])
+            self.assertGreaterEqual(repaired["steps"][1]["timeout"], 5000)
 
     def test_naver_like_record_package_json_import_end_to_end(self) -> None:
         from macro_studio.ai_automation import AIRecordingPackageBuilder, materialize_ai_document

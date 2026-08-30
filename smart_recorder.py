@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import deque
 import ctypes
 from ctypes import wintypes
 import json
@@ -361,6 +362,7 @@ class Recorder:
         sample_width: int = 360,
         sample_height: int = 240,
         right_click_condition: bool = False,
+        rolling_preframes: bool = False,
     ) -> None:
         self.output = output
         self.exclude_pid = exclude_pid
@@ -375,6 +377,7 @@ class Recorder:
         self.sample_width = max(160, min(1920, int(sample_width)))
         self.sample_height = max(120, min(1080, int(sample_height)))
         self.right_click_condition = bool(right_click_condition)
+        self.rolling_preframes = bool(rolling_preframes)
         self.record_mode = "action"
         self._mode_key_down = False
         self._branch_key_down = False
@@ -391,6 +394,10 @@ class Recorder:
         self._write_lock = threading.Lock()
         self._after_queue: queue.Queue[tuple[str, int, int] | None] = queue.Queue()
         self._after_thread: threading.Thread | None = None
+        self._pre_capture_thread: threading.Thread | None = None
+        self._pre_capture_stop = threading.Event()
+        self._pre_capture_lock = threading.Lock()
+        self._pre_capture_frames: deque[tuple[float, int, int, str]] = deque(maxlen=4)
         self._event_counter = 0
         self._down_points: dict[str, tuple[int, int, str]] = {}
 
@@ -471,6 +478,7 @@ class Recorder:
                 "image_sample_bmp": capture_click_sample(
                     int(point.x), int(point.y), self.sample_width, self.sample_height
                 ),
+                "image_previous_bmps": self._recent_before_samples(int(point.x), int(point.y)),
                 "image_sample_size": [self.sample_width, self.sample_height],
                 "image_anchor": [self.sample_width // 2, self.sample_height // 2],
                 "retry_from": "previous_action",
@@ -507,6 +515,31 @@ class Recorder:
                     "vk": 0,
                 }
             )
+
+    def _capture_before_worker(self) -> None:
+        """Keep a few lossless frames from immediately before an AI action."""
+        while not self._pre_capture_stop.wait(0.22):
+            if not self.gate_down:
+                continue
+            point = wintypes.POINT()
+            if not user32.GetCursorPos(ctypes.byref(point)):
+                continue
+            sample = capture_click_sample(int(point.x), int(point.y), self.sample_width, self.sample_height)
+            if not sample:
+                continue
+            with self._pre_capture_lock:
+                self._pre_capture_frames.append((time.perf_counter(), int(point.x), int(point.y), sample))
+
+    def _recent_before_samples(self, x: int, y: int) -> list[str]:
+        if not self.rolling_preframes:
+            return []
+        now = time.perf_counter()
+        with self._pre_capture_lock:
+            rows = list(self._pre_capture_frames)
+        return [
+            sample for stamp, frame_x, frame_y, sample in rows
+            if now - stamp <= 1.1 and abs(frame_x - x) <= 28 and abs(frame_y - y) <= 28
+        ][-2:]
 
     def _mouse_proc(self, code: int, message: int, data_ptr: int) -> int:
         down_messages = {WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL}
@@ -560,6 +593,9 @@ class Recorder:
                 if message == WM_MOUSEWHEEL
                 else capture_click_sample(int(data.pt.x), int(data.pt.y), sample_width, sample_height)
             )
+            previous_samples = [] if message == WM_MOUSEWHEEL else self._recent_before_samples(
+                int(data.pt.x), int(data.pt.y)
+            )
             self._event_counter += 1
             event_id = f"mouse-{time.perf_counter_ns()}-{self._event_counter}"
             if message != WM_MOUSEWHEEL:
@@ -576,6 +612,7 @@ class Recorder:
                     "client_y": int(client_y),
                     "window": details,
                     "image_sample_bmp": sample,
+                    "image_previous_bmps": previous_samples,
                     "image_sample_size": [sample_width, sample_height],
                     "image_anchor": [sample_width // 2, sample_height // 2],
                 }
@@ -668,6 +705,12 @@ class Recorder:
         with self.output.open("w", encoding="utf-8") as self.handle:
             self._after_thread = threading.Thread(target=self._capture_after_worker, name="macrorelay-after-capture", daemon=True)
             self._after_thread.start()
+            if self.rolling_preframes:
+                self._pre_capture_stop.clear()
+                self._pre_capture_thread = threading.Thread(
+                    target=self._capture_before_worker, name="macrorelay-before-capture", daemon=True
+                )
+                self._pre_capture_thread.start()
             module = kernel32.GetModuleHandleW(None)
             self.mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self.mouse_callback, module, 0)
             self.keyboard_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.keyboard_callback, module, 0)
@@ -701,9 +744,13 @@ class Recorder:
                 if self.keyboard_hook:
                     user32.UnhookWindowsHookEx(self.keyboard_hook)
                 self._after_queue.put(None)
+                self._pre_capture_stop.set()
                 if self._after_thread is not None:
                     self._after_thread.join(timeout=2.5)
                     self._after_thread = None
+                if self._pre_capture_thread is not None:
+                    self._pre_capture_thread.join(timeout=2.5)
+                    self._pre_capture_thread = None
         return 0
 
 
@@ -722,6 +769,7 @@ def main() -> int:
     parser.add_argument("--sample-width", type=int, default=360)
     parser.add_argument("--sample-height", type=int, default=240)
     parser.add_argument("--right-click-condition", action="store_true")
+    parser.add_argument("--rolling-preframes", action="store_true")
     args = parser.parse_args()
     return Recorder(
         args.out.resolve(),
@@ -737,6 +785,7 @@ def main() -> int:
         sample_width=args.sample_width,
         sample_height=args.sample_height,
         right_click_condition=args.right_click_condition,
+        rolling_preframes=args.rolling_preframes,
     ).run()
 
 

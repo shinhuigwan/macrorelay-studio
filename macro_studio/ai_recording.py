@@ -284,6 +284,7 @@ class AIRecordingController(SmartRecordingController):
                 "--sample-height",
                 "540",
                 "--right-click-condition",
+                "--rolling-preframes",
             ]
         )
         self.process.setWorkingDirectory(str(self.repository.root))

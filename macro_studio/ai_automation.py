@@ -131,6 +131,41 @@ def _image_similarity(first: QtGui.QImage, second: QtGui.QImage) -> float:
     return max(0.0, min(100.0, 100.0 - (delta / max(1, samples) / 255.0 * 100.0)))
 
 
+def _visual_detail_score(image: QtGui.QImage) -> float:
+    """Estimate whether a crop contains a searchable visual feature.
+
+    Flat backgrounds and large nearly uniform panels are poor templates even
+    though they match their source frame perfectly. This lightweight score is
+    intentionally independent from the post-click frame, because a successful
+    click often removes or recolors the target before that frame is captured.
+    """
+    if image.isNull() or image.width() < 8 or image.height() < 8:
+        return 0.0
+    probe = image.scaled(48, 32, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation).convertToFormat(
+        QtGui.QImage.Format_RGB888
+    )
+    raw = bytes(probe.bits())
+    stride = probe.bytesPerLine()
+    luminance: list[float] = []
+    edge_total = 0.0
+    for y in range(probe.height()):
+        for x in range(probe.width()):
+            offset = y * stride + x * 3
+            value = 0.2126 * raw[offset] + 0.7152 * raw[offset + 1] + 0.0722 * raw[offset + 2]
+            luminance.append(value)
+            if x:
+                edge_total += abs(value - luminance[-2])
+            if y:
+                edge_total += abs(value - luminance[(y - 1) * probe.width() + x])
+    if not luminance:
+        return 0.0
+    mean = sum(luminance) / len(luminance)
+    variance = sum((value - mean) ** 2 for value in luminance) / len(luminance)
+    contrast = min(100.0, (variance ** 0.5) / 64.0 * 100.0)
+    edge = min(100.0, edge_total / max(1, len(luminance) * 38.0) * 100.0)
+    return round(contrast * 0.55 + edge * 0.45, 2)
+
+
 def _multiscale_search_score(scene: QtGui.QImage, template: QtGui.QImage) -> tuple[float, float]:
     """Return the best sampled template score and its scale.
 
@@ -408,7 +443,7 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 허용 액션:
 {', '.join(sorted(ALLOWED_ACTIONS))}
 
-이미지 클릭은 기본적으로 `image_search`, `click.mode=inactive`, `click.method=auto`를 사용하십시오. 화면 조건은 `screen_condition`을 사용하고 클릭을 수행하지 마십시오. 검색 범위는 대상 프로그램의 클라이언트 상대 좌표를 우선 사용하며 클릭 오프셋은 선택된 PNG 후보의 값을 그대로 사용하십시오.
+이미지 클릭은 기본적으로 `image_search`, `engine=opencv`, `search_profile=balanced`, `click_enabled=true`, `click.mode=inactive`, `click.method=auto`를 사용하십시오. 화면 조건은 `screen_condition`을 사용하고 클릭을 수행하지 마십시오. 검색 범위는 대상 프로그램의 클라이언트 상대 좌표를 우선 사용하며 클릭 오프셋은 선택된 PNG 후보의 값을 그대로 사용하십시오.
 """
 
 
@@ -656,14 +691,24 @@ class AIRecordingPackageBuilder:
                     )
                     if isinstance(button_candidate, dict):
                         asset["selected_candidate"] = button_candidate.get("file")
+                        validation = asset.setdefault("validation", {})
+                        detail_score = float(button_candidate.get("detail_score") or 0)
+                        stability_score = float(button_candidate.get("stability_score") or 0)
+                        pre_count = int(validation.get("pre_action_frame_count") or 0)
+                        quality_ready = detail_score >= 10.0 and (not pre_count or stability_score >= 76.0)
+                        validation["recording_quality_score"] = round(detail_score, 2)
+                        validation["stability_score"] = round(stability_score, 2)
+                        validation["recording_quality_verified"] = quality_ready
                     verification = event_type == "screen_verification"
                     asset["label"] = f"{'결과 확인' if verification else '화면 조건'} {click_number}"
                     asset["purpose"] = "screen_verification" if verification else "screen_condition"
                     asset["click_purpose"] = "F6으로 지정한 이전 동작 결과" if verification else "우클릭으로 지정한 화면 조건"
-                    asset["readiness"] = "ready"
-                    asset["needs_setup"] = []
-                    asset.setdefault("validation", {})["image_ready"] = True
-                    asset["validation"]["search_verified"] = True
+                    validation = asset.setdefault("validation", {})
+                    quality_ready = bool(validation.get("recording_quality_verified"))
+                    asset["readiness"] = "ready" if quality_ready else "needs_review"
+                    asset["needs_setup"] = [] if quality_ready else ["choose_or_confirm_candidate", "verify_search"]
+                    validation["image_ready"] = True
+                    validation["search_verified"] = quality_ready
                     assets.append(asset)
                     preview = QtGui.QImage(str(stage / str(asset["selected_candidate"])))
                     contact_rows.append((
@@ -937,6 +982,11 @@ class AIRecordingPackageBuilder:
         if before.isNull():
             return None
         after = _decode_image(event.get("image_after_bmp"))
+        previous_frames = [
+            frame for frame in (
+                _decode_image(value) for value in event.get("image_previous_bmps") or []
+            ) if not frame.isNull()
+        ]
         anchor_values = event.get("image_anchor") if isinstance(event.get("image_anchor"), list) else []
         anchor = QtCore.QPoint(
             int(anchor_values[0]) if len(anchor_values) >= 2 else before.width() // 2,
@@ -947,6 +997,10 @@ class AIRecordingPackageBuilder:
         before = _redact_screen_regions(before, sample_left, sample_top, sensitive_regions)
         if not after.isNull():
             after = _redact_screen_regions(after, sample_left, sample_top, sensitive_regions)
+        previous_frames = [
+            _redact_screen_regions(frame, sample_left, sample_top, sensitive_regions)
+            for frame in previous_frames
+        ]
         before_name = f"frames/step-{click_number:03d}-before.png"
         before.save(str(stage / before_name), "PNG")
         after_name = ""
@@ -967,6 +1021,7 @@ class AIRecordingPackageBuilder:
             relative = f"asset-candidates/click-{click_number:03d}-{kind}.png"
             image.save(str(stage / relative), "PNG")
             score, matched_scale = _multiscale_search_score(after, image) if not after.isNull() else (0.0, 1.0)
+            stability_scores = [_multiscale_search_score(frame, image)[0] for frame in previous_frames]
             candidates.append(
                 {
                     "kind": kind,
@@ -975,6 +1030,9 @@ class AIRecordingPackageBuilder:
                     "image_anchor": [anchor.x() - rect.x(), anchor.y() - rect.y()],
                     "click_offset": [anchor.x() - rect.center().x(), anchor.y() - rect.center().y()],
                     "validation_score": round(score, 2),
+                    "detail_score": _visual_detail_score(image),
+                    "pre_action_scores": [round(value, 2) for value in stability_scores],
+                    "stability_score": round(min(stability_scores), 2) if stability_scores else 0.0,
                     "matched_scale": round(matched_scale, 2),
                 }
             )
@@ -991,6 +1049,9 @@ class AIRecordingPackageBuilder:
             relative = f"asset-candidates/click-{click_number:03d}-{kind}.png"
             image.save(str(stage / relative), "PNG")
             score, matched_scale = _multiscale_search_score(validation_scene, image) if not validation_scene.isNull() else (0.0, 1.0)
+            # Processed variants are manual fallbacks; automatic selection is
+            # intentionally limited to the original-color crops above.
+            stability_scores = []
             candidates.append(
                 {
                     "kind": kind,
@@ -1000,14 +1061,35 @@ class AIRecordingPackageBuilder:
                     "click_offset": [anchor.x() - button_rect.center().x(), anchor.y() - button_rect.center().y()],
                     "preprocessing": preprocessing,
                     "validation_score": round(score, 2),
+                    "detail_score": _visual_detail_score(image),
+                    "pre_action_scores": [round(value, 2) for value in stability_scores],
+                    "stability_score": round(min(stability_scores), 2) if stability_scores else 0.0,
                     "matched_scale": round(matched_scale, 2),
                 }
             )
-        candidates.sort(key=lambda item: float(item.get("validation_score") or 0), reverse=True)
-        selected = candidates[0]
+        raw_candidates = [item for item in candidates if item.get("kind") in {"small", "button", "wide"}]
+        size_penalty = {"small": 1.5, "button": 0.0, "wide": 6.0}
+        selected = max(
+            raw_candidates,
+            key=lambda item: (
+                float(item.get("detail_score") or 0)
+                + min(100.0, float(item.get("stability_score") or 0)) * (0.55 if previous_frames else 0.0)
+                + min(100.0, float(item.get("validation_score") or 0)) * 0.08
+                - size_penalty.get(str(item.get("kind") or ""), 0.0)
+            ),
+        )
+        candidates.sort(
+            key=lambda item: (
+                item is not selected,
+                -float(item.get("detail_score") or 0),
+                -float(item.get("validation_score") or 0),
+            )
+        )
         top_score = float(selected.get("validation_score") or 0)
-        tied = len(candidates) > 1 and abs(top_score - float(candidates[1].get("validation_score") or 0)) <= 0.5
-        readiness = "ready" if top_score >= 84 and not tied else "needs_review"
+        detail_score = float(selected.get("detail_score") or 0)
+        stability_score = float(selected.get("stability_score") or 0)
+        quality_ready = detail_score >= 10.0 and (not previous_frames or stability_score >= 76.0)
+        readiness = "ready" if quality_ready else "needs_review"
         return {
             "id": f"recorded-image-{click_number:03d}",
             "label": f"녹화 클릭 이미지 {click_number}",
@@ -1021,10 +1103,14 @@ class AIRecordingPackageBuilder:
             "readiness": readiness,
             "validation": {
                 "image_ready": True,
-                "search_verified": readiness == "ready",
+                "search_verified": quality_ready,
+                "recording_quality_verified": quality_ready,
+                "recording_quality_score": round(detail_score, 2),
+                "pre_action_frame_count": len(previous_frames),
+                "stability_score": round(stability_score, 2),
                 "score": round(top_score, 2),
                 "matched_scale": selected.get("matched_scale", 1.0),
-                "ambiguous": tied,
+                "ambiguous": not quality_ready,
                 "inactive_click_verified": False,
             },
             "needs_setup": ([] if readiness == "ready" else ["choose_or_confirm_candidate", "verify_search"])
@@ -1322,10 +1408,10 @@ def materialize_ai_document(
             asset_state = asset_states.get(asset_ref, {})
             validation = asset_state.get("validation") if isinstance(asset_state.get("validation"), dict) else {}
             step["asset"] = alias
-            step.setdefault("engine", "opencv")
-            step.setdefault("search_profile", "fast")
-            step.setdefault("confidence", 84)
-            step.setdefault("timeout", 800)
+            step["engine"] = "opencv"
+            step["search_profile"] = "balanced"
+            step["confidence"] = max(78, min(88, int(step.get("confidence") or 82)))
+            step["timeout"] = max(5000 if action == "screen_condition" else 2000, int(step.get("timeout") or 0))
             step.setdefault("poll_delay", 40)
             step["region_mode"] = "client" if target else "screen"
             step["region_coords"] = "relative" if target else "screen"
@@ -1354,6 +1440,7 @@ def materialize_ai_document(
             step["click"] = click
             step["click_enabled"] = action == "image_search"
             if action == "screen_condition":
+                step.pop("click", None)
                 step.setdefault("label", f"화면 조건 · {alias or '이미지 확인'}")
             if not alias:
                 step.setdefault("needs_setup", []).append("select_asset")
@@ -1412,6 +1499,7 @@ def materialize_ai_document(
             "target_ref": target_ref,
             "asset_ref": str(raw.get("asset_ref") or ""),
             "source_evidence": deepcopy(raw.get("source_evidence") or {}),
+            "asset_validation": deepcopy(validation) if action in {"image_search", "screen_condition"} else {},
         }
         workflow_id = str(raw.get("workflow_id") or "").strip()
         workflow_label = str(raw.get("workflow_label") or workflow_labels.get(workflow_id) or "").strip()

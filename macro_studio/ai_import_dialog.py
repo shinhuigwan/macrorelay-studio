@@ -397,12 +397,28 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
                 ai_meta["target_ref"] = remap[target_ref]
             action = str(step.get("action") or "")
             needs = [str(value) for value in step.get("needs_setup") or [] if str(value)]
-            if action == "image_search" and self.repository.asset_path(str(step.get("asset") or "")) is not None:
-                needs = [value for value in needs if value not in image_checks]
+            if action in {"image_search", "screen_condition"} and self.repository.asset_path(str(step.get("asset") or "")) is not None:
+                validation = ai_meta.get("asset_validation") if isinstance(ai_meta.get("asset_validation"), dict) else {}
+                quality_ready = bool(
+                    validation.get("recording_quality_verified") or validation.get("search_verified")
+                )
+                removable = {"select_asset", "confirm_asset", "verify_inactive_click"}
+                if quality_ready:
+                    removable.update({"choose_or_confirm_candidate", "verify_search"})
+                needs = [value for value in needs if value not in removable]
+                step["engine"] = "opencv"
+                step["search_profile"] = "balanced"
+                step["confidence"] = max(78, min(88, int(step.get("confidence") or 82)))
+                step["timeout"] = max(5000 if action == "screen_condition" else 2000, int(step.get("timeout") or 0))
                 click = step.get("click") if isinstance(step.get("click"), dict) else {}
                 click.setdefault("mode", "inactive")
                 click.setdefault("method", "auto")
-                step["click"] = click
+                if action == "image_search":
+                    step["click"] = click
+                    step["click_enabled"] = True
+                else:
+                    step.pop("click", None)
+                    step["click_enabled"] = False
             elif action in {"inactive_click", "type_text"}:
                 needs = [value for value in needs if value != "verify_inactive_click"]
                 step.setdefault("method", "auto")
@@ -843,6 +859,19 @@ class AIDraftSetupDialog(QtWidgets.QDialog):
         if pending:
             QtWidgets.QMessageBox.warning(self, "설정 미완료", "다음 항목을 먼저 확인하세요:\n\n" + "\n".join(f"• {item}" for item in pending))
             return
+        for step in self.macro.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            action = str(step.get("action") or "")
+            if action == "image_search":
+                step["engine"] = "opencv"
+                step["search_profile"] = "balanced"
+                step["click_enabled"] = True
+            elif action == "screen_condition":
+                step["engine"] = "opencv"
+                step["search_profile"] = "balanced"
+                step["click_enabled"] = False
+                step.pop("click", None)
         self.macro.setdefault("meta", {})["ai_draft"] = False
         self.macro.get("ai_setup", {}).update({"unresolved": [], "requirements": []})
         self.macro_changed.emit(deepcopy(self.macro))

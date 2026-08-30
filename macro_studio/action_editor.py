@@ -447,12 +447,21 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
     ],
     "wait": [FieldSpec("duration", "대기 시간", "duration", 500, 0, 3_600_000)],
     "datetime_condition": [
-        FieldSpec("date_start", "시작 날짜", "text", "", placeholder="YYYY-MM-DD · 비우면 제한 없음"),
-        FieldSpec("date_end", "종료 날짜", "text", "", placeholder="YYYY-MM-DD · 비우면 제한 없음"),
-        FieldSpec("time_start", "시작 시각", "text", "00:00", placeholder="HH:MM"),
-        FieldSpec("time_end", "종료 시각", "text", "23:59", placeholder="HH:MM"),
-        FieldSpec("day_mode", "요일", "choice", "everyday", options=choice(("매일", "everyday"), ("평일 · 월~금", "weekdays"), ("주말 · 토/일", "weekend"), ("직접 지정", "custom"))),
-        FieldSpec("custom_days", "직접 지정 요일", "text", "월,화,수,목,금", placeholder="예: 월,수,금", section="요일 상세"),
+        FieldSpec("date_start_enabled", "시작 날짜 사용", "bool", False, section="날짜 제한"),
+        FieldSpec("date_start", "시작 날짜", "date", "", section="날짜 제한"),
+        FieldSpec("date_end_enabled", "종료 날짜 사용", "bool", False, section="날짜 제한"),
+        FieldSpec("date_end", "종료 날짜", "date", "", section="날짜 제한"),
+        FieldSpec("time_start", "시작 시간", "time", "00:00", section="시간 제한"),
+        FieldSpec("time_end_enabled", "종료 시간 사용", "bool", False, section="시간 제한"),
+        FieldSpec("time_end", "종료 시간", "time", "23:59", section="시간 제한"),
+        FieldSpec("weekday_enabled", "요일 제한 사용", "bool", False, section="요일 제한", tooltip="끄면 매일 동작합니다."),
+        FieldSpec("weekday_mon", "월요일", "bool", True, section="요일 상세"),
+        FieldSpec("weekday_tue", "화요일", "bool", True, section="요일 상세"),
+        FieldSpec("weekday_wed", "수요일", "bool", True, section="요일 상세"),
+        FieldSpec("weekday_thu", "목요일", "bool", True, section="요일 상세"),
+        FieldSpec("weekday_fri", "금요일", "bool", True, section="요일 상세"),
+        FieldSpec("weekday_sat", "토요일", "bool", True, section="요일 상세"),
+        FieldSpec("weekday_sun", "일요일", "bool", True, section="요일 상세"),
         FieldSpec("invert", "조건 결과 반전", "bool", False, section="판정 방식"),
         FieldSpec("wait_until", "조건을 만족할 때까지 대기", "bool", False, section="판정 방식"),
         FieldSpec("wait_timeout", "최대 대기 시간", "duration", 0, 0, 86_400_000, tooltip="0이면 제한 없이 대기합니다.", section="판정 방식"),
@@ -1550,6 +1559,12 @@ class ActionEditor(QtWidgets.QWidget):
                 asset.currentIndexChanged.connect(self._update_offset_preview)
                 if asset.isEditable():
                     asset.lineEdit().textChanged.connect(self._update_offset_preview)
+        elif action == "datetime_condition":
+            for key in ("date_start_enabled", "date_end_enabled", "time_end_enabled", "weekday_enabled"):
+                toggle = self.widgets[action].get(key)
+                if isinstance(toggle, QtWidgets.QCheckBox):
+                    toggle.toggled.connect(self._sync_datetime_controls)
+            self._sync_datetime_controls()
         body_layout.addStretch(1)
         scroll.setWidget(body)
         return scroll
@@ -1606,6 +1621,15 @@ class ActionEditor(QtWidgets.QWidget):
             buttons.append(("▶ OCR 테스트", lambda: self._test_ocr(action)))
         elif action in {"inactive_click", "type_text", "table_paste"}:
             buttons.append(("◎ 대상 창 찾기", lambda: self._pick_window(action)))
+        if action == "type_text":
+            buttons.extend(
+                [
+                    ("↵ Enter 추가", lambda: self._append_type_text_key("{Enter}")),
+                    ("⇥ Tab 추가", lambda: self._append_type_text_key("{Tab}")),
+                    ("Esc 추가", lambda: self._append_type_text_key("{Esc}")),
+                    ("⌨ 기능키 선택", self._choose_type_text_key),
+                ]
+            )
         if not buttons:
             return None
         group = QtWidgets.QGroupBox("빠른 입력")
@@ -1616,6 +1640,54 @@ class ActionEditor(QtWidgets.QWidget):
             button.clicked.connect(callback)
             layout.addWidget(button, index // 3, index % 3)
         return group
+
+    def _sync_datetime_controls(self) -> None:
+        widgets = self.widgets.get("datetime_condition", {})
+        dependencies = {
+            "date_start": "date_start_enabled",
+            "date_end": "date_end_enabled",
+            "time_end": "time_end_enabled",
+        }
+        for field, toggle_key in dependencies.items():
+            editor = widgets.get(field)
+            toggle = widgets.get(toggle_key)
+            if editor is not None and isinstance(toggle, QtWidgets.QCheckBox):
+                editor.setEnabled(toggle.isChecked())
+        weekday_toggle = widgets.get("weekday_enabled")
+        weekday_enabled = isinstance(weekday_toggle, QtWidgets.QCheckBox) and weekday_toggle.isChecked()
+        for key in ("weekday_mon", "weekday_tue", "weekday_wed", "weekday_thu", "weekday_fri", "weekday_sat", "weekday_sun"):
+            widget = widgets.get(key)
+            if widget is not None:
+                widget.setEnabled(weekday_enabled)
+
+    def _append_type_text_key(self, token: str) -> None:
+        editor = self.widgets.get("type_text", {}).get("text")
+        mode = self.widgets.get("type_text", {}).get("send_mode")
+        if isinstance(mode, QtWidgets.QComboBox):
+            index = mode.findData("input")
+            if index >= 0:
+                mode.setCurrentIndex(index)
+        if isinstance(editor, QtWidgets.QPlainTextEdit):
+            editor.textCursor().insertText(token)
+            editor.setFocus(QtCore.Qt.OtherFocusReason)
+
+    def _choose_type_text_key(self) -> None:
+        choices = [
+            ("Enter", "{Enter}"), ("Tab", "{Tab}"), ("Escape", "{Esc}"),
+            ("Backspace", "{Backspace}"), ("Delete", "{Delete}"),
+            ("Home", "{Home}"), ("End", "{End}"), ("Page Up", "{PgUp}"),
+            ("Page Down", "{PgDn}"), ("방향키 ↑", "{Up}"), ("방향키 ↓", "{Down}"),
+            ("방향키 ←", "{Left}"), ("방향키 →", "{Right}"),
+            *[(f"F{number}", f"{{F{number}}}") for number in range(1, 13)],
+            ("Ctrl+A", "^a"), ("Ctrl+C", "^c"), ("Ctrl+V", "^v"),
+            ("Alt+F4", "!{F4}"), ("Shift+Tab", "+{Tab}"),
+        ]
+        labels = [label for label, _token in choices]
+        selected, accepted = QtWidgets.QInputDialog.getItem(self, "기능키 추가", "보낼 키", labels, 0, False)
+        if accepted:
+            token = next((value for label, value in choices if label == selected), "")
+            if token:
+                self._append_type_text_key(token)
 
     def _open_image_search_test_center(self) -> None:
         from .image_search_test import ImageSearchTestDialog
@@ -2227,6 +2299,14 @@ class ActionEditor(QtWidgets.QWidget):
         elif spec.kind == "multiline":
             widget = QtWidgets.QPlainTextEdit()
             widget.setMaximumHeight(96)
+        elif spec.kind == "date":
+            widget = QtWidgets.QDateEdit()
+            widget.setCalendarPopup(True)
+            widget.setDisplayFormat("yyyy-MM-dd")
+            widget.setDate(QtCore.QDate.currentDate())
+        elif spec.kind == "time":
+            widget = QtWidgets.QTimeEdit()
+            widget.setDisplayFormat("HH:mm")
         elif spec.kind == "path":
             holder = QtWidgets.QWidget()
             row = QtWidgets.QHBoxLayout(holder)
@@ -2317,6 +2397,20 @@ class ActionEditor(QtWidgets.QWidget):
                 mapping = normalized.get(field)
                 if isinstance(mapping, dict):
                     normalized[text_field] = "\n".join(f"{key}={value}" for key, value in mapping.items())
+        if action == "datetime_condition":
+            if "date_start_enabled" not in normalized:
+                normalized["date_start_enabled"] = bool(str(normalized.get("date_start") or "").strip())
+            if "date_end_enabled" not in normalized:
+                normalized["date_end_enabled"] = bool(str(normalized.get("date_end") or "").strip())
+            if "time_end_enabled" not in normalized:
+                normalized["time_end_enabled"] = bool(str(normalized.get("time_end") or "").strip())
+            if "weekday_enabled" not in normalized:
+                normalized["weekday_enabled"] = str(normalized.get("day_mode") or "everyday") != "everyday"
+            legacy_mode = str(normalized.get("day_mode") or "everyday")
+            legacy_days = str(normalized.get("custom_days") or "")
+            selected_days = set("월화수목금") if legacy_mode == "weekdays" else set("토일") if legacy_mode == "weekend" else set(legacy_days) if legacy_mode == "custom" else set("월화수목금토일")
+            for key, label in (("weekday_mon", "월"), ("weekday_tue", "화"), ("weekday_wed", "수"), ("weekday_thu", "목"), ("weekday_fri", "금"), ("weekday_sat", "토"), ("weekday_sun", "일")):
+                normalized.setdefault(key, label in selected_days)
         for spec in ACTION_FIELDS.get(action, []):
             if spec.key in COMMON_FIELD_KEYS:
                 continue
@@ -2330,6 +2424,8 @@ class ActionEditor(QtWidgets.QWidget):
             if isinstance(picker, MultiAssetPicker):
                 picker.set_offsets(normalized.get("asset_offsets") or {})
             self._update_offset_preview()
+        elif action == "datetime_condition":
+            self._sync_datetime_controls()
 
     def build_step(self) -> dict[str, Any]:
         action = self.current_action
@@ -2395,6 +2491,18 @@ class ActionEditor(QtWidgets.QWidget):
                 for key in ("target_control", "target_hwnd", "target_child_class"):
                     if key in original_click:
                         payload["click"][key] = original_click[key]
+        elif action == "datetime_condition":
+            day_pairs = (
+                ("weekday_mon", "월"), ("weekday_tue", "화"), ("weekday_wed", "수"),
+                ("weekday_thu", "목"), ("weekday_fri", "금"),
+                ("weekday_sat", "토"), ("weekday_sun", "일"),
+            )
+            if bool(payload.get("weekday_enabled")):
+                payload["day_mode"] = "custom"
+                payload["custom_days"] = ",".join(label for key, label in day_pairs if bool(payload.get(key)))
+            else:
+                payload["day_mode"] = "everyday"
+                payload["custom_days"] = ""
         if action == "inactive_click" and original_handle_method == "handle_probe":
             payload["method"] = "handle_probe"
             for key in ("target_control", "target_hwnd", "target_child_class"):
@@ -2450,6 +2558,15 @@ class ActionEditor(QtWidgets.QWidget):
             target.setCurrentIndex(max(index, 0))
         elif isinstance(target, QtWidgets.QPlainTextEdit):
             target.setPlainText(str(value or ""))
+            target.moveCursor(QtGui.QTextCursor.End)
+        elif isinstance(target, QtWidgets.QDateEdit):
+            parsed = QtCore.QDate.fromString(str(value or ""), "yyyy-MM-dd")
+            target.setDate(parsed if parsed.isValid() else QtCore.QDate.currentDate())
+        elif isinstance(target, QtWidgets.QTimeEdit):
+            parsed = QtCore.QTime.fromString(str(value or spec.default or "00:00"), "HH:mm")
+            if not parsed.isValid():
+                parsed = QtCore.QTime.fromString(str(value or spec.default or "00:00"), "H:mm")
+            target.setTime(parsed if parsed.isValid() else QtCore.QTime(0, 0))
         elif isinstance(target, QtWidgets.QLineEdit):
             target.setText(str(value if value is not None else ""))
 
@@ -2469,6 +2586,10 @@ class ActionEditor(QtWidgets.QWidget):
             return target.currentData() if target.currentData() is not None else target.currentText()
         if isinstance(target, QtWidgets.QPlainTextEdit):
             return target.toPlainText()
+        if isinstance(target, QtWidgets.QDateEdit):
+            return target.date().toString("yyyy-MM-dd")
+        if isinstance(target, QtWidgets.QTimeEdit):
+            return target.time().toString("HH:mm")
         if isinstance(target, QtWidgets.QLineEdit):
             return target.text().strip() if spec.kind != "multiline" else target.text()
         return spec.default

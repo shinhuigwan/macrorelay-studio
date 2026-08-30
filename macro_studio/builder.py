@@ -1295,7 +1295,11 @@ class BuilderPage(QtWidgets.QWidget):
             assets = step.get("assets") if isinstance(step.get("assets"), list) else []
             return f"멀티 이미지 서치 · {len(assets)}개" if len(assets) > 1 else str(step.get("asset") or "이미지 선택 필요")
         if action == "datetime_condition":
-            return f"{step.get('time_start') or '00:00'}~{step.get('time_end') or '23:59'} · 날짜·시간 조건"
+            time_text = str(step.get("time_start") or "00:00")
+            if bool(step.get("time_end_enabled", "time_end" in step)):
+                time_text += f"~{step.get('time_end') or '23:59'}"
+            wait_text = " · 조건까지 대기" if step.get("wait_until") else ""
+            return f"{time_text} · 날짜·시간 조건{wait_text}"
         if action == "type_text":
             text = str(step.get("text") or "")
             return text[:30] or "텍스트 입력"

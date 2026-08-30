@@ -936,6 +936,40 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("Goto, Step2", script)
         self.assertIn("Goto, Step3", script)
 
+    def test_datetime_condition_checkbox_flags_and_unlimited_wait(self) -> None:
+        script = self.engine.render_macro_script(
+            {
+                "steps": [{
+                    "action": "datetime_condition",
+                    "date_start_enabled": False,
+                    "date_start": "2099-01-01",
+                    "date_end_enabled": False,
+                    "date_end": "2099-12-31",
+                    "time_start": "05:30",
+                    "time_end_enabled": False,
+                    "time_end": "06:00",
+                    "weekday_enabled": True,
+                    "weekday_mon": True,
+                    "weekday_tue": False,
+                    "weekday_wed": True,
+                    "weekday_thu": False,
+                    "weekday_fri": False,
+                    "weekday_sat": False,
+                    "weekday_sun": False,
+                    "wait_until": True,
+                    "wait_timeout": 0,
+                    "poll_delay": 500,
+                }]
+            },
+            {},
+        )
+        self.assertIn('("" = "" or __time_date_1 >= "")', script)
+        self.assertIn('InStr("|2|4|"', script)
+        self.assertIn('__time_clock_1 >= "0530"', script)
+        self.assertNotIn('__time_clock_1 <= "0600"', script)
+        self.assertIn("Sleep, 500", script)
+        self.assertNotIn("A_TickCount - __time_wait_started_1 >=", script)
+
     def test_screen_condition_searches_without_click_and_auto_expands_tiny_region(self) -> None:
         macro = {
             "steps": [
@@ -3301,6 +3335,38 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual([(1, 2, "success")], removed)
         self.assertEqual(0, len(canvas.edges), "저장 신호를 기다리지 않고 화면에서 즉시 제거되어야 합니다.")
         canvas.close()
+
+    def test_datetime_editor_uses_enable_checkboxes_and_function_key_picker(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.action_editor import ActionEditor
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            editor = ActionEditor(MacroRepository(Path(directory)))
+            editor.load_step({
+                "action": "datetime_condition", "date_start": "2026-08-31",
+                "time_start": "05:30", "time_end": "23:59", "day_mode": "everyday",
+            })
+            widgets = editor.widgets["datetime_condition"]
+            self.assertTrue(widgets["date_start_enabled"].isChecked())
+            self.assertTrue(widgets["date_start"].isEnabled())
+            widgets["date_start_enabled"].setChecked(False)
+            widgets["time_end_enabled"].setChecked(False)
+            widgets["weekday_enabled"].setChecked(True)
+            widgets["weekday_tue"].setChecked(False)
+            rebuilt = editor.build_step()
+            self.assertFalse(rebuilt["date_start_enabled"])
+            self.assertFalse(rebuilt["time_end_enabled"])
+            self.assertTrue(rebuilt["weekday_enabled"])
+            self.assertNotIn("화", rebuilt["custom_days"])
+
+            editor.load_step({"action": "type_text", "text": "hello", "send_mode": "raw"})
+            editor._append_type_text_key("{Enter}")
+            typed = editor.build_step()
+            self.assertEqual("input", typed["send_mode"])
+            self.assertEqual("hello{Enter}", typed["text"])
+            editor.close()
 
     def test_builder_restores_action_forms_and_collapses_json(self) -> None:
         from PySide6 import QtWidgets

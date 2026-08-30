@@ -4016,22 +4016,47 @@ def render_datetime_condition(step: Dict[str, Any], step_index: int) -> List[str
         cleaned = "".join(char for char in str(value or "") if char.isdigit())
         return cleaned[:length] if len(cleaned) >= length else fallback
 
-    start_date = digits(step.get("date_start"), 8, "")
-    end_date = digits(step.get("date_end"), 8, "")
-    start_time = digits(step.get("time_start"), 4, "0000")
-    end_time = digits(step.get("time_end"), 4, "2359")
-    day_mode = str(step.get("day_mode") or "everyday")
-    if day_mode == "weekdays":
-        allowed_days = {2, 3, 4, 5, 6}
-    elif day_mode == "weekend":
-        allowed_days = {1, 7}
-    elif day_mode == "custom":
-        names = {"일": 1, "월": 2, "화": 3, "수": 4, "목": 5, "금": 6, "토": 7}
-        allowed_days = {number for label, number in names.items() if label in str(step.get("custom_days") or "")}
-        if not allowed_days:
-            allowed_days = set(range(1, 8))
+    def time_digits(value: Any, fallback: str) -> str:
+        cleaned = "".join(char for char in str(value or "") if char.isdigit())
+        if len(cleaned) == 3:
+            cleaned = "0" + cleaned
+        if len(cleaned) < 4:
+            return fallback
+        candidate = cleaned[:4]
+        return candidate if int(candidate[:2]) < 24 and int(candidate[2:]) < 60 else fallback
+
+    start_date_raw = digits(step.get("date_start"), 8, "")
+    end_date_raw = digits(step.get("date_end"), 8, "")
+    start_date_enabled = bool(step.get("date_start_enabled")) if "date_start_enabled" in step else bool(start_date_raw)
+    end_date_enabled = bool(step.get("date_end_enabled")) if "date_end_enabled" in step else bool(end_date_raw)
+    start_date = start_date_raw if start_date_enabled else ""
+    end_date = end_date_raw if end_date_enabled else ""
+    start_time = time_digits(step.get("time_start"), "0000")
+    end_time = time_digits(step.get("time_end"), "2359")
+    time_end_enabled = bool(step.get("time_end_enabled")) if "time_end_enabled" in step else bool(str(step.get("time_end") or "").strip())
+    if "weekday_enabled" in step:
+        weekday_enabled = bool(step.get("weekday_enabled"))
+        day_keys = {
+            1: "weekday_sun", 2: "weekday_mon", 3: "weekday_tue", 4: "weekday_wed",
+            5: "weekday_thu", 6: "weekday_fri", 7: "weekday_sat",
+        }
+        allowed_days = {number for number, key in day_keys.items() if not weekday_enabled or bool(step.get(key, True))}
+        # No checked day is an intentionally impossible condition, not "every day".
+        if weekday_enabled and not allowed_days:
+            allowed_days = set()
     else:
-        allowed_days = set(range(1, 8))
+        day_mode = str(step.get("day_mode") or "everyday")
+        if day_mode == "weekdays":
+            allowed_days = {2, 3, 4, 5, 6}
+        elif day_mode == "weekend":
+            allowed_days = {1, 7}
+        elif day_mode == "custom":
+            names = {"일": 1, "월": 2, "화": 3, "수": 4, "목": 5, "금": 6, "토": 7}
+            allowed_days = {number for label, number in names.items() if label in str(step.get("custom_days") or "")}
+            if not allowed_days:
+                allowed_days = set(range(1, 8))
+        else:
+            allowed_days = set(range(1, 8))
     day_token = "|" + "|".join(str(value) for value in sorted(allowed_days)) + "|"
     found_var = f"__time_condition_success_{step_index}"
     wait_until = bool(step.get("wait_until"))
@@ -4049,7 +4074,9 @@ def render_datetime_condition(step: Dict[str, Any], step_index: int) -> List[str
         f'    __time_date_ok_{step_index} := ("{start_date}" = "" or __time_date_{step_index} >= "{start_date}") and ("{end_date}" = "" or __time_date_{step_index} <= "{end_date}")',
         f'    __time_day_ok_{step_index} := InStr("{day_token}", "|" . __time_weekday_{step_index} . "|") > 0',
     ]
-    if start_time <= end_time:
+    if not time_end_enabled:
+        lines.append(f'    __time_clock_ok_{step_index} := (__time_clock_{step_index} >= "{start_time}")')
+    elif start_time <= end_time:
         lines.append(
             f'    __time_clock_ok_{step_index} := (__time_clock_{step_index} >= "{start_time}" and __time_clock_{step_index} <= "{end_time}")'
         )

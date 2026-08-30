@@ -1069,8 +1069,17 @@ class NodeCanvas(QtWidgets.QWidget):
             assets = step.get("assets") if isinstance(step.get("assets"), list) else []
             return f"멀티 이미지 {len(assets)}개" if len(assets) > 1 else str(step.get("asset") or "이미지 선택 필요")
         if action == "datetime_condition":
-            day_labels = {"everyday": "매일", "weekdays": "평일", "weekend": "주말", "custom": str(step.get("custom_days") or "요일 지정")}
-            return f"{day_labels.get(str(step.get('day_mode') or 'everyday'), '매일')} · {step.get('time_start') or '00:00'}~{step.get('time_end') or '23:59'}"
+            if "weekday_enabled" in step:
+                day_text = str(step.get("custom_days") or "요일 지정") if step.get("weekday_enabled") else "매일"
+            else:
+                legacy_days = {"everyday": "매일", "weekdays": "평일", "weekend": "주말", "custom": str(step.get("custom_days") or "요일 지정")}
+                day_text = legacy_days.get(str(step.get("day_mode") or "everyday"), "매일")
+            time_text = str(step.get("time_start") or "00:00")
+            if bool(step.get("time_end_enabled", "time_end" in step)):
+                time_text += f"~{step.get('time_end') or '23:59'}"
+            if step.get("wait_until"):
+                time_text += " · 대기"
+            return f"{day_text} · {time_text}"
         if action == "ocr":
             ocr_action = str(step.get("ocr_action") or "extract")
             if ocr_action in {"find_text", "find_click", "find_click_offset"}:

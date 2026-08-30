@@ -4717,7 +4717,7 @@ class AIAutomationTests(unittest.TestCase):
             expected = {
                 "prompt.txt", "schema.json", "manifest.json", "timeline.json", "targets.json", "recording.mp4",
                 "contact-sheet.png", "asset-manifest.json", "frames/step-001-before.png",
-                "video-segments.json",
+                "video-segments.json", "workflows.json",
                 "frames/step-001-after.png", "asset-candidates/click-001-button.png",
                 "asset-candidates/click-001-button-grayscale.png",
                 "asset-candidates/click-001-button-outline.png",
@@ -4776,6 +4776,30 @@ class AIAutomationTests(unittest.TestCase):
             self.assertEqual("screen_condition", assets[0]["purpose"])
             self.assertIn("button.png", assets[0]["selected_candidate"])
             self.assertIn("우클릭 자체를 mouse_click으로 만들지", prompt)
+
+    def test_ai_f7_workflow_markers_split_timeline_and_prompt_requests_json_file(self) -> None:
+        from macro_studio.ai_automation import AIRecordingPackageBuilder
+
+        events = [
+            {"type": "key", "t": 100, "token": "Enter", "char": "", "window": {}},
+            {
+                "type": "workflow_branch", "t": 200, "workflow_index": 2,
+                "workflow_id": "workflow-02", "label": "작업 분기 2",
+            },
+            {"type": "key", "t": 300, "token": "Tab", "char": "", "window": {}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            _archive, stage = AIRecordingPackageBuilder(Path(directory)).build(
+                events, package_id="ai-workflow-split"
+            )
+            timeline = json.loads((stage / "timeline.json").read_text(encoding="utf-8"))
+            workflows = json.loads((stage / "workflows.json").read_text(encoding="utf-8"))["workflows"]
+            prompt = (stage / "prompt.txt").read_text(encoding="utf-8")
+            action_rows = [row for row in timeline if row["type"] != "workflow_branch_marker"]
+            self.assertEqual(["workflow-01", "workflow-02"], [row["workflow_id"] for row in action_rows])
+            self.assertEqual(2, len(workflows))
+            self.assertIn("macrorelay-ai.json", prompt)
+            self.assertIn("파일 하나로만 첨부", prompt)
 
     def test_ai_execution_condition_exposes_cutout_editor_after_capture(self) -> None:
         from PySide6 import QtGui, QtWidgets
@@ -5098,7 +5122,7 @@ class AIAutomationTests(unittest.TestCase):
             labels = [button.text() for button in builder.findChildren(QtWidgets.QPushButton)]
             self.assertIn("✦ AI 매크로 녹화", labels)
             self.assertIn("AI 분석 패키지 생성", labels)
-            self.assertIn("AI JSON 불러오기", labels)
+            self.assertIn("받은 JSON 바로 가져오기", labels)
             emitted: list[str] = []
             builder.run_macro.connect(emitted.append)
             with mock.patch.object(QtWidgets.QMessageBox, "warning", return_value=QtWidgets.QMessageBox.Ok):

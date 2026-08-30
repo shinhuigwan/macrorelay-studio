@@ -508,6 +508,9 @@ class NodeItem(QtWidgets.QGraphicsObject):
         delay = int(self.step.get("sleep_after") or 0)
         success_delay = int(self.step.get("on_success_delay") or 0)
         detail = f"완료 {delay}ms" if delay else "완료 즉시"
+        workflow_label = str(self.step.get("workflow_label") or "").strip()
+        if workflow_label:
+            detail = f"⑂ {workflow_label}  ·  " + detail
         repeat_var = str(self.step.get("repeat_var") or "").strip().lstrip("$")
         if repeat_var:
             detail = f"반복 ${repeat_var}회  ·  " + detail

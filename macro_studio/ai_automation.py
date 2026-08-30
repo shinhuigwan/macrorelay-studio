@@ -306,7 +306,7 @@ def load_ai_recording(path: Path) -> list[dict[str, Any]]:
     }
     events: list[dict[str, Any]] = []
     for item in records:
-        if item.get("type") not in {"mouse", "screen_condition", "key", "mouse_drag"}:
+        if item.get("type") not in {"mouse", "screen_condition", "key", "mouse_drag", "workflow_branch"}:
             continue
         prepared = dict(item)
         if prepared.get("type") == "mouse" and str(prepared.get("event_id") or "") in drag_sources:
@@ -357,6 +357,7 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
             "click_purpose": "버튼 클릭",
         }],
         "variables": {},
+        "workflows": [{"id": "workflow-01", "label": "로그인", "order": 1}],
         "triggers": [trigger_example],
         "steps": [{
             "id": "step-01", "action": "image_search", "target_ref": "target-01",
@@ -364,6 +365,7 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
             "params": {"confidence": 86, "timeout": 1200, "click_enabled": True},
             "on_success": "end", "on_fail": "end", "retry_count": 2, "retry_delay": 250,
             "needs_setup": [],
+            "workflow_id": "workflow-01", "workflow_label": "로그인",
             "source_evidence": {"timeline_id": "click-001", "frame": "frames/step-001-before.png"},
         }],
         "setup_requirements": [],
@@ -383,10 +385,12 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 8. 정말로 매크로를 만들 수 없는 단 하나의 정보만 누락된 경우에만 질문하십시오. 여러 질문을 나열하지 말고 한 번에 하나만 질문하십시오. 그 외 불확실성은 안전한 기본값과 `needs_setup`으로 처리한 초안을 즉시 만드십시오.
 9. 아이디·비밀번호·API 키를 평문으로 넣지 마십시오. 녹화에 실제 민감 입력 동작이 있을 때만 `vault_get`과 보안 보관함 이름을 사용하십시오.
 10. 임의 Python, AutoHotkey, PowerShell, 셸 코드를 생성하지 마십시오. 허용 액션만 사용하십시오.
-11. 마지막 답변에는 설명과 JSON을 분리하고, JSON은 하나의 완전한 코드 블록으로 출력하십시오.
+11. 설명이나 코드 블록을 채팅 본문에 출력하지 마십시오. 완성 결과는 다운로드 가능한 `macrorelay-ai.json` 파일 하나로만 첨부하십시오. 파일 생성이 지원되지 않는 환경에서만 완전한 JSON 객체 하나만 출력하십시오.
 12. timeline의 `screen_condition_marker`는 사용자가 녹화 중 우클릭으로 명시한 중간 화면 조건입니다. 반드시 같은 asset_ref를 사용하는 `screen_condition` 노드로 만드십시오. 이 노드 다음의 일반 동작은 성공선에 연결하고, 실패선은 다음 `screen_condition_marker` 또는 안전한 종료로 연결하십시오. 우클릭 자체를 mouse_click으로 만들지 마십시오.
+13. timeline의 `workflow_branch_marker`와 각 항목의 `workflow_id`는 사용자가 F7 또는 `다음 작업` 버튼으로 나눈 독립 작업입니다. 작업별로 짧은 한국어 이름을 추론해 `workflows`에 기록하고 모든 step에 `workflow_id`, `workflow_label`을 넣으십시오. 한 작업 내부의 선을 다른 작업 내부로 뒤섞지 말고, 작업 종료점에서만 다음 작업 시작점으로 연결하십시오. 각 작업의 우클릭 화면 조건은 그 작업의 진입·분기 조건입니다.
+14. 작업 분기가 여러 개면 녹화 순서를 기본 실행 순서로 사용합니다. 앞 작업이 명시적으로 종료되어야 하는 경우를 제외하면 앞 작업의 정상 종료를 다음 작업 시작점에 연결하고, 조건 불충족은 그 작업을 건너뛰어 다음 작업으로 이동시킵니다.
 
-스키마 버전은 `{AI_SCHEMA_VERSION}`입니다. 최상위 필수 키는 `schema_version`, `source_package_id`, `name`, `description`, `targets`, `assets`, `variables`, `triggers`, `steps`, `setup_requirements`입니다.
+스키마 버전은 `{AI_SCHEMA_VERSION}`입니다. 최상위 필수 키는 `schema_version`, `source_package_id`, `name`, `description`, `targets`, `assets`, `variables`, `triggers`, `steps`, `setup_requirements`이며, 작업 분기가 있으면 `workflows`도 포함하십시오.
 
 각 target은 `id`, `label`, `exe`, `title`, `class`, `window_token`, `coordinate_base`, `inactive_click_verified`를 사용합니다. 과거 hwnd 숫자는 저장하지 마십시오.
 
@@ -425,6 +429,16 @@ def ai_schema_document() -> dict[str, Any]:
             "targets": {"type": "array", "items": {"type": "object", "required": ["id"], "properties": {"id": identifier}}},
             "assets": {"type": "array", "items": {"type": "object", "required": ["id"], "properties": {"id": identifier}}},
             "variables": {"type": ["object", "array"]},
+            "workflows": {
+                "type": "array",
+                "items": {
+                    "type": "object", "required": ["id", "label", "order"],
+                    "properties": {
+                        "id": identifier, "label": {"type": "string", "minLength": 1},
+                        "order": {"type": "integer", "minimum": 1},
+                    },
+                },
+            },
             "triggers": {
                 "type": "array",
                 "items": {
@@ -456,6 +470,8 @@ def ai_schema_document() -> dict[str, Any]:
                         "retry_delay": {"type": "integer", "minimum": 0, "maximum": 3600000},
                         "needs_setup": {"type": "array", "items": {"type": "string"}},
                         "source_evidence": {"type": "object"},
+                        "workflow_id": {"type": "string"},
+                        "workflow_label": {"type": "string"},
                     },
                 },
             },
@@ -512,6 +528,19 @@ class AIRecordingPackageBuilder:
             window = event.get("window") if isinstance(event.get("window"), dict) else {}
             target_id = target_lookup.get(self._target_key(window), "")
             event_type = str(event.get("type") or "")
+            if event_type == "workflow_branch":
+                workflow_index = max(2, int(event.get("workflow_index") or 2))
+                timeline.append({
+                    "id": f"workflow-marker-{workflow_index:02d}",
+                    "t": current_time,
+                    "delay_from_previous_ms": max(0, current_time - previous_time),
+                    "type": "workflow_branch_marker",
+                    "workflow_id": str(event.get("workflow_id") or f"workflow-{workflow_index:02d}"),
+                    "workflow_index": workflow_index,
+                    "label": str(event.get("label") or f"작업 분기 {workflow_index}"),
+                })
+                previous_time = current_time
+                continue
             if event_type == "capture":
                 marker_number += 1
                 marker_image = _decode_image(event.get("image_sample_bmp"))
@@ -678,6 +707,28 @@ class AIRecordingPackageBuilder:
             timeline.append(row)
             previous_time = current_time
 
+        # A recording always starts in workflow 1. F7 markers change the
+        # active workflow for following rows, keeping the package easy to
+        # reason about without duplicating the workflow id on every raw event.
+        active_workflow = "workflow-01"
+        active_index = 1
+        workflow_rows: list[dict[str, Any]] = [
+            {"id": active_workflow, "label": "작업 분기 1", "order": active_index}
+        ]
+        for row in timeline:
+            if row.get("type") == "workflow_branch_marker":
+                active_index = max(1, int(row.get("workflow_index") or active_index + 1))
+                active_workflow = str(row.get("workflow_id") or f"workflow-{active_index:02d}")
+                if not any(item["id"] == active_workflow for item in workflow_rows):
+                    workflow_rows.append({
+                        "id": active_workflow,
+                        "label": str(row.get("label") or f"작업 분기 {active_index}"),
+                        "order": active_index,
+                    })
+                continue
+            row["workflow_id"] = active_workflow
+            row["workflow_index"] = active_index
+
         packaged_trigger, trigger_asset = self._prepare_trigger(stage, trigger_config or {}, targets, target_lookup)
         if trigger_asset:
             assets.append(trigger_asset)
@@ -688,6 +739,7 @@ class AIRecordingPackageBuilder:
         (stage / "prompt.txt").write_text(prompt, encoding="utf-8")
         _write_json(stage / "schema.json", ai_schema_document())
         _write_json(stage / "timeline.json", timeline)
+        _write_json(stage / "workflows.json", {"workflows": workflow_rows})
         _write_json(stage / "targets.json", targets)
         _write_json(stage / "asset-manifest.json", {"assets": assets})
         _write_json(stage / "video-segments.json", {"segments": video_segments or []})
@@ -705,6 +757,7 @@ class AIRecordingPackageBuilder:
             "package_id": identifier,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "event_count": len(timeline),
+            "workflow_count": len(workflow_rows),
             "target_count": len(targets),
             "asset_count": len(assets),
             "trigger": packaged_trigger,
@@ -1031,7 +1084,7 @@ def validate_ai_document(payload: Any) -> list[AIImportIssue]:
     if not isinstance(payload, dict):
         return [AIImportIssue("error", "root_type", "JSON 최상위 값은 객체여야 합니다.")]
     required = {"schema_version", "name", "description", "targets", "assets", "variables", "triggers", "steps", "setup_requirements"}
-    allowed_top = required | {"source_package_id"}
+    allowed_top = required | {"source_package_id", "workflows"}
     for key in sorted(required - set(payload)):
         issues.append(AIImportIssue("error", "missing_top_level", f"필수 항목 `{key}`가 없습니다."))
     for key in sorted(set(payload) - allowed_top):
@@ -1227,6 +1280,12 @@ def materialize_ai_document(
         asset_aliases[asset_id] = unique
 
     raw_steps, step_lookup = _items_by_id(payload.get("steps"))
+    workflow_rows, _workflow_lookup = _items_by_id(payload.get("workflows"))
+    workflow_labels = {
+        str(item.get("id") or ""): str(item.get("label") or item.get("id") or "작업")
+        for item in workflow_rows
+        if str(item.get("id") or "")
+    }
     index_by_id = {str(step.get("id")): index for index, step in enumerate(raw_steps, start=1)}
     steps: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
@@ -1335,6 +1394,11 @@ def materialize_ai_document(
             "asset_ref": str(raw.get("asset_ref") or ""),
             "source_evidence": deepcopy(raw.get("source_evidence") or {}),
         }
+        workflow_id = str(raw.get("workflow_id") or "").strip()
+        workflow_label = str(raw.get("workflow_label") or workflow_labels.get(workflow_id) or "").strip()
+        if workflow_id:
+            step["workflow_id"] = workflow_id
+            step["workflow_label"] = workflow_label or workflow_id
         steps.append(step)
     top_requirements = [str(value) for value in payload.get("setup_requirements", []) if str(value)] if isinstance(payload.get("setup_requirements"), list) else []
     stored_targets: list[dict[str, Any]] = []
@@ -1391,6 +1455,17 @@ def materialize_ai_document(
     if not runtime_triggers:
         runtime_triggers = [{"id": "trigger-001", "type": "manual", "enabled": True}]
 
+    graph_positions: dict[str, list[float]] = {}
+    workflow_order: list[str] = []
+    workflow_columns: dict[str, int] = {}
+    for index, step in enumerate(steps, start=1):
+        workflow_id = str(step.get("workflow_id") or "workflow-01")
+        if workflow_id not in workflow_order:
+            workflow_order.append(workflow_id)
+        column = workflow_columns.get(workflow_id, 0)
+        workflow_columns[workflow_id] = column + 1
+        graph_positions[str(index)] = [column * 340.0, workflow_order.index(workflow_id) * 210.0]
+
     macro = {
         "name": str(payload.get("name") or "AI 자동화 초안").strip() or "AI 자동화 초안",
         "description": str(payload.get("description") or ""),
@@ -1406,6 +1481,7 @@ def materialize_ai_document(
             "ai_imported_at": datetime.now(timezone.utc).isoformat(),
         },
         "steps": steps,
+        "graph_positions": graph_positions,
         "triggers": runtime_triggers,
         "variables": deepcopy(payload.get("variables") if isinstance(payload.get("variables"), (list, dict)) else {}),
         "ai_setup": {

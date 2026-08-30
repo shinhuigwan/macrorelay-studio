@@ -481,17 +481,18 @@ class BuilderPage(QtWidgets.QWidget):
         )
         self.ai_record_btn = primary_button("✦ AI 매크로 녹화")
         self.ai_record_btn.setToolTip(
-            "평소처럼 한 번 조작하면 화면 영상·원본 PNG·클릭·키보드·대상 창 정보를 함께 기록합니다. F10으로 종료합니다."
+            "화면 영상·PNG·클릭·키보드·대상 창을 기록합니다. 우클릭=화면 조건, F7=다음 독립 작업, F10=종료."
         )
         self.ai_record_btn.clicked.connect(self._start_ai_recording)
         self.ai_package_btn = QtWidgets.QPushButton("AI 분석 패키지 생성")
         self.ai_package_btn.setToolTip("마지막 AI 녹화의 ChatGPT 분석 ZIP을 확인하거나 다시 생성합니다.")
         self.ai_package_btn.clicked.connect(self._generate_ai_package)
-        self.ai_prompt_btn = QtWidgets.QPushButton("ChatGPT용 프롬프트 복사")
+        self.ai_prompt_btn = QtWidgets.QPushButton("ChatGPT 요청 복사")
+        self.ai_prompt_btn.setToolTip("ChatGPT가 설명 없이 다운로드 가능한 macrorelay-ai.json 파일만 만들도록 요청합니다.")
         self.ai_prompt_btn.clicked.connect(self._copy_ai_prompt)
         self.ai_folder_btn = QtWidgets.QPushButton("패키지 저장 폴더 열기")
         self.ai_folder_btn.clicked.connect(self._open_ai_package_folder)
-        self.ai_import_btn = QtWidgets.QPushButton("AI JSON 불러오기")
+        self.ai_import_btn = QtWidgets.QPushButton("받은 JSON 바로 가져오기")
         self.ai_import_btn.clicked.connect(self._import_ai_json)
         self.ai_continue_btn = QtWidgets.QPushButton("미완성 설정 계속하기")
         self.ai_continue_btn.clicked.connect(self._continue_ai_setup)
@@ -1829,7 +1830,8 @@ class BuilderPage(QtWidgets.QWidget):
         answer = QtWidgets.QMessageBox.question(
             self,
             "AI 자동 매크로 제작 녹화",
-            "2초 뒤 녹화가 자동으로 시작됩니다. 평소처럼 작업하고 F10으로 종료하세요.\n\n"
+            "2초 뒤 녹화가 자동으로 시작됩니다. 첫 작업을 녹화하고, 다른 작업으로 나눌 때 F7 또는 녹화 바의 "
+            "‘다음 작업’을 누르세요. 우클릭은 해당 작업의 화면 조건이며 F10으로 전체 녹화를 종료합니다.\n\n"
             "영상은 동작 순서 분석용이며, 이미지 서치 후보는 클릭 시점의 무손실 PNG로 따로 저장됩니다. "
             "키 입력은 분석 패키지에서 마스킹되지만 비밀번호 입력 화면은 가능하면 녹화에서 제외하세요.\n\n"
             "AI 녹화를 시작할까요?",
@@ -1843,7 +1845,7 @@ class BuilderPage(QtWidgets.QWidget):
         controller.failed.connect(self._ai_recording_failed)
         self._ai_recording_controller = controller
         controller.start()
-        self.status.emit("AI 매크로 녹화 시작 · 평소처럼 조작하고 F10으로 종료하세요.")
+        self.status.emit("AI 녹화 시작 · 우클릭은 화면 조건, F7은 다음 작업 분기, F10은 종료입니다.")
 
     @QtCore.Slot(str, str, list)
     def _ai_package_completed(self, archive: str, stage: str, events: list[dict[str, Any]]) -> None:
@@ -1857,7 +1859,10 @@ class BuilderPage(QtWidgets.QWidget):
         self._ai_completion_message = message
         message.setWindowTitle("AI 분석 패키지 생성 완료")
         message.setIcon(QtWidgets.QMessageBox.Information)
-        message.setText("ChatGPT에 ZIP 파일과 복사한 프롬프트를 전달한 뒤, 생성된 JSON을 다시 불러오세요.")
+        message.setText(
+            "ChatGPT에 ZIP 파일과 복사한 요청을 전달하세요. ChatGPT가 만든 macrorelay-ai.json을 내려받아 "
+            "‘받은 JSON 바로 가져오기’로 선택하면 됩니다."
+        )
         message.setDetailedText(f"ZIP: {archive}\n작업 폴더: {stage}")
         copy_button = message.addButton("프롬프트 복사", QtWidgets.QMessageBox.ActionRole)
         folder_button = message.addButton("저장 폴더 열기", QtWidgets.QMessageBox.ActionRole)

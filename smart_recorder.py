@@ -37,6 +37,7 @@ WM_MBUTTONDOWN = 0x0207
 WM_MBUTTONUP = 0x0208
 WM_MOUSEWHEEL = 0x020A
 VK_F8 = 0x77
+VK_F7 = 0x76
 VK_F10 = 0x79
 VK_OEM_3 = 0xC0  # ` / ~ key on standard Windows keyboard layouts
 SHIFT_KEYS = {0x10, 0xA0, 0xA1}
@@ -350,6 +351,7 @@ class Recorder:
         exclude_pid: int,
         delay: float,
         capture_vk: int = VK_F8,
+        branch_vk: int = VK_F7,
         stop_vk: int = VK_F10,
         hold_vk: int = VK_OEM_3,
         initial_active: bool = False,
@@ -362,6 +364,7 @@ class Recorder:
         self.exclude_pid = exclude_pid
         self.delay = max(0.0, delay)
         self.capture_vk = int(capture_vk)
+        self.branch_vk = int(branch_vk)
         self.stop_vk = int(stop_vk)
         self.hold_vk = int(hold_vk)
         self.gate_down = bool(initial_active)
@@ -371,6 +374,8 @@ class Recorder:
         self.right_click_condition = bool(right_click_condition)
         self.record_mode = "action"
         self._mode_key_down = False
+        self._branch_key_down = False
+        self.workflow_index = 1
         self._shift_down = False
         self._pressed_modifiers: set[str] = set()
         self.started = time.perf_counter()
@@ -404,6 +409,8 @@ class Recorder:
             return
         payload["t"] = round((time.perf_counter() - self.started - self.delay) * 1000)
         payload["record_mode"] = self.record_mode
+        payload["workflow_index"] = self.workflow_index
+        payload["workflow_id"] = f"workflow-{self.workflow_index:02d}"
         self._write_payload(payload)
 
     def set_gate_active(self, active: bool) -> None:
@@ -426,6 +433,19 @@ class Recorder:
 
     def cycle_record_mode(self) -> None:
         self.set_record_mode("branch" if self.record_mode == "action" else "action")
+
+    def start_new_workflow(self) -> None:
+        self.workflow_index += 1
+        self.emit_control(
+            {
+                "type": "workflow_branch",
+                "workflow_index": self.workflow_index,
+                "workflow_id": f"workflow-{self.workflow_index:02d}",
+                "label": f"작업 분기 {self.workflow_index}",
+                "active": self.gate_down,
+                "vk": self.branch_vk,
+            }
+        )
 
     def emit_control(self, payload: dict[str, object]) -> None:
         """Write recorder controls even during countdown or over Studio UI.
@@ -563,6 +583,12 @@ class Recorder:
                 # Recorder control keys never reach the target app or become
                 # recorded key actions.
                 return 1
+            if self.branch_vk and vk == self.branch_vk:
+                if pressed and not self._branch_key_down:
+                    self.start_new_workflow()
+                self._branch_key_down = pressed
+                # F7 is a recording control and must never reach the target.
+                return 1
             if message not in {WM_KEYDOWN, WM_SYSKEYDOWN}:
                 return int(user32.CallNextHookEx(self.keyboard_hook, code, message, data_ptr))
             if vk == self.stop_vk:
@@ -619,6 +645,8 @@ class Recorder:
                         "hold_vk": self.hold_vk,
                         "gate_active": self.gate_down,
                         "record_mode": self.record_mode,
+                        "workflow_index": self.workflow_index,
+                        "workflow_id": f"workflow-{self.workflow_index:02d}",
                     }
                 )
                 + "\n"
@@ -647,6 +675,7 @@ def main() -> int:
     parser.add_argument("--exclude-pid", type=int, default=os.getpid())
     parser.add_argument("--delay", type=float, default=2.0)
     parser.add_argument("--capture-vk", type=int, default=VK_F8)
+    parser.add_argument("--branch-vk", type=int, default=VK_F7)
     parser.add_argument("--stop-vk", type=int, default=VK_F10)
     parser.add_argument("--hold-vk", type=int, default=VK_OEM_3)
     parser.add_argument("--initial-active", action="store_true")
@@ -660,6 +689,7 @@ def main() -> int:
         args.exclude_pid,
         args.delay,
         args.capture_vk,
+        args.branch_vk,
         args.stop_vk,
         args.hold_vk,
         initial_active=args.initial_active,

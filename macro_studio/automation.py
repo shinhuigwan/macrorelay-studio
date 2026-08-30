@@ -185,6 +185,7 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
 class RecordingBar(QtWidgets.QDialog):
     stop_requested = QtCore.Signal()
     capture_requested = QtCore.Signal()
+    branch_requested = QtCore.Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -195,6 +196,7 @@ class RecordingBar(QtWidgets.QDialog):
         self.setWindowTitle("스마트 녹화")
         self.setWindowFlags(QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint)
         self.setFixedWidth(660)
+        self.workflow_index = 1
         layout = QtWidgets.QHBoxLayout(self)
         self.dot = QtWidgets.QLabel("●")
         self.dot.setStyleSheet("color:#697386; font-size:18pt;")
@@ -207,11 +209,16 @@ class RecordingBar(QtWidgets.QDialog):
         self.capture_button.setToolTip("화면 위에서 붓처럼 드래그해 이미지 서치 원본 영역을 지정합니다.")
         self.capture_button.setEnabled(False)
         self.capture_button.clicked.connect(self.capture_requested.emit)
+        self.branch_button = QtWidgets.QPushButton("⑂ 다음 작업  F7")
+        self.branch_button.setToolTip("현재 작업을 끝내고 독립된 새 작업 분기 녹화를 시작합니다.")
+        self.branch_button.setVisible(False)
+        self.branch_button.clicked.connect(self.branch_requested.emit)
         stop = QtWidgets.QPushButton("■ 종료  F10")
         stop.clicked.connect(self.stop_requested.emit)
         layout.addWidget(self.dot)
         layout.addWidget(self.mode_badge)
         layout.addWidget(self.label, 1)
+        layout.addWidget(self.branch_button)
         layout.addWidget(self.capture_button)
         layout.addWidget(stop)
         self.timer = QtCore.QTimer(self)
@@ -253,6 +260,20 @@ class RecordingBar(QtWidgets.QDialog):
             self.label.setText(f"ON {elapsed} · 일반 액션 · Shift+` → 분기 · ` → 정지")
         else:
             self.label.setText(f"OFF {elapsed} · ` → 시작 · Shift+` → 모드 · F10 종료")
+
+    def enable_workflow_branches(self) -> None:
+        self.branch_button.setVisible(True)
+        self.setFixedWidth(850)
+        self.mode_badge.setText(f"작업 {self.workflow_index}")
+        self._tick()
+
+    def set_workflow_index(self, index: int) -> None:
+        self.workflow_index = max(1, int(index))
+        if self.branch_button.isVisible():
+            self.mode_badge.setText(f"작업 {self.workflow_index}")
+            self.label.setText(
+                f"작업 {self.workflow_index} 녹화 중 · 우클릭=조건 · F7=다음 작업 · F10=종료"
+            )
 
     def set_gate_active(self, active: bool) -> None:
         self.gate_active = bool(active)
@@ -1031,6 +1052,7 @@ class SmartRecordingController(QtCore.QObject):
         requests: list[dict[str, Any]] = []
         latest_gate_state: bool | None = None
         latest_record_mode: str | None = None
+        latest_workflow_index: int | None = None
         for line in lines:
             try:
                 payload = json.loads(line)
@@ -1044,6 +1066,8 @@ class SmartRecordingController(QtCore.QObject):
                     latest_record_mode = str(payload.get("mode") or latest_record_mode or "action")
                 elif payload.get("type") == "mode_state":
                     latest_record_mode = str(payload.get("mode") or "action")
+                elif payload.get("type") == "workflow_branch":
+                    latest_workflow_index = max(1, int(payload.get("workflow_index") or 1))
         if latest_gate_state is not None and latest_gate_state != self._last_gate_state:
             self._last_gate_state = latest_gate_state
             if self.bar is not None:
@@ -1054,6 +1078,8 @@ class SmartRecordingController(QtCore.QObject):
                 self._last_record_mode = normalized_mode
                 if self.bar is not None:
                     self.bar.set_record_mode(normalized_mode)
+        if latest_workflow_index is not None and self.bar is not None:
+            self.bar.set_workflow_index(latest_workflow_index)
         return requests
 
     def _poll_capture_requests(self) -> None:

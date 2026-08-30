@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import ctypes
 from pathlib import Path
 import shutil
 import subprocess
@@ -268,6 +269,8 @@ class AIRecordingController(SmartRecordingController):
                 "2",
                 "--capture-vk",
                 str(0x77),
+                "--branch-vk",
+                str(0x76),
                 "--stop-vk",
                 str(0x79),
                 "--hold-vk",
@@ -287,17 +290,31 @@ class AIRecordingController(SmartRecordingController):
         self.process.errorOccurred.connect(self._process_error)
         self.bar = RecordingBar(self.host)
         self.bar.setWindowTitle("AI 자동 매크로 제작 녹화")
-        self.bar.label.setText("2초 후 자동 녹화 · 좌클릭=동작 · 우클릭=화면 조건 · F8 중요 화면 · F10 종료")
+        self.bar.label.setText("작업 1 · 좌클릭=동작 · 우클릭=화면 조건 · F7=다음 작업 · F10=종료")
         self.bar.mode_badge.setText("AI 자동")
+        self.bar.enable_workflow_branches()
         self.bar.set_gate_active(True)
         self.bar.timer.stop()
-        self.bar.label.setText("2초 후 자동 녹화 · 좌클릭=동작 · 우클릭=화면 조건 · F8 중요 화면 · F10 종료")
+        self.bar.set_workflow_index(1)
         self.bar.stop_requested.connect(self.stop)
         self.bar.capture_requested.connect(self.request_image_capture)
+        self.bar.branch_requested.connect(self._request_next_workflow)
         self.bar.show()
         self.process.start()
         self._capture_poll.start()
         self._video_timer.start()
+
+    @QtCore.Slot()
+    def _request_next_workflow(self) -> None:
+        """Send the same global F7 control used when the target has focus."""
+        if self.process is None or self.process.state() == QtCore.QProcess.NotRunning:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            user32.keybd_event(0x76, 0, 0, 0)
+            user32.keybd_event(0x76, 0, 0x0002, 0)
+        except (AttributeError, OSError):
+            self.failed.emit("새 작업 분기 단축키를 전달하지 못했습니다.")
 
     def _latest_key_time(self) -> int:
         if not self.output.is_file():
@@ -367,7 +384,9 @@ class AIRecordingController(SmartRecordingController):
                 item = json.loads(line)
             except (TypeError, ValueError):
                 continue
-            if isinstance(item, dict) and item.get("type") in {"mouse", "screen_condition", "key", "mouse_drag", "capture_request"}:
+            if isinstance(item, dict) and item.get("type") in {
+                "mouse", "screen_condition", "key", "mouse_drag", "capture_request", "workflow_branch"
+            }:
                 latest = max(latest, int(item.get("t") or 0))
         return latest
 

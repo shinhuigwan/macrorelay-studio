@@ -97,13 +97,17 @@ class AIExecutionConditionDialog(QtWidgets.QDialog):
     def _capture_trigger(self) -> None:
         parent = self.parentWidget()
         parent_was_visible = bool(parent is not None and parent.isVisible())
+        parent_opacity = float(parent.windowOpacity()) if parent is not None else 1.0
         image = QtGui.QImage()
         screen_rect = QtCore.QRect()
         pixmap = QtGui.QPixmap()
         geometry = QtCore.QRect()
         self.hide()
         if parent_was_visible:
-            parent.hide()
+            # Hiding and showing the parent of a running modal dialog can leave
+            # the native Windows parent disabled even after the dialog closes.
+            # Make it transparent instead so Qt's modal ownership never breaks.
+            parent.setWindowOpacity(0.0)
         try:
             wait = QtCore.QEventLoop(self)
             QtCore.QTimer.singleShot(120, wait.quit)
@@ -119,7 +123,7 @@ class AIExecutionConditionDialog(QtWidgets.QDialog):
             picker.deleteLater()
         finally:
             if parent_was_visible and parent is not None:
-                parent.show()
+                parent.setWindowOpacity(parent_opacity)
                 parent.raise_()
             self.show()
             self.raise_()
@@ -439,6 +443,8 @@ class AIRecordingController(SmartRecordingController):
         condition_dialog = AIExecutionConditionDialog(self.repository, events, self.host)
         accepted = condition_dialog.exec() == QtWidgets.QDialog.Accepted
         trigger_config = condition_dialog.configuration() if accepted else {"type": "manual"}
+        condition_dialog.close()
+        condition_dialog.deleteLater()
         try:
             archive, stage = AIRecordingPackageBuilder(self.repository.root).build(
                 events, video, trigger_config=trigger_config, video_segments=self._video_segments
@@ -453,5 +459,15 @@ class AIRecordingController(SmartRecordingController):
         shutil.rmtree(self.frame_dir, ignore_errors=True)
         if video is not None:
             video.unlink(missing_ok=True)
-        self.package_completed.emit(str(archive), str(stage), events)
+        self._pending_delivery = (str(archive), str(stage), events)
+        # Deliver on a clean event-loop turn, after the modal condition dialog
+        # has fully released its native Windows parent.
+        QtCore.QTimer.singleShot(0, self._deliver_package)
+
+    def _deliver_package(self) -> None:
+        pending = getattr(self, "_pending_delivery", None)
+        self._pending_delivery = None
+        if pending:
+            archive, stage, events = pending
+            self.package_completed.emit(archive, stage, events)
         self.deleteLater()

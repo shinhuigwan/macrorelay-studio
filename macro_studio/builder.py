@@ -430,6 +430,7 @@ class BuilderPage(QtWidgets.QWidget):
         self._log_dialog: MacroLogDialog | None = None
         self._recording_controller: SmartRecordingController | None = None
         self._ai_recording_controller: AIRecordingController | None = None
+        self._ai_completion_message: QtWidgets.QMessageBox | None = None
         self._automation_overlay: AutomationOverlay | None = None
         self._collapsed_groups: set[str] = set()
         self._last_recording_path = self.repository.root / ".automation" / "last-recording.json"
@@ -1760,19 +1761,39 @@ class BuilderPage(QtWidgets.QWidget):
         self._remember_last_ai_recording(events)
         self._last_ai_package = self._load_last_ai_package()
         self.status.emit(f"AI 분석 패키지를 생성했습니다 · {Path(archive).name}")
-        message = QtWidgets.QMessageBox(self)
+        if self._ai_completion_message is not None:
+            self._ai_completion_message.close()
+        message = QtWidgets.QMessageBox(self.window())
+        self._ai_completion_message = message
         message.setWindowTitle("AI 분석 패키지 생성 완료")
         message.setIcon(QtWidgets.QMessageBox.Information)
-        message.setText("ChatGPT에 ZIP 파일을 첨부하고, 함께 복사한 프롬프트의 질문에 답한 뒤 생성된 JSON을 다시 불러오세요.")
+        message.setText("ChatGPT에 ZIP 파일과 복사한 프롬프트를 전달한 뒤, 생성된 JSON을 다시 불러오세요.")
         message.setDetailedText(f"ZIP: {archive}\n작업 폴더: {stage}")
         copy_button = message.addButton("프롬프트 복사", QtWidgets.QMessageBox.ActionRole)
         folder_button = message.addButton("저장 폴더 열기", QtWidgets.QMessageBox.ActionRole)
         message.addButton(QtWidgets.QMessageBox.Ok)
-        message.exec()
-        if message.clickedButton() is copy_button:
-            self._copy_ai_prompt()
-        elif message.clickedButton() is folder_button:
-            self._open_ai_package_folder()
+        message.setModal(False)
+        message.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+
+        def handle_action(button: QtWidgets.QAbstractButton) -> None:
+            if button is copy_button:
+                self._copy_ai_prompt()
+            elif button is folder_button:
+                self._open_ai_package_folder()
+            if message.isVisible():
+                message.accept()
+
+        def clear_message(_result: int) -> None:
+            if self._ai_completion_message is message:
+                self._ai_completion_message = None
+
+        message.buttonClicked.connect(handle_action)
+        message.finished.connect(clear_message)
+        # This notice is deliberately non-modal. Even if Windows fails to
+        # activate or paint it, Studio must remain clickable and closable.
+        message.show()
+        message.raise_()
+        message.activateWindow()
 
     @QtCore.Slot(str)
     def _ai_recording_failed(self, detail: str) -> None:

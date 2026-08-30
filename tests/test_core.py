@@ -4664,6 +4664,83 @@ class AIAutomationTests(unittest.TestCase):
             self.assertEqual("✨ 누끼·상세 편집", dialog.edit_button.text())
             dialog.close()
 
+    def test_ai_trigger_capture_keeps_modal_parent_enabled_and_restores_opacity(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.ai_recording import AIExecutionConditionDialog
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            parent = QtWidgets.QWidget()
+            parent.show()
+            dialog = AIExecutionConditionDialog(repository, [], parent)
+            dialog.show()
+            app.processEvents()
+            pixmap = QtGui.QPixmap(120, 80)
+            pixmap.fill(QtGui.QColor("#203044"))
+
+            class CancelPicker:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def exec(self):
+                    return QtWidgets.QDialog.Rejected
+
+                def captured_image(self):
+                    return QtGui.QImage()
+
+                def selected_screen_rect(self):
+                    return QtCore.QRect()
+
+                def deleteLater(self):
+                    pass
+
+            with mock.patch("macro_studio.ai_recording.capture_virtual_desktop", return_value=(pixmap, QtCore.QRect(0, 0, 120, 80))), \
+                 mock.patch("macro_studio.ai_recording.ScreenCaptureDialog", CancelPicker):
+                dialog._capture_trigger()
+            app.processEvents()
+            self.assertTrue(parent.isVisible())
+            self.assertEqual(1.0, parent.windowOpacity())
+            self.assertTrue(parent.isEnabled())
+            dialog.close()
+            parent.close()
+
+    def test_ai_package_completion_prompt_copy_is_non_modal_and_releases_studio(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            stage = repository.root / ".automation" / "ai-packages" / "completion-test"
+            stage.mkdir(parents=True, exist_ok=True)
+            prompt = stage / "prompt.txt"
+            prompt.write_text("AI TEST PROMPT", encoding="utf-8")
+            archive = repository.root / "exports" / "ai-recordings" / "completion.zip"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_bytes(b"zip")
+            record = {"prompt": str(prompt), "archive": str(archive), "stage": str(stage)}
+            last = repository.root / ".automation" / "last-ai-package.json"
+            last.parent.mkdir(parents=True, exist_ok=True)
+            last.write_text(json.dumps(record), encoding="utf-8")
+            builder = BuilderPage(repository)
+            builder.show()
+            builder._ai_package_completed(str(archive), str(stage), [])
+            app.processEvents()
+            message = builder._ai_completion_message
+            self.assertIsNotNone(message)
+            self.assertTrue(message.isVisible())
+            self.assertFalse(message.isModal())
+            copy_button = next(button for button in message.buttons() if button.text() == "프롬프트 복사")
+            copy_button.click()
+            app.processEvents()
+            self.assertEqual("AI TEST PROMPT", app.clipboard().text())
+            self.assertIsNone(builder._ai_completion_message)
+            self.assertTrue(builder.isEnabled())
+            builder.close()
+
     def test_ai_package_merges_title_changes_for_same_application_window(self) -> None:
         from macro_studio.ai_automation import AIRecordingPackageBuilder
 

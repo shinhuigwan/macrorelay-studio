@@ -4706,6 +4706,41 @@ class AIAutomationTests(unittest.TestCase):
             dialog.close()
             parent.close()
 
+    def test_ai_execution_condition_is_async_and_never_disables_studio(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.ai_recording import AIRecordingController
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            parent = QtWidgets.QWidget()
+            parent.show()
+            controller = AIRecordingController(repository, parent)
+            completed: list[tuple[str, str, list]] = []
+            controller.package_completed.connect(lambda archive, stage, events: completed.append((archive, stage, events)))
+            event = {"type": "mouse", "t": 10, "button": "Left", "x": 20, "y": 30}
+            archive = repository.root / "exports" / "recording.zip"
+            stage = repository.root / ".automation" / "ai-packages" / "recording"
+            with mock.patch("macro_studio.ai_recording.load_ai_recording", return_value=[event]), \
+                 mock.patch.object(controller, "_encode_video", return_value=None), \
+                 mock.patch("macro_studio.ai_recording.AIRecordingPackageBuilder.build", return_value=(archive, stage)):
+                controller._finished(0, QtCore.QProcess.ExitStatus.NormalExit)
+                app.processEvents()
+                dialog = controller._condition_dialog
+                self.assertIsNotNone(dialog)
+                self.assertTrue(dialog.isVisible())
+                self.assertFalse(dialog.isModal())
+                self.assertEqual(QtCore.Qt.NonModal, dialog.windowModality())
+                self.assertTrue(parent.isEnabled())
+                dialog.accept()
+                app.processEvents()
+                app.processEvents()
+            self.assertEqual(1, len(completed))
+            self.assertEqual([event], completed[0][2])
+            self.assertTrue(parent.isEnabled())
+            parent.close()
+
     def test_ai_package_completion_prompt_copy_is_non_modal_and_releases_studio(self) -> None:
         from PySide6 import QtWidgets
         from macro_studio.builder import BuilderPage

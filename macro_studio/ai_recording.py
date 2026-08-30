@@ -246,6 +246,9 @@ class AIRecordingController(SmartRecordingController):
         self._last_action_time = -1
         self._keep_video_until = -1
         self._video_segments: list[dict[str, int]] = []
+        self._condition_dialog: AIExecutionConditionDialog | None = None
+        self._pending_condition_events: list[dict] = []
+        self._pending_condition_video: Path | None = None
 
     def start(self) -> None:
         helper = self.repository.root / "smart_recorder.py"
@@ -440,11 +443,54 @@ class AIRecordingController(SmartRecordingController):
             self.deleteLater()
             return
         video = self._encode_video()
-        condition_dialog = AIExecutionConditionDialog(self.repository, events, self.host)
-        accepted = condition_dialog.exec() == QtWidgets.QDialog.Accepted
-        trigger_config = condition_dialog.configuration() if accepted else {"type": "manual"}
-        condition_dialog.close()
-        condition_dialog.deleteLater()
+        self._show_execution_condition(events, video)
+
+    def _show_execution_condition(self, events: list[dict], video: Path | None) -> None:
+        """Open post-recording setup without a nested modal event loop.
+
+        QDialog.exec() disables the native Windows owner until its nested event
+        loop unwinds. The capture picker temporarily hides this dialog, and a
+        completion notice is opened immediately afterwards; that combination
+        could leave the Studio owner disabled even though every dialog had
+        disappeared. Keeping this workflow asynchronous avoids that stale
+        native modal state entirely.
+        """
+        self._pending_condition_events = list(events)
+        self._pending_condition_video = video
+        dialog = AIExecutionConditionDialog(self.repository, events, self.host)
+        self._condition_dialog = dialog
+        dialog.setModal(False)
+        dialog.setWindowModality(QtCore.Qt.NonModal)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        dialog.finished.connect(self._execution_condition_finished)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    @QtCore.Slot(int)
+    def _execution_condition_finished(self, result: int) -> None:
+        dialog = self._condition_dialog
+        if dialog is None:
+            return
+        events = self._pending_condition_events
+        video = self._pending_condition_video
+        trigger_config = dialog.configuration() if result == QtWidgets.QDialog.Accepted else {"type": "manual"}
+        self._condition_dialog = None
+        self._pending_condition_events = []
+        self._pending_condition_video = None
+        # Let the dialog's native window close before package generation and
+        # before the completion notice is created.
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: self._build_recording_package(events, video, trigger_config),
+        )
+
+    def _build_recording_package(
+        self,
+        events: list[dict],
+        video: Path | None,
+        trigger_config: dict,
+    ) -> None:
         try:
             archive, stage = AIRecordingPackageBuilder(self.repository.root).build(
                 events, video, trigger_config=trigger_config, video_segments=self._video_segments
@@ -460,8 +506,7 @@ class AIRecordingController(SmartRecordingController):
         if video is not None:
             video.unlink(missing_ok=True)
         self._pending_delivery = (str(archive), str(stage), events)
-        # Deliver on a clean event-loop turn, after the modal condition dialog
-        # has fully released its native Windows parent.
+        # Deliver on a clean event-loop turn after package generation.
         QtCore.QTimer.singleShot(0, self._deliver_package)
 
     def _deliver_package(self) -> None:

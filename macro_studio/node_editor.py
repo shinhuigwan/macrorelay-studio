@@ -1000,6 +1000,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.steps: list[dict[str, Any]] = []
         self.nodes: dict[int, NodeItem] = {}
         self.edges: list[EdgeItem] = []
+        self.workflow_items: list[tuple[QtWidgets.QGraphicsPathItem, QtWidgets.QGraphicsSimpleTextItem, list[int]]] = []
         self.trigger_node: TriggerNodeItem | None = None
         self.trigger_edge: QtWidgets.QGraphicsPathItem | None = None
         self.manual_routes: dict[str, list[list[float]]] = {}
@@ -1120,6 +1121,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.steps = list(self.macro.get("steps") or [])
         self.nodes = {}
         self.edges = []
+        self.workflow_items = []
         self.trigger_node = None
         self.trigger_edge = None
         raw_routes = self.macro.get("graph_routes") or {}
@@ -1151,6 +1153,7 @@ class NodeCanvas(QtWidgets.QWidget):
             node.setPos(positions.get(index, suggested[index]))
             self.scene.addItem(node)
             self.nodes[index] = node
+        self._add_workflow_lanes()
         self.rebuild_edges()
         self._add_trigger_visual()
         rect = self.scene.itemsBoundingRect()
@@ -1270,6 +1273,22 @@ class NodeCanvas(QtWidgets.QWidget):
         total = len(self.steps)
         if not total:
             return {}
+        workflow_groups: list[tuple[str, list[int]]] = []
+        workflow_lookup: dict[str, int] = {}
+        for index, step in enumerate(self.steps, start=1):
+            workflow_id = str(step.get("workflow_id") or "").strip()
+            if not workflow_id:
+                continue
+            if workflow_id not in workflow_lookup:
+                workflow_lookup[workflow_id] = len(workflow_groups)
+                workflow_groups.append((workflow_id, []))
+            workflow_groups[workflow_lookup[workflow_id]][1].append(index)
+        if workflow_groups and sum(len(indexes) for _identifier, indexes in workflow_groups) == total:
+            positions: dict[int, QtCore.QPointF] = {}
+            for row, (_identifier, indexes) in enumerate(workflow_groups):
+                for column, index in enumerate(indexes):
+                    positions[index] = QtCore.QPointF(column * 310.0, row * 210.0)
+            return positions
         outgoing: dict[int, list[int]] = {index: [] for index in range(1, total + 1)}
         indegree = {index: 0 for index in range(1, total + 1)}
         for index, step in enumerate(self.steps, start=1):
@@ -1354,7 +1373,53 @@ class NodeCanvas(QtWidgets.QWidget):
 
     def node_moved(self) -> None:
         self._route_edges()
+        self._sync_workflow_lanes()
         self._positions_timer.start()
+
+    def _add_workflow_lanes(self) -> None:
+        groups: dict[str, list[int]] = {}
+        labels: dict[str, str] = {}
+        for index, step in enumerate(self.steps, start=1):
+            workflow_id = str(step.get("workflow_id") or "").strip()
+            if not workflow_id or index not in self.nodes:
+                continue
+            groups.setdefault(workflow_id, []).append(index)
+            labels.setdefault(workflow_id, str(step.get("workflow_label") or workflow_id).strip())
+        colors = ("#6F62D9", "#2C9E88", "#B37A39", "#A85586")
+        for group_index, (workflow_id, indexes) in enumerate(groups.items()):
+            lane = QtWidgets.QGraphicsPathItem()
+            lane.setZValue(-30)
+            color = QtGui.QColor(colors[group_index % len(colors)])
+            lane.setPen(QtGui.QPen(color, 1.4, QtCore.Qt.DashLine))
+            fill = QtGui.QColor(color)
+            fill.setAlpha(20)
+            lane.setBrush(QtGui.QBrush(fill))
+            label = QtWidgets.QGraphicsSimpleTextItem(f"작업 {group_index + 1} · {labels[workflow_id]}")
+            label.setZValue(-29)
+            label.setBrush(QtGui.QBrush(color.lighter(135)))
+            font = label.font()
+            font.setBold(True)
+            font.setPointSizeF(9.5)
+            label.setFont(font)
+            self.scene.addItem(lane)
+            self.scene.addItem(label)
+            self.workflow_items.append((lane, label, indexes))
+        self._sync_workflow_lanes()
+
+    def _sync_workflow_lanes(self) -> None:
+        for lane, label, indexes in self.workflow_items:
+            rect = QtCore.QRectF()
+            for index in indexes:
+                node = self.nodes.get(index)
+                if node is not None:
+                    rect = rect.united(node.sceneBoundingRect()) if not rect.isNull() else node.sceneBoundingRect()
+            if rect.isNull():
+                continue
+            rect = rect.adjusted(-24, -50, 24, 30)
+            path = QtGui.QPainterPath()
+            path.addRoundedRect(rect, 16, 16)
+            lane.setPath(path)
+            label.setPos(rect.left() + 14, rect.top() + 10)
 
     def rebuild_edges(self) -> None:
         for edge in self.edges:
@@ -1517,6 +1582,7 @@ class NodeCanvas(QtWidgets.QWidget):
             node.setPos(positions[index])
         self.suspended = False
         self._route_edges()
+        self._sync_workflow_lanes()
         self.positions_changed.emit(self.positions())
         self.fit_all()
 

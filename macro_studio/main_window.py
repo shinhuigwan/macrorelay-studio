@@ -122,6 +122,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar = sidebar
         sidebar.setObjectName("Sidebar")
         layout = QtWidgets.QVBoxLayout(sidebar)
+        self.sidebar_layout = layout
         layout.setContentsMargins(14, 20, 14, 16)
         layout.setSpacing(5)
         header = QtWidgets.QHBoxLayout()
@@ -167,7 +168,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "sidebar"):
             return
         collapsed = self._sidebar_collapsed
-        self.sidebar.setFixedWidth(74 if collapsed else 260)
+        self.sidebar.setFixedWidth(56 if collapsed else 260)
+        if hasattr(self, "sidebar_layout"):
+            margins = (6, 12, 6, 12) if collapsed else (14, 20, 14, 16)
+            self.sidebar_layout.setContentsMargins(*margins)
         self.sidebar_brand.setVisible(not collapsed)
         self.sidebar_caption.setVisible(not collapsed)
         self.sidebar_footer.setVisible(not collapsed)

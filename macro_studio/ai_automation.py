@@ -306,7 +306,7 @@ def load_ai_recording(path: Path) -> list[dict[str, Any]]:
     }
     events: list[dict[str, Any]] = []
     for item in records:
-        if item.get("type") not in {"mouse", "screen_condition", "key", "mouse_drag", "workflow_branch"}:
+        if item.get("type") not in {"mouse", "screen_condition", "screen_verification", "key", "mouse_drag", "workflow_branch"}:
             continue
         prepared = dict(item)
         if prepared.get("type") == "mouse" and str(prepared.get("event_id") or "") in drag_sources:
@@ -389,6 +389,8 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 12. timeline의 `screen_condition_marker`는 사용자가 녹화 중 우클릭으로 명시한 중간 화면 조건입니다. 반드시 같은 asset_ref를 사용하는 `screen_condition` 노드로 만드십시오. 이 노드 다음의 일반 동작은 성공선에 연결하고, 실패선은 다음 `screen_condition_marker` 또는 안전한 종료로 연결하십시오. 우클릭 자체를 mouse_click으로 만들지 마십시오.
 13. timeline의 `workflow_branch_marker`와 각 항목의 `workflow_id`는 사용자가 F7 또는 `다음 작업` 버튼으로 나눈 독립 작업입니다. 작업별로 짧은 한국어 이름을 추론해 `workflows`에 기록하고 모든 step에 `workflow_id`, `workflow_label`을 넣으십시오. 한 작업 내부의 선을 다른 작업 내부로 뒤섞지 말고, 작업 종료점에서만 다음 작업 시작점으로 연결하십시오. 각 작업의 우클릭 화면 조건은 그 작업의 진입·분기 조건입니다.
 14. 작업 분기가 여러 개면 녹화 순서를 기본 실행 순서로 사용합니다. 앞 작업이 명시적으로 종료되어야 하는 경우를 제외하면 앞 작업의 정상 종료를 다음 작업 시작점에 연결하고, 조건 불충족은 그 작업을 건너뛰어 다음 작업으로 이동시킵니다.
+15. timeline의 `screen_verification_marker`는 사용자가 F6으로 표시한 ‘이전 동작 결과 확인’입니다. 같은 asset_ref의 `screen_condition`을 만들고 성공하면 다음 동작으로 진행하십시오. 실패하면 해당 작업 안의 직전 실제 동작으로 돌아가 500ms 뒤 다시 시도하되 최대 3회로 제한하고, 모두 실패하면 작업을 안전하게 종료하십시오.
+16. 작업 이름이나 작업 구분만을 위해 `flow_control` 노드를 만들지 마십시오. workflow_id와 workflow_label이 시각적 작업 레인을 만듭니다. 반복·카운터·명시적 점프가 실제로 녹화된 경우에만 flow_control을 사용하고, 녹화에 없는 대기 노드를 일괄 삽입하지 마십시오.
 
 스키마 버전은 `{AI_SCHEMA_VERSION}`입니다. 최상위 필수 키는 `schema_version`, `source_package_id`, `name`, `description`, `targets`, `assets`, `variables`, `triggers`, `steps`, `setup_requirements`이며, 작업 분기가 있으면 `workflows`도 포함하십시오.
 
@@ -644,7 +646,7 @@ class AIRecordingPackageBuilder:
                 )
                 previous_time = current_time
                 continue
-            if event_type == "screen_condition":
+            if event_type in {"screen_condition", "screen_verification"}:
                 click_number += 1
                 asset = self._write_click_images(stage, event, click_number, target_id, sensitive_regions)
                 if asset:
@@ -654,26 +656,36 @@ class AIRecordingPackageBuilder:
                     )
                     if isinstance(button_candidate, dict):
                         asset["selected_candidate"] = button_candidate.get("file")
-                    asset["label"] = f"화면 조건 {click_number}"
-                    asset["purpose"] = "screen_condition"
-                    asset["click_purpose"] = "우클릭으로 지정한 화면 조건"
+                    verification = event_type == "screen_verification"
+                    asset["label"] = f"{'결과 확인' if verification else '화면 조건'} {click_number}"
+                    asset["purpose"] = "screen_verification" if verification else "screen_condition"
+                    asset["click_purpose"] = "F6으로 지정한 이전 동작 결과" if verification else "우클릭으로 지정한 화면 조건"
                     asset["readiness"] = "ready"
                     asset["needs_setup"] = []
                     asset.setdefault("validation", {})["image_ready"] = True
                     asset["validation"]["search_verified"] = True
                     assets.append(asset)
                     preview = QtGui.QImage(str(stage / str(asset["selected_candidate"])))
-                    contact_rows.append((f"조건-{click_number:03d}", preview, "우클릭 화면 조건"))
+                    contact_rows.append((
+                        f"{'확인' if verification else '조건'}-{click_number:03d}", preview,
+                        "F6 결과 확인" if verification else "우클릭 화면 조건",
+                    ))
                     timeline.append({
-                        "id": f"condition-{click_number:03d}",
+                        "id": f"{'verification' if verification else 'condition'}-{click_number:03d}",
                         "t": current_time,
                         "delay_from_previous_ms": max(0, current_time - previous_time),
-                        "type": "screen_condition_marker",
+                        "type": "screen_verification_marker" if verification else "screen_condition_marker",
                         "asset_ref": asset["id"],
                         "target_ref": target_id,
                         "screen": [int(event.get("x") or 0), int(event.get("y") or 0)],
                         "client": [int(event.get("client_x") or 0), int(event.get("client_y") or 0)],
-                        "branch_rule": "success_runs_following_actions; failure_skips_to_next_screen_condition",
+                        "branch_rule": (
+                            "success_runs_following_actions; failure_retries_previous_action_3_times_then_stops_workflow"
+                            if verification else
+                            "success_runs_following_actions; failure_skips_to_next_screen_condition"
+                        ),
+                        "retry_count": 3 if verification else 0,
+                        "retry_delay": 500 if verification else 0,
                     })
                     previous_time = current_time
                 continue
@@ -1167,6 +1179,13 @@ def validate_ai_document(payload: Any) -> list[AIImportIssue]:
         if action == "flow_control":
             jump = str(params.get("jump_to") or step.get("jump_to") or "")
             count = int(params.get("repeat_count") or step.get("repeat_count") or 0)
+            counter = str(params.get("counter_key") or step.get("counter_key") or "").strip()
+            if not jump and not count and not counter:
+                issues.append(AIImportIssue(
+                    "warning", "workflow_placeholder",
+                    "작업 구분용 반복 이동 노드는 필요하지 않습니다. 작업 레인으로 표시되므로 삭제를 권장합니다.",
+                    step_id,
+                ))
             if jump and jump in lookup and count == 0:
                 issues.append(AIImportIssue("warning", "possible_infinite_loop", "반복 제한이 없는 이동 노드입니다.", step_id))
     return issues

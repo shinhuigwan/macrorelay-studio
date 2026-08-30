@@ -2076,7 +2076,7 @@ class UiSmokeTests(unittest.TestCase):
             original_state = window._sidebar_collapsed
             window._toggle_sidebar()
             self.assertNotEqual(original_state, window._sidebar_collapsed)
-            self.assertEqual(74 if window._sidebar_collapsed else 260, window.sidebar.width())
+            self.assertEqual(56 if window._sidebar_collapsed else 260, window.sidebar.width())
             window.close()
             app.processEvents()
 
@@ -2836,14 +2836,12 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIn("▤ 최근 녹화 검토", labels)
             self.assertIn("⌑ 비활성 클릭 핸들 실험실", labels)
             self.assertIn("⑂ 선택 노드 분기 묶기", labels)
-            self.assertGreater(
-                builder.inactive_handle_lab_btn.geometry().left(),
-                builder.review_recording_btn.geometry().right(),
-            )
-            self.assertGreater(
-                builder.branch_group_btn.geometry().left(),
-                builder.inactive_handle_lab_btn.geometry().right(),
-            )
+            tool_buttons = {button.text(): button for button in builder.findChildren(QtWidgets.QToolButton)}
+            self.assertIn("녹화 도구 ▾", tool_buttons)
+            recording_menu_labels = {action.text() for action in tool_buttons["녹화 도구 ▾"].menu().actions()}
+            self.assertIn("최근 녹화 검토", recording_menu_labels)
+            self.assertIn("비활성 클릭 핸들 실험실", recording_menu_labels)
+            self.assertIn("선택 노드 분기 묶기", recording_menu_labels)
             self.assertIn("▶ 선택 단계 테스트", labels)
             self.assertIn("⧉ 노드 복제", labels)
             self.assertNotIn("노드 보관", labels)
@@ -3949,6 +3947,24 @@ class UiSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(target_bottom, failure.path().pointAtPercent(1).y(), delta=1.0)
         canvas.close()
 
+    def test_ai_workflow_steps_render_as_separate_lanes(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro({"steps": [
+            {"action": "wait", "workflow_id": "login", "workflow_label": "로그인", "on_success": 2},
+            {"action": "image_search", "workflow_id": "login", "workflow_label": "로그인"},
+            {"action": "screen_condition", "workflow_id": "mail", "workflow_label": "메일 확인"},
+        ]})
+        app.processEvents()
+        self.assertEqual(2, len(canvas.workflow_items))
+        self.assertAlmostEqual(canvas.nodes[1].pos().y(), canvas.nodes[2].pos().y())
+        self.assertGreater(canvas.nodes[3].pos().y(), canvas.nodes[1].pos().y())
+        self.assertTrue(all(not lane.path().isEmpty() for lane, _label, _indexes in canvas.workflow_items))
+        canvas.close()
+
     def test_manual_edge_waypoint_is_restored_dragged_and_cleared(self) -> None:
         from PySide6 import QtCore, QtWidgets
         from PySide6.QtTest import QTest
@@ -4867,6 +4883,29 @@ class AIAutomationTests(unittest.TestCase):
             self.assertIn("macrorelay-ai.json", prompt)
             self.assertIn("파일 하나로만 첨부", prompt)
 
+    def test_ai_f6_result_verification_builds_retry_checkpoint_asset(self) -> None:
+        from macro_studio.ai_automation import AIRecordingPackageBuilder
+
+        events = [{
+            "type": "screen_verification", "t": 450, "x": 420, "y": 260,
+            "client_x": 320, "client_y": 210, "event_id": "verify-raw-1",
+            "image_sample_bmp": self._sample_bmp(), "image_anchor": [180, 120],
+            "retry_from": "previous_action", "retry_count": 3,
+            "window": {"exe": "whale.exe", "title": "로그인 완료", "class": "Chrome_WidgetWin_1"},
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            _archive, stage = AIRecordingPackageBuilder(Path(directory)).build(
+                events, package_id="ai-result-verification"
+            )
+            timeline = json.loads((stage / "timeline.json").read_text(encoding="utf-8"))
+            assets = json.loads((stage / "asset-manifest.json").read_text(encoding="utf-8"))["assets"]
+            prompt = (stage / "prompt.txt").read_text(encoding="utf-8")
+            self.assertEqual("screen_verification_marker", timeline[0]["type"])
+            self.assertEqual(3, timeline[0]["retry_count"])
+            self.assertEqual("screen_verification", assets[0]["purpose"])
+            self.assertIn("직전 실제 동작으로 돌아가", prompt)
+            self.assertIn("작업 구분만을 위해 `flow_control`", prompt)
+
     def test_ai_execution_condition_exposes_cutout_editor_after_capture(self) -> None:
         from PySide6 import QtGui, QtWidgets
         from macro_studio.ai_recording import AIExecutionConditionDialog
@@ -5189,6 +5228,15 @@ class AIAutomationTests(unittest.TestCase):
             self.assertIn("✦ AI 매크로 녹화", labels)
             self.assertIn("AI 분석 패키지 생성", labels)
             self.assertIn("받은 JSON 바로 가져오기", labels)
+            builder.show()
+            _app.processEvents()
+            self.assertEqual(3, builder.builder_splitter.count())
+            builder._toggle_builder_side("macro")
+            _app.processEvents()
+            self.assertFalse(builder.macro_panel.isVisible())
+            builder._toggle_builder_side("macro", True)
+            _app.processEvents()
+            self.assertTrue(builder.macro_panel.isVisible())
             emitted: list[str] = []
             builder.run_macro.connect(emitted.append)
             with mock.patch.object(QtWidgets.QMessageBox, "warning", return_value=QtWidgets.QMessageBox.Ok):

@@ -271,6 +271,8 @@ class AIRecordingController(SmartRecordingController):
                 str(0x77),
                 "--branch-vk",
                 str(0x76),
+                "--verify-vk",
+                str(0x75),
                 "--stop-vk",
                 str(0x79),
                 "--hold-vk",
@@ -290,7 +292,7 @@ class AIRecordingController(SmartRecordingController):
         self.process.errorOccurred.connect(self._process_error)
         self.bar = RecordingBar(self.host)
         self.bar.setWindowTitle("AI 자동 매크로 제작 녹화")
-        self.bar.label.setText("작업 1 · 좌클릭=동작 · 우클릭=화면 조건 · F7=다음 작업 · F10=종료")
+        self.bar.label.setText("작업 1 · 우클릭=조건 · F6=결과 확인 · F7=다음 작업 · F10=종료")
         self.bar.mode_badge.setText("AI 자동")
         self.bar.enable_workflow_branches()
         self.bar.set_gate_active(True)
@@ -385,7 +387,7 @@ class AIRecordingController(SmartRecordingController):
             except (TypeError, ValueError):
                 continue
             if isinstance(item, dict) and item.get("type") in {
-                "mouse", "screen_condition", "key", "mouse_drag", "capture_request", "workflow_branch"
+                "mouse", "screen_condition", "screen_verification", "key", "mouse_drag", "capture_request", "workflow_branch"
             }:
                 latest = max(latest, int(item.get("t") or 0))
         return latest

@@ -38,6 +38,7 @@ WM_MBUTTONUP = 0x0208
 WM_MOUSEWHEEL = 0x020A
 VK_F8 = 0x77
 VK_F7 = 0x76
+VK_F6 = 0x75
 VK_F10 = 0x79
 VK_OEM_3 = 0xC0  # ` / ~ key on standard Windows keyboard layouts
 SHIFT_KEYS = {0x10, 0xA0, 0xA1}
@@ -352,6 +353,7 @@ class Recorder:
         delay: float,
         capture_vk: int = VK_F8,
         branch_vk: int = VK_F7,
+        verify_vk: int = VK_F6,
         stop_vk: int = VK_F10,
         hold_vk: int = VK_OEM_3,
         initial_active: bool = False,
@@ -365,6 +367,7 @@ class Recorder:
         self.delay = max(0.0, delay)
         self.capture_vk = int(capture_vk)
         self.branch_vk = int(branch_vk)
+        self.verify_vk = int(verify_vk)
         self.stop_vk = int(stop_vk)
         self.hold_vk = int(hold_vk)
         self.gate_down = bool(initial_active)
@@ -375,6 +378,7 @@ class Recorder:
         self.record_mode = "action"
         self._mode_key_down = False
         self._branch_key_down = False
+        self._verify_key_down = False
         self.workflow_index = 1
         self._shift_down = False
         self._pressed_modifiers: set[str] = set()
@@ -444,6 +448,33 @@ class Recorder:
                 "label": f"작업 분기 {self.workflow_index}",
                 "active": self.gate_down,
                 "vk": self.branch_vk,
+            }
+        )
+
+    def capture_verification_marker(self) -> None:
+        point = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            return
+        hwnd = int(user32.WindowFromPoint(point) or 0)
+        details = window_details(hwnd)
+        origin = details.get("client_origin") if isinstance(details, dict) else None
+        client_x = point.x - int(origin[0]) if isinstance(origin, list) and len(origin) >= 2 else point.x
+        client_y = point.y - int(origin[1]) if isinstance(origin, list) and len(origin) >= 2 else point.y
+        self._event_counter += 1
+        self.emit(
+            {
+                "type": "screen_verification",
+                "event_id": f"verify-{time.perf_counter_ns()}-{self._event_counter}",
+                "x": int(point.x), "y": int(point.y),
+                "client_x": int(client_x), "client_y": int(client_y),
+                "window": details,
+                "image_sample_bmp": capture_click_sample(
+                    int(point.x), int(point.y), self.sample_width, self.sample_height
+                ),
+                "image_sample_size": [self.sample_width, self.sample_height],
+                "image_anchor": [self.sample_width // 2, self.sample_height // 2],
+                "retry_from": "previous_action",
+                "retry_count": 3,
             }
         )
 
@@ -589,6 +620,12 @@ class Recorder:
                 self._branch_key_down = pressed
                 # F7 is a recording control and must never reach the target.
                 return 1
+            if self.verify_vk and vk == self.verify_vk:
+                if pressed and not self._verify_key_down and self.gate_down:
+                    self.capture_verification_marker()
+                self._verify_key_down = pressed
+                # F6 marks the screen under the cursor; it is not sent to the app.
+                return 1
             if message not in {WM_KEYDOWN, WM_SYSKEYDOWN}:
                 return int(user32.CallNextHookEx(self.keyboard_hook, code, message, data_ptr))
             if vk == self.stop_vk:
@@ -647,6 +684,7 @@ class Recorder:
                         "record_mode": self.record_mode,
                         "workflow_index": self.workflow_index,
                         "workflow_id": f"workflow-{self.workflow_index:02d}",
+                        "verify_vk": self.verify_vk,
                     }
                 )
                 + "\n"
@@ -676,6 +714,7 @@ def main() -> int:
     parser.add_argument("--delay", type=float, default=2.0)
     parser.add_argument("--capture-vk", type=int, default=VK_F8)
     parser.add_argument("--branch-vk", type=int, default=VK_F7)
+    parser.add_argument("--verify-vk", type=int, default=VK_F6)
     parser.add_argument("--stop-vk", type=int, default=VK_F10)
     parser.add_argument("--hold-vk", type=int, default=VK_OEM_3)
     parser.add_argument("--initial-active", action="store_true")
@@ -690,6 +729,7 @@ def main() -> int:
         args.delay,
         args.capture_vk,
         args.branch_vk,
+        args.verify_vk,
         args.stop_vk,
         args.hold_vk,
         initial_active=args.initial_active,

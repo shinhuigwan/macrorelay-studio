@@ -272,7 +272,7 @@ class RecordingBar(QtWidgets.QDialog):
         if self.branch_button.isVisible():
             self.mode_badge.setText(f"작업 {self.workflow_index}")
             self.label.setText(
-                f"작업 {self.workflow_index} 녹화 중 · 우클릭=조건 · F7=다음 작업 · F10=종료"
+                f"작업 {self.workflow_index} · 우클릭=조건 · F6=결과 확인 · F7=다음 작업 · F10=종료"
             )
 
     def set_gate_active(self, active: bool) -> None:

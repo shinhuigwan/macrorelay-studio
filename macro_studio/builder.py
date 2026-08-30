@@ -446,14 +446,12 @@ class BuilderPage(QtWidgets.QWidget):
         self.shortcut_buttons: dict[str, QtWidgets.QPushButton] = {}
 
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(28, 24, 28, 24)
-        root.setSpacing(12)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
         root.addWidget(PageHeader("노드 매크로 빌더", "스마트 녹화 · 자동 설정 · 단계 테스트 · 자동 진단 · 재사용 블록"))
 
         toolbar_top = QtWidgets.QHBoxLayout()
-        toolbar_recording = QtWidgets.QHBoxLayout()
-        toolbar_ai = QtWidgets.QHBoxLayout()
-        toolbar_bottom = QtWidgets.QHBoxLayout()
+        toolbar_tools = QtWidgets.QHBoxLayout()
         new_btn = primary_button("＋ 새 매크로")
         new_btn.clicked.connect(self._create_macro)
         duplicate_btn = QtWidgets.QPushButton("복제")
@@ -531,30 +529,49 @@ class BuilderPage(QtWidgets.QWidget):
         toolbar_top.addWidget(self.run_button)
         toolbar_top.addWidget(self.stop_button)
         toolbar_top.addWidget(log_btn)
-        toolbar_recording.addWidget(self.record_btn)
-        toolbar_recording.addWidget(self.review_recording_btn)
-        toolbar_recording.addWidget(self.inactive_handle_lab_btn)
-        toolbar_recording.addWidget(self.branch_group_btn)
-        toolbar_recording.addStretch(1)
-        toolbar_ai.addWidget(self.ai_record_btn)
-        toolbar_ai.addWidget(self.ai_package_btn)
-        toolbar_ai.addWidget(self.ai_prompt_btn)
-        toolbar_ai.addWidget(self.ai_folder_btn)
-        toolbar_ai.addWidget(self.ai_import_btn)
-        toolbar_ai.addWidget(self.ai_continue_btn)
-        toolbar_ai.addStretch(1)
+        recording_tools = QtWidgets.QToolButton()
+        recording_tools.setText("녹화 도구 ▾")
+        recording_tools.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        recording_menu = QtWidgets.QMenu(recording_tools)
+        recording_menu.addAction("최근 녹화 검토", self.review_recording_btn.click)
+        recording_menu.addAction("비활성 클릭 핸들 실험실", self.inactive_handle_lab_btn.click)
+        recording_menu.addAction("선택 노드 분기 묶기", self.branch_group_btn.click)
+        recording_tools.setMenu(recording_menu)
+        ai_tools = QtWidgets.QToolButton()
+        ai_tools.setText("AI 도구 ▾")
+        ai_tools.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        ai_menu = QtWidgets.QMenu(ai_tools)
+        ai_menu.addAction("AI 분석 패키지 생성", self.ai_package_btn.click)
+        ai_menu.addAction("ChatGPT 요청 복사", self.ai_prompt_btn.click)
+        ai_menu.addAction("패키지 저장 폴더 열기", self.ai_folder_btn.click)
+        ai_menu.addSeparator()
+        ai_menu.addAction("받은 JSON 바로 가져오기", self.ai_import_btn.click)
+        ai_menu.addAction("미완성 설정 계속하기", self.ai_continue_btn.click)
+        ai_tools.setMenu(ai_menu)
+        # Keep these command buttons alive for shortcuts and UI automation. Their
+        # visible entry points live in the compact menus above.
+        for command_button in (
+            self.review_recording_btn, self.inactive_handle_lab_btn, self.branch_group_btn,
+            self.ai_package_btn, self.ai_prompt_btn, self.ai_folder_btn,
+            self.ai_import_btn, self.ai_continue_btn,
+        ):
+            command_button.setParent(self)
+            command_button.hide()
         action_label = QtWidgets.QLabel("추가할 노드 액션")
         action_label.setObjectName("Muted")
-        toolbar_bottom.addWidget(action_label)
-        toolbar_bottom.addWidget(self.action_combo)
-        toolbar_bottom.addWidget(wizard_btn)
-        toolbar_bottom.addWidget(self.add_node_button)
-        toolbar_bottom.addStretch(1)
-        toolbar_bottom.addWidget(diagnose_btn)
+        toolbar_tools.addWidget(self.record_btn)
+        toolbar_tools.addWidget(recording_tools)
+        toolbar_tools.addWidget(self.ai_record_btn)
+        toolbar_tools.addWidget(ai_tools)
+        toolbar_tools.addSpacing(8)
+        toolbar_tools.addWidget(action_label)
+        toolbar_tools.addWidget(self.action_combo)
+        toolbar_tools.addWidget(wizard_btn)
+        toolbar_tools.addWidget(self.add_node_button)
+        toolbar_tools.addStretch(1)
+        toolbar_tools.addWidget(diagnose_btn)
         root.addLayout(toolbar_top)
-        root.addLayout(toolbar_recording)
-        root.addLayout(toolbar_ai)
-        root.addLayout(toolbar_bottom)
+        root.addLayout(toolbar_tools)
 
         self.shortcut_buttons.update(
             {
@@ -567,13 +584,19 @@ class BuilderPage(QtWidgets.QWidget):
             }
         )
 
-        splitter = QtWidgets.QSplitter()
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_macro_panel())
-        splitter.addWidget(self._build_steps_panel())
-        splitter.addWidget(self._build_inspector())
-        splitter.setSizes([250, 820, 390])
-        root.addWidget(splitter, 1)
+        self.builder_splitter = QtWidgets.QSplitter()
+        self.builder_splitter.setChildrenCollapsible(True)
+        self.macro_panel = self._build_macro_panel()
+        self.steps_panel = self._build_steps_panel()
+        self.inspector_panel = self._build_inspector()
+        self.builder_splitter.addWidget(self.macro_panel)
+        self.builder_splitter.addWidget(self.steps_panel)
+        self.builder_splitter.addWidget(self.inspector_panel)
+        self.builder_splitter.setStretchFactor(0, 0)
+        self.builder_splitter.setStretchFactor(1, 1)
+        self.builder_splitter.setStretchFactor(2, 0)
+        self.builder_splitter.setSizes([230, 1050, 360])
+        root.addWidget(self.builder_splitter, 1)
 
     def _build_macro_panel(self) -> QtWidgets.QWidget:
         card = Card()
@@ -676,8 +699,16 @@ class BuilderPage(QtWidgets.QWidget):
         test_channel_action.triggered.connect(lambda: self._set_current_release_channel("test"))
         self.node_more_button.setMenu(self.node_more_menu)
         header.addWidget(self.subflow_back_button)
+        self.macro_panel_toggle = QtWidgets.QPushButton("◀ 목록")
+        self.macro_panel_toggle.setToolTip("매크로 목록 패널 접기/펼치기")
+        self.macro_panel_toggle.clicked.connect(lambda: self._toggle_builder_side("macro"))
+        header.addWidget(self.macro_panel_toggle)
         header.addWidget(self.macro_title)
         header.addStretch(1)
+        self.inspector_panel_toggle = QtWidgets.QPushButton("설정 ▶")
+        self.inspector_panel_toggle.setToolTip("단계 설정 패널 접기/펼치기")
+        self.inspector_panel_toggle.clicked.connect(lambda: self._toggle_builder_side("inspector"))
+        header.addWidget(self.inspector_panel_toggle)
         node_actions = QtWidgets.QHBoxLayout()
         node_actions.setSpacing(7)
         self.undo_button = QtWidgets.QPushButton("↶ 실행 취소")
@@ -751,7 +782,7 @@ class BuilderPage(QtWidgets.QWidget):
 
     def _build_inspector(self) -> QtWidgets.QWidget:
         card = Card()
-        card.setMinimumWidth(390)
+        card.setMinimumWidth(0)
         layout = QtWidgets.QVBoxLayout(card)
         layout.setContentsMargins(14, 14, 14, 14)
         title = QtWidgets.QLabel("단계 설정")
@@ -1346,6 +1377,8 @@ class BuilderPage(QtWidgets.QWidget):
 
     @QtCore.Slot(int)
     def _focus_inspector(self, index: int) -> None:
+        if hasattr(self, "inspector_panel") and not self.inspector_panel.isVisible():
+            self._toggle_builder_side("inspector", True)
         self._select_graph_node(index)
         steps = list((self.current_macro or {}).get("steps") or [])
         if 1 <= index <= len(steps) and str(steps[index - 1].get("action") or "") == "call_submacro":
@@ -1360,6 +1393,27 @@ class BuilderPage(QtWidgets.QWidget):
             self.status.emit(f"'{target}' 서브플로우 내부를 열었습니다. 상위 흐름 버튼으로 돌아갈 수 있습니다.")
             return
         self.label_edit.setFocus(QtCore.Qt.MouseFocusReason)
+
+    def _toggle_builder_side(self, side: str, force_open: bool = False) -> None:
+        if not hasattr(self, "builder_splitter"):
+            return
+        is_macro = side == "macro"
+        panel = self.macro_panel if is_macro else self.inspector_panel
+        button = self.macro_panel_toggle if is_macro else self.inspector_panel_toggle
+        visible = panel.isVisibleTo(self) and panel.width() > 0
+        if force_open or not visible:
+            panel.show()
+            sizes = self.builder_splitter.sizes()
+            preferred = 230 if is_macro else 360
+            index = 0 if is_macro else 2
+            if len(sizes) == 3:
+                sizes[index] = preferred
+                sizes[1] = max(480, sizes[1] - preferred)
+                self.builder_splitter.setSizes(sizes)
+            button.setText("◀ 목록" if is_macro else "설정 ▶")
+            return
+        panel.hide()
+        button.setText("목록 ▶" if is_macro else "◀ 설정")
 
     def _leave_subflow(self) -> None:
         if not self._subflow_parent_stack:

@@ -1557,8 +1557,20 @@ internal static class Program
             lines.extend(["", "주의:", *(f"- {note}" for note in notes)])
         (destination / "사용방법.txt").write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
 
+    @staticmethod
+    def _assert_real_run_ready(payload: dict[str, Any]) -> None:
+        steps = payload.get("steps") if isinstance(payload.get("steps"), list) else []
+        pending = [index for index, step in enumerate(steps, start=1) if isinstance(step, dict) and step.get("needs_setup")]
+        if bool((payload.get("meta") or {}).get("ai_draft")) or pending:
+            suffix = f" (미완성 노드: {', '.join(map(str, pending[:12]))})" if pending else ""
+            raise RuntimeError(
+                "미완성 AI 초안은 정식 실행할 수 없습니다. Builder의 '미완성 설정 계속하기'에서 설정을 완료하거나 "
+                f"드라이런·이 단계만 테스트를 사용하세요.{suffix}"
+            )
+
     def run_macro(self, name: str) -> subprocess.Popen[Any]:
         payload = deepcopy(self.load_macro(name))
+        self._assert_real_run_ready(payload)
         if any(
             step.get("action") == "image_search" and str(step.get("engine") or "ahk").lower() == "opencv"
             for step in payload.get("steps", [])
@@ -1575,6 +1587,7 @@ internal static class Program
     def run_macro_from_step(self, name: str, step_index: int) -> subprocess.Popen[Any]:
         """Run the real macro from a selected source node and keep normal flow afterwards."""
         payload = deepcopy(self.load_macro(name))
+        self._assert_real_run_ready(payload)
         steps = payload.get("steps") or []
         if not 1 <= int(step_index) <= len(steps):
             raise IndexError(f"재개할 {step_index}번 단계를 찾을 수 없습니다.")

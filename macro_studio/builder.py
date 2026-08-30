@@ -8,6 +8,9 @@ from typing import Any
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .action_editor import ACTION_LABELS, ActionEditor, action_template
+from .ai_automation import AIRecordingPackageBuilder, ai_draft_readiness, materialize_ai_document
+from .ai_import_dialog import AIDraftSetupDialog, AIImportPreviewDialog, load_ai_json, package_stage_for
+from .ai_recording import AIRecordingController
 from .automation import (
     AutomationAnalyzer,
     AutomationOverlay,
@@ -426,12 +429,17 @@ class BuilderPage(QtWidgets.QWidget):
         self._action_settings_dialog: ActionEditorDialog | None = None
         self._log_dialog: MacroLogDialog | None = None
         self._recording_controller: SmartRecordingController | None = None
+        self._ai_recording_controller: AIRecordingController | None = None
         self._automation_overlay: AutomationOverlay | None = None
         self._collapsed_groups: set[str] = set()
         self._last_recording_path = self.repository.root / ".automation" / "last-recording.json"
+        self._last_ai_recording_path = self.repository.root / ".automation" / "last-ai-recording.json"
+        self._last_ai_package_path = self.repository.root / ".automation" / "last-ai-package.json"
         self._handle_profiles_path = self.repository.root / ".automation" / "inactive-click-profiles.json"
         self._inactive_handle_profiles = self._load_inactive_handle_profiles()
         self._last_recording_events = self._load_last_recording()
+        self._last_ai_recording_events = self._load_last_ai_recording()
+        self._last_ai_package = self._load_last_ai_package()
         self._subflow_parent_stack: list[tuple[str, int]] = []
         self.shortcut_buttons: dict[str, QtWidgets.QPushButton] = {}
 
@@ -442,6 +450,7 @@ class BuilderPage(QtWidgets.QWidget):
 
         toolbar_top = QtWidgets.QHBoxLayout()
         toolbar_recording = QtWidgets.QHBoxLayout()
+        toolbar_ai = QtWidgets.QHBoxLayout()
         toolbar_bottom = QtWidgets.QHBoxLayout()
         new_btn = primary_button("＋ 새 매크로")
         new_btn.clicked.connect(self._create_macro)
@@ -468,6 +477,22 @@ class BuilderPage(QtWidgets.QWidget):
         self.branch_group_btn.clicked.connect(
             lambda: self._configure_start_search_candidates(self.node_canvas.selected_indexes())
         )
+        self.ai_record_btn = primary_button("✦ AI 매크로 녹화")
+        self.ai_record_btn.setToolTip(
+            "평소처럼 한 번 조작하면 화면 영상·원본 PNG·클릭·키보드·대상 창 정보를 함께 기록합니다. F10으로 종료합니다."
+        )
+        self.ai_record_btn.clicked.connect(self._start_ai_recording)
+        self.ai_package_btn = QtWidgets.QPushButton("AI 분석 패키지 생성")
+        self.ai_package_btn.setToolTip("마지막 AI 녹화의 ChatGPT 분석 ZIP을 확인하거나 다시 생성합니다.")
+        self.ai_package_btn.clicked.connect(self._generate_ai_package)
+        self.ai_prompt_btn = QtWidgets.QPushButton("ChatGPT용 프롬프트 복사")
+        self.ai_prompt_btn.clicked.connect(self._copy_ai_prompt)
+        self.ai_folder_btn = QtWidgets.QPushButton("패키지 저장 폴더 열기")
+        self.ai_folder_btn.clicked.connect(self._open_ai_package_folder)
+        self.ai_import_btn = QtWidgets.QPushButton("AI JSON 불러오기")
+        self.ai_import_btn.clicked.connect(self._import_ai_json)
+        self.ai_continue_btn = QtWidgets.QPushButton("미완성 설정 계속하기")
+        self.ai_continue_btn.clicked.connect(self._continue_ai_setup)
         self.action_combo = QtWidgets.QComboBox()
         self._populate_action_combo(self.action_combo)
         self.action_combo.setMinimumWidth(145)
@@ -508,6 +533,13 @@ class BuilderPage(QtWidgets.QWidget):
         toolbar_recording.addWidget(self.inactive_handle_lab_btn)
         toolbar_recording.addWidget(self.branch_group_btn)
         toolbar_recording.addStretch(1)
+        toolbar_ai.addWidget(self.ai_record_btn)
+        toolbar_ai.addWidget(self.ai_package_btn)
+        toolbar_ai.addWidget(self.ai_prompt_btn)
+        toolbar_ai.addWidget(self.ai_folder_btn)
+        toolbar_ai.addWidget(self.ai_import_btn)
+        toolbar_ai.addWidget(self.ai_continue_btn)
+        toolbar_ai.addStretch(1)
         action_label = QtWidgets.QLabel("추가할 노드 액션")
         action_label.setObjectName("Muted")
         toolbar_bottom.addWidget(action_label)
@@ -518,6 +550,7 @@ class BuilderPage(QtWidgets.QWidget):
         toolbar_bottom.addWidget(diagnose_btn)
         root.addLayout(toolbar_top)
         root.addLayout(toolbar_recording)
+        root.addLayout(toolbar_ai)
         root.addLayout(toolbar_bottom)
 
         self.shortcut_buttons.update(
@@ -1674,6 +1707,210 @@ class BuilderPage(QtWidgets.QWidget):
         self._append_automation_steps(steps, f"스마트 녹화에서 노드 {len(steps)}개를 추가했습니다.")
         self.data_changed.emit()
 
+    def _load_last_ai_recording(self) -> list[dict[str, Any]]:
+        try:
+            payload = json.loads(self._last_ai_recording_path.read_text(encoding="utf-8-sig"))
+        except (OSError, TypeError, ValueError):
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+    def _load_last_ai_package(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self._last_ai_package_path.read_text(encoding="utf-8-sig"))
+        except (OSError, TypeError, ValueError):
+            return {}
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    def _remember_last_ai_recording(self, events: list[dict[str, Any]]) -> None:
+        self._last_ai_recording_events = deepcopy(events)
+        try:
+            self._last_ai_recording_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._last_ai_recording_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self._last_ai_recording_path)
+        except OSError:
+            pass
+
+    def _start_ai_recording(self) -> None:
+        if self._ai_recording_controller is not None or self._recording_controller is not None:
+            self.status.emit("다른 녹화가 이미 실행 중입니다.")
+            return
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "AI 자동 매크로 제작 녹화",
+            "2초 뒤 녹화가 자동으로 시작됩니다. 평소처럼 작업하고 F10으로 종료하세요.\n\n"
+            "영상은 동작 순서 분석용이며, 이미지 서치 후보는 클릭 시점의 무손실 PNG로 따로 저장됩니다. "
+            "키 입력은 분석 패키지에서 마스킹되지만 비밀번호 입력 화면은 가능하면 녹화에서 제외하세요.\n\n"
+            "AI 녹화를 시작할까요?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        controller = AIRecordingController(self.repository, self.window())
+        controller.package_completed.connect(self._ai_package_completed)
+        controller.failed.connect(self._ai_recording_failed)
+        self._ai_recording_controller = controller
+        controller.start()
+        self.status.emit("AI 매크로 녹화 시작 · 평소처럼 조작하고 F10으로 종료하세요.")
+
+    @QtCore.Slot(str, str, list)
+    def _ai_package_completed(self, archive: str, stage: str, events: list[dict[str, Any]]) -> None:
+        self._ai_recording_controller = None
+        self._remember_last_ai_recording(events)
+        self._last_ai_package = self._load_last_ai_package()
+        self.status.emit(f"AI 분석 패키지를 생성했습니다 · {Path(archive).name}")
+        message = QtWidgets.QMessageBox(self)
+        message.setWindowTitle("AI 분석 패키지 생성 완료")
+        message.setIcon(QtWidgets.QMessageBox.Information)
+        message.setText("ChatGPT에 ZIP 파일을 첨부하고, 함께 복사한 프롬프트의 질문에 답한 뒤 생성된 JSON을 다시 불러오세요.")
+        message.setDetailedText(f"ZIP: {archive}\n작업 폴더: {stage}")
+        copy_button = message.addButton("프롬프트 복사", QtWidgets.QMessageBox.ActionRole)
+        folder_button = message.addButton("저장 폴더 열기", QtWidgets.QMessageBox.ActionRole)
+        message.addButton(QtWidgets.QMessageBox.Ok)
+        message.exec()
+        if message.clickedButton() is copy_button:
+            self._copy_ai_prompt()
+        elif message.clickedButton() is folder_button:
+            self._open_ai_package_folder()
+
+    @QtCore.Slot(str)
+    def _ai_recording_failed(self, detail: str) -> None:
+        self._ai_recording_controller = None
+        QtWidgets.QMessageBox.warning(self, "AI 매크로 녹화", detail)
+        self.status.emit(detail)
+
+    def _generate_ai_package(self) -> None:
+        record = self._load_last_ai_package()
+        archive = Path(str(record.get("archive") or "")) if record else Path()
+        if record and archive.is_file():
+            self._last_ai_package = record
+            self.status.emit(f"마지막 AI 분석 패키지가 준비되어 있습니다 · {archive.name}")
+            QtWidgets.QMessageBox.information(self, "AI 분석 패키지", f"마지막 패키지가 준비되어 있습니다.\n\n{archive}")
+            return
+        events = self._last_ai_recording_events or self._load_last_ai_recording()
+        if not events:
+            QtWidgets.QMessageBox.information(self, "AI 분석 패키지", "먼저 AI 매크로 녹화를 진행하세요.")
+            return
+        try:
+            archive, _stage = AIRecordingPackageBuilder(self.repository.root).build(events)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "패키지 생성 실패", str(exc))
+            return
+        self._last_ai_package = self._load_last_ai_package()
+        self.status.emit(f"AI 분석 패키지를 다시 생성했습니다 · {archive.name}")
+
+    def _copy_ai_prompt(self) -> None:
+        record = self._load_last_ai_package()
+        prompt = Path(str(record.get("prompt") or "")) if record else Path()
+        if not prompt.is_file():
+            QtWidgets.QMessageBox.information(self, "ChatGPT용 프롬프트", "먼저 AI 분석 패키지를 생성하세요.")
+            return
+        try:
+            text = prompt.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "프롬프트 복사 실패", str(exc))
+            return
+        QtWidgets.QApplication.clipboard().setText(text)
+        self.status.emit("ChatGPT용 프롬프트를 클립보드에 복사했습니다.")
+
+    def _open_ai_package_folder(self) -> None:
+        record = self._load_last_ai_package()
+        archive = Path(str(record.get("archive") or "")) if record else Path()
+        folder = archive.parent if archive.is_file() else self.repository.exports_dir / "ai-recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        if not QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder.resolve()))):
+            self.status.emit(f"패키지 폴더를 열지 못했습니다 · {folder}")
+
+    def _unique_ai_macro_name(self, requested: str) -> str:
+        base = requested.strip() or "AI 자동화 초안"
+        candidate = base
+        suffix = 2
+        while self.repository.macro_path(candidate).exists():
+            candidate = f"{base} (AI 초안 {suffix})"
+            suffix += 1
+        return candidate
+
+    def _import_ai_json(self) -> None:
+        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "MacroRelay AI JSON 불러오기",
+            str(self.repository.exports_dir),
+            "JSON 파일 (*.json)",
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            payload = load_ai_json(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            QtWidgets.QMessageBox.warning(self, "AI JSON 불러오기 실패", str(exc))
+            return
+        stage = package_stage_for(self.repository.root, payload)
+        preview = AIImportPreviewDialog(payload, self.repository, stage, self.window())
+        if preview.exec() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            macro, issues = materialize_ai_document(payload, self.repository, stage)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "AI JSON 변환 실패", str(exc))
+            return
+        errors = [issue.detail for issue in issues if issue.severity == "error"]
+        if errors:
+            QtWidgets.QMessageBox.warning(self, "AI JSON 변환 실패", "\n".join(f"• {item}" for item in errors))
+            return
+        name = self._unique_ai_macro_name(str(macro.get("name") or "AI 자동화 초안"))
+        macro["name"] = name
+        try:
+            self.repository.create_macro(name, str(macro.get("description") or ""))
+            self.repository.save_macro(name, macro)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "AI 초안 저장 실패", str(exc))
+            return
+        self.refresh(name)
+        self.data_changed.emit()
+        self.status.emit(f"'{name}'을(를) AI 초안으로 가져왔습니다.")
+        self._open_ai_setup()
+
+    def _apply_ai_draft_change(self, macro: dict[str, Any]) -> None:
+        if not self.current_name:
+            return
+        self.current_macro = deepcopy(macro)
+        self.current_macro["name"] = self.current_name
+        self.repository.save_macro(self.current_name, self.current_macro)
+        self._last_persisted_macro = deepcopy(self.current_macro)
+        self._refresh_steps(max(0, self.steps_table.currentRow()))
+        self._data_change_timer.start()
+
+    def _edit_ai_step(self, index: int) -> None:
+        steps = (self.current_macro or {}).get("steps") or []
+        if not 0 < index <= len(steps):
+            return
+        self.steps_table.selectRow(index - 1)
+        self._load_step(index - 1)
+        self._open_action_settings()
+
+    def _run_ai_inactive_lab(self, dialog: AIDraftSetupDialog) -> None:
+        if self._open_inactive_handle_lab():
+            profile = dict(self._inactive_handle_profiles[-1]) if self._inactive_handle_profiles else {}
+            dialog.apply_inactive_profile(profile)
+
+    def _open_ai_setup(self) -> None:
+        if not self.current_macro or not bool((self.current_macro.get("meta") or {}).get("ai_draft")):
+            self.status.emit("현재 매크로는 미완성 AI 초안이 아닙니다.")
+            return
+        dialog = AIDraftSetupDialog(self.current_macro, self.repository, self.window())
+        dialog.macro_changed.connect(self._apply_ai_draft_change)
+        dialog.step_edit_requested.connect(self._edit_ai_step)
+        dialog.inactive_lab_requested.connect(lambda: self._run_ai_inactive_lab(dialog))
+        dialog.dry_run_requested.connect(self._run_dry_run)
+        dialog.exec()
+        if self.current_name:
+            self.refresh(self.current_name)
+
+    def _continue_ai_setup(self) -> None:
+        self._open_ai_setup()
+
     def _load_last_recording(self) -> list[dict[str, Any]]:
         try:
             payload = json.loads(self._last_recording_path.read_text(encoding="utf-8-sig"))
@@ -1782,7 +2019,7 @@ class BuilderPage(QtWidgets.QWidget):
             event["_handle_profile"] = profile
         return prepared
 
-    def _open_inactive_handle_lab(self) -> None:
+    def _open_inactive_handle_lab(self) -> bool:
         host = self.window()
         was_visible = host.isVisible()
         ignored = {int(widget.winId()) for widget in QtWidgets.QApplication.topLevelWidgets()}
@@ -1797,18 +2034,18 @@ class BuilderPage(QtWidgets.QWidget):
             host.raise_()
             host.activateWindow()
         if not accepted or picker.probe_result is None:
-            return
+            return False
         lab = InactiveClickLabDialog(picker.probe_result, host)
         if lab.exec() != QtWidgets.QDialog.Accepted:
-            return
+            return False
         profile = lab.selected_payload()
         if not profile:
-            return
+            return False
         try:
             self._save_inactive_handle_profile(profile)
         except OSError as exc:
             QtWidgets.QMessageBox.warning(self, "핸들 저장 실패", str(exc))
-            return
+            return False
         target = str(profile.get("window_exe") or profile.get("window") or "대상 프로그램")
         self.status.emit(f"{target} 비활성 클릭 핸들을 저장했습니다.")
         QtWidgets.QMessageBox.information(
@@ -1816,12 +2053,16 @@ class BuilderPage(QtWidgets.QWidget):
             "비활성 클릭 핸들 저장",
             f"{target}의 시험 성공 핸들을 저장했습니다.\n이후 같은 프로그램의 스마트 녹화 클릭에 자동 적용됩니다.",
         )
+        return True
 
     def _stop_smart_recording(self) -> None:
-        if self._recording_controller is None:
-            self.status.emit("현재 스마트 녹화가 실행 중이 아닙니다.")
+        if self._ai_recording_controller is not None:
+            self._ai_recording_controller.stop()
             return
-        self._recording_controller.stop()
+        if self._recording_controller is not None:
+            self._recording_controller.stop()
+            return
+        self.status.emit("현재 실행 중인 녹화가 없습니다.")
 
     def set_shortcut_labels(self, shortcuts: dict[str, str]) -> None:
         for action_id, button in self.shortcut_buttons.items():
@@ -2355,12 +2596,29 @@ class BuilderPage(QtWidgets.QWidget):
             return None
         return {"kind": "macro_step", "name": name, "payload": snapshot}
 
+    def _block_unfinished_ai_run(self) -> bool:
+        macro = self.current_macro or {}
+        if not bool((macro.get("meta") or {}).get("ai_draft")):
+            return False
+        complete, total, pending = ai_draft_readiness(macro)
+        detail = "\n".join(f"• {item}" for item in pending) if pending else "• 설정 완료 버튼으로 AI 초안을 확정하세요."
+        QtWidgets.QMessageBox.warning(
+            self,
+            "AI 초안 실행 차단",
+            f"이 매크로는 아직 AI 초안입니다. 준비도 {complete}/{total}\n\n{detail}\n\n"
+            "드라이런과 이 단계만 테스트는 사용할 수 있습니다.",
+        )
+        self.status.emit("미완성 AI 초안의 정식 실행을 차단했습니다.")
+        return True
+
     def _run_current(self) -> None:
         if not self.run_button.isEnabled():
             self.status.emit("이미 매크로가 실행 중입니다. 새로 실행하려면 먼저 정지해 주세요.")
             return
         if not self.current_name:
             self.status.emit("실행할 매크로를 먼저 선택하세요.")
+            return
+        if self._block_unfinished_ai_run():
             return
         row = self.steps_table.currentRow()
         steps = (self.current_macro or {}).get("steps") or []
@@ -2391,6 +2649,8 @@ class BuilderPage(QtWidgets.QWidget):
     def _run_from_selected_step(self) -> None:
         if not self.current_name or self.current_macro is None:
             self.status.emit("실행할 매크로를 먼저 선택하세요.")
+            return
+        if self._block_unfinished_ai_run():
             return
         index = self.node_canvas.selected_index()
         if index <= 0:

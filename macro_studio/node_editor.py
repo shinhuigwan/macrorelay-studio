@@ -356,6 +356,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
         running = self.index == self.canvas.active_step
         execution = self.canvas.execution_states.get(self.index, {})
         execution_status = str(execution.get("status") or "").upper()
+        needs_setup = bool(self.step.get("needs_setup"))
         candidate_position = self.canvas.start_candidate_position(self.index)
         lod = max(0.01, option.levelOfDetailFromTransform(painter.worldTransform()))
         font_boost = min(2.5, max(1.0, 0.82 / lod))
@@ -370,13 +371,15 @@ class NodeItem(QtWidgets.QGraphicsObject):
             if execution_status == "SUCCESS"
             else COLORS["danger"]
             if execution_status == "FAIL"
+            else "#FF9D45"
+            if needs_setup
             else COLORS["accent"]
             if selected
             else COLORS["warning"]
             if candidate_position
             else "#343B4D"
         )
-        border_width = 4.5 if running else (2 if selected else 1.2)
+        border_width = 4.5 if running else (2.6 if needs_setup else 2 if selected else 1.2)
         if running:
             painter.setPen(QtGui.QPen(QtGui.QColor(56, 231, 255, 70), 10))
             painter.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 14, 14)
@@ -485,6 +488,15 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 QtCore.Qt.AlignCenter,
                 f"{'성공' if execution_status == 'SUCCESS' else '실패'} {int(execution.get('duration_ms') or 0)}ms",
             )
+        elif needs_setup:
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor("#FF9D45"))
+            painter.drawRoundedRect(QtCore.QRectF(158, 92, 94, 22), 7, 7)
+            warning_font = QtGui.QFont("Malgun Gothic", 8)
+            warning_font.setBold(True)
+            painter.setFont(warning_font)
+            painter.setPen(QtGui.QColor("#1B0D02"))
+            painter.drawText(QtCore.QRectF(158, 92, 94, 22), QtCore.Qt.AlignCenter, "⚠ 설정 필요")
 
     def itemChange(self, change, value):
         result = super().itemChange(change, value)

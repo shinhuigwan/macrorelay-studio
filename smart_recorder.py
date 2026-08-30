@@ -8,8 +8,10 @@ from ctypes import wintypes
 import json
 import os
 from pathlib import Path
+import queue
 import struct
 import sys
+import threading
 import time
 
 
@@ -28,8 +30,11 @@ WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
 WM_RBUTTONDOWN = 0x0204
+WM_RBUTTONUP = 0x0205
 WM_MBUTTONDOWN = 0x0207
+WM_MBUTTONUP = 0x0208
 WM_MOUSEWHEEL = 0x020A
 VK_F8 = 0x77
 VK_F10 = 0x79
@@ -158,6 +163,20 @@ class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
 
 
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", HWND),
+        ("hwndFocus", HWND),
+        ("hwndCapture", HWND),
+        ("hwndMenuOwner", HWND),
+        ("hwndMoveSize", HWND),
+        ("hwndCaret", HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
 def enable_dpi_awareness() -> None:
     """Keep hook, window and capture coordinates in the same physical-pixel space."""
     try:
@@ -212,7 +231,8 @@ def capture_click_sample(x: int, y: int, width: int = 360, height: int = 240) ->
 def window_details(hwnd: int) -> dict[str, object]:
     if not hwnd:
         return {}
-    root = int(user32.GetAncestor(hwnd, 2) or hwnd)
+    child = int(hwnd)
+    root = int(user32.GetAncestor(child, 2) or child)
     title_buffer = ctypes.create_unicode_buffer(2048)
     user32.GetWindowTextW(root, title_buffer, len(title_buffer))
     class_buffer = ctypes.create_unicode_buffer(512)
@@ -235,8 +255,37 @@ def window_details(hwnd: int) -> dict[str, object]:
     user32.GetWindowRect(root, ctypes.byref(rect))
     user32.GetClientRect(root, ctypes.byref(client))
     user32.ClientToScreen(root, ctypes.byref(origin))
+    try:
+        dpi = int(user32.GetDpiForWindow(root) or 96)
+    except (AttributeError, OSError):
+        dpi = 96
+    virtual_screen = [
+        int(user32.GetSystemMetrics(76)),
+        int(user32.GetSystemMetrics(77)),
+        int(user32.GetSystemMetrics(78)),
+        int(user32.GetSystemMetrics(79)),
+    ]
+    focus_hwnd = 0
+    focus_class = ""
+    focus_rect: list[int] = []
+    gui = GUITHREADINFO()
+    gui.cbSize = ctypes.sizeof(GUITHREADINFO)
+    try:
+        if user32.GetGUIThreadInfo(thread_id, ctypes.byref(gui)):
+            focus_hwnd = int(gui.hwndFocus or 0)
+            if focus_hwnd:
+                focus_bounds = wintypes.RECT()
+                if user32.GetWindowRect(focus_hwnd, ctypes.byref(focus_bounds)):
+                    focus_rect = [focus_bounds.left, focus_bounds.top, focus_bounds.right, focus_bounds.bottom]
+                focus_buffer = ctypes.create_unicode_buffer(512)
+                user32.GetClassNameW(focus_hwnd, focus_buffer, len(focus_buffer))
+                focus_class = focus_buffer.value
+    except (AttributeError, OSError):
+        pass
     return {
         "hwnd": root,
+        "root_hwnd": root,
+        "child_hwnd": child,
         "pid": int(pid.value),
         "thread": thread_id,
         "title": title_buffer.value,
@@ -245,6 +294,12 @@ def window_details(hwnd: int) -> dict[str, object]:
         "window_rect": [rect.left, rect.top, rect.right, rect.bottom],
         "client_origin": [origin.x, origin.y],
         "client_size": [client.right - client.left, client.bottom - client.top],
+        "dpi": dpi,
+        "scale_percent": round(dpi / 96 * 100),
+        "virtual_screen": virtual_screen,
+        "focus_hwnd": focus_hwnd,
+        "focus_class": focus_class,
+        "focus_rect": focus_rect,
     }
 
 
@@ -265,6 +320,12 @@ SPECIAL_KEYS = {
     0x2E: "Delete",
 }
 MODIFIERS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+MODIFIER_NAMES = {
+    0x10: "Shift", 0xA0: "Shift", 0xA1: "Shift",
+    0x11: "Ctrl", 0xA2: "Ctrl", 0xA3: "Ctrl",
+    0x12: "Alt", 0xA4: "Alt", 0xA5: "Alt",
+    0x5B: "Win", 0x5C: "Win",
+}
 
 
 def key_value(vk: int, scan: int, thread_id: int) -> tuple[str, str]:
@@ -291,6 +352,10 @@ class Recorder:
         capture_vk: int = VK_F8,
         stop_vk: int = VK_F10,
         hold_vk: int = VK_OEM_3,
+        initial_active: bool = False,
+        redact_text: bool = False,
+        sample_width: int = 360,
+        sample_height: int = 240,
     ) -> None:
         self.output = output
         self.exclude_pid = exclude_pid
@@ -298,16 +363,34 @@ class Recorder:
         self.capture_vk = int(capture_vk)
         self.stop_vk = int(stop_vk)
         self.hold_vk = int(hold_vk)
-        self.gate_down = False
+        self.gate_down = bool(initial_active)
+        self.redact_text = bool(redact_text)
+        self.sample_width = max(160, min(1920, int(sample_width)))
+        self.sample_height = max(120, min(1080, int(sample_height)))
         self.record_mode = "action"
         self._mode_key_down = False
         self._shift_down = False
+        self._pressed_modifiers: set[str] = set()
         self.started = time.perf_counter()
         self.mouse_hook = None
         self.keyboard_hook = None
         self.mouse_callback = HOOKPROC(self._mouse_proc)
         self.keyboard_callback = HOOKPROC(self._keyboard_proc)
         self.handle = None
+        self._write_lock = threading.Lock()
+        self._after_queue: queue.Queue[tuple[str, int, int] | None] = queue.Queue()
+        self._after_thread: threading.Thread | None = None
+        self._event_counter = 0
+        self._down_points: dict[str, tuple[int, int, str]] = {}
+
+    def _write_payload(self, payload: dict[str, object]) -> None:
+        if self.handle is None:
+            return
+        with self._write_lock:
+            if self.handle is None:
+                return
+            self.handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self.handle.flush()
 
     def emit(self, payload: dict[str, object]) -> None:
         if not self.gate_down:
@@ -319,9 +402,7 @@ class Recorder:
             return
         payload["t"] = round((time.perf_counter() - self.started - self.delay) * 1000)
         payload["record_mode"] = self.record_mode
-        assert self.handle is not None
-        self.handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        self.handle.flush()
+        self._write_payload(payload)
 
     def set_gate_active(self, active: bool) -> None:
         normalized = bool(active)
@@ -354,14 +435,55 @@ class Recorder:
             return
         payload["t"] = max(0, round((time.perf_counter() - self.started - self.delay) * 1000))
         payload["request_id"] = f"{time.perf_counter_ns()}-{int(payload.get('vk') or 0)}"
-        self.handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        self.handle.flush()
+        self._write_payload(payload)
+
+    def _capture_after_worker(self) -> None:
+        while True:
+            request = self._after_queue.get()
+            if request is None:
+                return
+            event_id, x, y = request
+            time.sleep(0.22)
+            sample = capture_click_sample(x, y, self.sample_width, self.sample_height)
+            self.emit_control(
+                {
+                    "type": "mouse_after",
+                    "event_id": event_id,
+                    "image_after_bmp": sample,
+                    "image_sample_size": [self.sample_width, self.sample_height],
+                    "vk": 0,
+                }
+            )
 
     def _mouse_proc(self, code: int, message: int, data_ptr: int) -> int:
-        if code == HC_ACTION and message in {WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL}:
+        down_messages = {WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL}
+        up_messages = {WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP}
+        if code == HC_ACTION and message in down_messages | up_messages:
             if not self.gate_down:
                 return int(user32.CallNextHookEx(self.mouse_hook, code, message, data_ptr))
             data = ctypes.cast(data_ptr, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            up_button = {
+                WM_LBUTTONUP: "Left",
+                WM_RBUTTONUP: "Right",
+                WM_MBUTTONUP: "Middle",
+            }.get(int(message), "")
+            if up_button:
+                down = self._down_points.pop(up_button, None)
+                if down is not None:
+                    start_x, start_y, source_event_id = down
+                    if abs(int(data.pt.x) - start_x) > 5 or abs(int(data.pt.y) - start_y) > 5:
+                        details = window_details(int(user32.WindowFromPoint(data.pt) or 0))
+                        self.emit(
+                            {
+                                "type": "mouse_drag",
+                                "button": up_button,
+                                "from_screen": [start_x, start_y],
+                                "to_screen": [int(data.pt.x), int(data.pt.y)],
+                                "source_event_id": source_event_id,
+                                "window": details,
+                            }
+                        )
+                return int(user32.CallNextHookEx(self.mouse_hook, code, message, data_ptr))
             hwnd = int(user32.WindowFromPoint(data.pt) or 0)
             details = window_details(hwnd)
             button = {
@@ -369,22 +491,29 @@ class Recorder:
                 WM_RBUTTONDOWN: "Right",
                 WM_MBUTTONDOWN: "Middle",
             }.get(int(message), "WheelUp")
+            wheel_delta = 0
             if message == WM_MOUSEWHEEL:
-                delta = ctypes.c_short((int(data.mouseData) >> 16) & 0xFFFF).value
-                button = "WheelUp" if delta > 0 else "WheelDown"
+                wheel_delta = ctypes.c_short((int(data.mouseData) >> 16) & 0xFFFF).value
+                button = "WheelUp" if wheel_delta > 0 else "WheelDown"
             origin = details.get("client_origin") if isinstance(details, dict) else None
             client_x = data.pt.x - int(origin[0]) if isinstance(origin, list) and len(origin) >= 2 else data.pt.x
             client_y = data.pt.y - int(origin[1]) if isinstance(origin, list) and len(origin) >= 2 else data.pt.y
-            sample_width, sample_height = 360, 240
+            sample_width, sample_height = self.sample_width, self.sample_height
             sample = (
                 ""
                 if message == WM_MOUSEWHEEL
                 else capture_click_sample(int(data.pt.x), int(data.pt.y), sample_width, sample_height)
             )
+            self._event_counter += 1
+            event_id = f"mouse-{time.perf_counter_ns()}-{self._event_counter}"
+            if message != WM_MOUSEWHEEL:
+                self._down_points[button] = (int(data.pt.x), int(data.pt.y), event_id)
             self.emit(
                 {
                     "type": "mouse",
+                    "event_id": event_id,
                     "button": button,
+                    "wheel_delta": int(wheel_delta),
                     "x": int(data.pt.x),
                     "y": int(data.pt.y),
                     "client_x": int(client_x),
@@ -395,6 +524,8 @@ class Recorder:
                     "image_anchor": [sample_width // 2, sample_height // 2],
                 }
             )
+            if message != WM_MOUSEWHEEL:
+                self._after_queue.put((event_id, int(data.pt.x), int(data.pt.y)))
         return int(user32.CallNextHookEx(self.mouse_hook, code, message, data_ptr))
 
     def _keyboard_proc(self, code: int, message: int, data_ptr: int) -> int:
@@ -405,7 +536,13 @@ class Recorder:
             pressed = message in {WM_KEYDOWN, WM_SYSKEYDOWN}
             if vk in SHIFT_KEYS and not injected:
                 self._shift_down = pressed
-            if vk == self.hold_vk and not injected:
+            modifier = MODIFIER_NAMES.get(vk, "")
+            if modifier and not injected:
+                if pressed:
+                    self._pressed_modifiers.add(modifier)
+                else:
+                    self._pressed_modifiers.discard(modifier)
+            if self.hold_vk and vk == self.hold_vk and not injected:
                 if pressed and not self._mode_key_down:
                     if self._shift_down:
                         self.cycle_record_mode()
@@ -435,12 +572,17 @@ class Recorder:
             if self.gate_down and vk not in MODIFIERS and not injected:
                 details = window_details(int(user32.GetForegroundWindow() or 0))
                 char, token = key_value(vk, int(data.scanCode), int(details.get("thread") or 0))
+                modifiers = sorted(self._pressed_modifiers)
+                command_key = bool({"Ctrl", "Alt", "Win"} & set(modifiers))
+                if self.redact_text and char and not command_key:
+                    char, token = "[REDACTED]", "Printable"
                 self.emit(
                     {
                         "type": "key",
                         "vk": vk,
                         "char": char,
                         "token": token,
+                        "modifiers": modifiers,
                         "window": details,
                     }
                 )
@@ -450,6 +592,8 @@ class Recorder:
         enable_dpi_awareness()
         self.output.parent.mkdir(parents=True, exist_ok=True)
         with self.output.open("w", encoding="utf-8") as self.handle:
+            self._after_thread = threading.Thread(target=self._capture_after_worker, name="macrorelay-after-capture", daemon=True)
+            self._after_thread.start()
             module = kernel32.GetModuleHandleW(None)
             self.mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self.mouse_callback, module, 0)
             self.keyboard_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.keyboard_callback, module, 0)
@@ -479,6 +623,10 @@ class Recorder:
                     user32.UnhookWindowsHookEx(self.mouse_hook)
                 if self.keyboard_hook:
                     user32.UnhookWindowsHookEx(self.keyboard_hook)
+                self._after_queue.put(None)
+                if self._after_thread is not None:
+                    self._after_thread.join(timeout=2.5)
+                    self._after_thread = None
         return 0
 
 
@@ -490,8 +638,23 @@ def main() -> int:
     parser.add_argument("--capture-vk", type=int, default=VK_F8)
     parser.add_argument("--stop-vk", type=int, default=VK_F10)
     parser.add_argument("--hold-vk", type=int, default=VK_OEM_3)
+    parser.add_argument("--initial-active", action="store_true")
+    parser.add_argument("--redact-text", action="store_true")
+    parser.add_argument("--sample-width", type=int, default=360)
+    parser.add_argument("--sample-height", type=int, default=240)
     args = parser.parse_args()
-    return Recorder(args.out.resolve(), args.exclude_pid, args.delay, args.capture_vk, args.stop_vk, args.hold_vk).run()
+    return Recorder(
+        args.out.resolve(),
+        args.exclude_pid,
+        args.delay,
+        args.capture_vk,
+        args.stop_vk,
+        args.hold_vk,
+        initial_active=args.initial_active,
+        redact_text=args.redact_text,
+        sample_width=args.sample_width,
+        sample_height=args.sample_height,
+    ).run()
 
 
 if __name__ == "__main__":

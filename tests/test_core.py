@@ -4525,5 +4525,304 @@ class RemoteFeatureTests(unittest.TestCase):
             self.assertTrue((ROOT / "remote" / "mobile" / name).is_file(), name)
 
 
+class AIAutomationTests(unittest.TestCase):
+    @staticmethod
+    def _sample_bmp() -> str:
+        from PySide6 import QtCore, QtGui, QtWidgets
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        image = QtGui.QImage(360, 240, QtGui.QImage.Format_ARGB32)
+        image.fill(QtGui.QColor("#203050"))
+        painter = QtGui.QPainter(image)
+        painter.fillRect(130, 85, 100, 70, QtGui.QColor("#48D8C2"))
+        painter.end()
+        data = QtCore.QByteArray()
+        buffer = QtCore.QBuffer(data)
+        buffer.open(QtCore.QIODevice.WriteOnly)
+        self_saved = image.save(buffer, "BMP")
+        buffer.close()
+        if not self_saved:
+            raise AssertionError("sample image encoding failed")
+        return base64.b64encode(bytes(data)).decode("ascii")
+
+    def test_ai_recording_package_contains_prompt_png_metadata_and_redacts_text(self) -> None:
+        from macro_studio.ai_automation import AIRecordingPackageBuilder
+
+        sample = self._sample_bmp()
+        window = {
+            "exe": "browser.exe",
+            "title": "로그인",
+            "class": "BrowserWindow",
+            "hwnd": 101,
+            "root_hwnd": 100,
+            "child_hwnd": 102,
+            "window_rect": [100, 100, 1200, 900],
+            "client_origin": [108, 132],
+            "client_size": [1080, 720],
+            "dpi": 120,
+            "virtual_screen": [-1920, 0, 3840, 1080],
+        }
+        events = [
+            {"type": "key", "t": 100, "token": "P", "char": "P", "window": window},
+            {
+                "type": "mouse", "t": 420, "button": "Left", "x": 500, "y": 360,
+                "client_x": 392, "client_y": 228, "event_id": "click-raw-1",
+                "image_sample_bmp": sample, "image_after_bmp": sample,
+                "image_anchor": [180, 120], "window": window,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "recording.mp4"
+            video.write_bytes(b"test-mp4")
+            archive, stage = AIRecordingPackageBuilder(root).build(events, video, "ai-test-package")
+            self.assertTrue(archive.is_file())
+            expected = {
+                "prompt.txt", "schema.json", "manifest.json", "timeline.json", "targets.json", "recording.mp4",
+                "contact-sheet.png", "asset-manifest.json", "frames/step-001-before.png",
+                "frames/step-001-after.png", "asset-candidates/click-001-button.png",
+                "asset-candidates/click-001-button-grayscale.png",
+                "asset-candidates/click-001-button-outline.png",
+                "asset-candidates/click-001-button-cutout.png",
+            }
+            import zipfile
+
+            with zipfile.ZipFile(archive) as bundle:
+                names = set(bundle.namelist())
+                self.assertTrue(expected <= names)
+                self.assertEqual(b"\x89PNG\r\n\x1a\n", bundle.read("frames/step-001-before.png")[:8])
+            timeline_text = (stage / "timeline.json").read_text(encoding="utf-8")
+            self.assertIn("[REDACTED]", timeline_text)
+            self.assertNotIn('"value": "P"', timeline_text)
+            prompt = (stage / "prompt.txt").read_text(encoding="utf-8")
+            self.assertIn("지금 즉시 JSON을 만들지", prompt)
+            self.assertIn("사용자의 답변을 받은 뒤에만", prompt)
+            targets = json.loads((stage / "targets.json").read_text(encoding="utf-8"))
+            self.assertTrue(targets[0]["reacquire_each_run"])
+            self.assertEqual("browser.exe", targets[0]["exe"])
+
+    def test_ai_validator_rejects_raw_code_unknown_edges_and_actions(self) -> None:
+        from macro_studio.ai_automation import validate_ai_document
+
+        payload = {
+            "schema_version": "macrorelay-ai-1.0", "name": "unsafe", "description": "",
+            "targets": [], "assets": [], "variables": {}, "triggers": [], "setup_requirements": [],
+            "steps": [{"id": "one", "action": "shell_exec", "python_code": "print(1)", "on_success": "missing"}],
+        }
+        codes = {issue.code for issue in validate_ai_document(payload)}
+        self.assertIn("unsupported_action", codes)
+        self.assertIn("raw_code", codes)
+        self.assertIn("bad_edge", codes)
+
+    def test_ai_recording_coalesces_double_click_and_attaches_after_frame(self) -> None:
+        from macro_studio.ai_automation import load_ai_recording
+
+        records = [
+            {"type": "mouse", "event_id": "a", "t": 100, "button": "Left", "x": 20, "y": 30, "image_sample_bmp": "before"},
+            {"type": "mouse_after", "event_id": "a", "t": 200, "image_after_bmp": "after-a"},
+            {"type": "mouse", "event_id": "b", "t": 280, "button": "Left", "x": 22, "y": 31, "image_sample_bmp": "middle"},
+            {"type": "mouse_after", "event_id": "b", "t": 480, "image_after_bmp": "after-b"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "recording.jsonl"
+            path.write_text("\n".join(json.dumps(item) for item in records), encoding="utf-8")
+            events = load_ai_recording(path)
+        self.assertEqual(1, len(events))
+        self.assertEqual("double_click", events[0]["gesture"])
+        self.assertEqual(2, events[0]["click_count"])
+        self.assertEqual("before", events[0]["image_sample_bmp"])
+        self.assertEqual("after-b", events[0]["image_after_bmp"])
+
+    def test_ai_json_materializes_png_asset_client_target_and_draft(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.ai_automation import materialize_ai_document
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            stage = root / ".automation" / "ai-packages" / "ai-import-test"
+            candidate = stage / "asset-candidates" / "login.png"
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            image = QtGui.QImage(80, 50, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#42C7B8"))
+            self.assertTrue(image.save(str(candidate), "PNG"))
+            (stage / "asset-manifest.json").write_text(json.dumps({"assets": [{
+                "id": "login-image", "selected_candidate": "asset-candidates/login.png",
+                "readiness": "ready", "validation": {"search_verified": True},
+                "candidates": [{"file": "asset-candidates/login.png", "click_offset": [12, -4]}],
+            }]}), encoding="utf-8")
+            payload = {
+                "schema_version": "macrorelay-ai-1.0", "source_package_id": "ai-import-test",
+                "name": "로그인 AI", "description": "test",
+                "targets": [{"id": "browser", "exe": "browser.exe", "title": "로그인", "class": "Browser",
+                             "window_token": "로그인 ahk_exe browser.exe", "inactive_click_verified": False}],
+                "assets": [{"id": "login-image", "label": "로그인 버튼"}],
+                "variables": {}, "triggers": [], "setup_requirements": [],
+                "steps": [{"id": "find", "action": "image_search", "asset_ref": "login-image",
+                           "target_ref": "browser", "on_success": "end", "params": {"confidence": 88}}],
+            }
+            macro, issues = materialize_ai_document(payload, repository, stage)
+            self.assertFalse([issue for issue in issues if issue.severity == "error"])
+            self.assertTrue(macro["meta"]["ai_draft"])
+            step = macro["steps"][0]
+            self.assertEqual("client", step["region_mode"])
+            self.assertEqual("relative", step["region_coords"])
+            self.assertEqual("browser.exe", step["region_window_exe"])
+            self.assertEqual("inactive", step["click"]["mode"])
+            self.assertEqual([12, -4], step["click"]["offset"])
+            self.assertIn("verify_inactive_click", step["needs_setup"])
+            asset_path = repository.asset_path(step["asset"])
+            self.assertIsNotNone(asset_path)
+            self.assertEqual(".png", asset_path.suffix.lower())
+
+    def test_builder_exposes_ai_workflow_and_blocks_real_draft_run(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("AI 초안")
+            draft = repository.load_macro("AI 초안")
+            draft["meta"]["ai_draft"] = True
+            draft["steps"] = [{"action": "wait", "duration": 10, "needs_setup": ["confirm_wait"]}]
+            draft["ai_setup"] = {"targets": [], "assets": [], "requirements": [], "unresolved": []}
+            repository.save_macro("AI 초안", draft)
+            builder = BuilderPage(repository)
+            builder.refresh("AI 초안")
+            labels = [button.text() for button in builder.findChildren(QtWidgets.QPushButton)]
+            self.assertIn("✦ AI 매크로 녹화", labels)
+            self.assertIn("AI 분석 패키지 생성", labels)
+            self.assertIn("AI JSON 불러오기", labels)
+            emitted: list[str] = []
+            builder.run_macro.connect(emitted.append)
+            with mock.patch.object(QtWidgets.QMessageBox, "warning", return_value=QtWidgets.QMessageBox.Ok):
+                builder._run_current()
+            self.assertEqual([], emitted)
+            builder.deleteLater()
+
+    def test_repository_blocks_ai_draft_from_non_builder_entry_points(self) -> None:
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("remote-draft")
+            macro = repository.load_macro("remote-draft")
+            macro["meta"]["ai_draft"] = True
+            macro["steps"] = [{"action": "wait", "duration": 1, "needs_setup": ["confirm"]}]
+            repository.save_macro("remote-draft", macro)
+            with self.assertRaisesRegex(RuntimeError, "미완성 AI 초안"):
+                repository.run_macro("remote-draft")
+            with self.assertRaisesRegex(RuntimeError, "미완성 AI 초안"):
+                repository.run_macro_from_step("remote-draft", 1)
+
+    def test_ai_setup_dialog_shares_target_profile_without_persisting_hwnd(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.ai_import_dialog import AIDraftSetupDialog
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            image = QtGui.QImage(50, 30, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#35CDB2"))
+            alias = repository.add_asset_image(image, "login")
+            macro = {
+                "name": "AI 초안", "meta": {"ai_draft": True},
+                "steps": [{
+                    "action": "image_search", "asset": alias, "region_window_exe": "browser.exe",
+                    "click": {"mode": "inactive"}, "needs_setup": ["verify_inactive_click"],
+                    "_ai": {"target_ref": "browser"},
+                }],
+                "ai_setup": {"targets": [{
+                    "id": "browser", "label": "브라우저", "exe": "browser.exe",
+                    "window_token": "ahk_exe browser.exe", "inactive_click_verified": False,
+                    "reacquire_each_run": True,
+                }], "assets": [], "requirements": [], "unresolved": []},
+            }
+            dialog = AIDraftSetupDialog(macro, repository)
+            self.assertEqual(1, dialog.targets.rowCount())
+            self.assertEqual(1, dialog.gallery.count())
+            dialog.apply_inactive_profile({
+                "window_exe": "browser.exe", "target_control": "Chrome_RenderWidgetHostHWND1",
+                "target_child_class": "Chrome_RenderWidgetHostHWND", "target_hwnd": "123456",
+            })
+            step = dialog.macro["steps"][0]
+            self.assertEqual("handle_probe", step["click"]["method"])
+            self.assertEqual("", step["click"]["target_hwnd"])
+            self.assertNotIn("verify_inactive_click", step["needs_setup"])
+            self.assertTrue(dialog.macro["ai_setup"]["targets"][0]["inactive_click_verified"])
+            dialog.close()
+
+    def test_naver_like_record_package_json_import_end_to_end(self) -> None:
+        from macro_studio.ai_automation import AIRecordingPackageBuilder, materialize_ai_document
+        from macro_studio.repository import MacroRepository
+
+        sample = self._sample_bmp()
+        window = {
+            "exe": "browser.exe", "title": "NAVER 로그인", "class": "Chrome_WidgetWin_1",
+            "window_rect": [100, 80, 1300, 900], "client_origin": [108, 112], "client_size": [1184, 780],
+            "focus_class": "Chrome_RenderWidgetHostHWND", "focus_rect": [420, 260, 800, 310],
+            "dpi": 120, "scale_percent": 125, "virtual_screen": [0, 0, 1920, 1080],
+        }
+        events = [
+            {"type": "mouse", "event_id": "login", "t": 100, "button": "Left", "x": 610, "y": 210,
+             "client_x": 502, "client_y": 98, "image_sample_bmp": sample, "image_after_bmp": sample,
+             "image_anchor": [180, 120], "window": window},
+            {"type": "key", "t": 450, "token": "Printable", "char": "[REDACTED]", "window": window},
+            {"type": "key", "t": 520, "token": "Printable", "char": "[REDACTED]", "window": window},
+            {"type": "key", "t": 700, "token": "Tab", "char": "", "window": window},
+            {"type": "key", "t": 820, "token": "Printable", "char": "[REDACTED]", "window": window},
+            {"type": "mouse", "event_id": "submit", "t": 1200, "button": "Left", "x": 620, "y": 430,
+             "client_x": 512, "client_y": 318, "image_sample_bmp": sample, "image_after_bmp": sample,
+             "image_anchor": [180, 120], "window": window},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            _archive, stage = AIRecordingPackageBuilder(root).build(events, package_id="naver-like")
+            timeline_text = (stage / "timeline.json").read_text(encoding="utf-8")
+            self.assertNotIn("naver-user", timeline_text)
+            self.assertNotIn("naver-password", timeline_text)
+            self.assertIn("[REDACTED]", timeline_text)
+            targets = json.loads((stage / "targets.json").read_text(encoding="utf-8"))
+            manifest_assets = json.loads((stage / "asset-manifest.json").read_text(encoding="utf-8"))["assets"]
+            payload_assets = [
+                {"id": item["id"], "label": item["label"], "target_ref": item["target_ref"],
+                 "candidate": item["selected_candidate"], "required": True, "click_purpose": item["click_purpose"]}
+                for item in manifest_assets
+            ]
+            payload = {
+                "schema_version": "macrorelay-ai-1.0", "source_package_id": "naver-like",
+                "name": "NAVER 자동 로그인 AI", "description": "녹화 기반 로그인 초안",
+                "targets": targets, "assets": payload_assets, "variables": {}, "triggers": [],
+                "steps": [
+                    {"id": "open-login", "action": "image_search", "target_ref": "target-01",
+                     "asset_ref": payload_assets[0]["id"], "on_success": "user", "on_fail": "end"},
+                    {"id": "user", "action": "type_text", "target_ref": "target-01",
+                     "params": {"text": "[REDACTED]"}, "on_success": "password", "needs_setup": ["classify_sensitive_input"]},
+                    {"id": "password", "action": "vault_get", "params": {"secret": "naver_password", "name": "password"},
+                     "on_success": "submit"},
+                    {"id": "submit", "action": "image_search", "target_ref": "target-01",
+                     "asset_ref": payload_assets[-1]["id"], "on_success": "end", "on_fail": "end"},
+                ],
+                "setup_requirements": ["아이디 입력값을 평문 또는 별도 DPAPI 보관함 참조로 지정"],
+            }
+            macro, issues = materialize_ai_document(payload, repository, stage)
+            self.assertFalse([issue for issue in issues if issue.severity == "error"])
+            self.assertEqual(4, len(macro["steps"]))
+            self.assertEqual(2, len([step for step in macro["steps"] if step["action"] == "image_search"]))
+            self.assertTrue(all(repository.asset_path(step["asset"]) for step in macro["steps"] if step["action"] == "image_search"))
+            self.assertEqual(2, macro["steps"][0]["on_success"])
+            self.assertEqual(3, macro["steps"][1]["on_success"])
+            self.assertTrue(macro["meta"]["ai_draft"])
+            self.assertTrue(macro["ai_setup"]["targets"][0]["reacquire_each_run"])
+            self.assertNotIn("observed_handles", macro["ai_setup"]["targets"][0])
+
+
 if __name__ == "__main__":
     unittest.main()

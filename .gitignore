@@ -32,6 +32,7 @@ browser_profiles/
 *_profile/
 
 # Machine paths, secrets and live process state
+.vault/
 *_path.txt
 remote_config.json
 runtime/

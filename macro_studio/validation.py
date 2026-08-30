@@ -46,6 +46,16 @@ class ProjectValidator:
                 continue
             if not steps:
                 issues.append(Issue("warning", "빈 매크로", "실행할 노드가 없습니다.", summary.name))
+            if bool((macro.get("meta") or {}).get("ai_draft")):
+                pending = [
+                    index
+                    for index, step in enumerate(steps, start=1)
+                    if isinstance(step, dict) and step.get("needs_setup")
+                ]
+                detail = "미완성 설정 계속하기에서 검토를 완료해야 정식 실행할 수 있습니다."
+                if pending:
+                    detail += f" 설정 필요 노드: {', '.join(map(str, pending[:12]))}"
+                issues.append(Issue("warning", "AI 초안", detail, summary.name))
             if len(steps) > 1:
                 first = steps[0] if isinstance(steps[0], dict) else {}
                 if (

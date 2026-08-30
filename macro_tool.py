@@ -25,6 +25,8 @@ ACTIONS = [
     "mouse_click",
     "inactive_click",
     "image_search",
+    "screen_condition",
+    "datetime_condition",
     "browser_action",
     "ocr",
     "flow_control",
@@ -2441,6 +2443,29 @@ def render_image_search(
         lines.append(f"{indent}        {bottom_var} := {region_base_y} + {region_height} - 1")
         lines.append(f"{indent}    }}")
         lines.append(f"{indent}}}")
+        # A stale recording can leave a 13x23-style client region after the
+        # window is moved/resized. It cannot contain even the template, so
+        # recover to the current target client instead of silently failing.
+        lines.append(
+            f"{indent}if (({right_var} - {left_var} + 1) < Max(48, FoundImageW) or ({bottom_var} - {top_var} + 1) < Max(48, FoundImageH))"
+        )
+        lines.append(f"{indent}{{")
+        lines.append(f'{indent}    Log("image search region auto-expanded: too small for template")')
+        lines.append(f"{indent}    if ({region_prefix}UseBase)")
+        lines.append(f"{indent}    {{")
+        lines.append(f"{indent}        {left_var} := {region_base_x}")
+        lines.append(f"{indent}        {top_var} := {region_base_y}")
+        lines.append(f"{indent}        {right_var} := {region_base_x} + {region_width} - 1")
+        lines.append(f"{indent}        {bottom_var} := {region_base_y} + {region_height} - 1")
+        lines.append(f"{indent}    }}")
+        lines.append(f"{indent}    else")
+        lines.append(f"{indent}    {{")
+        lines.append(f"{indent}        {left_var} := VirtualLeft")
+        lines.append(f"{indent}        {top_var} := VirtualTop")
+        lines.append(f"{indent}        {right_var} := VirtualRight")
+        lines.append(f"{indent}        {bottom_var} := VirtualBottom")
+        lines.append(f"{indent}    }}")
+        lines.append(f"{indent}}}")
         return left_var, top_var, right_var, bottom_var
 
     def emit_opencv_cli_result(indent=""):
@@ -3984,6 +4009,84 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def render_datetime_condition(step: Dict[str, Any], step_index: int) -> List[str]:
+    """Render a local-computer date/time predicate with optional efficient wait."""
+
+    def digits(value: Any, length: int, fallback: str) -> str:
+        cleaned = "".join(char for char in str(value or "") if char.isdigit())
+        return cleaned[:length] if len(cleaned) >= length else fallback
+
+    start_date = digits(step.get("date_start"), 8, "")
+    end_date = digits(step.get("date_end"), 8, "")
+    start_time = digits(step.get("time_start"), 4, "0000")
+    end_time = digits(step.get("time_end"), 4, "2359")
+    day_mode = str(step.get("day_mode") or "everyday")
+    if day_mode == "weekdays":
+        allowed_days = {2, 3, 4, 5, 6}
+    elif day_mode == "weekend":
+        allowed_days = {1, 7}
+    elif day_mode == "custom":
+        names = {"일": 1, "월": 2, "화": 3, "수": 4, "목": 5, "금": 6, "토": 7}
+        allowed_days = {number for label, number in names.items() if label in str(step.get("custom_days") or "")}
+        if not allowed_days:
+            allowed_days = set(range(1, 8))
+    else:
+        allowed_days = set(range(1, 8))
+    day_token = "|" + "|".join(str(value) for value in sorted(allowed_days)) + "|"
+    found_var = f"__time_condition_success_{step_index}"
+    wait_until = bool(step.get("wait_until"))
+    wait_timeout = max(0, int(step.get("wait_timeout") or 0))
+    poll_delay = max(100, int(step.get("poll_delay") or 500))
+    invert = bool(step.get("invert"))
+    lines = [
+        f"{found_var} := 0",
+        f"__time_wait_started_{step_index} := A_TickCount",
+        "Loop",
+        "{",
+        f"    FormatTime, __time_date_{step_index},, yyyyMMdd",
+        f"    FormatTime, __time_clock_{step_index},, HHmm",
+        f"    FormatTime, __time_weekday_{step_index},, WDay",
+        f'    __time_date_ok_{step_index} := ("{start_date}" = "" or __time_date_{step_index} >= "{start_date}") and ("{end_date}" = "" or __time_date_{step_index} <= "{end_date}")',
+        f'    __time_day_ok_{step_index} := InStr("{day_token}", "|" . __time_weekday_{step_index} . "|") > 0',
+    ]
+    if start_time <= end_time:
+        lines.append(
+            f'    __time_clock_ok_{step_index} := (__time_clock_{step_index} >= "{start_time}" and __time_clock_{step_index} <= "{end_time}")'
+        )
+    else:
+        lines.append(
+            f'    __time_clock_ok_{step_index} := (__time_clock_{step_index} >= "{start_time}" or __time_clock_{step_index} <= "{end_time}")'
+        )
+    lines.extend(
+        [
+            f"    {found_var} := (__time_date_ok_{step_index} and __time_day_ok_{step_index} and __time_clock_ok_{step_index})",
+        ]
+    )
+    if invert:
+        lines.append(f"    {found_var} := !{found_var}")
+    lines.extend(
+        [
+            f"    if ({found_var})",
+            "        break",
+        ]
+    )
+    if not wait_until:
+        lines.extend(["    break", "}"])
+    else:
+        if wait_timeout:
+            lines.extend(
+                [
+                    f"    if (A_TickCount - __time_wait_started_{step_index} >= {wait_timeout})",
+                    "        break",
+                ]
+            )
+        lines.extend([f"    Sleep, {poll_delay}", "}"])
+    lines.append(
+        f'Log("date/time condition: result=" . {found_var} . " date=" . __time_date_{step_index} . " time=" . __time_clock_{step_index} . " weekday=" . __time_weekday_{step_index})'
+    )
+    return lines
+
+
 def render_step(
     step: Dict[str, Any],
     assets: Dict[str, Dict[str, Any]],
@@ -4038,8 +4141,12 @@ def render_step(
         return ["; call_submacro expanded"]
     if action == "text_condition":
         return render_text_condition(step, step_index)
-    if action == "image_search":
-        return render_image_search(step, assets, step_index)
+    if action in {"image_search", "screen_condition"}:
+        prepared = dict(step)
+        prepared["click_enabled"] = False if action == "screen_condition" else bool(step.get("click_enabled"))
+        return render_image_search(prepared, assets, step_index)
+    if action == "datetime_condition":
+        return render_datetime_condition(step, step_index)
     return [f"; unknown action {action!r}"]
 
 
@@ -4178,12 +4285,12 @@ def _expand_macro_steps(
                 has_internal_fail = int(prepared.get(child_fail_field) or 0) > 0
             except (TypeError, ValueError):
                 has_internal_fail = False
-            if action in {"image_search", "ocr", "text_condition"} and not has_internal_fail:
+            if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "text_condition"} and not has_internal_fail:
                 if fail_target:
                     prepared[child_fail_field] = fail_target
                 else:
                     prepared["_subflow_abort_on_fail"] = True
-                if action == "image_search":
+                if action in {"image_search", "screen_condition"}:
                     # Route through the shared failure block so the parent
                     # result variable and failure output are both applied.
                     prepared["abort_on_fail"] = False
@@ -4232,7 +4339,7 @@ def render_macro_script(
         lines.extend(browser_action_helpers())
         lines.append("")
     has_vision = any(
-        step.get("action") == "image_search"
+        step.get("action") in {"image_search", "screen_condition"}
         and (
             str(step.get("engine") or "ahk").lower() == "opencv"
             or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
@@ -4399,19 +4506,25 @@ def render_macro_script(
             lines.append("")
             continue
 
-        if action in {"image_search", "ocr"}:
-            found_var = f"__step_found_{count}" if action == "image_search" else "__ocr_success"
+        if action in {"image_search", "screen_condition", "ocr", "datetime_condition"}:
+            found_var = (
+                f"__step_found_{count}"
+                if action in {"image_search", "screen_condition"}
+                else f"__time_condition_success_{count}"
+                if action == "datetime_condition"
+                else "__ocr_success"
+            )
             lines.append(f"if ({found_var})")
             lines.append("{")
             lines.append(f"    __node_retry_{count} := 0")
             lines.extend("    " + line for line in render_subflow_success(step))
             lines.append(f"    MarkStepSuccess({count}, {on_success or (count + 1 if count < total_steps else 0)})")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
-            if action == "image_search":
+            if action in {"image_search", "screen_condition"}:
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; confidence=" . OpenCvBestScore . "; x=" . FoundX . "; y=" . FoundY . "; scale=" . Round(FoundScaleX, 3) . "x" . Round(FoundScaleY, 3) . "; elapsed_ms=" . VisionElapsed . "; cache=" . VisionCacheHit . "; captures=" . VisionCaptures . "; capture_reuse=" . VisionCaptureReuses)'
                 )
-            else:
+            elif action == "ocr":
                 store_var = normalize_variable_name(step.get("store_var"))
                 variable_detail = f' . "; var:{store_var}=" . {store_var}' if store_var else ""
                 lines.append(
@@ -4425,7 +4538,7 @@ def render_macro_script(
                 lines.append(f"    __rep{count} := 0")
                 if repeat_var:
                     lines.append(f"    __rep_limit{count} := \"\"")
-            if action == "image_search" and bool(step.get("repeat_on_success")):
+            if action in {"image_search", "screen_condition"} and bool(step.get("repeat_on_success")):
                 repeat_on_success_delay = max(0, int(step.get("repeat_on_success_delay", 50) or 0))
                 lines.append(f'    Log("image search success loop: step {count}")')
                 if repeat_on_success_delay:
@@ -4444,11 +4557,11 @@ def render_macro_script(
             lines.append("else")
             lines.append("{")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "FAIL")')
-            if action == "image_search":
+            if action in {"image_search", "screen_condition"}:
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; best_confidence=" . OpenCvBestScore . "; result=not_found")'
                 )
-            else:
+            elif action == "ocr":
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "text=" . OCR_LastText . "; confidence=" . OCR_LastConfidence . "; engine=" . OCR_LastEngine)'
                 )
@@ -4556,7 +4669,7 @@ def prepare_macro_for_runtime(macro: Dict[str, Any], runtime_mode: str = "auto")
                 "AutoHotkey 전용으로 내보낼 수 없는 Python 필수 단계가 있습니다: " + detail
             )
     for step in steps:
-        if not isinstance(step, dict) or step.get("action") != "image_search":
+        if not isinstance(step, dict) or step.get("action") not in {"image_search", "screen_condition"}:
             continue
         if mode == "ahk":
             if isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1:
@@ -4634,7 +4747,7 @@ def export_macro_payload(
         if tessdata.is_dir():
             shutil.copytree(tessdata, target.parent / "tessdata", dirs_exist_ok=True)
     if any(
-        step.get("action") == "image_search"
+        step.get("action") in {"image_search", "screen_condition"}
         and (
             str(step.get("engine") or "ahk").lower() == "opencv"
             or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
@@ -4673,7 +4786,7 @@ def copy_assets_for_macro(macro: Dict[str, Any], destination: Path) -> None:
     assets = read_assets()
     aliases = set()
     for step in macro.get("steps", []):
-        if step.get("action") == "image_search":
+        if step.get("action") in {"image_search", "screen_condition"}:
             alias = step.get("asset")
             if alias:
                 aliases.add(alias)

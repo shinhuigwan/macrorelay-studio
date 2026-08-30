@@ -88,7 +88,7 @@ class ProjectValidator:
                     issues.append(
                         Issue("error", "반복 변수 이름 오류", f"'{repeat_var}'", summary.name, index)
                     )
-                if action == "image_search":
+                if action in {"image_search", "screen_condition"}:
                     aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
                     primary = str(step.get("asset") or "")
                     if primary and primary not in aliases:
@@ -149,7 +149,7 @@ class ProjectValidator:
                         issues.append(Issue("error", "서브플로우 파일 누락", f"'{target_macro}' 매크로를 찾을 수 없습니다.", summary.name, index))
                     elif target_macro == summary.name:
                         issues.append(Issue("error", "서브플로우 순환 호출", "매크로가 자기 자신을 호출할 수 없습니다.", summary.name, index))
-                if action == "image_search" and bool(step.get("repeat_on_success")):
+                if action in {"image_search", "screen_condition"} and bool(step.get("repeat_on_success")):
                     issues.append(
                         Issue(
                             "warning",

@@ -29,6 +29,8 @@ ALLOWED_ACTIONS = {
     "mouse_click",
     "inactive_click",
     "image_search",
+    "screen_condition",
+    "datetime_condition",
     "type_text",
     "wait",
     "browser_action",
@@ -304,7 +306,7 @@ def load_ai_recording(path: Path) -> list[dict[str, Any]]:
     }
     events: list[dict[str, Any]] = []
     for item in records:
-        if item.get("type") not in {"mouse", "key", "mouse_drag"}:
+        if item.get("type") not in {"mouse", "screen_condition", "key", "mouse_drag"}:
             continue
         prepared = dict(item)
         if prepared.get("type") == "mouse" and str(prepared.get("event_id") or "") in drag_sources:
@@ -382,6 +384,7 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 9. 아이디·비밀번호·API 키를 평문으로 넣지 마십시오. 녹화에 실제 민감 입력 동작이 있을 때만 `vault_get`과 보안 보관함 이름을 사용하십시오.
 10. 임의 Python, AutoHotkey, PowerShell, 셸 코드를 생성하지 마십시오. 허용 액션만 사용하십시오.
 11. 마지막 답변에는 설명과 JSON을 분리하고, JSON은 하나의 완전한 코드 블록으로 출력하십시오.
+12. timeline의 `screen_condition_marker`는 사용자가 녹화 중 우클릭으로 명시한 중간 화면 조건입니다. 반드시 같은 asset_ref를 사용하는 `screen_condition` 노드로 만드십시오. 이 노드 다음의 일반 동작은 성공선에 연결하고, 실패선은 다음 `screen_condition_marker` 또는 안전한 종료로 연결하십시오. 우클릭 자체를 mouse_click으로 만들지 마십시오.
 
 스키마 버전은 `{AI_SCHEMA_VERSION}`입니다. 최상위 필수 키는 `schema_version`, `source_package_id`, `name`, `description`, `targets`, `assets`, `variables`, `triggers`, `steps`, `setup_requirements`입니다.
 
@@ -399,7 +402,7 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 허용 액션:
 {', '.join(sorted(ALLOWED_ACTIONS))}
 
-이미지 클릭은 기본적으로 `image_search`, `click.mode=inactive`, `click.method=auto`를 사용하십시오. 검색 범위는 대상 프로그램의 클라이언트 상대 좌표를 우선 사용하며 클릭 오프셋은 선택된 PNG 후보의 값을 그대로 사용하십시오.
+이미지 클릭은 기본적으로 `image_search`, `click.mode=inactive`, `click.method=auto`를 사용하십시오. 화면 조건은 `screen_condition`을 사용하고 클릭을 수행하지 마십시오. 검색 범위는 대상 프로그램의 클라이언트 상대 좌표를 우선 사용하며 클릭 오프셋은 선택된 PNG 후보의 값을 그대로 사용하십시오.
 """
 
 
@@ -611,6 +614,39 @@ class AIRecordingPackageBuilder:
                     }
                 )
                 previous_time = current_time
+                continue
+            if event_type == "screen_condition":
+                click_number += 1
+                asset = self._write_click_images(stage, event, click_number, target_id, sensitive_regions)
+                if asset:
+                    button_candidate = next(
+                        (item for item in asset.get("candidates") or [] if item.get("kind") == "button"),
+                        None,
+                    )
+                    if isinstance(button_candidate, dict):
+                        asset["selected_candidate"] = button_candidate.get("file")
+                    asset["label"] = f"화면 조건 {click_number}"
+                    asset["purpose"] = "screen_condition"
+                    asset["click_purpose"] = "우클릭으로 지정한 화면 조건"
+                    asset["readiness"] = "ready"
+                    asset["needs_setup"] = []
+                    asset.setdefault("validation", {})["image_ready"] = True
+                    asset["validation"]["search_verified"] = True
+                    assets.append(asset)
+                    preview = QtGui.QImage(str(stage / str(asset["selected_candidate"])))
+                    contact_rows.append((f"조건-{click_number:03d}", preview, "우클릭 화면 조건"))
+                    timeline.append({
+                        "id": f"condition-{click_number:03d}",
+                        "t": current_time,
+                        "delay_from_previous_ms": max(0, current_time - previous_time),
+                        "type": "screen_condition_marker",
+                        "asset_ref": asset["id"],
+                        "target_ref": target_id,
+                        "screen": [int(event.get("x") or 0), int(event.get("y") or 0)],
+                        "client": [int(event.get("client_x") or 0), int(event.get("client_y") or 0)],
+                        "branch_rule": "success_runs_following_actions; failure_skips_to_next_screen_condition",
+                    })
+                    previous_time = current_time
                 continue
             if event_type != "mouse":
                 continue
@@ -1050,7 +1086,7 @@ def validate_ai_document(payload: Any) -> list[AIImportIssue]:
         asset_ref = str(step.get("asset_ref") or "")
         if asset_ref and asset_ref not in asset_lookup:
             issues.append(AIImportIssue("error", "unknown_asset", f"이미지 `{asset_ref}`를 찾을 수 없습니다.", step_id))
-        if action == "image_search" and not asset_ref:
+        if action in {"image_search", "screen_condition"} and not asset_ref:
             issues.append(AIImportIssue("warning", "missing_asset", "이미지 서치 자산을 설정해야 합니다.", step_id))
         for edge in ("on_success", "on_fail"):
             target = str(step.get(edge) or "")
@@ -1070,7 +1106,7 @@ def validate_ai_document(payload: Any) -> list[AIImportIssue]:
                 issues.append(AIImportIssue("error", "plaintext_secret", "민감 입력값은 평문 대신 vault_get 보안 보관함 참조를 사용해야 합니다.", step_id))
             elif action == "type_text" and value and value != "[REDACTED]" and classification not in {"public", "non_sensitive"}:
                 issues.append(AIImportIssue("warning", "classify_text", "입력 텍스트가 민감정보인지 가져온 뒤 확인해야 합니다.", step_id))
-        if action == "image_search":
+        if action in {"image_search", "screen_condition"}:
             click = params.get("click") if isinstance(params.get("click"), dict) else step.get("click") if isinstance(step.get("click"), dict) else {}
             mode = str(click.get("mode") or "inactive").casefold()
             if mode not in {"active", "inactive", "none"}:
@@ -1202,7 +1238,7 @@ def materialize_ai_document(
         target = target_lookup.get(target_ref, {})
         window_token = str(target.get("window_token") or "")
         exe = str(target.get("exe") or "")
-        if action == "image_search":
+        if action in {"image_search", "screen_condition"}:
             asset_ref = str(raw.get("asset_ref") or "")
             alias = asset_aliases.get(asset_ref, "")
             asset_state = asset_states.get(asset_ref, {})
@@ -1238,7 +1274,9 @@ def materialize_ai_document(
                     "offset": [int(offset[0]), int(offset[1])],
                 })
             step["click"] = click
-            step["click_enabled"] = True
+            step["click_enabled"] = action == "image_search"
+            if action == "screen_condition":
+                step.setdefault("label", f"화면 조건 · {alias or '이미지 확인'}")
             if not alias:
                 step.setdefault("needs_setup", []).append("select_asset")
             elif str(asset_state.get("readiness") or "") not in {"ready", "verified"} or not bool(
@@ -1394,12 +1432,12 @@ def ai_draft_readiness(macro: dict[str, Any]) -> tuple[int, int, list[str]]:
         "시작 화면",
         all(str(trigger.get("asset") or "") and not trigger.get("needs_setup") for trigger in automatic_triggers),
     ))
-    target_actions = {"mouse_click", "inactive_click", "image_search", "type_text", "browser_action", "ocr", "run_program", "terminate_program"}
+    target_actions = {"mouse_click", "inactive_click", "image_search", "screen_condition", "type_text", "browser_action", "ocr", "run_program", "terminate_program"}
     needs_target = any(isinstance(step, dict) and step.get("action") in target_actions for step in steps)
     checks.append(("대상 프로그램", (not needs_target) or (bool(targets) and all(str(item.get("exe") or item.get("window_token") or "") for item in targets if isinstance(item, dict)))))
-    image_steps = [step for step in steps if isinstance(step, dict) and step.get("action") == "image_search"]
+    image_steps = [step for step in steps if isinstance(step, dict) and step.get("action") in {"image_search", "screen_condition"}]
     checks.append(("이미지 자산", all(str(step.get("asset") or "") for step in image_steps)))
-    inactive_steps = [step for step in steps if isinstance(step, dict) and step.get("action") in {"image_search", "inactive_click", "type_text"}]
+    inactive_steps = [step for step in steps if isinstance(step, dict) and step.get("action") in {"image_search", "screen_condition", "inactive_click", "type_text"}]
     checks.append(("비활성 클릭", all("verify_inactive_click" not in (step.get("needs_setup") or []) for step in inactive_steps)))
     ocr_steps = [step for step in steps if isinstance(step, dict) and step.get("action") == "ocr"]
     checks.append(("OCR 영역", all(not step.get("needs_setup") for step in ocr_steps)))

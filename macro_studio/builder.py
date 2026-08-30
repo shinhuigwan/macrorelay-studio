@@ -888,7 +888,7 @@ class BuilderPage(QtWidgets.QWidget):
         if not 0 <= row < len(steps):
             return
         step = steps[row]
-        if str(step.get("action") or "") != "image_search":
+        if str(step.get("action") or "") not in {"image_search", "screen_condition"}:
             return
         aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
         primary = str(step.get("asset") or "").strip()
@@ -1033,7 +1033,7 @@ class BuilderPage(QtWidgets.QWidget):
     def _update_action_summary(self, step: dict[str, Any]) -> None:
         action = str(step.get("action") or "wait")
         details: list[str] = []
-        if action == "image_search":
+        if action in {"image_search", "screen_condition"}:
             region_mode = str(step.get("region_mode") or "screen").lower()
             region_label = {"screen": "화면", "window": "창", "client": "클라이언트"}.get(region_mode, region_mode)
             region_count = len(step.get("regions") or [])
@@ -1290,9 +1290,11 @@ class BuilderPage(QtWidgets.QWidget):
     @staticmethod
     def _step_summary(step: dict[str, Any]) -> str:
         action = step.get("action")
-        if action == "image_search":
+        if action in {"image_search", "screen_condition"}:
             assets = step.get("assets") if isinstance(step.get("assets"), list) else []
             return f"멀티 이미지 서치 · {len(assets)}개" if len(assets) > 1 else str(step.get("asset") or "이미지 선택 필요")
+        if action == "datetime_condition":
+            return f"{step.get('time_start') or '00:00'}~{step.get('time_end') or '23:59'} · 날짜·시간 조건"
         if action == "type_text":
             text = str(step.get("text") or "")
             return text[:30] or "텍스트 입력"
@@ -2888,7 +2890,7 @@ class BuilderPage(QtWidgets.QWidget):
             if not isinstance(step, dict):
                 continue
             action = str(step.get("action") or "")
-            if action == "image_search" and str(step.get("engine") or "ahk").lower() == "opencv":
+            if action in {"image_search", "screen_condition"} and str(step.get("engine") or "ahk").lower() == "opencv":
                 try:
                     self.repository._ensure_opencv_runtime()
                 except Exception as exc:
@@ -2905,7 +2907,7 @@ class BuilderPage(QtWidgets.QWidget):
                 target_title, target_exe = str(step.get("window") or ""), str(step.get("window_exe") or "")
             elif action == "inactive_click":
                 target_title, target_exe = str(step.get("window") or ""), str(step.get("window_exe") or "")
-            elif action == "image_search" and str(step.get("region_mode") or "screen") in {"window", "client"}:
+            elif action in {"image_search", "screen_condition"} and str(step.get("region_mode") or "screen") in {"window", "client"}:
                 target_title, target_exe = str(step.get("region_window") or ""), str(step.get("region_window_exe") or "")
             elif action == "ocr" and str(step.get("capture_mode") or "screen") in {"window", "client"}:
                 target_title = str(step.get("window_title") or "")

@@ -30,13 +30,23 @@ LOG_FILE = RUNTIME / "vision_engine.log"
 PORT = 9235
 
 python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
-for candidate in (
+_runtime_candidates = (
     ROOT / "runtime" / "opencv" / python_tag / "packages",
     ROOT / "runtime_packages" / python_tag,
     ROOT / "runtime_packages",
-):
-    if candidate.is_dir() and str(candidate) not in sys.path:
-        sys.path.insert(0, str(candidate))
+)
+# Rebuild the candidate portion of ``sys.path`` instead of merely inserting
+# missing paths.  The selected managed package directory is commonly already
+# present through PYTHONPATH; skipping it while inserting the legacy fallback
+# would put that fallback first and mix cp311 NumPy with a cp312 interpreter.
+_runtime_paths = [str(candidate.resolve()) for candidate in _runtime_candidates if candidate.is_dir()]
+_runtime_keys = {os.path.normcase(os.path.normpath(path)) for path in _runtime_paths}
+sys.path[:] = [
+    path
+    for path in sys.path
+    if os.path.normcase(os.path.normpath(path or os.curdir)) not in _runtime_keys
+]
+sys.path[:0] = _runtime_paths
 
 import opencv_search as search  # noqa: E402
 
@@ -589,6 +599,9 @@ class VisionState:
             "frame_cache_count": len(self.frame_cache),
             "capture_count": self.capture_count,
             "capture_reuse_count": self.capture_reuse_count,
+            "python_executable": str(Path(sys.executable).resolve()),
+            "python_abi": python_tag,
+            "package_root": str(next((path for path in sys.path if "runtime\\opencv" in path.casefold()), "")),
         }
 
     def close(self) -> None:

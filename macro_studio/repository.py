@@ -191,7 +191,7 @@ class MacroRepository:
     def _upgrade_smart_image_steps(payload: dict[str, Any]) -> None:
         """Repair settings produced by early smart-recording test builds."""
         for step in payload.get("steps") or []:
-            if not isinstance(step, dict) or step.get("action") != "image_search":
+            if not isinstance(step, dict) or step.get("action") not in {"image_search", "screen_condition"}:
                 continue
             alias = str(step.get("asset") or "")
             if not alias.startswith("자동녹화-"):
@@ -1229,7 +1229,7 @@ internal static class Program
     def _portable_requirements(steps: list[dict[str, Any]]) -> dict[str, Any]:
         actions = {str(step.get("action") or "") for step in steps if isinstance(step, dict)}
         opencv = any(
-            step.get("action") == "image_search" and str(step.get("engine") or "ahk").casefold() == "opencv"
+            step.get("action") in {"image_search", "screen_condition"} and str(step.get("engine") or "ahk").casefold() == "opencv"
             for step in steps
             if isinstance(step, dict)
         )
@@ -1576,7 +1576,7 @@ internal static class Program
         payload = deepcopy(self.load_macro(name))
         self._assert_real_run_ready(payload)
         if any(
-            step.get("action") == "image_search" and str(step.get("engine") or "ahk").lower() == "opencv"
+            step.get("action") in {"image_search", "screen_condition"} and str(step.get("engine") or "ahk").lower() == "opencv"
             for step in payload.get("steps", [])
         ):
             self._ensure_opencv_runtime()
@@ -1649,7 +1649,7 @@ internal static class Program
     ) -> subprocess.Popen[Any]:
         environment = os.environ.copy()
         has_opencv = any(
-            step.get("action") == "image_search" and str(step.get("engine") or "ahk").lower() == "opencv"
+            step.get("action") in {"image_search", "screen_condition"} and str(step.get("engine") or "ahk").lower() == "opencv"
             for step in payload.get("steps", [])
         )
         has_ocr = any(step.get("action") == "ocr" for step in payload.get("steps", []))
@@ -1724,7 +1724,7 @@ internal static class Program
     def _preload_vision_templates(self, payload: dict[str, Any], python: Path, packages: Path) -> None:
         aliases: list[str] = []
         for step in payload.get("steps") or []:
-            if not isinstance(step, dict) or step.get("action") != "image_search":
+            if not isinstance(step, dict) or step.get("action") not in {"image_search", "screen_condition"}:
                 continue
             values = step.get("assets") if isinstance(step.get("assets"), list) else []
             values = [step.get("asset"), *values]
@@ -1735,6 +1735,17 @@ internal static class Program
         try:
             status = self._vision_request({"cmd": "status"}, timeout=0.25)
         except (OSError, ValueError, json.JSONDecodeError):
+            status = {}
+        expected_python = str(python.resolve()).casefold()
+        running_python = str(status.get("python_executable") or "").casefold()
+        running_packages = str(status.get("package_root") or "").casefold()
+        expected_package_root = str(packages.resolve()).casefold()
+        if status.get("ok") and (running_python != expected_python or running_packages != expected_package_root):
+            try:
+                self._vision_request({"cmd": "shutdown"}, timeout=0.3)
+                time.sleep(0.12)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
             status = {}
         if not status.get("ok"):
             script = self.root / "vision_engine.py"

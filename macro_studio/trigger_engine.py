@@ -70,14 +70,37 @@ class EventTriggerEngine:
         return parsed if isinstance(parsed, dict) else {}
 
     def _start_engine(self, script_name: str, port: int, ocr: bool = False) -> bool:
+        expected_python: Path | None = None
+        expected_packages: Path | None = None
+        if not ocr:
+            try:
+                expected_python, expected_packages = self.repository._ensure_opencv_runtime()
+            except Exception:
+                return False
         try:
-            if self._request(port, {"cmd": "status"}, 0.2).get("ok"):
-                return True
+            status = self._request(port, {"cmd": "status"}, 0.2)
+            if status.get("ok"):
+                running_python = str(status.get("python_executable") or "")
+                running_packages = str(status.get("package_root") or "")
+                if ocr or (
+                    expected_python is not None
+                    and expected_packages is not None
+                    and Path(running_python).resolve() == expected_python.resolve()
+                    and Path(running_packages).resolve() == expected_packages.resolve()
+                ):
+                    return True
+                self._request(port, {"cmd": "shutdown"}, 0.3)
+                time.sleep(0.12)
         except Exception:
             pass
         try:
-            python, packages = self.repository._ensure_ocr_runtime() if ocr else self.repository._ensure_opencv_runtime()
+            if ocr:
+                python, packages = self.repository._ensure_ocr_runtime()
+            else:
+                python, packages = expected_python, expected_packages
         except Exception:
+            return False
+        if python is None or packages is None:
             return False
         script = self.repository.root / script_name
         if not script.is_file():

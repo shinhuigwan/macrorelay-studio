@@ -912,6 +912,49 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("__step_found_3 := 0", missing_asset)
         self.assertIn("missing asset", missing_asset)
 
+    def test_datetime_condition_branches_by_local_date_time_and_weekday(self) -> None:
+        macro = {
+            "steps": [
+                {
+                    "action": "datetime_condition",
+                    "date_start": "2026-08-01",
+                    "date_end": "2026-08-31",
+                    "time_start": "09:00",
+                    "time_end": "18:00",
+                    "day_mode": "weekdays",
+                    "on_success": 2,
+                    "on_fail": 3,
+                },
+                {"action": "wait", "duration": 1},
+                {"action": "wait", "duration": 1},
+            ]
+        }
+        script = self.engine.render_macro_script(macro, {})
+        self.assertIn("FormatTime, __time_date_1,, yyyyMMdd", script)
+        self.assertIn('InStr("|2|3|4|5|6|"', script)
+        self.assertIn("if (__time_condition_success_1)", script)
+        self.assertIn("Goto, Step2", script)
+        self.assertIn("Goto, Step3", script)
+
+    def test_screen_condition_searches_without_click_and_auto_expands_tiny_region(self) -> None:
+        macro = {
+            "steps": [
+                {
+                    "action": "screen_condition",
+                    "asset": "login",
+                    "engine": "opencv",
+                    "region_mode": "client",
+                    "region_coords": "relative",
+                    "region": [0, 0, 13, 23],
+                }
+            ]
+        }
+        script = self.engine.render_macro_script(macro, {"login": {"file": "login.png"}})
+        self.assertIn("VisionEnginePort := 9235", script)
+        self.assertIn("image search region auto-expanded", script)
+        self.assertIn("if (__step_found_1)", script)
+        self.assertNotIn("Click, %ClickX%", script)
+
     def test_opencv_macro_uses_persistent_vision_engine_with_cli_fallback(self) -> None:
         macro = {
             "name": "persistent-vision",
@@ -4696,6 +4739,43 @@ class AIAutomationTests(unittest.TestCase):
             targets = json.loads((stage / "targets.json").read_text(encoding="utf-8"))
             self.assertTrue(targets[0]["reacquire_each_run"])
             self.assertEqual("browser.exe", targets[0]["exe"])
+
+    def test_ai_right_click_becomes_screen_condition_marker_not_click(self) -> None:
+        from macro_studio.ai_automation import AIRecordingPackageBuilder
+
+        sample = self._sample_bmp()
+        window = {
+            "exe": "whale.exe",
+            "title": "NAVER 로그인",
+            "class": "Chrome_WidgetWin_1",
+            "client_origin": [100, 50],
+            "client_size": [1200, 800],
+        }
+        events = [{
+            "type": "screen_condition",
+            "t": 100,
+            "button": "Right",
+            "x": 420,
+            "y": 260,
+            "client_x": 320,
+            "client_y": 210,
+            "event_id": "condition-raw-1",
+            "image_sample_bmp": sample,
+            "image_anchor": [180, 120],
+            "window": window,
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            _archive, stage = AIRecordingPackageBuilder(Path(directory)).build(
+                events, package_id="ai-screen-condition"
+            )
+            timeline = json.loads((stage / "timeline.json").read_text(encoding="utf-8"))
+            assets = json.loads((stage / "asset-manifest.json").read_text(encoding="utf-8"))["assets"]
+            prompt = (stage / "prompt.txt").read_text(encoding="utf-8")
+            self.assertEqual("screen_condition_marker", timeline[0]["type"])
+            self.assertNotEqual("click", timeline[0]["type"])
+            self.assertEqual("screen_condition", assets[0]["purpose"])
+            self.assertIn("button.png", assets[0]["selected_candidate"])
+            self.assertIn("우클릭 자체를 mouse_click으로 만들지", prompt)
 
     def test_ai_execution_condition_exposes_cutout_editor_after_capture(self) -> None:
         from PySide6 import QtGui, QtWidgets

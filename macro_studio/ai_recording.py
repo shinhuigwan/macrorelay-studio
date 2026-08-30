@@ -278,6 +278,7 @@ class AIRecordingController(SmartRecordingController):
                 "960",
                 "--sample-height",
                 "540",
+                "--right-click-condition",
             ]
         )
         self.process.setWorkingDirectory(str(self.repository.root))
@@ -286,11 +287,11 @@ class AIRecordingController(SmartRecordingController):
         self.process.errorOccurred.connect(self._process_error)
         self.bar = RecordingBar(self.host)
         self.bar.setWindowTitle("AI 자동 매크로 제작 녹화")
-        self.bar.label.setText("2초 후 자동 녹화 · 평소처럼 작업 · F8 중요 화면 · F10 종료")
+        self.bar.label.setText("2초 후 자동 녹화 · 좌클릭=동작 · 우클릭=화면 조건 · F8 중요 화면 · F10 종료")
         self.bar.mode_badge.setText("AI 자동")
         self.bar.set_gate_active(True)
         self.bar.timer.stop()
-        self.bar.label.setText("2초 후 자동 녹화 · 평소처럼 작업 · F8 중요 화면 · F10 종료")
+        self.bar.label.setText("2초 후 자동 녹화 · 좌클릭=동작 · 우클릭=화면 조건 · F8 중요 화면 · F10 종료")
         self.bar.stop_requested.connect(self.stop)
         self.bar.capture_requested.connect(self.request_image_capture)
         self.bar.show()
@@ -366,7 +367,7 @@ class AIRecordingController(SmartRecordingController):
                 item = json.loads(line)
             except (TypeError, ValueError):
                 continue
-            if isinstance(item, dict) and item.get("type") in {"mouse", "key", "mouse_drag", "capture_request"}:
+            if isinstance(item, dict) and item.get("type") in {"mouse", "screen_condition", "key", "mouse_drag", "capture_request"}:
                 latest = max(latest, int(item.get("t") or 0))
         return latest
 

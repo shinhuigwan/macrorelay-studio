@@ -356,6 +356,7 @@ class Recorder:
         redact_text: bool = False,
         sample_width: int = 360,
         sample_height: int = 240,
+        right_click_condition: bool = False,
     ) -> None:
         self.output = output
         self.exclude_pid = exclude_pid
@@ -367,6 +368,7 @@ class Recorder:
         self.redact_text = bool(redact_text)
         self.sample_width = max(160, min(1920, int(sample_width)))
         self.sample_height = max(120, min(1080, int(sample_height)))
+        self.right_click_condition = bool(right_click_condition)
         self.record_mode = "action"
         self._mode_key_down = False
         self._shift_down = False
@@ -462,6 +464,9 @@ class Recorder:
             if not self.gate_down:
                 return int(user32.CallNextHookEx(self.mouse_hook, code, message, data_ptr))
             data = ctypes.cast(data_ptr, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            if self.right_click_condition and message == WM_RBUTTONUP:
+                self._down_points.pop("Right", None)
+                return 1
             up_button = {
                 WM_LBUTTONUP: "Left",
                 WM_RBUTTONUP: "Right",
@@ -510,7 +515,7 @@ class Recorder:
                 self._down_points[button] = (int(data.pt.x), int(data.pt.y), event_id)
             self.emit(
                 {
-                    "type": "mouse",
+                    "type": "screen_condition" if self.right_click_condition and message == WM_RBUTTONDOWN else "mouse",
                     "event_id": event_id,
                     "button": button,
                     "wheel_delta": int(wheel_delta),
@@ -524,6 +529,12 @@ class Recorder:
                     "image_anchor": [sample_width // 2, sample_height // 2],
                 }
             )
+            if self.right_click_condition and message == WM_RBUTTONDOWN:
+                # The right click is a semantic marker for AI recording. Do
+                # not open the target application's context menu or record it
+                # as an actual click action.
+                self._down_points.pop("Right", None)
+                return 1
             if message != WM_MOUSEWHEEL:
                 self._after_queue.put((event_id, int(data.pt.x), int(data.pt.y)))
         return int(user32.CallNextHookEx(self.mouse_hook, code, message, data_ptr))
@@ -642,6 +653,7 @@ def main() -> int:
     parser.add_argument("--redact-text", action="store_true")
     parser.add_argument("--sample-width", type=int, default=360)
     parser.add_argument("--sample-height", type=int, default=240)
+    parser.add_argument("--right-click-condition", action="store_true")
     args = parser.parse_args()
     return Recorder(
         args.out.resolve(),
@@ -654,6 +666,7 @@ def main() -> int:
         redact_text=args.redact_text,
         sample_width=args.sample_width,
         sample_height=args.sample_height,
+        right_click_condition=args.right_click_condition,
     ).run()
 
 

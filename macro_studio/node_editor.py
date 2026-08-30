@@ -14,6 +14,8 @@ ACTION_STYLES: dict[str, tuple[str, str]] = {
     "mouse_click": ("CLICK", "#7C6CFF"),
     "inactive_click": ("CLICK", "#7C6CFF"),
     "image_search": ("VISION", "#4D9FFF"),
+    "screen_condition": ("IF", "#A879FF"),
+    "datetime_condition": ("TIME", "#F5B942"),
     "ocr": ("OCR", "#4D9FFF"),
     "type_text": ("TEXT", "#C47CFF"),
     "wait": ("WAIT", "#F5B942"),
@@ -36,6 +38,7 @@ ACTION_STYLES: dict[str, tuple[str, str]] = {
 
 ACTION_TITLES = {
     "mouse_click": "마우스 클릭", "inactive_click": "비활성 클릭", "image_search": "이미지 서치",
+    "screen_condition": "화면 조건", "datetime_condition": "날짜·시간 조건",
     "ocr": "OCR 인식", "type_text": "텍스트 입력", "wait": "대기", "browser_action": "브라우저 요소",
     "table_store": "테이블 저장", "table_copy": "테이블 복사", "table_paste": "테이블 붙여넣기",
     "table_excel_read": "Excel 읽기", "table_excel_write": "Excel 쓰기", "flow_control": "반복 이동",
@@ -390,7 +393,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.success_port.setPos(self.WIDTH, 72)
         self.fail_port.setPos(self.WIDTH, 101)
         self.preview_badge: NodeImagePreviewBadge | None = None
-        if str(step.get("action") or "") == "image_search":
+        if str(step.get("action") or "") in {"image_search", "screen_condition"}:
             aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
             primary = str(step.get("asset") or "").strip()
             if primary and primary not in aliases:
@@ -407,8 +410,9 @@ class NodeItem(QtWidgets.QGraphicsObject):
             badge.setCursor(QtCore.Qt.PointingHandCursor)
             if entries:
                 names = ", ".join(html.escape(alias) for alias, _path in entries)
+                preview_title = "화면 조건" if str(step.get("action") or "") == "screen_condition" else ("멀티 이미지 서치" if len(entries) > 1 else "이미지 서치")
                 badge.setToolTip(
-                    f"<b>{'멀티 이미지 서치' if len(entries) > 1 else '이미지 서치'}</b><br>"
+                    f"<b>{preview_title}</b><br>"
                     f"{names}<br>커서를 올리면 {'전체 이미지' if len(entries) > 1 else '원본'} 미리보기 · 클릭하면 상세 편집"
                 )
             else:
@@ -509,7 +513,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
             detail = f"반복 ${repeat_var}회  ·  " + detail
         elif int(self.step.get("repeat") or 1) > 1:
             detail = f"반복 {int(self.step.get('repeat') or 1)}회  ·  " + detail
-        if action == "image_search" and bool(self.step.get("repeat_on_success")):
+        if action in {"image_search", "screen_condition"} and bool(self.step.get("repeat_on_success")):
             detail = "탐지 중 재검색 · 미탐지 시 실패  ·  " + detail
         if success_delay:
             detail += f"  ·  연결 {success_delay}ms"
@@ -529,9 +533,11 @@ class NodeItem(QtWidgets.QGraphicsObject):
         port_font.setPointSizeF(7.5 * font_boost)
         painter.setFont(port_font)
         painter.setPen(QtGui.QColor(COLORS["success"]))
-        painter.drawText(QtCore.QRectF(226, 62, 28, 18), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, "OK")
+        success_text = "보임" if action == "screen_condition" else "충족" if action == "datetime_condition" else "OK"
+        fail_text = "없음" if action == "screen_condition" else "불충족" if action == "datetime_condition" else "ERR"
+        painter.drawText(QtCore.QRectF(202, 62, 52, 18), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, success_text)
         painter.setPen(QtGui.QColor(COLORS["danger"]))
-        painter.drawText(QtCore.QRectF(226, 91, 28, 18), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, "ERR")
+        painter.drawText(QtCore.QRectF(202, 91, 52, 18), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, fail_text)
 
         if self.index == self.canvas.start_step:
             painter.setPen(QtGui.QPen(QtGui.QColor(COLORS["success"]), 2))
@@ -690,6 +696,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self.manual_points = self.canvas.route_points(self)
         self._waypoint_handles: list[EdgeWaypointHandle] = []
         self._handle_dragging = False
+        self._disposed = False
         self.update_path()
 
     def paint(
@@ -710,9 +717,17 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
 
     def itemChange(self, change: QtWidgets.QGraphicsItem.GraphicsItemChange, value: Any) -> Any:
         result = super().itemChange(change, value)
-        if change == QtWidgets.QGraphicsItem.ItemSelectedHasChanged:
+        if change == QtWidgets.QGraphicsItem.ItemSelectedHasChanged and not self._disposed:
             QtCore.QTimer.singleShot(0, self._sync_waypoint_handles)
         return result
+
+    def dispose(self) -> None:
+        """Invalidate queued Qt callbacks before the C++ graphics item dies."""
+        if self._disposed:
+            return
+        self._disposed = True
+        self._handle_dragging = False
+        self._clear_waypoint_handles()
 
     def _clear_waypoint_handles(self) -> None:
         for handle in self._waypoint_handles:
@@ -727,9 +742,16 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self._waypoint_handles = []
 
     def _sync_waypoint_handles(self) -> None:
-        if self._handle_dragging:
+        if self._disposed or self._handle_dragging:
             return
-        if not self.isSelected() or self.scene() is None:
+        try:
+            selected = self.isSelected()
+            scene = self.scene()
+        except RuntimeError:
+            self._disposed = True
+            self._waypoint_handles = []
+            return
+        if not selected or scene is None:
             self._clear_waypoint_handles()
             return
         points = self.manual_points or [self.path().pointAtPercent(0.5)]
@@ -779,6 +801,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         return stroker.createStroke(self.path())
 
     def update_path(self) -> None:
+        if self._disposed:
+            return
         source_node = self.canvas.nodes.get(self.source)
         target_node = self.canvas.nodes.get(self.target)
         if not source_node or not target_node:
@@ -1038,9 +1062,12 @@ class NodeCanvas(QtWidgets.QWidget):
         label = str(step.get("label") or "").strip()
         if label:
             return label
-        if action == "image_search":
+        if action in {"image_search", "screen_condition"}:
             assets = step.get("assets") if isinstance(step.get("assets"), list) else []
             return f"멀티 이미지 {len(assets)}개" if len(assets) > 1 else str(step.get("asset") or "이미지 선택 필요")
+        if action == "datetime_condition":
+            day_labels = {"everyday": "매일", "weekdays": "평일", "weekend": "주말", "custom": str(step.get("custom_days") or "요일 지정")}
+            return f"{day_labels.get(str(step.get('day_mode') or 'everyday'), '매일')} · {step.get('time_start') or '00:00'}~{step.get('time_end') or '23:59'}"
         if action == "ocr":
             ocr_action = str(step.get("ocr_action") or "extract")
             if ocr_action in {"find_text", "find_click", "find_click_offset"}:
@@ -1074,6 +1101,8 @@ class NodeCanvas(QtWidgets.QWidget):
         self.hide_image_preview()
         self.active_step = 0
         self.execution_states = {}
+        for edge in self.edges:
+            edge.dispose()
         self.scene.clear()
         self.macro = macro or {}
         self.steps = list(self.macro.get("steps") or [])
@@ -1317,8 +1346,12 @@ class NodeCanvas(QtWidgets.QWidget):
 
     def rebuild_edges(self) -> None:
         for edge in self.edges:
-            if edge.scene() is self.scene:
-                self.scene.removeItem(edge)
+            edge.dispose()
+            try:
+                if edge.scene() is self.scene:
+                    self.scene.removeItem(edge)
+            except RuntimeError:
+                pass
         self.edges = []
         for index, step in enumerate(self.steps, start=1):
             for field, kind in (("on_success", "success"), ("on_fail", "fail")):
@@ -1428,8 +1461,12 @@ class NodeCanvas(QtWidgets.QWidget):
     def remove_edge(self, source: int, target: int, kind: str, condition_index: int = -1) -> None:
         for edge in list(self.edges):
             if edge.source == source and edge.target == target and edge.kind == kind and edge.condition_index == condition_index:
-                if edge.scene() is self.scene:
-                    self.scene.removeItem(edge)
+                edge.dispose()
+                try:
+                    if edge.scene() is self.scene:
+                        self.scene.removeItem(edge)
+                except RuntimeError:
+                    pass
                 self.edges.remove(edge)
                 break
         self.scene.update()

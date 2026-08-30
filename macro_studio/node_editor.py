@@ -271,10 +271,17 @@ class ImagePreviewPopup(QtWidgets.QFrame):
 
 
 class NodeImagePreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
-    def __init__(self, canvas: "NodeCanvas", entries: list[tuple[str, Path]], parent=None) -> None:
+    def __init__(
+        self,
+        canvas: "NodeCanvas",
+        entries: list[tuple[str, Path]],
+        step_index: int | None = None,
+        parent=None,
+    ) -> None:
         super().__init__("▦" if len(entries) > 1 else "▧", parent)
         self.canvas = canvas
         self.entries = entries
+        self.step_index = step_index
         self.setAcceptHoverEvents(True)
 
     def hoverEnterEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
@@ -285,6 +292,74 @@ class NodeImagePreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
     def hoverLeaveEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
         self.canvas.hide_image_preview()
         super().hoverLeaveEvent(event)
+
+    def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton and self.step_index is not None and self.entries:
+            self.canvas.hide_image_preview()
+            self.canvas.image_edit_requested.emit(self.step_index)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class TriggerNodeItem(QtWidgets.QGraphicsObject):
+    """Visual-only card for a macro-level image trigger.
+
+    Triggers are not executable steps, so keeping them outside ``nodes`` prevents
+    graph editing and runtime highlighting from accidentally treating them as one.
+    """
+
+    WIDTH = 270.0
+    HEIGHT = 104.0
+
+    def __init__(self, trigger: dict[str, Any], canvas: "NodeCanvas") -> None:
+        super().__init__()
+        self.trigger = trigger
+        self.canvas = canvas
+        self.display_title = "화면 트리거"
+        self.setZValue(2)
+        self.setToolTip("이 이미지가 화면에 나타나면 매크로 실행을 시작합니다. 실행 단계가 아닌 시작 조건입니다.")
+        alias = str(trigger.get("asset") or trigger.get("name") or "시작 이미지 선택 필요").strip()
+        path = canvas.asset_preview_path(alias)
+        self.preview_badge: NodeImagePreviewBadge | None = None
+        if path is not None:
+            badge = NodeImagePreviewBadge(canvas, [(alias, path)], None, self)
+            font = QtGui.QFont("Segoe UI Symbol", 12)
+            font.setBold(True)
+            badge.setFont(font)
+            badge.setBrush(QtGui.QColor("#C49BFF"))
+            badge.setPos(243, 7)
+            badge.setZValue(8)
+            badge.setCursor(QtCore.Qt.PointingHandCursor)
+            badge.setToolTip(f"<b>화면 트리거</b><br>{html.escape(alias)}<br>커서를 올리면 시작 조건 이미지를 확인합니다.")
+            self.preview_badge = badge
+
+    def boundingRect(self) -> QtCore.QRectF:
+        return QtCore.QRectF(-3, -3, self.WIDTH + 6, self.HEIGHT + 6)
+
+    def paint(self, painter: QtGui.QPainter, _option: QtWidgets.QStyleOptionGraphicsItem, _widget=None) -> None:
+        rect = QtCore.QRectF(0, 0, self.WIDTH, self.HEIGHT)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#A879FF"), 2.2))
+        painter.setBrush(QtGui.QColor("#1D1930"))
+        painter.drawRoundedRect(rect, 10, 10)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor("#392A59"))
+        painter.drawRoundedRect(QtCore.QRectF(0, 0, self.WIDTH, 34), 10, 10)
+        painter.drawRect(QtCore.QRectF(0, 23, self.WIDTH, 11))
+        painter.setPen(QtGui.QColor("#EDE5FF"))
+        title_font = QtGui.QFont("Malgun Gothic", 10)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.drawText(QtCore.QRectF(12, 4, 220, 27), QtCore.Qt.AlignVCenter, "⚡  화면 트리거")
+        alias = str(self.trigger.get("asset") or self.trigger.get("name") or "시작 이미지 선택 필요")
+        body_font = QtGui.QFont("Malgun Gothic", 9)
+        painter.setFont(body_font)
+        painter.setPen(QtGui.QColor("#F2F4F8"))
+        elided = QtGui.QFontMetrics(body_font).elidedText(alias, QtCore.Qt.ElideRight, 244)
+        painter.drawText(QtCore.QRectF(13, 42, 244, 24), QtCore.Qt.AlignVCenter, elided)
+        painter.setPen(QtGui.QColor("#C7B5E8"))
+        painter.drawText(QtCore.QRectF(13, 70, 244, 22), QtCore.Qt.AlignVCenter, "화면에 나타나면 매크로 시작")
 
 
 class NodeItem(QtWidgets.QGraphicsObject):
@@ -322,7 +397,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 aliases.insert(0, primary)
             aliases = list(dict.fromkeys(aliases))
             entries = [(alias, path) for alias in aliases if (path := canvas.asset_preview_path(alias)) is not None]
-            badge = NodeImagePreviewBadge(canvas, entries, self)
+            badge = NodeImagePreviewBadge(canvas, entries, index, self)
             font = QtGui.QFont("Segoe UI Symbol", 12)
             font.setBold(True)
             badge.setFont(font)
@@ -334,7 +409,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 names = ", ".join(html.escape(alias) for alias, _path in entries)
                 badge.setToolTip(
                     f"<b>{'멀티 이미지 서치' if len(entries) > 1 else '이미지 서치'}</b><br>"
-                    f"{names}<br>커서를 올리면 {'전체 이미지' if len(entries) > 1 else '원본'}를 확인합니다."
+                    f"{names}<br>커서를 올리면 {'전체 이미지' if len(entries) > 1 else '원본'} 미리보기 · 클릭하면 상세 편집"
                 )
             else:
                 badge.setToolTip("이미지 미선택 · 미리보기 파일을 찾을 수 없습니다.")
@@ -889,6 +964,7 @@ class NodeCanvas(QtWidgets.QWidget):
     wait_duration_requested = QtCore.Signal(list)
     all_wait_duration_requested = QtCore.Signal()
     start_search_group_requested = QtCore.Signal(list)
+    image_edit_requested = QtCore.Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -897,6 +973,8 @@ class NodeCanvas(QtWidgets.QWidget):
         self.steps: list[dict[str, Any]] = []
         self.nodes: dict[int, NodeItem] = {}
         self.edges: list[EdgeItem] = []
+        self.trigger_node: TriggerNodeItem | None = None
+        self.trigger_edge: QtWidgets.QGraphicsPathItem | None = None
         self.manual_routes: dict[str, list[list[float]]] = {}
         self.start_step = 0
         self.start_candidates: list[int] = []
@@ -1001,6 +1079,8 @@ class NodeCanvas(QtWidgets.QWidget):
         self.steps = list(self.macro.get("steps") or [])
         self.nodes = {}
         self.edges = []
+        self.trigger_node = None
+        self.trigger_edge = None
         raw_routes = self.macro.get("graph_routes") or {}
         self.manual_routes = dict(raw_routes) if isinstance(raw_routes, dict) else {}
         self.start_step = int(self.macro.get("graph_start_step") or 0)
@@ -1031,6 +1111,7 @@ class NodeCanvas(QtWidgets.QWidget):
             self.scene.addItem(node)
             self.nodes[index] = node
         self.rebuild_edges()
+        self._add_trigger_visual()
         rect = self.scene.itemsBoundingRect()
         if rect.isEmpty():
             rect = QtCore.QRectF(-500, -350, 1000, 700)
@@ -1042,6 +1123,42 @@ class NodeCanvas(QtWidgets.QWidget):
             self.select_node(selected)
         if self.nodes and not positions:
             QtCore.QTimer.singleShot(0, self.view.fit_all)
+
+    def _add_trigger_visual(self) -> None:
+        raw_triggers = self.macro.get("triggers") or []
+        if not isinstance(raw_triggers, list) or not self.nodes:
+            return
+        trigger = next(
+            (
+                item
+                for item in raw_triggers
+                if isinstance(item, dict)
+                and item.get("enabled", True)
+                and str(item.get("type") or "").lower() in {"image_appear", "image_appears"}
+            ),
+            None,
+        )
+        if trigger is None:
+            return
+        target_index = self.start_step if self.start_step in self.nodes else (self.start_candidates[0] if self.start_candidates else 1)
+        target = self.nodes.get(target_index) or self.nodes[min(self.nodes)]
+        card = TriggerNodeItem(trigger, self)
+        card.setPos(target.pos() + QtCore.QPointF(-TriggerNodeItem.WIDTH - 120, 8))
+        self.scene.addItem(card)
+        start = card.scenePos() + QtCore.QPointF(card.WIDTH, card.HEIGHT / 2)
+        end = target.scenePos() + QtCore.QPointF(0, target.HEIGHT / 2)
+        path = QtGui.QPainterPath(start)
+        midpoint = (start.x() + end.x()) / 2
+        path.cubicTo(midpoint, start.y(), midpoint, end.y(), end.x(), end.y())
+        edge = QtWidgets.QGraphicsPathItem(path)
+        pen = QtGui.QPen(QtGui.QColor("#A879FF"), 2.2, QtCore.Qt.DashLine)
+        pen.setCapStyle(QtCore.Qt.RoundCap)
+        edge.setPen(pen)
+        edge.setZValue(-3)
+        edge.setToolTip("화면 트리거가 감지되면 이 시작 노드부터 실행합니다.")
+        self.scene.addItem(edge)
+        self.trigger_node = card
+        self.trigger_edge = edge
 
     def set_asset_previews(self, paths: dict[str, str | Path]) -> None:
         self._asset_preview_paths = {

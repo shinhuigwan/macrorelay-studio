@@ -3003,6 +3003,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(builder.action_summary_label.text().startswith("멀티 이미지 서치"))
             self.assertEqual("▦", badge.text())
             self.assertIn("전체 이미지", badge.toolTip())
+            self.assertIn("클릭하면 상세 편집", badge.toolTip())
             entries = [(alias, repository.asset_path(alias)) for alias in aliases]
             builder.node_canvas.show_image_preview(entries, QtCore.QPoint(100, 100))
             app.processEvents()
@@ -3012,6 +3013,57 @@ class UiSmokeTests(unittest.TestCase):
             self.assertLessEqual(builder.node_canvas._preview_popup.width(), popup_pixmap.width() + 28)
             self.assertIn("2개", builder.node_canvas._preview_popup.title.text())
             builder.node_canvas.hide_image_preview()
+            window.close()
+        app.processEvents()
+
+    def test_macro_image_trigger_is_shown_as_a_separate_visual_card(self) -> None:
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.app import create_app
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            source = root / "trigger.png"
+            image = QtGui.QImage(52, 38, QtGui.QImage.Format_RGB32)
+            image.fill(QtGui.QColor("#A879FF"))
+            self.assertTrue(image.save(str(source)))
+            alias = repository.add_asset(source, "메일 화면 시작 조건")
+            repository.create_macro("trigger-visual")
+            payload = repository.load_macro("trigger-visual")
+            payload["steps"] = [{"action": "image_search", "asset": alias}]
+            payload["triggers"] = [{"type": "image_appears", "enabled": True, "asset": alias}]
+            repository.save_macro("trigger-visual", payload)
+            _created_app, window = create_app(root)
+            builder = window.pages["builder"]
+            builder.refresh("trigger-visual")
+            self.assertIsNotNone(builder.node_canvas.trigger_node)
+            self.assertEqual("화면 트리거", builder.node_canvas.trigger_node.display_title)
+            self.assertIsNotNone(builder.node_canvas.trigger_edge)
+            self.assertEqual("이미지 서치", builder.node_canvas.nodes[1].display_title)
+            window.close()
+        app.processEvents()
+
+    def test_short_inspector_keeps_readable_input_heights(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.app import create_app
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            repository.create_macro("short-inspector")
+            _created_app, window = create_app(root)
+            window.resize(1200, 620)
+            window.show()
+            builder = window.pages["builder"]
+            builder.refresh("short-inspector")
+            app.processEvents()
+            self.assertTrue(builder.inspector_scroll.widgetResizable())
+            self.assertGreaterEqual(builder.label_edit.height(), 34)
+            self.assertGreaterEqual(builder.success_spin.height(), 34)
             window.close()
         app.processEvents()
 

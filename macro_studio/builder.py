@@ -21,6 +21,7 @@ from .automation import (
 )
 from .log_dialog import MacroLogDialog
 from .inactive_click_lab import HandlePointPicker, InactiveClickLabDialog
+from .image_editor import ImageEditorDialog
 from .node_editor import NodeCanvas
 from .repository import MacroRepository
 from .theme import COLORS
@@ -707,6 +708,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.wait_duration_requested.connect(self._set_selected_wait_durations)
         self.node_canvas.all_wait_duration_requested.connect(self._set_all_wait_durations)
         self.node_canvas.start_search_group_requested.connect(self._configure_start_search_candidates)
+        self.node_canvas.image_edit_requested.connect(self._edit_node_search_image)
 
         list_page = QtWidgets.QWidget()
         list_layout = QtWidgets.QVBoxLayout(list_page)
@@ -843,14 +845,100 @@ class BuilderPage(QtWidgets.QWidget):
         save_btn = primary_button("변경사항 저장")
         save_btn.clicked.connect(self._save_step)
         self.inspector_action.currentIndexChanged.connect(self._change_action_template)
-        layout.addWidget(title)
-        layout.addLayout(form)
-        layout.addWidget(action_box)
-        layout.addStretch(1)
-        layout.addWidget(self.advanced_toggle)
-        layout.addWidget(self.json_panel)
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(2, 2, 6, 2)
+        content_layout.setSpacing(9)
+        content_layout.addWidget(title)
+        content_layout.addLayout(form)
+        content_layout.addWidget(action_box)
+        content_layout.addStretch(1)
+        content_layout.addWidget(self.advanced_toggle)
+        content_layout.addWidget(self.json_panel)
+        inspector_scroll = QtWidgets.QScrollArea()
+        inspector_scroll.setObjectName("InspectorScroll")
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        inspector_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        inspector_scroll.setWidget(content)
+        self.inspector_scroll = inspector_scroll
+        for control in (
+            self.inspector_action,
+            self.label_edit,
+            self.repeat_spin,
+            self.repeat_var_edit,
+            self.success_spin,
+            self.success_delay_spin,
+            self.fail_spin,
+            self.fail_delay_spin,
+            self.node_retry_spin,
+            self.node_retry_delay_spin,
+            self.delay_spin,
+        ):
+            control.setMinimumHeight(34)
+            control.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        form.setVerticalSpacing(8)
+        layout.addWidget(inspector_scroll, 1)
         layout.addWidget(save_btn)
         return card
+
+    def _edit_node_search_image(self, step_index: int) -> None:
+        steps = list((self.current_macro or {}).get("steps") or [])
+        row = int(step_index) - 1
+        if not 0 <= row < len(steps):
+            return
+        step = steps[row]
+        if str(step.get("action") or "") != "image_search":
+            return
+        aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
+        primary = str(step.get("asset") or "").strip()
+        if primary and primary not in aliases:
+            aliases.insert(0, primary)
+        aliases = [alias for alias in dict.fromkeys(aliases) if self.repository.asset_path(alias) is not None]
+        if not aliases:
+            self.status.emit("편집할 검색 이미지를 찾지 못했습니다.")
+            return
+        alias = aliases[0]
+        if len(aliases) > 1:
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("멀티 이미지 서치 · 편집할 이미지 선택")
+            dialog.setMinimumSize(680, 430)
+            dialog.resize(820, 560)
+            dialog_layout = QtWidgets.QVBoxLayout(dialog)
+            hint = QtWidgets.QLabel("상세 편집할 이미지를 미리보기에서 선택하세요.")
+            hint.setObjectName("Muted")
+            picker = QtWidgets.QListWidget()
+            picker.setViewMode(QtWidgets.QListView.IconMode)
+            picker.setResizeMode(QtWidgets.QListView.Adjust)
+            picker.setMovement(QtWidgets.QListView.Static)
+            picker.setIconSize(QtCore.QSize(150, 105))
+            picker.setGridSize(QtCore.QSize(180, 145))
+            picker.setWordWrap(True)
+            for candidate in aliases:
+                path = self.repository.asset_path(candidate)
+                item = QtWidgets.QListWidgetItem(QtGui.QIcon(str(path)), candidate)
+                item.setData(QtCore.Qt.UserRole, candidate)
+                picker.addItem(item)
+            picker.setCurrentRow(0)
+            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+            buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("상세 편집")
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            picker.itemDoubleClicked.connect(lambda _item: dialog.accept())
+            dialog_layout.addWidget(hint)
+            dialog_layout.addWidget(picker, 1)
+            dialog_layout.addWidget(buttons)
+            if dialog.exec() != QtWidgets.QDialog.Accepted or picker.currentItem() is None:
+                return
+            alias = str(picker.currentItem().data(QtCore.Qt.UserRole) or "")
+        path = self.repository.asset_path(alias)
+        if path is None:
+            self.status.emit("이미지 파일을 찾지 못했습니다.")
+            return
+        editor = ImageEditorDialog(path, alias, self.repository.history_dir, self)
+        if editor.exec() == QtWidgets.QDialog.Accepted:
+            self._refresh_steps(row)
+            self.status.emit(f"'{alias}' 이미지를 저장하고 미리보기에 적용했습니다.")
 
     @staticmethod
     def _populate_action_combo(combo: QtWidgets.QComboBox) -> None:

@@ -3172,7 +3172,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("SUCCESS", builder.node_canvas.execution_states[1]["status"])
             self.assertEqual(31, builder.node_canvas.execution_states[2]["duration_ms"])
             self.assertGreaterEqual(window.minimumWidth(), 1120)
-            self.assertIn(window.nav_buttons["builder"].parentWidget().width(), {74, 260})
+            self.assertIn(window.nav_buttons["builder"].parentWidget().width(), {56, 260})
             self.assertTrue(builder.run_button.isVisible())
             builder.set_running_step(0)
             self.assertEqual(0, builder.node_canvas.active_step)
@@ -5454,6 +5454,86 @@ class AIAutomationTests(unittest.TestCase):
             self.assertTrue(macro["meta"]["ai_draft"])
             self.assertTrue(macro["ai_setup"]["targets"][0]["reacquire_each_run"])
             self.assertNotIn("observed_handles", macro["ai_setup"]["targets"][0])
+
+    def test_behavior_learning_store_persists_demos_and_readiness(self) -> None:
+        from macro_studio.ai_learning import BehaviorLearningStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = BehaviorLearningStore(root)
+            behavior = store.add_behavior("골드 강화", "공격력과 방어력에 골드를 사용", 2)
+            stage = root / "demo-stage"
+            stage.mkdir()
+            (stage / "manifest.json").write_text("{}", encoding="utf-8")
+            archive = root / "demo.zip"
+            archive.write_bytes(b"zip")
+            store.add_demo(behavior["id"], str(archive), str(stage), 8, "normal", "기본 상황")
+            self.assertEqual("needs_more", store.readiness(store.behavior(behavior["id"]))[0])
+            store.add_demo(behavior["id"], str(archive), str(stage), 9, "variation", "다른 골드 수량")
+            self.assertEqual("ready", store.readiness(store.behavior(behavior["id"]))[0])
+            reloaded = BehaviorLearningStore(root)
+            loaded = reloaded.behavior(behavior["id"])
+            self.assertIsNotNone(loaded)
+            self.assertEqual(2, len(loaded["demos"]))
+            self.assertEqual("다른 골드 수량", loaded["demos"][1]["note"])
+
+    def test_behavior_learning_package_combines_behaviors_and_prompts_for_manager(self) -> None:
+        import zipfile
+
+        from macro_studio.ai_learning import BehaviorLearningStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = BehaviorLearningStore(root)
+            store.set_project_name("방치형 게임 성장")
+            for index, (name, purpose) in enumerate((("골드 강화", "공격과 방어 강화"), ("퀘스트", "요구 퀘스트 진행")), 1):
+                behavior = store.add_behavior(name, purpose, index)
+                for demo_index in range(2):
+                    stage = root / f"stage-{index}-{demo_index}"
+                    stage.mkdir()
+                    (stage / "timeline.json").write_text("[]", encoding="utf-8")
+                    (stage / "asset.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                    archive = root / f"demo-{index}-{demo_index}.zip"
+                    archive.write_bytes(b"zip")
+                    store.add_demo(behavior["id"], str(archive), str(stage), 5, "normal")
+            archive, stage = store.build_package()
+            self.assertTrue(archive.is_file())
+            manifest = json.loads((stage / "learning-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(2, manifest["behavior_count"])
+            self.assertEqual("방치형 게임 성장", manifest["project_name"])
+            prompt = (stage / "prompt.txt").read_text(encoding="utf-8")
+            self.assertIn("공통 규칙과 우연한 동작을 구분", prompt)
+            self.assertIn("우선순위가 높은 것부터", prompt)
+            self.assertIn("macrorelay-ai.json", prompt)
+            with zipfile.ZipFile(archive) as bundle:
+                names = set(bundle.namelist())
+            self.assertIn("learning-manifest.json", names)
+            self.assertIn("behaviors/behavior-01/demo-01/timeline.json", names)
+            self.assertIn("behaviors/behavior-02/demo-02/asset.png", names)
+
+    def test_behavior_demo_skips_single_macro_execution_condition_dialog(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.ai_recording import AIRecordingController
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            controller = AIRecordingController(repository, None, ask_execution_condition=False)
+            event = {"type": "mouse", "t": 10, "button": "Left", "x": 20, "y": 30}
+            archive = repository.root / "exports" / "demo.zip"
+            stage = repository.root / ".automation" / "ai-packages" / "demo"
+            completed: list[tuple[str, str, list]] = []
+            controller.package_completed.connect(lambda *args: completed.append(args))
+            with mock.patch("macro_studio.ai_recording.load_ai_recording", return_value=[event]), \
+                 mock.patch.object(controller, "_encode_video", return_value=None), \
+                 mock.patch("macro_studio.ai_recording.AIRecordingPackageBuilder.build", return_value=(archive, stage)):
+                controller._finished(0, QtCore.QProcess.ExitStatus.NormalExit)
+                app.processEvents()
+                app.processEvents()
+            self.assertIsNone(controller._condition_dialog)
+            self.assertEqual(1, len(completed))
+            self.assertEqual([event], completed[0][2])
 
 
 if __name__ == "__main__":

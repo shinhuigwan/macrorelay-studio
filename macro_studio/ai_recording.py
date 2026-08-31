@@ -233,8 +233,9 @@ class AIExecutionConditionDialog(QtWidgets.QDialog):
 class AIRecordingController(SmartRecordingController):
     package_completed = QtCore.Signal(str, str, list)
 
-    def __init__(self, repository, parent=None) -> None:
+    def __init__(self, repository, parent=None, *, ask_execution_condition: bool = True) -> None:
         super().__init__(repository, parent)
+        self.ask_execution_condition = ask_execution_condition
         self.output = repository.root / ".automation" / f"ai-recording-{uuid.uuid4().hex}.jsonl"
         self.frame_dir = repository.root / ".automation" / f"ai-video-frames-{uuid.uuid4().hex}"
         self.frame_dir.mkdir(parents=True, exist_ok=True)
@@ -466,7 +467,10 @@ class AIRecordingController(SmartRecordingController):
             self.deleteLater()
             return
         video = self._encode_video()
-        self._show_execution_condition(events, video)
+        if self.ask_execution_condition:
+            self._show_execution_condition(events, video)
+        else:
+            self._build_recording_package(events, video, {"type": "manual"})
 
     def _show_execution_condition(self, events: list[dict], video: Path | None) -> None:
         """Open post-recording setup without a nested modal event loop.

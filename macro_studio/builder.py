@@ -10,6 +10,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .action_editor import ACTION_LABELS, ActionEditor, action_template
 from .ai_automation import AIRecordingPackageBuilder, ai_draft_readiness, materialize_ai_document
 from .ai_import_dialog import AIDraftSetupDialog, AIImportPreviewDialog, load_ai_json, package_stage_for
+from .ai_learning import BehaviorLearningDialog, BehaviorLearningStore, DEMO_KIND_LABELS
 from .ai_recording import AIRecordingController
 from .automation import (
     AutomationAnalyzer,
@@ -432,6 +433,9 @@ class BuilderPage(QtWidgets.QWidget):
         self._recording_controller: SmartRecordingController | None = None
         self._ai_recording_controller: AIRecordingController | None = None
         self._ai_completion_message: QtWidgets.QMessageBox | None = None
+        self._behavior_learning_store = BehaviorLearningStore(self.repository.root)
+        self._behavior_learning_dialog: BehaviorLearningDialog | None = None
+        self._pending_behavior_demo: tuple[str, str, str] | None = None
         self._automation_overlay: AutomationOverlay | None = None
         self._collapsed_groups: set[str] = set()
         self._last_recording_path = self.repository.root / ".automation" / "last-recording.json"
@@ -482,6 +486,11 @@ class BuilderPage(QtWidgets.QWidget):
             "화면 영상·PNG·클릭·키보드·대상 창을 기록합니다. 우클릭=화면 조건, F7=다음 독립 작업, F10=종료."
         )
         self.ai_record_btn.clicked.connect(self._start_ai_recording)
+        self.ai_learning_btn = primary_button("✦ AI 플레이 학습")
+        self.ai_learning_btn.setToolTip(
+            "골드 강화·퀘스트·합성처럼 행동을 나누고 각 행동을 2~3회 시연해 AI가 규칙과 복구 흐름을 추론합니다."
+        )
+        self.ai_learning_btn.clicked.connect(self._open_behavior_learning)
         self.ai_package_btn = QtWidgets.QPushButton("AI 분석 패키지 생성")
         self.ai_package_btn.setToolTip("마지막 AI 녹화의 ChatGPT 분석 ZIP을 확인하거나 다시 생성합니다.")
         self.ai_package_btn.clicked.connect(self._generate_ai_package)
@@ -541,6 +550,9 @@ class BuilderPage(QtWidgets.QWidget):
         ai_tools.setText("AI 도구 ▾")
         ai_tools.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         ai_menu = QtWidgets.QMenu(ai_tools)
+        ai_menu.addAction("AI 플레이 학습", self.ai_learning_btn.click)
+        ai_menu.addAction("단일 AI 녹화 (기존 방식)", self.ai_record_btn.click)
+        ai_menu.addSeparator()
         ai_menu.addAction("AI 분석 패키지 생성", self.ai_package_btn.click)
         ai_menu.addAction("ChatGPT 요청 복사", self.ai_prompt_btn.click)
         ai_menu.addAction("패키지 저장 폴더 열기", self.ai_folder_btn.click)
@@ -552,6 +564,7 @@ class BuilderPage(QtWidgets.QWidget):
         # visible entry points live in the compact menus above.
         for command_button in (
             self.review_recording_btn, self.inactive_handle_lab_btn, self.branch_group_btn,
+            self.ai_record_btn,
             self.ai_package_btn, self.ai_prompt_btn, self.ai_folder_btn,
             self.ai_import_btn, self.ai_continue_btn,
         ):
@@ -561,7 +574,7 @@ class BuilderPage(QtWidgets.QWidget):
         action_label.setObjectName("Muted")
         toolbar_tools.addWidget(self.record_btn)
         toolbar_tools.addWidget(recording_tools)
-        toolbar_tools.addWidget(self.ai_record_btn)
+        toolbar_tools.addWidget(self.ai_learning_btn)
         toolbar_tools.addWidget(ai_tools)
         toolbar_tools.addSpacing(8)
         toolbar_tools.addWidget(action_label)
@@ -1880,6 +1893,90 @@ class BuilderPage(QtWidgets.QWidget):
             temporary.replace(self._last_ai_recording_path)
         except OSError:
             pass
+
+    def _open_behavior_learning(self) -> None:
+        if self._behavior_learning_dialog is None:
+            dialog = BehaviorLearningDialog(self._behavior_learning_store, self.window())
+            dialog.record_requested.connect(self._start_behavior_demo)
+            dialog.import_requested.connect(self._import_ai_json)
+            dialog.status.connect(self.status.emit)
+            dialog.finished.connect(lambda _result: None)
+            self._behavior_learning_dialog = dialog
+        self._behavior_learning_dialog.refresh()
+        self._behavior_learning_dialog.show()
+        self._behavior_learning_dialog.raise_()
+        self._behavior_learning_dialog.activateWindow()
+
+    @QtCore.Slot(str, str, str)
+    def _start_behavior_demo(self, behavior_id: str, kind: str, note: str) -> None:
+        if self._ai_recording_controller is not None or self._recording_controller is not None:
+            self.status.emit("다른 녹화가 이미 실행 중입니다.")
+            return
+        behavior = self._behavior_learning_store.behavior(behavior_id)
+        if behavior is None:
+            self.status.emit("시연을 저장할 행동을 찾지 못했습니다.")
+            return
+        self._pending_behavior_demo = (behavior_id, kind, note)
+        if self._behavior_learning_dialog is not None:
+            self._behavior_learning_dialog.hide()
+        controller = AIRecordingController(self.repository, self.window(), ask_execution_condition=False)
+        controller.package_completed.connect(self._behavior_demo_completed)
+        controller.failed.connect(self._behavior_recording_failed)
+        self._ai_recording_controller = controller
+        controller.start()
+        if controller.bar is not None:
+            controller.bar.setWindowTitle(f"AI 행동 시연 · {behavior.get('name')}")
+            controller.bar.label.setText(
+                f"{behavior.get('name')} · 실제 행동을 보여주세요 · 우클릭=조건 · F6=결과 확인 · F10=종료"
+            )
+            controller.bar.mode_badge.setText(DEMO_KIND_LABELS.get(kind, "행동 시연"))
+        self.status.emit(f"'{behavior.get('name')}' 시연 녹화를 시작했습니다 · F10으로 종료")
+
+    @QtCore.Slot(str, str, list)
+    def _behavior_demo_completed(self, archive: str, stage: str, events: list[dict[str, Any]]) -> None:
+        self._ai_recording_controller = None
+        pending = self._pending_behavior_demo
+        self._pending_behavior_demo = None
+        self._remember_last_ai_recording(events)
+        self._last_ai_package = self._load_last_ai_package()
+        if pending is None:
+            self.status.emit("시연은 완료됐지만 연결된 행동 정보를 찾지 못했습니다.")
+            return
+        behavior_id, kind, note = pending
+        try:
+            self._behavior_learning_store.add_demo(behavior_id, archive, stage, len(events), kind, note)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "행동 시연 저장 실패", str(exc))
+            return
+        behavior = self._behavior_learning_store.behavior(behavior_id) or {}
+        if self._behavior_learning_dialog is not None:
+            self._behavior_learning_dialog.refresh(behavior_id)
+            self._behavior_learning_dialog.show()
+            self._behavior_learning_dialog.raise_()
+            self._behavior_learning_dialog.activateWindow()
+        demo_count = len(behavior.get("demos") or [])
+        self.status.emit(f"'{behavior.get('name')}' 시연 {demo_count}회를 저장했습니다.")
+        message = QtWidgets.QMessageBox(self.window())
+        message.setWindowTitle("행동 시연 저장 완료")
+        if demo_count < 2:
+            message.setText("첫 시연을 저장했습니다. 같은 행동을 다른 상황에서 한 번 더 보여주세요.")
+        elif demo_count == 2:
+            message.setText("분석 가능한 2회 시연이 모였습니다. 변형 또는 실패·복구 시연 1회를 더 추가하면 더 안정적입니다.")
+        else:
+            message.setText(f"{demo_count}회 시연이 준비됐습니다. 학습 패키지를 생성할 수 있습니다.")
+        message.setModal(False)
+        message.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        message.show()
+
+    @QtCore.Slot(str)
+    def _behavior_recording_failed(self, detail: str) -> None:
+        self._ai_recording_controller = None
+        self._pending_behavior_demo = None
+        if self._behavior_learning_dialog is not None:
+            self._behavior_learning_dialog.show()
+            self._behavior_learning_dialog.raise_()
+        QtWidgets.QMessageBox.warning(self, "AI 행동 시연", detail)
+        self.status.emit(detail)
 
     def _start_ai_recording(self) -> None:
         if self._ai_recording_controller is not None or self._recording_controller is not None:

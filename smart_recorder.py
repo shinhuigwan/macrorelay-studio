@@ -37,10 +37,14 @@ WM_RBUTTONUP = 0x0205
 WM_MBUTTONDOWN = 0x0207
 WM_MBUTTONUP = 0x0208
 WM_MOUSEWHEEL = 0x020A
+VK_F5 = 0x74
+VK_F6 = 0x75
 VK_F8 = 0x77
 VK_F7 = 0x76
-VK_F6 = 0x75
+VK_F9 = 0x78
 VK_F10 = 0x79
+VK_F11 = 0x7A
+VK_F12 = 0x7B
 VK_OEM_3 = 0xC0  # ` / ~ key on standard Windows keyboard layouts
 SHIFT_KEYS = {0x10, 0xA0, 0xA1}
 LLKHF_INJECTED = 0x10
@@ -354,7 +358,10 @@ class Recorder:
         delay: float,
         capture_vk: int = VK_F8,
         branch_vk: int = VK_F7,
-        verify_vk: int = VK_F6,
+        verify_vk: int = VK_F5,
+        wait_vk: int = VK_F6,
+        mode_vk: int = VK_F11,
+        toggle_vk: int = VK_F12,
         stop_vk: int = VK_F10,
         hold_vk: int = VK_OEM_3,
         initial_active: bool = False,
@@ -371,6 +378,9 @@ class Recorder:
         self.capture_vk = int(capture_vk)
         self.branch_vk = int(branch_vk)
         self.verify_vk = int(verify_vk)
+        self.wait_vk = int(wait_vk)
+        self.mode_vk = int(mode_vk)
+        self.toggle_vk = int(toggle_vk)
         self.stop_vk = int(stop_vk)
         self.hold_vk = int(hold_vk)
         self.gate_down = bool(initial_active)
@@ -384,6 +394,9 @@ class Recorder:
         self._mode_key_down = False
         self._branch_key_down = False
         self._verify_key_down = False
+        self._wait_key_down = False
+        self._function_mode_key_down = False
+        self._toggle_key_down = False
         self.workflow_index = 1
         self._shift_down = False
         self._pressed_modifiers: set[str] = set()
@@ -486,6 +499,16 @@ class Recorder:
                 "image_anchor": [self.sample_width // 2, self.sample_height // 2],
                 "retry_from": "previous_action",
                 "retry_count": 3,
+            }
+        )
+
+    def insert_wait_marker(self, duration: int = 1000) -> None:
+        self._event_counter += 1
+        self.emit(
+            {
+                "type": "wait_marker",
+                "event_id": f"wait-{time.perf_counter_ns()}-{self._event_counter}",
+                "duration": max(100, int(duration)),
             }
         )
 
@@ -621,7 +644,7 @@ class Recorder:
                 }
             )
             if self.right_click_condition and message == WM_RBUTTONDOWN:
-                # The right click is a semantic marker for AI recording. Do
+                # The right click is a semantic screen-condition marker. Do
                 # not open the target application's context menu or record it
                 # as an actual click action.
                 self._down_points.pop("Right", None)
@@ -664,7 +687,26 @@ class Recorder:
                 if pressed and not self._verify_key_down and self.gate_down:
                     self.capture_verification_marker()
                 self._verify_key_down = pressed
-                # F6 marks the screen under the cursor; it is not sent to the app.
+                # F5 marks the screen under the cursor; it is not sent to the app.
+                return 1
+            if self.wait_vk and vk == self.wait_vk:
+                if pressed and not self._wait_key_down and self.gate_down:
+                    self.insert_wait_marker(1000)
+                self._wait_key_down = pressed
+                return 1
+            if self.mode_vk and vk == self.mode_vk:
+                if pressed and not self._function_mode_key_down:
+                    self.cycle_record_mode()
+                self._function_mode_key_down = pressed
+                return 1
+            if self.toggle_vk and vk == self.toggle_vk:
+                if pressed and not self._toggle_key_down:
+                    self.set_gate_active(not self.gate_down)
+                self._toggle_key_down = pressed
+                return 1
+            if vk == VK_F9:
+                # F9 is the session start key. Once the recorder is running it
+                # remains a control key and must not leak into the target app.
                 return 1
             if message not in {WM_KEYDOWN, WM_SYSKEYDOWN}:
                 return int(user32.CallNextHookEx(self.keyboard_hook, code, message, data_ptr))
@@ -690,9 +732,11 @@ class Recorder:
                 command_key = bool({"Ctrl", "Alt", "Win"} & set(modifiers))
                 if self.redact_text and char and not command_key:
                     char, token = "[REDACTED]", "Printable"
+                self._event_counter += 1
                 self.emit(
                     {
                         "type": "key",
+                        "event_id": f"key-{time.perf_counter_ns()}-{self._event_counter}",
                         "vk": vk,
                         "char": char,
                         "token": token,
@@ -765,7 +809,10 @@ def main() -> int:
     parser.add_argument("--delay", type=float, default=2.0)
     parser.add_argument("--capture-vk", type=int, default=VK_F8)
     parser.add_argument("--branch-vk", type=int, default=VK_F7)
-    parser.add_argument("--verify-vk", type=int, default=VK_F6)
+    parser.add_argument("--verify-vk", type=int, default=VK_F5)
+    parser.add_argument("--wait-vk", type=int, default=VK_F6)
+    parser.add_argument("--mode-vk", type=int, default=VK_F11)
+    parser.add_argument("--toggle-vk", type=int, default=VK_F12)
     parser.add_argument("--stop-vk", type=int, default=VK_F10)
     parser.add_argument("--hold-vk", type=int, default=VK_OEM_3)
     parser.add_argument("--initial-active", action="store_true")
@@ -783,6 +830,9 @@ def main() -> int:
         args.capture_vk,
         args.branch_vk,
         args.verify_vk,
+        args.wait_vk,
+        args.mode_vk,
+        args.toggle_vk,
         args.stop_vk,
         args.hold_vk,
         initial_active=args.initial_active,

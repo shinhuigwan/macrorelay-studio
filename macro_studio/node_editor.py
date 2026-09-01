@@ -368,12 +368,14 @@ class TriggerNodeItem(QtWidgets.QGraphicsObject):
 class NodeItem(QtWidgets.QGraphicsObject):
     WIDTH = 270.0
     HEIGHT = 122.0
+    COLLAPSED_HEIGHT = 44.0
 
     def __init__(self, index: int, step: dict[str, Any], canvas: "NodeCanvas") -> None:
         super().__init__()
         self.index = index
         self.step = step
         self.canvas = canvas
+        self.collapsed = index in canvas.collapsed_nodes
         self.display_title = (
             "멀티 이미지 서치"
             if str(step.get("action") or "") == "image_search" and len(step.get("assets") or []) > 1
@@ -390,8 +392,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.setCursor(QtCore.Qt.OpenHandCursor)
         self.success_port = NodePort(self, "success")
         self.fail_port = NodePort(self, "fail")
-        self.success_port.setPos(self.WIDTH, 72)
-        self.fail_port.setPos(self.WIDTH, 101)
+        self._sync_compact_geometry()
         self.preview_badge: NodeImagePreviewBadge | None = None
         if str(step.get("action") or "") in {"image_search", "screen_condition"}:
             aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
@@ -418,9 +419,36 @@ class NodeItem(QtWidgets.QGraphicsObject):
             else:
                 badge.setToolTip("이미지 미선택 · 미리보기 파일을 찾을 수 없습니다.")
             self.preview_badge = badge
+            badge.setVisible(not self.collapsed)
+
+    def current_height(self) -> float:
+        return self.COLLAPSED_HEIGHT if self.collapsed else self.HEIGHT
+
+    def _sync_compact_geometry(self) -> None:
+        if self.collapsed:
+            self.success_port.setPos(self.WIDTH, 14)
+            self.fail_port.setPos(self.WIDTH, 32)
+        else:
+            self.success_port.setPos(self.WIDTH, 72)
+            self.fail_port.setPos(self.WIDTH, 101)
+
+    def set_collapsed(self, collapsed: bool, notify: bool = True) -> None:
+        normalized = bool(collapsed)
+        if normalized == self.collapsed:
+            return
+        self.prepareGeometryChange()
+        self.collapsed = normalized
+        self._sync_compact_geometry()
+        if self.preview_badge is not None:
+            self.preview_badge.setVisible(not normalized)
+        self.update()
+        self.canvas._route_edges()
+        self.canvas._sync_workflow_lanes()
+        if notify:
+            self.canvas.node_collapsed(self.index, normalized)
 
     def boundingRect(self) -> QtCore.QRectF:
-        return QtCore.QRectF(-3, -3, self.WIDTH + 12, self.HEIGHT + 6)
+        return QtCore.QRectF(-3, -3, self.WIDTH + 12, self.current_height() + 6)
 
     def paint(
         self,
@@ -440,7 +468,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
         lod = max(0.01, option.levelOfDetailFromTransform(painter.worldTransform()))
         font_boost = min(2.5, max(1.0, 0.82 / lod))
         compact = lod < 0.62
-        rect = QtCore.QRectF(0, 0, self.WIDTH, self.HEIGHT)
+        height = self.current_height()
+        rect = QtCore.QRectF(0, 0, self.WIDTH, height)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.setBrush(QtGui.QColor("#181C25"))
         border_color = (
@@ -490,12 +519,35 @@ class NodeItem(QtWidgets.QGraphicsObject):
         title_metrics = QtGui.QFontMetrics(title_font)
         title_width = 194 if compact else 151
         painter.drawText(QtCore.QRectF(55, 6, title_width, 29), QtCore.Qt.AlignVCenter, title_metrics.elidedText(action_title, QtCore.Qt.ElideRight, title_width))
-        if not compact:
+        if not compact and not self.collapsed:
             badge_font = QtGui.QFont("Segoe UI")
             badge_font.setPointSizeF(7.5 * font_boost)
             painter.setFont(badge_font)
             painter.setPen(QtGui.QColor(accent))
             painter.drawText(QtCore.QRectF(211, 8, 44, 24), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, badge)
+
+        collapse_font = QtGui.QFont("Segoe UI Symbol", 10)
+        collapse_font.setBold(True)
+        painter.setFont(collapse_font)
+        painter.setPen(QtGui.QColor("#B8C0D0"))
+        painter.drawText(
+            QtCore.QRectF(216, 7, 23, 25),
+            QtCore.Qt.AlignCenter,
+            "▸" if self.collapsed else "▾",
+        )
+
+        if self.collapsed:
+            port_font = QtGui.QFont("Segoe UI", 6.5 * font_boost)
+            painter.setFont(port_font)
+            painter.setPen(QtGui.QColor(COLORS["success"]))
+            painter.drawText(QtCore.QRectF(238, 4, 18, 16), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, "OK")
+            painter.setPen(QtGui.QColor(COLORS["danger"]))
+            painter.drawText(QtCore.QRectF(238, 23, 18, 16), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, "ERR")
+            if self.index == self.canvas.start_step:
+                painter.setPen(QtGui.QPen(QtGui.QColor(COLORS["success"]), 2))
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.drawRoundedRect(rect.adjusted(3, 3, -3, -3), 9, 9)
+            return
 
         summary = self.canvas.step_summary(self.step)
         summary_font = QtGui.QFont("Malgun Gothic")
@@ -597,6 +649,16 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.canvas.inspector_requested.emit(self.index)
         event.accept()
 
+    def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        point = event.pos()
+        if event.button() == QtCore.Qt.LeftButton and 212 <= point.x() <= 241 and 0 <= point.y() <= 40:
+            selected = self.canvas.selected_indexes()
+            indexes = selected if self.index in selected and len(selected) > 1 else [self.index]
+            self.canvas.set_nodes_collapsed(indexes, not self.collapsed)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:
         if not self.isSelected():
             self.canvas.select_node(self.index)
@@ -613,6 +675,13 @@ class NodeItem(QtWidgets.QGraphicsObject):
             change_wait = menu.addAction(label)
             change_all_wait = menu.addAction("모든 대기 노드 시간 변경")
             menu.addSeparator()
+        selected_indexes = self.canvas.selected_indexes() or [self.index]
+        collapse = menu.addAction(
+            f"선택 노드 {len(selected_indexes)}개 펼치기"
+            if all(self.canvas.nodes[index].collapsed for index in selected_indexes if index in self.canvas.nodes)
+            else f"선택 노드 {len(selected_indexes)}개 접기"
+        )
+        menu.addSeparator()
         duplicate = menu.addAction("노드 복제")
         archive = menu.addAction("노드 보관")
         chosen = menu.exec(event.screenPos())
@@ -620,6 +689,11 @@ class NodeItem(QtWidgets.QGraphicsObject):
             self.canvas.wait_duration_requested.emit(wait_indexes or [self.index])
         elif change_all_wait is not None and chosen == change_all_wait:
             self.canvas.all_wait_duration_requested.emit()
+        elif chosen == collapse:
+            should_collapse = not all(
+                self.canvas.nodes[index].collapsed for index in selected_indexes if index in self.canvas.nodes
+            )
+            self.canvas.set_nodes_collapsed(selected_indexes, should_collapse)
         elif chosen == duplicate:
             self.canvas.node_duplicate_requested.emit(self.index)
         elif chosen == archive:
@@ -812,16 +886,17 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             return
         port = source_node.success_port if self.kind == "success" else source_node.fail_port
         start = port.mapToScene(port.rect().center())
+        target_height = target_node.current_height()
         if self.manual_points:
-            end = target_node.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + self.target_offset_y))
+            end = target_node.mapToScene(QtCore.QPointF(0, target_height / 2 + self.target_offset_y))
         elif self.route_side == "top":
             end = target_node.mapToScene(QtCore.QPointF(NodeItem.WIDTH / 2 + self.target_offset_y, 0))
         elif self.route_side == "bottom":
             end = target_node.mapToScene(
-                QtCore.QPointF(NodeItem.WIDTH / 2 + self.target_offset_y, NodeItem.HEIGHT)
+                QtCore.QPointF(NodeItem.WIDTH / 2 + self.target_offset_y, target_height)
             )
         else:
-            end = target_node.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + self.target_offset_y))
+            end = target_node.mapToScene(QtCore.QPointF(0, target_height / 2 + self.target_offset_y))
         distance = abs(end.x() - start.x())
         if self.manual_points:
             path = QtGui.QPainterPath(start)
@@ -992,6 +1067,7 @@ class NodeCanvas(QtWidgets.QWidget):
     all_wait_duration_requested = QtCore.Signal()
     start_search_group_requested = QtCore.Signal(list)
     image_edit_requested = QtCore.Signal(int)
+    collapsed_changed = QtCore.Signal(list)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1009,6 +1085,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.end_step = 0
         self.active_step = 0
         self.execution_states: dict[int, dict[str, Any]] = {}
+        self.collapsed_nodes: set[int] = set()
         self._temp_edge: QtWidgets.QGraphicsPathItem | None = None
         self._temp_start = QtCore.QPointF()
         self.rubber_selecting = False
@@ -1126,6 +1203,12 @@ class NodeCanvas(QtWidgets.QWidget):
         self.trigger_edge = None
         raw_routes = self.macro.get("graph_routes") or {}
         self.manual_routes = dict(raw_routes) if isinstance(raw_routes, dict) else {}
+        raw_collapsed = self.macro.get("graph_collapsed") or []
+        self.collapsed_nodes = {
+            int(value)
+            for value in raw_collapsed
+            if str(value).lstrip("-").isdigit() and 0 < int(value) <= len(self.steps)
+        } if isinstance(raw_collapsed, list) else set()
         self.start_step = int(self.macro.get("graph_start_step") or 0)
         raw_candidates = self.macro.get("start_search_candidates") or []
         self.start_candidates = []
@@ -1347,6 +1430,34 @@ class NodeCanvas(QtWidgets.QWidget):
             for index, node in self.nodes.items()
         }
 
+    def node_collapsed(self, index: int, collapsed: bool) -> None:
+        if collapsed:
+            self.collapsed_nodes.add(int(index))
+        else:
+            self.collapsed_nodes.discard(int(index))
+        self.collapsed_changed.emit(sorted(self.collapsed_nodes))
+
+    def set_nodes_collapsed(self, indexes: list[int], collapsed: bool) -> None:
+        changed = False
+        self.suspended = True
+        try:
+            for index in indexes:
+                node = self.nodes.get(int(index))
+                if node is None or node.collapsed == bool(collapsed):
+                    continue
+                node.set_collapsed(collapsed, notify=False)
+                if collapsed:
+                    self.collapsed_nodes.add(int(index))
+                else:
+                    self.collapsed_nodes.discard(int(index))
+                changed = True
+        finally:
+            self.suspended = False
+        if changed:
+            self._route_edges()
+            self._sync_workflow_lanes()
+            self.collapsed_changed.emit(sorted(self.collapsed_nodes))
+
     @staticmethod
     def edge_route_key(edge: EdgeItem) -> str:
         return f"{edge.source}:{edge.kind}:{edge.target}:{edge.condition_index}"
@@ -1491,7 +1602,7 @@ class NodeCanvas(QtWidgets.QWidget):
                 continue
             port = source.success_port if edge.kind == "success" else source.fail_port
             start = port.mapToScene(port.rect().center())
-            end = target.mapToScene(QtCore.QPointF(0, NodeItem.HEIGHT / 2 + edge.target_offset_y))
+            end = target.mapToScene(QtCore.QPointF(0, target.current_height() / 2 + edge.target_offset_y))
             forward = end.x() > start.x() + 4.0
             obstacle = False
             if forward and end.x() - start.x() > 90.0:

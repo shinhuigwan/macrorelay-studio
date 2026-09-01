@@ -450,7 +450,10 @@ class BuilderPage(QtWidgets.QWidget):
         archive_btn = danger_button("보관")
         archive_btn.clicked.connect(self._archive_macro)
         self.record_btn = QtWidgets.QPushButton("● 스마트 녹화")
-        self.record_btn.setToolTip("F9 세션 시작 · ` 기록 ON/OFF · Shift+` 일반/분기 모드 · F8 이미지 캡처 · F10 종료")
+        self.record_btn.setToolTip(
+            "F9 시작 · ` 또는 F12 기록 ON/OFF · F5 결과 확인 · F6 1초 대기 · "
+            "F7 새 작업 · F8 이미지 캡처 · F11 일반/분기 · F10 종료"
+        )
         self.record_btn.clicked.connect(self._start_smart_recording)
         self.review_recording_btn = QtWidgets.QPushButton("▤ 최근 녹화 검토")
         self.review_recording_btn.setToolTip("닫았던 마지막 스마트 녹화 검토창을 다시 엽니다.")
@@ -689,6 +692,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.inspector_requested.connect(self._focus_inspector)
         self.node_canvas.positions_changed.connect(self._graph_positions_changed)
         self.node_canvas.routes_changed.connect(self._graph_routes_changed)
+        self.node_canvas.collapsed_changed.connect(self._graph_collapsed_changed)
         self.node_canvas.link_requested.connect(self._connect_graph_nodes)
         self.node_canvas.edge_delete_requested.connect(self._delete_graph_edge)
         self.node_canvas.edge_delay_requested.connect(self._set_graph_edge_delay)
@@ -1401,6 +1405,16 @@ class BuilderPage(QtWidgets.QWidget):
             self.current_macro.pop("graph_routes", None)
         self._graph_save_timer.start()
 
+    @QtCore.Slot(list)
+    def _graph_collapsed_changed(self, indexes: list[int]) -> None:
+        if self.current_macro is None:
+            return
+        if indexes:
+            self.current_macro["graph_collapsed"] = sorted({int(index) for index in indexes if int(index) > 0})
+        else:
+            self.current_macro.pop("graph_collapsed", None)
+        self._graph_save_timer.start()
+
     def _save_graph_positions(self) -> None:
         if not self.current_name or self.current_macro is None:
             return
@@ -1735,6 +1749,30 @@ class BuilderPage(QtWidgets.QWidget):
                 for rule in conditions:
                     if isinstance(rule, dict) and int(rule.get("target") or 0):
                         rule["target"] = int(rule["target"]) + base
+        live_rows: list[tuple[int, list[float]]] = []
+        for offset, step in enumerate(prepared, start=1):
+            value = step.pop("_live_position", None)
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                try:
+                    live_rows.append((offset, [float(value[0]), float(value[1])]))
+                except (TypeError, ValueError):
+                    pass
+            if not str(step.get("workflow_id") or "").strip():
+                step.pop("workflow_id", None)
+                step.pop("workflow_label", None)
+        if live_rows:
+            graph_positions = self.current_macro.setdefault("graph_positions", {})
+            shift_x = 0.0
+            if base and isinstance(graph_positions, dict):
+                existing_x = [
+                    float(value[0])
+                    for value in graph_positions.values()
+                    if isinstance(value, (list, tuple)) and len(value) >= 2
+                ]
+                if existing_x:
+                    shift_x = max(existing_x) + 350.0 - min(position[0] for _offset, position in live_rows)
+            for offset, position in live_rows:
+                graph_positions[str(base + offset)] = [round(position[0] + shift_x, 2), round(position[1], 2)]
         if steps and prepared:
             previous = steps[-1]
             if isinstance(previous, dict) and previous.get("action") != "flow_control" and not int(previous.get("on_success") or 0):
@@ -1762,7 +1800,7 @@ class BuilderPage(QtWidgets.QWidget):
         controller.failed.connect(self._smart_recording_failed)
         self._recording_controller = controller
         controller.start()
-        self.status.emit("스마트 녹화 준비 · ` 기록 ON/OFF · Shift+` 일반/분기 모드 · F8 캡처 · F10 종료")
+        self.status.emit("스마트 녹화 준비 · 실시간 노드맵 · F5 확인 · F7 새 작업 · F8 캡처 · F10 종료")
 
     @staticmethod
     def _recording_notice_hidden_today() -> bool:
@@ -1781,6 +1819,9 @@ class BuilderPage(QtWidgets.QWidget):
         message.setText(
             "2초 뒤 녹화가 준비됩니다. 단독 ` 키를 한 번 누르면 기록이 켜지고 다시 누르면 일시정지됩니다.\n"
             "Shift+` 키는 일반 액션과 순차 이미지 분기 후보 모드를 전환합니다.\n"
+            "F5는 현재 커서의 이미지를 '결과 확인' 노드로, F6은 1초 대기 노드로 추가합니다.\n"
+            "F7은 새 작업 분기를 시작하고, F11은 일반/분기 모드, F12는 기록 ON/OFF를 전환합니다.\n"
+            "우클릭은 실제 클릭하지 않고 해당 위치의 이미지를 화면 조건으로 기록합니다.\n"
             "분기 모드의 클릭·키 입력·텍스트도 분기 액션으로 저장되며, F8 이미지는 대체 후보로 추가됩니다.\n"
             "`과 Shift+` 키 자체는 대상 프로그램에 입력되거나 매크로 동작으로 저장되지 않습니다.\n"
             "암호·개인정보를 입력했다면 검토 화면에서 텍스트 저장을 해제하세요.\n\n"
@@ -2214,6 +2255,23 @@ class BuilderPage(QtWidgets.QWidget):
         else:
             self.current_macro.pop("graph_routes", None)
 
+    def _remap_graph_collapsed(self, mapping: dict[int, int]) -> None:
+        if self.current_macro is None:
+            return
+        collapsed = self.current_macro.get("graph_collapsed") or []
+        remapped = sorted(
+            {
+                mapping[index]
+                for value in collapsed if str(value).lstrip("-").isdigit()
+                for index in [int(value)]
+                if index in mapping
+            }
+        ) if isinstance(collapsed, list) else []
+        if remapped:
+            self.current_macro["graph_collapsed"] = remapped
+        else:
+            self.current_macro.pop("graph_collapsed", None)
+
     def _normalize_edges_after_delete(self, deleted: int) -> None:
         steps = (self.current_macro or {}).get("steps") or []
         old_count = len(steps) + 1
@@ -2286,13 +2344,13 @@ class BuilderPage(QtWidgets.QWidget):
                         automation["candidate_count"] = len(normalized_candidates)
             else:
                 self.current_macro.pop("start_search_candidates", None)
-        self._remap_graph_routes(
-            {
+        mapping = {
                 old_index: old_index - 1 if old_index > deleted else old_index
                 for old_index in range(1, old_count + 1)
                 if old_index != deleted
             }
-        )
+        self._remap_graph_routes(mapping)
+        self._remap_graph_collapsed(mapping)
 
     def _move_step(self, direction: int) -> None:
         if not self.current_macro:
@@ -2333,6 +2391,9 @@ class BuilderPage(QtWidgets.QWidget):
         if isinstance(candidates, list):
             self.current_macro["start_search_candidates"] = [mapping.get(int(value), int(value)) for value in candidates]
         self._remap_graph_routes(
+            {index: mapping.get(index, index) for index in range(1, len(steps) + 1)}
+        )
+        self._remap_graph_collapsed(
             {index: mapping.get(index, index) for index in range(1, len(steps) + 1)}
         )
         self._persist("단계 순서를 변경했습니다.")

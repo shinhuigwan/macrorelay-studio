@@ -4786,6 +4786,109 @@ class SmartRecordingUiTests(unittest.TestCase):
             builder.shutdown_automation()
             builder.deleteLater()
 
+    def test_f5_verification_and_f6_wait_become_explicit_drafts_and_nodes(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog, recording_drafts
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        verification = {
+            "type": "screen_verification",
+            "event_id": "verify-1",
+            "t": 100,
+            "x": 500,
+            "y": 400,
+            "client_x": 120,
+            "client_y": 90,
+            "record_mode": "action",
+            "workflow_id": "workflow-01",
+            "workflow_index": 1,
+            "window": {
+                "exe": "sample.exe",
+                "title": "Sample",
+                "class": "SampleWindow",
+                "client_origin": [380, 310],
+                "client_size": [800, 600],
+                "capture_size": [800, 600],
+                "capture_scope": "client",
+            },
+            "image_sample_bmp": self._sample_bmp(),
+            "image_sample_size": [360, 240],
+            "image_anchor": [180, 120],
+        }
+        wait = {
+            "type": "wait_marker",
+            "event_id": "wait-1",
+            "t": 200,
+            "duration": 1000,
+            "record_mode": "action",
+            "workflow_id": "workflow-01",
+            "workflow_index": 1,
+        }
+        drafts = recording_drafts([verification, wait], include_waits=False)
+        self.assertEqual(["screen_verification", "wait"], [draft["kind"] for draft in drafts])
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog([verification, wait], MacroRepository(Path(directory)))
+            steps = dialog.build_steps()
+            self.assertEqual("screen_condition", steps[0]["action"])
+            self.assertFalse(steps[0]["click_enabled"])
+            self.assertTrue(steps[0]["abort_on_fail"])
+            self.assertEqual(1000, steps[1]["duration"])
+            dialog.close()
+
+    def test_live_recording_map_adds_draggable_identifiable_nodes(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.automation import RecordingBar
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        bar = RecordingBar()
+        events = [
+            {
+                "type": "mouse", "event_id": "mouse-1", "t": 100, "button": "Left",
+                "x": 10, "y": 20, "record_mode": "action", "workflow_id": "workflow-01",
+            },
+            {
+                "type": "screen_verification", "event_id": "verify-1", "t": 200,
+                "x": 10, "y": 20, "record_mode": "action", "workflow_id": "workflow-01",
+            },
+        ]
+        bar.update_live_events(events)
+        app.processEvents()
+        self.assertEqual(2, len(bar.live_canvas.nodes))
+        self.assertEqual("screen_condition", bar.live_canvas.steps[1]["action"])
+        bar.live_canvas.nodes[1].setPos(QtCore.QPointF(77, 88))
+        self.assertEqual([77.0, 88.0], bar.event_positions()["mouse-1"])
+        bar.close()
+
+    def test_node_cards_collapse_to_header_and_restore_from_macro_state(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas, NodeItem
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro(
+            {
+                "steps": [
+                    {"action": "image_search", "label": "로그인 확인", "on_success": 2},
+                    {"action": "wait", "duration": 500},
+                ],
+                "graph_collapsed": [1],
+            }
+        )
+        app.processEvents()
+        self.assertTrue(canvas.nodes[1].collapsed)
+        self.assertEqual(NodeItem.COLLAPSED_HEIGHT + 6, canvas.nodes[1].boundingRect().height())
+        changed: list[list[int]] = []
+        canvas.collapsed_changed.connect(changed.append)
+        canvas.set_nodes_collapsed([1, 2], True)
+        self.assertEqual([1, 2], changed[-1])
+        canvas.set_nodes_collapsed([1, 2], False)
+        self.assertEqual([], changed[-1])
+        canvas.close()
+
     def test_repository_removes_only_retired_ai_recording_artifacts(self) -> None:
         from macro_studio.repository import MacroRepository
 

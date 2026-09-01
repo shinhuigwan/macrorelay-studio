@@ -49,7 +49,9 @@ def load_recording(path: Path) -> list[dict[str, Any]]:
             payload = json.loads(line)
         except (TypeError, ValueError):
             continue
-        if isinstance(payload, dict) and payload.get("type") in {"mouse", "key"}:
+        if isinstance(payload, dict) and payload.get("type") in {
+            "mouse", "key", "screen_condition", "screen_verification", "wait_marker"
+        }:
             events.append(payload)
     return sorted(events, key=lambda item: int(item.get("t") or 0))
 
@@ -64,6 +66,10 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
         current_time = int(event.get("t") or 0)
         gap = current_time - previous_time
         record_mode = "branch" if str(event.get("record_mode") or "action").lower() == "branch" else "action"
+        workflow = {
+            "workflow_id": str(event.get("workflow_id") or ""),
+            "workflow_index": int(event.get("workflow_index") or 1),
+        }
         # Branch-mode F8 captures open an editor, so their timestamp gaps are
         # UI editing time rather than intentional macro waits. Keep those
         # candidates contiguous while still preserving their real actions.
@@ -75,8 +81,45 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                     "t": previous_time,
                     "duration": min(5000, max(300, gap - 180)),
                     "detail": f"화면 반응 대기 {min(5000, max(300, gap - 180))} ms",
+                    **workflow,
                 }
             )
+        if event.get("type") == "wait_marker":
+            duration = max(100, int(event.get("duration") or 1000))
+            drafts.append(
+                {
+                    "kind": "wait",
+                    "record_mode": record_mode,
+                    "t": current_time,
+                    "duration": duration,
+                    "detail": f"단축키 대기 {duration} ms",
+                    "event": event,
+                    **workflow,
+                }
+            )
+            previous_time = current_time
+            index += 1
+            continue
+
+        if event.get("type") in {"screen_condition", "screen_verification"}:
+            window = event.get("window") if isinstance(event.get("window"), dict) else {}
+            verification = event.get("type") == "screen_verification"
+            drafts.append(
+                {
+                    "kind": "screen_verification" if verification else "screen_condition",
+                    "t": current_time,
+                    "event": event,
+                    "count": 1,
+                    "strategy": "image",
+                    "record_mode": record_mode,
+                    "detail": "F5 결과 확인 · 없으면 정지" if verification else "우클릭 화면 조건 · 보이면 진행",
+                    "target": _window_label(window),
+                    **workflow,
+                }
+            )
+            previous_time = current_time
+            index += 1
+            continue
         if event.get("type") == "mouse":
             count = 1
             if index + 1 < len(events):
@@ -102,6 +145,7 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                     "record_mode": record_mode,
                     "detail": f"{event.get('button', 'Left')} {'더블 클릭' if count == 2 else '클릭'} · {event.get('x')}, {event.get('y')}",
                     "target": _window_label(window),
+                    **workflow,
                 }
             if isinstance(event.get("_handle_profile"), dict):
                 draft["handle_profile"] = dict(event["_handle_profile"])
@@ -124,6 +168,7 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                     "record_mode": record_mode,
                     "detail": f"직접 지정 이미지 · {int(size[0] or 0)}×{int(size[1] or 0)}",
                     "target": _window_label(window),
+                    **workflow,
                 }
             if isinstance(event.get("_handle_profile"), dict):
                 draft["handle_profile"] = dict(event["_handle_profile"])
@@ -149,6 +194,12 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
             group.append(key_event)
             last_time = int(key_event.get("t") or last_time)
             index += 1
+        if not group:
+            # Forward-compatible guard for recorder controls unknown to this
+            # Studio build. Never leave the draft compressor stuck on one row.
+            index += 1
+            previous_time = current_time
+            continue
         text = ""
         segments: list[tuple[str, str]] = []
         for key_event in group:
@@ -176,6 +227,8 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                     "window": window,
                     "detail": f"텍스트 입력 · {len(value)}자" if segment_kind == "text" else f"키 입력 · {value}",
                     "target": _window_label(window),
+                    "event": group[0],
+                    **workflow,
                 }
             )
         previous_time = last_time
@@ -195,15 +248,19 @@ class RecordingBar(QtWidgets.QDialog):
         self.record_mode = "action"
         self.setWindowTitle("스마트 녹화")
         self.setWindowFlags(QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint)
-        self.setFixedWidth(660)
+        self.resize(1040, 620)
+        self.setMinimumSize(760, 430)
         self.workflow_index = 1
-        layout = QtWidgets.QHBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(7)
+        controls = QtWidgets.QHBoxLayout()
         self.dot = QtWidgets.QLabel("●")
         self.dot.setStyleSheet("color:#697386; font-size:18pt;")
         self.mode_badge = QtWidgets.QLabel("일반 액션")
         self.mode_badge.setAlignment(QtCore.Qt.AlignCenter)
         self.mode_badge.setFixedWidth(82)
-        self.label = QtWidgets.QLabel("2초 후 준비 · ` 시작/정지 · Shift+` 모드 · F10 종료")
+        self.label = QtWidgets.QLabel("2초 후 준비 · ` 시작/정지 · F5 확인 · F8 캡처 · F10 종료")
         self.label.setStyleSheet("font-weight:700;")
         self.capture_button = QtWidgets.QPushButton("▣ 이미지 캡처  F8")
         self.capture_button.setToolTip("화면 위에서 붓처럼 드래그해 이미지 서치 원본 영역을 지정합니다.")
@@ -215,12 +272,32 @@ class RecordingBar(QtWidgets.QDialog):
         self.branch_button.clicked.connect(self.branch_requested.emit)
         stop = QtWidgets.QPushButton("■ 종료  F10")
         stop.clicked.connect(self.stop_requested.emit)
-        layout.addWidget(self.dot)
-        layout.addWidget(self.mode_badge)
-        layout.addWidget(self.label, 1)
-        layout.addWidget(self.branch_button)
-        layout.addWidget(self.capture_button)
-        layout.addWidget(stop)
+        self.map_toggle = QtWidgets.QPushButton("노드맵 접기")
+        self.map_toggle.clicked.connect(self._toggle_live_map)
+        controls.addWidget(self.dot)
+        controls.addWidget(self.mode_badge)
+        controls.addWidget(self.label, 1)
+        controls.addWidget(self.branch_button)
+        controls.addWidget(self.capture_button)
+        controls.addWidget(self.map_toggle)
+        controls.addWidget(stop)
+        layout.addLayout(controls)
+        shortcuts = QtWidgets.QLabel(
+            "F5 결과 확인 · F6 1초 대기 · F7 새 작업 · F8 이미지 · F9 시작 · F10 종료 · "
+            "F11 일반/분기 · F12 기록 ON/OFF · 우클릭 화면 조건"
+        )
+        shortcuts.setObjectName("Muted")
+        shortcuts.setWordWrap(True)
+        layout.addWidget(shortcuts)
+        from .node_editor import NodeCanvas
+
+        self.live_canvas = NodeCanvas(self)
+        self.live_canvas.flow_label.setText("SMART RECORDING · LIVE NODE MAP")
+        self.live_canvas.setMinimumHeight(300)
+        self.live_canvas.set_macro({"steps": []})
+        layout.addWidget(self.live_canvas, 1)
+        self._event_positions: dict[str, list[float]] = {}
+        self._last_live_signature: tuple[str, ...] = ()
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self._tick)
@@ -255,15 +332,14 @@ class RecordingBar(QtWidgets.QDialog):
         seconds = max(0, self.elapsed.elapsed() - 2000) // 1000
         elapsed = f"{seconds // 60:02d}:{seconds % 60:02d}"
         if self.gate_active and self.record_mode == "branch":
-            self.label.setText(f"ON {elapsed} · 분기 액션 기록 · F8 이미지 · Shift+` → 일반")
+            self.label.setText(f"ON {elapsed} · 분기 액션 · F5 확인 · F8 이미지 · F11 → 일반")
         elif self.gate_active:
-            self.label.setText(f"ON {elapsed} · 일반 액션 · Shift+` → 분기 · ` → 정지")
+            self.label.setText(f"ON {elapsed} · 일반 액션 · F5 확인 · F8 이미지 · F11 → 분기")
         else:
-            self.label.setText(f"OFF {elapsed} · ` → 시작 · Shift+` → 모드 · F10 종료")
+            self.label.setText(f"OFF {elapsed} · ` 또는 F12 → 시작 · F11 → 모드 · F10 종료")
 
     def enable_workflow_branches(self) -> None:
         self.branch_button.setVisible(True)
-        self.setFixedWidth(850)
         self.mode_badge.setText(f"작업 {self.workflow_index}")
         self._tick()
 
@@ -272,7 +348,7 @@ class RecordingBar(QtWidgets.QDialog):
         if self.branch_button.isVisible():
             self.mode_badge.setText(f"작업 {self.workflow_index}")
             self.label.setText(
-                f"작업 {self.workflow_index} · 우클릭=조건 · F6=결과 확인 · F7=다음 작업 · F10=종료"
+                f"작업 {self.workflow_index} · 우클릭=조건 · F5=결과 확인 · F7=다음 작업 · F10=종료"
             )
 
     def set_gate_active(self, active: bool) -> None:
@@ -299,7 +375,69 @@ class RecordingBar(QtWidgets.QDialog):
 
     def show_capture_result(self, width: int, height: int) -> None:
         role = "분기 후보" if self.record_mode == "branch" else "기본 이미지"
-        self.label.setText(f"{role} {width}×{height} 완료 · Shift+` → 모드 · ` → 정지")
+        self.label.setText(f"{role} {width}×{height} 완료 · F11 → 모드 · F12 → 기록 정지")
+
+    def _toggle_live_map(self) -> None:
+        visible = not self.live_canvas.isVisible()
+        self.live_canvas.setVisible(visible)
+        self.map_toggle.setText("노드맵 접기" if visible else "노드맵 펼치기")
+        if visible:
+            self.resize(max(self.width(), 900), max(self.height(), 520))
+
+    @staticmethod
+    def _live_step(draft: dict[str, Any], index: int) -> dict[str, Any]:
+        kind = str(draft.get("kind") or "")
+        event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
+        event_id = str(event.get("event_id") or f"draft-{kind}-{int(draft.get('t') or 0)}-{index}")
+        workflow_id = str(draft.get("workflow_id") or "workflow-01")
+        common = {
+            "label": str(draft.get("detail") or kind or "녹화 동작"),
+            "_event_id": event_id,
+            "workflow_id": workflow_id,
+            "workflow_label": f"스마트 작업 {int(draft.get('workflow_index') or 1)}",
+        }
+        if kind == "wait":
+            return {"action": "wait", "duration": int(draft.get("duration") or 1000), **common}
+        if kind == "screen_verification":
+            return {"action": "screen_condition", "label": "F5 결과 확인 · 없으면 정지", **common}
+        if kind == "screen_condition":
+            return {"action": "screen_condition", "label": "우클릭 화면 조건", **common}
+        if kind in {"mouse", "image_capture"}:
+            label = "F8 이미지 캡처" if kind == "image_capture" else str(draft.get("detail") or "클릭")
+            return {"action": "image_search", "label": label, **common}
+        if kind in {"text", "key"}:
+            return {"action": "type_text", **common}
+        return {"action": "flow_control", **common}
+
+    def _remember_live_positions(self) -> None:
+        for index, node in self.live_canvas.nodes.items():
+            if not 0 < index <= len(self.live_canvas.steps):
+                continue
+            event_id = str(self.live_canvas.steps[index - 1].get("_event_id") or "")
+            if event_id:
+                self._event_positions[event_id] = [round(node.pos().x(), 2), round(node.pos().y(), 2)]
+
+    def update_live_events(self, events: list[dict[str, Any]]) -> None:
+        drafts = recording_drafts(events, include_waits=False)
+        steps = [self._live_step(draft, index) for index, draft in enumerate(drafts, start=1)]
+        signature = tuple(str(step.get("_event_id") or "") for step in steps)
+        if signature == self._last_live_signature:
+            return
+        self._remember_live_positions()
+        positions = {
+            str(index): self._event_positions[event_id]
+            for index, event_id in enumerate(signature, start=1)
+            if event_id in self._event_positions
+        }
+        for index, step in enumerate(steps[:-1], start=1):
+            if str(step.get("workflow_id") or "") == str(steps[index].get("workflow_id") or ""):
+                step["on_success"] = index + 1
+        self.live_canvas.set_macro({"steps": steps, "graph_positions": positions})
+        self._last_live_signature = signature
+
+    def event_positions(self) -> dict[str, list[float]]:
+        self._remember_live_positions()
+        return dict(self._event_positions)
 
 
 def _recorded_sample_image(event: dict[str, Any]) -> QtGui.QImage:
@@ -1021,7 +1159,10 @@ class SmartRecordingController(QtCore.QObject):
         self.process.setArguments(
             [
                 str(helper), "--out", str(self.output), "--exclude-pid", str(os.getpid()), "--delay", "2",
-                "--capture-vk", str(0x77), "--stop-vk", str(0x79), "--hold-vk", str(0xC0),
+                "--capture-vk", str(0x77), "--branch-vk", str(0x76), "--verify-vk", str(0x74),
+                "--wait-vk", str(0x75), "--mode-vk", str(0x7A), "--toggle-vk", str(0x7B),
+                "--stop-vk", str(0x79), "--hold-vk", str(0xC0),
+                "--right-click-condition", "--rolling-preframes",
             ]
         )
         self.process.setWorkingDirectory(str(self.repository.root))
@@ -1029,8 +1170,10 @@ class SmartRecordingController(QtCore.QObject):
         self.process.finished.connect(self._finished)
         self.process.errorOccurred.connect(self._process_error)
         self.bar = RecordingBar(self.host)
+        self.bar.enable_workflow_branches()
         self.bar.stop_requested.connect(self.stop)
         self.bar.capture_requested.connect(self.request_image_capture)
+        self.bar.branch_requested.connect(self.request_workflow_branch)
         self.bar.show()
         self.process.start()
         self._capture_poll.start()
@@ -1041,6 +1184,17 @@ class SmartRecordingController(QtCore.QObject):
             self.process.terminate()
             if not self.process.waitForFinished(1200):
                 self.process.kill()
+
+    @QtCore.Slot()
+    def request_workflow_branch(self) -> None:
+        if sys.platform != "win32" or self.process is None or self.process.state() == QtCore.QProcess.NotRunning:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            user32.keybd_event(0x76, 0, 0, 0)
+            user32.keybd_event(0x76, 0, 0x0002, 0)
+        except Exception:
+            return
 
     def _read_capture_requests(self) -> list[dict[str, Any]]:
         if not self.output.is_file():
@@ -1080,6 +1234,12 @@ class SmartRecordingController(QtCore.QObject):
                     self.bar.set_record_mode(normalized_mode)
         if latest_workflow_index is not None and self.bar is not None:
             self.bar.set_workflow_index(latest_workflow_index)
+        if self.bar is not None:
+            live_events = sorted(
+                [*load_recording(self.output), *self._manual_captures],
+                key=lambda item: int(item.get("t") or 0),
+            )
+            self.bar.update_live_events(live_events)
         return requests
 
     def _poll_capture_requests(self) -> None:
@@ -1168,6 +1328,7 @@ class SmartRecordingController(QtCore.QObject):
             self._manual_captures.append(
                 {
                     "type": "capture",
+                    "event_id": f"capture-{uuid.uuid4().hex}",
                     "t": int(event_time),
                     "x": int(center.x()),
                     "y": int(center.y()),
@@ -1184,6 +1345,11 @@ class SmartRecordingController(QtCore.QObject):
             )
             if self.bar is not None:
                 self.bar.show_capture_result(image.width(), image.height())
+                live_events = sorted(
+                    [*load_recording(self.output), *self._manual_captures],
+                    key=lambda item: int(item.get("t") or 0),
+                )
+                self.bar.update_live_events(live_events)
         finally:
             self._capture_in_progress = False
             if self.bar is not None:
@@ -1196,6 +1362,7 @@ class SmartRecordingController(QtCore.QObject):
 
     def _finished(self, exit_code: int, _status: QtCore.QProcess.ExitStatus) -> None:
         self._capture_poll.stop()
+        live_positions = self.bar.event_positions() if self.bar is not None else {}
         if self.bar is not None:
             self.bar.close()
             self.bar.deleteLater()
@@ -1204,6 +1371,10 @@ class SmartRecordingController(QtCore.QObject):
             [*load_recording(self.output), *self._manual_captures],
             key=lambda item: int(item.get("t") or 0),
         )
+        for event in events:
+            event_id = str(event.get("event_id") or "")
+            if event_id in live_positions:
+                event["_live_position"] = list(live_positions[event_id])
         try:
             self.output.unlink(missing_ok=True)
         except OSError:
@@ -1360,7 +1531,15 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self.table.setRowCount(len(self.drafts))
         self.preview_labels.clear()
         self.preview_buttons.clear()
-        kind_labels = {"mouse": "클릭", "image_capture": "이미지", "text": "텍스트", "key": "키", "wait": "대기"}
+        kind_labels = {
+            "mouse": "클릭",
+            "image_capture": "이미지",
+            "screen_condition": "화면 조건",
+            "screen_verification": "결과 확인",
+            "text": "텍스트",
+            "key": "키",
+            "wait": "대기",
+        }
         for row, draft in enumerate(self.drafts):
             use_item = QtWidgets.QTableWidgetItem()
             use_item.setCheckState(QtCore.Qt.Checked if draft.get("_review_enabled", True) else QtCore.Qt.Unchecked)
@@ -1402,9 +1581,15 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                     f"대상 창 좌표: {int(profile.get('x') or 0)}, {int(profile.get('y') or 0)}"
                 )
             self.table.setItem(row, 3, target_item)
-            if draft.get("kind") in {"mouse", "image_capture"}:
+            if draft.get("kind") in {"mouse", "image_capture", "screen_condition", "screen_verification"}:
                 combo = QtWidgets.QComboBox()
-                if draft.get("kind") == "image_capture":
+                if draft.get("kind") in {"screen_condition", "screen_verification"}:
+                    combo.addItem("이미지가 보이는지 확인 · 클릭 안 함", "image")
+                    event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
+                    image = _recorded_sample_image(event)
+                    if not image.isNull() and row not in self.crop_rects:
+                        self.crop_sizes[row] = QtCore.QSize(min(128, image.width()), min(88, image.height()))
+                elif draft.get("kind") == "image_capture":
                     combo.addItem("직접 캡처 이미지 찾아 클릭", "image")
                     event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
                     image = _recorded_sample_image(event)
@@ -1774,7 +1959,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             strategy = str(widget.currentData() or "window") if isinstance(widget, QtWidgets.QComboBox) else "auto"
             selected.append((row, draft, strategy))
         need_capture = any(
-            draft.get("kind") in {"mouse", "image_capture"}
+            draft.get("kind") in {"mouse", "image_capture", "screen_condition", "screen_verification"}
             and strategy == "image"
             and not str((draft.get("event") or {}).get("image_sample_bmp") or "")
             for _row, draft, strategy in selected
@@ -1791,6 +1976,9 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                         "label": "화면 반응 대기",
                         "duration": int(draft.get("duration") or 500),
                         "_recording_mode": record_mode,
+                        "workflow_id": str(draft.get("workflow_id") or ""),
+                        "workflow_label": f"스마트 작업 {int(draft.get('workflow_index') or 1)}",
+                        "_live_position": list(((draft.get("event") or {}).get("_live_position") or []))[:2],
                     }
                 )
                 continue
@@ -1803,6 +1991,9 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                         "send_mode": "raw",
                         "mode": "active",
                         "_recording_mode": record_mode,
+                        "workflow_id": str(draft.get("workflow_id") or ""),
+                        "workflow_label": f"스마트 작업 {int(draft.get('workflow_index') or 1)}",
+                        "_live_position": list(((draft.get("event") or {}).get("_live_position") or []))[:2],
                     }
                 )
                 continue
@@ -1816,6 +2007,9 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                         "send_mode": "input",
                         "mode": "active",
                         "_recording_mode": record_mode,
+                        "workflow_id": str(draft.get("workflow_id") or ""),
+                        "workflow_label": f"스마트 작업 {int(draft.get('workflow_index') or 1)}",
+                        "_live_position": list(((draft.get("event") or {}).get("_live_position") or []))[:2],
                     }
                 )
                 continue
@@ -1929,6 +2123,22 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                     "click": click,
                     "abort_on_fail": False,
                 }
+                if kind in {"screen_condition", "screen_verification"}:
+                    step["action"] = "screen_condition"
+                    step["label"] = "F5 결과 화면 확인" if kind == "screen_verification" else "우클릭 화면 조건"
+                    step["click_enabled"] = False
+                    step.pop("click", None)
+                    step["timeout"] = 3000 if kind == "screen_verification" else 1200
+                    step["poll_delay"] = 80
+                    step["abort_on_fail"] = True
+                    automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+                    automation.update(
+                        {
+                            "smart_recording_control": "F5" if kind == "screen_verification" else "RightClick",
+                            "missing_behavior": "stop",
+                        }
+                    )
+                    step["_automation"] = automation
             elif strategy == "handle_probe" and profile:
                 step = {
                     "action": "inactive_click",
@@ -1991,6 +2201,13 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                     },
                 }
             step["_recording_mode"] = record_mode
+            workflow_id = str(draft.get("workflow_id") or "").strip()
+            if workflow_id:
+                step["workflow_id"] = workflow_id
+                step["workflow_label"] = f"스마트 작업 {int(draft.get('workflow_index') or 1)}"
+            live_position = event.get("_live_position") if isinstance(event, dict) else None
+            if isinstance(live_position, (list, tuple)) and len(live_position) >= 2:
+                step["_live_position"] = [float(live_position[0]), float(live_position[1])]
             multi_group = str(draft.get("_review_multi_group") or "")
             if multi_group:
                 step["_recording_multi_group"] = multi_group
@@ -2028,7 +2245,8 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             step.pop("_recording_multi_group", None)
         if self.connect_steps.isChecked():
             for index, step in enumerate(steps[:-1]):
-                if step.get("action") != "flow_control":
+                same_workflow = str(step.get("workflow_id") or "") == str(steps[index + 1].get("workflow_id") or "")
+                if step.get("action") != "flow_control" and same_workflow:
                     step["on_success"] = index + 2
             # A normal image capture followed by one or more branch-mode F8
             # captures becomes a priority fallback chain. Success from any

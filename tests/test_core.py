@@ -4800,6 +4800,8 @@ class AIAutomationTests(unittest.TestCase):
                 "prompt.txt", "schema.json", "manifest.json", "timeline.json", "targets.json", "recording.mp4",
                 "contact-sheet.png", "asset-manifest.json", "frames/step-001-before.png",
                 "video-segments.json", "workflows.json",
+                "studio-capabilities.json", "node-reference.md", "recommended-actions.json",
+                "generation-checklist.json",
                 "frames/step-001-after.png", "asset-candidates/click-001-button.png",
                 "asset-candidates/click-001-button-grayscale.png",
                 "asset-candidates/click-001-button-outline.png",
@@ -4818,6 +4820,7 @@ class AIAutomationTests(unittest.TestCase):
             self.assertIn("흐름이 명확하면 질문하지 말고 즉시 JSON", prompt)
             self.assertIn("1회 실행 후 종료", prompt)
             self.assertIn("질문으로 되묻지", prompt)
+            self.assertIn("232개 설정 필드", prompt)
             targets = json.loads((stage / "targets.json").read_text(encoding="utf-8"))
             self.assertTrue(targets[0]["reacquire_each_run"])
             self.assertEqual("browser.exe", targets[0]["exe"])
@@ -5108,7 +5111,7 @@ class AIAutomationTests(unittest.TestCase):
                 },
             )
             manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual("image_appear", manifest["trigger"]["type"])
+            self.assertEqual("image_appears", manifest["trigger"]["type"])
             self.assertEqual("target-01", manifest["trigger"]["target_ref"])
             self.assertEqual("trigger-image-001", manifest["trigger"]["asset_ref"])
             self.assertEqual(500, manifest["trigger"]["params"]["poll_interval"])
@@ -5493,6 +5496,15 @@ class AIAutomationTests(unittest.TestCase):
                     stage.mkdir()
                     (stage / "timeline.json").write_text("[]", encoding="utf-8")
                     (stage / "asset.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                    (stage / "prompt.txt").write_text("OLD DEMO PROMPT", encoding="utf-8")
+                    (stage / "schema.json").write_text("{}", encoding="utf-8")
+                    (stage / "targets.json").write_text(json.dumps([{
+                        "id": "target-01", "exe": "game.exe", "class": "GameWindow", "title": "Game",
+                    }]), encoding="utf-8")
+                    (stage / "asset-manifest.json").write_text(json.dumps({"assets": [{
+                        "id": "asset-01", "label": "강화 버튼", "target_ref": "target-01",
+                        "candidate": "asset.png", "selected_candidate": "asset.png", "candidates": [],
+                    }]}), encoding="utf-8")
                     archive = root / f"demo-{index}-{demo_index}.zip"
                     archive.write_bytes(b"zip")
                     store.add_demo(behavior["id"], str(archive), str(stage), 5, "normal")
@@ -5508,8 +5520,21 @@ class AIAutomationTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as bundle:
                 names = set(bundle.namelist())
             self.assertIn("learning-manifest.json", names)
+            self.assertIn("studio-capabilities.json", names)
+            self.assertIn("node-reference.md", names)
+            self.assertIn("asset-manifest.json", names)
             self.assertIn("behaviors/behavior-01/demo-01/timeline.json", names)
             self.assertIn("behaviors/behavior-02/demo-02/asset.png", names)
+            self.assertNotIn("behaviors/behavior-01/demo-01/prompt.txt", names)
+            self.assertNotIn("behaviors/behavior-01/demo-01/schema.json", names)
+            assets = json.loads((stage / "asset-manifest.json").read_text(encoding="utf-8"))["assets"]
+            self.assertEqual(4, len(assets))
+            self.assertEqual(4, len({item["id"] for item in assets}))
+            self.assertTrue(all(item["candidate"].startswith("behaviors/") for item in assets))
+            self.assertTrue(all((stage / item["candidate"]).is_file() for item in assets))
+
+            from macro_studio.ai_import_dialog import package_stage_for
+            self.assertEqual(stage, package_stage_for(root, {"source_package_id": manifest["package_id"]}))
 
     def test_behavior_demo_skips_single_macro_execution_condition_dialog(self) -> None:
         from PySide6 import QtCore, QtWidgets
@@ -5519,21 +5544,104 @@ class AIAutomationTests(unittest.TestCase):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         with tempfile.TemporaryDirectory() as directory:
             repository = MacroRepository(Path(directory))
-            controller = AIRecordingController(repository, None, ask_execution_condition=False)
+            controller = AIRecordingController(
+                repository, None, ask_execution_condition=False, record_video=False
+            )
             event = {"type": "mouse", "t": 10, "button": "Left", "x": 20, "y": 30}
             archive = repository.root / "exports" / "demo.zip"
             stage = repository.root / ".automation" / "ai-packages" / "demo"
             completed: list[tuple[str, str, list]] = []
             controller.package_completed.connect(lambda *args: completed.append(args))
             with mock.patch("macro_studio.ai_recording.load_ai_recording", return_value=[event]), \
-                 mock.patch.object(controller, "_encode_video", return_value=None), \
+                 mock.patch.object(controller, "_encode_video", return_value=None) as encode, \
                  mock.patch("macro_studio.ai_recording.AIRecordingPackageBuilder.build", return_value=(archive, stage)):
                 controller._finished(0, QtCore.QProcess.ExitStatus.NormalExit)
                 app.processEvents()
                 app.processEvents()
+            encode.assert_not_called()
             self.assertIsNone(controller._condition_dialog)
             self.assertEqual(1, len(completed))
             self.assertEqual([event], completed[0][2])
+
+    def test_ai_capability_catalog_matches_every_visible_action_field(self) -> None:
+        from macro_studio.action_editor import ACTION_FIELDS
+        from macro_studio.ai_automation import ai_capabilities_document
+
+        document = ai_capabilities_document()
+        self.assertEqual(set(ACTION_FIELDS), set(document["actions"]))
+        self.assertEqual(232, sum(len(row["fields"]) for row in document["actions"].values()))
+        image_fields = {field["path"]: field for field in document["actions"]["image_search"]["fields"]}
+        self.assertEqual([0, 0], image_fields["click.offset"]["default"])
+        self.assertEqual({"active", "inactive"}, {row["value"] for row in image_fields["click.mode"]["choices"]})
+        ocr_fields = {field["path"] for field in document["actions"]["ocr"]["fields"]}
+        self.assertTrue({"ocr_action", "store_var", "number_condition", "value_regex"} <= ocr_fields)
+        self.assertIn("vault_get", document["contract"]["safety"]["secrets"])
+        self.assertEqual(
+            {"manual", "process_start", "process_stop", "window_appears", "image_appears", "ocr_threshold", "schedule"},
+            set(document["triggers"]),
+        )
+
+    def test_ai_json_loader_normalizes_labels_defaults_and_single_references(self) -> None:
+        from macro_studio.ai_import_dialog import load_ai_json
+
+        payload = {
+            "name": "자동 보정", "targets": {"target-01": {"exe": "app.exe"}},
+            "assets": {"asset-01": {"candidate": "button.png"}},
+            "steps": [{"action": "이미지 검색", "parameters": {"confidence": 88}, "success": "end"}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "macrorelay-ai.json"
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            normalized = load_ai_json(path)
+        step = normalized["steps"][0]
+        self.assertEqual("macrorelay-ai-1.0", normalized["schema_version"])
+        self.assertEqual("image_search", step["action"])
+        self.assertEqual("step-001", step["id"])
+        self.assertEqual("target-01", step["target_ref"])
+        self.assertEqual("asset-01", step["asset_ref"])
+        self.assertEqual("end", step["on_success"])
+        self.assertEqual(88, step["params"]["confidence"])
+
+    def test_ai_import_supports_all_event_trigger_families(self) -> None:
+        from macro_studio.ai_automation import materialize_ai_document
+        from macro_studio.repository import MacroRepository
+
+        payload = {
+            "schema_version": "macrorelay-ai-1.0", "source_package_id": "trigger-all",
+            "name": "이벤트 자동화", "description": "모든 트리거",
+            "targets": [], "assets": [], "variables": {},
+            "triggers": [
+                {"id": "t1", "type": "process_start", "process": "game.exe", "interval": 1},
+                {"id": "t2", "type": "window_appears", "title": "완료", "interval": 2},
+                {"id": "t3", "type": "schedule", "time": "05:30", "days": [0, 2, 4]},
+                {"id": "t4", "type": "ocr_threshold", "region": [0, 0, 500, 300], "operator": ">=", "value": 1000},
+            ],
+            "steps": [{"id": "step-1", "action": "wait", "params": {"duration": 100}}],
+            "setup_requirements": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            macro, issues = materialize_ai_document(payload, MacroRepository(Path(directory)))
+        self.assertFalse([issue for issue in issues if issue.severity == "error"])
+        self.assertEqual(["process_start", "window_appears", "schedule", "ocr_threshold"], [row["type"] for row in macro["triggers"]])
+        self.assertEqual("game.exe", macro["triggers"][0]["process"])
+        self.assertEqual([0, 2, 4], macro["triggers"][2]["days"])
+        self.assertEqual(1000.0, macro["triggers"][3]["value"])
+
+    def test_ai_validator_reports_unknown_or_invalid_action_parameters(self) -> None:
+        from macro_studio.ai_automation import validate_ai_document
+
+        payload = {
+            "schema_version": "macrorelay-ai-1.0", "name": "필드 검사", "description": "",
+            "targets": [], "assets": [], "variables": {}, "triggers": [], "setup_requirements": [],
+            "steps": [{
+                "id": "one", "action": "image_search",
+                "params": {"engine": "unknown-engine", "confidence": "높음", "invented_option": True},
+            }],
+        }
+        issues = validate_ai_document(payload)
+        self.assertIn("ignored_param", {issue.code for issue in issues})
+        self.assertIn("param_type", {issue.code for issue in issues})
+        self.assertIn("param_choice", {issue.code for issue in issues})
 
 
 if __name__ == "__main__":

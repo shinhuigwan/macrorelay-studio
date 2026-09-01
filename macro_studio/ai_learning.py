@@ -10,6 +10,7 @@ from typing import Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .ai_automation import write_ai_reference_files
 from .widgets import Card, danger_button, primary_button
 
 
@@ -26,6 +27,21 @@ def _write_json(path: Path, value: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _read_json_value(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, TypeError, ValueError):
+        return default
 
 
 class BehaviorLearningStore:
@@ -150,12 +166,88 @@ class BehaviorLearningStore:
         stage = self.base / "packages" / package_id
         stage.mkdir(parents=True, exist_ok=False)
         manifest_behaviors: list[dict[str, Any]] = []
+        asset_catalog: list[dict[str, Any]] = []
+        target_catalog: list[dict[str, Any]] = []
+        timeline_catalog: list[dict[str, Any]] = []
+        combined_timeline: list[dict[str, Any]] = []
         for behavior_index, behavior in enumerate(behaviors, 1):
             safe_folder = f"behavior-{behavior_index:02d}"
             demo_rows: list[dict[str, Any]] = []
             for demo_index, demo in enumerate(behavior.get("demos") or [], 1):
                 destination = stage / "behaviors" / safe_folder / f"demo-{demo_index:02d}"
                 source = self._copy_demo(demo, destination)
+                # The outer package contains one authoritative current Studio
+                # contract. Removing nested prompts/schemas avoids conflicting
+                # instructions and keeps multi-demo packages small and fast.
+                for redundant in (
+                    "prompt.txt", "schema.json", "studio-capabilities.json", "node-reference.md",
+                    "recommended-actions.json", "generation-checklist.json", "README.txt",
+                ):
+                    (destination / redundant).unlink(missing_ok=True)
+                prefix = f"{safe_folder}-demo-{demo_index:02d}"
+                relative_demo = f"behaviors/{safe_folder}/demo-{demo_index:02d}"
+                target_id_map: dict[str, str] = {}
+                raw_targets = _read_json_value(destination / "targets.json", [])
+                if isinstance(raw_targets, dict):
+                    raw_targets = raw_targets.get("targets") or []
+                if not isinstance(raw_targets, list):
+                    raw_targets = []
+                for target in raw_targets:
+                    if not isinstance(target, dict):
+                        continue
+                    old_id = str(target.get("id") or f"target-{len(target_id_map) + 1:02d}")
+                    new_id = f"{prefix}-{old_id}"
+                    target_id_map[old_id] = new_id
+                    target_catalog.append({
+                        **target,
+                        "id": new_id,
+                        "source_target_id": old_id,
+                        "behavior_id": behavior.get("id"),
+                        "behavior_name": behavior.get("name"),
+                        "demo_id": demo.get("id"),
+                    })
+                raw_assets = _read_json(destination / "asset-manifest.json").get("assets")
+                for asset in raw_assets if isinstance(raw_assets, list) else []:
+                    if not isinstance(asset, dict):
+                        continue
+                    old_id = str(asset.get("id") or f"asset-{len(asset_catalog) + 1:03d}")
+                    prepared = dict(asset)
+                    prepared["id"] = f"{prefix}-{old_id}"
+                    prepared["source_asset_id"] = old_id
+                    prepared["behavior_id"] = behavior.get("id")
+                    prepared["behavior_name"] = behavior.get("name")
+                    prepared["demo_id"] = demo.get("id")
+                    prepared["target_ref"] = target_id_map.get(str(asset.get("target_ref") or ""), "")
+                    for key in ("candidate", "selected_candidate"):
+                        if str(prepared.get(key) or ""):
+                            prepared[key] = f"{relative_demo}/{prepared[key]}"
+                    candidates = []
+                    for candidate in prepared.get("candidates") if isinstance(prepared.get("candidates"), list) else []:
+                        if not isinstance(candidate, dict):
+                            continue
+                        item = dict(candidate)
+                        if str(item.get("file") or ""):
+                            item["file"] = f"{relative_demo}/{item['file']}"
+                        candidates.append(item)
+                    prepared["candidates"] = candidates
+                    asset_catalog.append(prepared)
+                parsed_timeline = _read_json_value(destination / "timeline.json", [])
+                if isinstance(parsed_timeline, dict):
+                    parsed_timeline = parsed_timeline.get("timeline") or []
+                if not isinstance(parsed_timeline, list):
+                    parsed_timeline = []
+                for item in parsed_timeline:
+                    if isinstance(item, dict):
+                        combined_timeline.append(dict(item))
+                timeline_catalog.append({
+                    "behavior_id": behavior.get("id"),
+                    "behavior_name": behavior.get("name"),
+                    "demo_id": demo.get("id"),
+                    "kind": demo.get("kind", "normal"),
+                    "timeline": f"{relative_demo}/timeline.json",
+                    "asset_manifest": f"{relative_demo}/asset-manifest.json",
+                    "targets": f"{relative_demo}/targets.json",
+                })
                 demo_rows.append({
                     "id": demo.get("id"),
                     "kind": demo.get("kind", "normal"),
@@ -181,6 +273,10 @@ class BehaviorLearningStore:
             "behaviors": manifest_behaviors,
         }
         _write_json(stage / "learning-manifest.json", manifest)
+        _write_json(stage / "asset-manifest.json", {"assets": asset_catalog})
+        _write_json(stage / "targets.json", target_catalog)
+        _write_json(stage / "learning-evidence-index.json", {"demonstrations": timeline_catalog})
+        write_ai_reference_files(stage, combined_timeline)
         prompt = self._prompt(manifest)
         (stage / "prompt.txt").write_text(prompt, encoding="utf-8")
         (stage / "README.txt").write_text(
@@ -218,6 +314,17 @@ class BehaviorLearningStore:
 첨부된 `{manifest['package_id']}` ZIP은 사용자가 행동별로 나누어 녹화한 실제 시연 묶음입니다.
 사용자에게 노드 연결법을 다시 묻지 말고, 같은 행동의 여러 시연에서 공통 규칙과 우연한 동작을 구분하여 자동화 흐름을 추론하십시오.
 
+분석 전에 반드시 최상단의 다음 파일을 모두 읽으십시오.
+- `studio-capabilities.json`: 현재 Studio의 모든 노드와 실제 설정 필드, 기본값, 허용값, 사용 조건
+- `node-reference.md`: 전체 기능의 사람이 읽을 수 있는 상세 설명과 노드별 기본 params
+- `schema.json`: 반환 JSON의 정확한 구조
+- `asset-manifest.json`: 모든 시연 PNG를 충돌 없는 고유 ID와 패키지 기준 경로로 합친 카탈로그
+- `targets.json`: 시연별 대상 프로그램 카탈로그
+- `learning-evidence-index.json`: 행동·시연과 타임라인 파일의 대응표
+- `generation-checklist.json`: 반환 전 필수 자체 검증 목록
+
+녹화에 직접 나타난 클릭만 복사하지 말고, 위 전체 기능 중 목적 달성에 필요한 OCR·변수·조건·반복·서브매크로·테이블·알림 기능을 스스로 판단해 사용하십시오. 단, 명세에 없는 action·params 경로·선택값은 만들지 마십시오.
+
 프로젝트: {manifest.get('project_name')}
 행동 목록:
 {behavior_lines}
@@ -232,6 +339,10 @@ class BehaviorLearningStore:
 7. 한 행동의 성공·실패 흐름이 다른 행동의 내부 노드와 뒤섞이지 않도록 명확한 그룹과 표시 이름을 부여합니다.
 8. 로그인 정보나 비밀번호는 실제 값을 만들지 말고 MacroRelay Vault 변수로 남깁니다.
 9. 정말로 결과를 바꾸는 업무 규칙이 누락된 경우만 한 번 질문합니다. 영상으로 판단 가능하면 질문하지 않습니다.
+10. 반환 JSON의 `source_package_id`는 반드시 `{manifest['package_id']}`로 지정합니다.
+11. 이미지 asset의 id와 candidate는 최상단 `asset-manifest.json` 값을 그대로 사용합니다. demo 내부의 짧은 원본 id를 사용하지 않습니다.
+12. 각 step의 `source_evidence`에 선택한 행동·시연·timeline id와 해당 노드를 선택한 이유를 기록합니다.
+13. 반환 전에 `generation-checklist.json`을 모두 검사하고, 실패한 항목이 있으면 스스로 수정한 뒤 결과를 냅니다.
 
 결과는 MacroRelay Studio가 가져올 수 있는 `macrorelay-ai.json` 파일 하나로만 제공하십시오.
 설명용 코드 블록이나 긴 해설은 출력하지 말고, 다운로드 가능한 JSON 첨부 파일로 답하십시오.

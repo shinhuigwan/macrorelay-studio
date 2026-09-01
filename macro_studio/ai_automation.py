@@ -51,6 +51,45 @@ ALLOWED_ACTIONS = {
     "terminate_program",
     "remote_notify",
 }
+
+# These descriptions are shipped to the AI together with the mechanically
+# generated FieldSpec catalog.  The catalog tells it *how* to configure every
+# node; these rules tell it *when* each node is the correct tool.
+ACTION_SEMANTICS: dict[str, dict[str, Any]] = {
+    "mouse_click": {"use_when": "화면이 활성화되어도 되고 이미지 판정 없이 고정 위치를 클릭할 때", "result": "지정 좌표 클릭 완료"},
+    "inactive_click": {"use_when": "대상 프로그램을 활성화하지 않고 좌표 클릭 또는 드래그를 전달할 때", "result": "대상 창 메시지 전송 완료"},
+    "image_search": {"use_when": "PNG 이미지가 화면 어디에 있든 찾고 필요하면 중심·오프셋을 클릭할 때", "result": "탐지 성공/실패 분기", "requires": ["asset_ref 또는 assets"]},
+    "screen_condition": {"use_when": "특정 화면·버튼의 존재 여부만 판정하고 클릭하지 않을 때", "result": "조건 성공/실패 분기", "requires": ["asset_ref"]},
+    "datetime_condition": {"use_when": "날짜·요일·시간 조건을 검사하거나 조건 시각까지 대기할 때", "result": "시간 조건 성공/실패 분기"},
+    "type_text": {"use_when": "활성 또는 비활성 창에 문자열과 기능키를 입력할 때", "result": "입력 전송 완료", "requires": ["params.text 또는 vault_get 결과 변수"]},
+    "wait": {"use_when": "화면 판정 없이 정해진 시간만 대기해야 할 때", "result": "시간 경과"},
+    "browser_action": {"use_when": "Chrome 계열 디버그 연결에서 CSS 선택자로 클릭·입력·추출할 때", "result": "브라우저 요소 동작 성공/실패", "requires": ["params.selector"]},
+    "ocr": {"use_when": "화면이나 브라우저의 글자·숫자를 읽고 찾기·클릭·조건·변수 저장할 때", "result": "OCR_LastText/OCR_LastNumber 및 선택 변수 갱신"},
+    "table_store": {"use_when": "상수·변수·OCR 값을 Studio 데이터 테이블 셀에 저장할 때", "result": "테이블 셀 갱신"},
+    "table_copy": {"use_when": "테이블 범위를 클립보드로 복사하고 행·열 커서를 이동할 때", "result": "클립보드와 테이블 커서 갱신"},
+    "table_paste": {"use_when": "테이블 범위를 대상 창에 활성/비활성 방식으로 순서대로 입력할 때", "result": "선택 범위 입력과 커서 갱신"},
+    "table_excel_read": {"use_when": "Excel 파일 셀 또는 범위를 Studio 테이블로 읽을 때", "result": "테이블 갱신"},
+    "table_excel_write": {"use_when": "Studio 테이블 값을 Excel 파일에 기록할 때", "result": "Excel 저장"},
+    "set_var": {"use_when": "문자열·숫자·다른 변수 결과를 사용자 변수에 저장할 때", "result": "지정 변수 갱신", "requires": ["params.name"]},
+    "vault_get": {"use_when": "비밀번호·API 키처럼 평문 저장하면 안 되는 값을 DPAPI 보관함에서 변수로 가져올 때", "result": "보안 값이 지정 변수에만 로드", "requires": ["params.name", "params.secret"]},
+    "calc_var": {"use_when": "변수에 사칙연산·증감·수식을 적용할 때", "result": "숫자 변수 갱신", "requires": ["params.name"]},
+    "coord_mode": {"use_when": "뒤따르는 좌표 액션의 화면/창/클라이언트 기준을 명시적으로 변경할 때", "result": "좌표 해석 기준 변경"},
+    "call_submacro": {"use_when": "재사용 가능한 다른 매크로 행동을 호출하고 입력·출력 변수를 연결할 때", "result": "서브매크로 결과와 출력 변수 갱신", "requires": ["params.macro"]},
+    "flow_control": {"use_when": "명시적 횟수 반복이나 카운터 기반 점프가 필요할 때만", "result": "지정 노드로 제한된 이동", "requires": ["params.jump_to와 유한 repeat_count 또는 counter_key"]},
+    "text_condition": {"use_when": "OCR·클립보드·변수 문자열을 포함/일치/정규식으로 분기할 때", "result": "텍스트 일치/불일치 분기"},
+    "run_program": {"use_when": "사용자가 지정한 실행 파일·문서·URL을 시작할 때", "result": "프로그램 시작 요청", "requires": ["params.command"]},
+    "terminate_program": {"use_when": "프로세스 이름으로 대상 프로그램 종료를 요청할 때", "result": "프로세스 종료 요청", "requires": ["params.process"]},
+    "remote_notify": {"use_when": "완료·실패·OCR 결과를 연결된 모바일에 알릴 때", "result": "원격 알림 전송"},
+}
+AI_TRIGGER_TYPES: dict[str, dict[str, Any]] = {
+    "manual": {"label": "직접 실행", "use_when": "사용자가 실행 버튼·단축키·원격 명령으로 시작", "fields": {}},
+    "process_start": {"label": "프로그램 시작", "use_when": "특정 프로세스가 실행된 순간 시작", "fields": {"process": "실행 파일 이름", "interval": "확인 간격(초)"}},
+    "process_stop": {"label": "프로그램 종료", "use_when": "실행 중이던 특정 프로세스가 종료된 순간 시작", "fields": {"process": "실행 파일 이름", "interval": "확인 간격(초)"}},
+    "window_appears": {"label": "창 나타남", "use_when": "제목에 특정 문자열을 포함한 창이 나타나면 시작", "fields": {"title": "창 제목 일부", "interval": "확인 간격(초)"}},
+    "image_appears": {"label": "이미지 나타남", "use_when": "PNG가 화면 또는 대상 프로그램에 나타나면 시작", "fields": {"asset_ref": "asset-manifest id", "target_ref": "선택 대상 id", "params.threshold": "0.5~0.99", "params.poll_interval": "밀리초", "params.stable_ms": "안정 대기 밀리초", "params.search_scope": "target_client 또는 screen"}},
+    "ocr_threshold": {"label": "OCR 숫자 조건", "use_when": "화면 범위의 OCR 숫자가 비교 조건을 만족하면 시작", "fields": {"region": "[left,top,right,bottom]", "operator": ">= <= > < == !=", "value": "기준 숫자", "profile": "number/auto/game_ui", "lang": "eng+kor", "interval": "확인 간격(초)"}},
+    "schedule": {"label": "지정 시간·요일", "use_when": "선택 요일의 HH:mm에 한 번 시작", "fields": {"time": "HH:mm", "days": "월=0 ... 일=6 배열", "interval": "확인 간격(초)"}},
+}
 FORBIDDEN_KEYS = {
     "python",
     "python_code",
@@ -375,6 +414,8 @@ def load_ai_recording(path: Path) -> list[dict[str, Any]]:
 
 
 def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = None) -> str:
+    capabilities = ai_capabilities_document()
+    field_count = sum(len(row.get("fields") or []) for row in capabilities.get("actions", {}).values())
     trigger_example = deepcopy(packaged_trigger) if packaged_trigger else {"id": "trigger-001", "type": "manual"}
     example = {
         "schema_version": AI_SCHEMA_VERSION,
@@ -409,6 +450,8 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 
 첨부된 AI 녹화 패키지 `{package_id}`를 분석하십시오. 이 패키지에는 사용자가 수행한 동작의 비식별 타임라인, 대상 프로그램 정보, 원본 PNG 이미지 후보와 선택적 동작 영상이 들어 있습니다.
 
+가장 먼저 패키지 최상단의 `studio-capabilities.json`, `node-reference.md`, `schema.json`, `generation-checklist.json`을 읽으십시오. 여기에는 현재 Studio가 실제로 지원하는 모든 노드와 {field_count}개 설정 필드의 경로·형식·기본값·허용값·사용 조건이 들어 있습니다. 녹화에 직접 나타나지 않은 OCR·변수·조건·반복·서브매크로·테이블·알림 기능도 목적 달성에 필요하면 스스로 선택하십시오. 명세에 없는 action, params 필드, 선택값은 추측하거나 만들지 마십시오.
+
 중요 규칙:
 1. 사용자가 평소처럼 수행한 기록을 그대로 자동화하는 것이 기본 목적입니다. 흐름이 명확하면 질문하지 말고 즉시 JSON을 만드십시오.
 2. 기본값은 1회 실행 후 종료, 이미지 검색 3회 재시도, 재시도 간격 500ms, 최종 실패 시 정지, 알림 없음입니다. 이 기본값을 확인 질문으로 되묻지 마십시오.
@@ -426,6 +469,7 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 14. 작업 분기가 여러 개면 녹화 순서를 기본 실행 순서로 사용합니다. 앞 작업이 명시적으로 종료되어야 하는 경우를 제외하면 앞 작업의 정상 종료를 다음 작업 시작점에 연결하고, 조건 불충족은 그 작업을 건너뛰어 다음 작업으로 이동시킵니다.
 15. timeline의 `screen_verification_marker`는 사용자가 F6으로 표시한 ‘이전 동작 결과 확인’입니다. 같은 asset_ref의 `screen_condition`을 만들고 성공하면 다음 동작으로 진행하십시오. 실패하면 해당 작업 안의 직전 실제 동작으로 돌아가 500ms 뒤 다시 시도하되 최대 3회로 제한하고, 모두 실패하면 작업을 안전하게 종료하십시오.
 16. 작업 이름이나 작업 구분만을 위해 `flow_control` 노드를 만들지 마십시오. workflow_id와 workflow_label이 시각적 작업 레인을 만듭니다. 반복·카운터·명시적 점프가 실제로 녹화된 경우에만 flow_control을 사용하고, 녹화에 없는 대기 노드를 일괄 삽입하지 마십시오.
+17. 반환 전 `generation-checklist.json`의 모든 항목을 자체 검사하십시오. 각 step의 `source_evidence`에 선택 이유와 근거 timeline/asset id를 기록하십시오.
 
 스키마 버전은 `{AI_SCHEMA_VERSION}`입니다. 최상위 필수 키는 `schema_version`, `source_package_id`, `name`, `description`, `targets`, `assets`, `variables`, `triggers`, `steps`, `setup_requirements`이며, 작업 분기가 있으면 `workflows`도 포함하십시오.
 
@@ -433,7 +477,7 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 
 각 asset은 `id`, `label`, `target_ref`, `candidate`, `required`, `click_purpose`를 사용합니다. candidate는 asset-manifest.json에 있는 상대 PNG 경로만 사용하십시오.
 
-각 trigger는 `manual` 또는 `image_appear`만 사용합니다. `image_appear`는 패키지의 `target_ref`, `asset_ref`, `params`를 변경하지 마십시오.
+각 trigger는 `manual`, `process_start`, `process_stop`, `window_appears`, `image_appears`, `ocr_threshold`, `schedule` 중 목적에 맞는 것을 선택합니다. 여러 자동 실행 조건이 필요하면 배열에 각각 추가합니다. 녹화 패키지에 지정된 이미지 실행 조건은 `target_ref`, `asset_ref`, `params`를 변경하지 마십시오.
 
 각 step은 `id`, `action`, 선택적 `params`, `target_ref`, `asset_ref`, `on_success`, `on_fail`, `retry_count`, `retry_delay`, `needs_setup`, `source_evidence`를 사용합니다. 노드 연결은 step id를 참조합니다.
 
@@ -445,6 +489,195 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 
 이미지 클릭은 기본적으로 `image_search`, `engine=opencv`, `search_profile=balanced`, `click_enabled=true`, `click.mode=inactive`, `click.method=auto`를 사용하십시오. 화면 조건은 `screen_condition`을 사용하고 클릭을 수행하지 마십시오. 검색 범위는 대상 프로그램의 클라이언트 상대 좌표를 우선 사용하며 클릭 오프셋은 선택된 PNG 후보의 값을 그대로 사용하십시오.
 """
+
+
+def _field_json_type(kind: str) -> str | list[str]:
+    if kind in {"int", "duration"}:
+        return "integer"
+    if kind == "float":
+        return "number"
+    if kind == "bool":
+        return "boolean"
+    if kind in {"assets", "offset"}:
+        return "array"
+    return "string"
+
+
+def ai_capabilities_document() -> dict[str, Any]:
+    """Return the exact node contract generated from the editor itself.
+
+    Keeping this derived from ACTION_FIELDS prevents the AI reference from
+    drifting whenever a visible Studio option is added or renamed.
+    """
+    from . import __version__
+    from .action_editor import ACTION_FIELDS, ACTION_LABELS, action_template
+
+    actions: dict[str, Any] = {}
+    for action in sorted(ALLOWED_ACTIONS):
+        fields = []
+        for spec in ACTION_FIELDS.get(action, []):
+            field: dict[str, Any] = {
+                "path": spec.key,
+                "label": spec.label,
+                "kind": spec.kind,
+                "json_type": _field_json_type(spec.kind),
+                "default": deepcopy(spec.default),
+                "section": spec.section,
+            }
+            if spec.kind in {"int", "duration", "float"}:
+                field.update(minimum=spec.minimum, maximum=spec.maximum)
+            if spec.options:
+                field["choices"] = [{"label": label, "value": value} for label, value in spec.options]
+            if spec.tooltip:
+                field["rule"] = spec.tooltip
+            if spec.placeholder:
+                field["example_hint"] = spec.placeholder
+            fields.append(field)
+        template = action_template(action)
+        template.pop("action", None)
+        semantics = deepcopy(ACTION_SEMANTICS.get(action) or {})
+        actions[action] = {
+            "label": ACTION_LABELS.get(action, action),
+            **semantics,
+            "params_location": "모든 설정은 step.params 안에 넣습니다. 연결·재시도 공통 필드는 step 최상위에 둡니다.",
+            "default_params": template,
+            "fields": fields,
+            "allowed_field_paths": [field["path"] for field in fields],
+        }
+    return {
+        "document_type": "macrorelay-studio-capabilities",
+        "studio_version": __version__,
+        "ai_schema_version": AI_SCHEMA_VERSION,
+        "generated_from": "macro_studio.action_editor.ACTION_FIELDS",
+        "contract": {
+            "step_shape": {
+                "required": ["id", "action"],
+                "optional": [
+                    "params", "target_ref", "asset_ref", "on_success", "on_fail", "retry_count",
+                    "retry_delay", "needs_setup", "source_evidence", "workflow_id", "workflow_label",
+                ],
+                "connections": "on_success/on_fail은 존재하는 step.id 또는 end를 참조합니다.",
+                "params": "해당 action의 fields.path만 사용합니다. 목록에 없는 필드는 만들지 않습니다.",
+            },
+            "common_step_fields": {
+                "label": "노드 표시 이름",
+                "on_success": "성공 시 step.id 또는 end",
+                "on_fail": "실패 시 step.id 또는 end",
+                "on_success_delay": "성공 연결 전 대기(ms)",
+                "on_fail_delay": "실패 연결 전 대기(ms)",
+                "sleep_after": "노드 완료 후 대기(ms)",
+                "repeat": "현재 노드 자체 반복 횟수",
+                "repeat_var": "반복 횟수를 읽을 변수 이름",
+                "retry_count": "실패 후 추가 재시도 횟수",
+                "retry_delay": "재시도 간격(ms)",
+                "edge_conditions": "연결별 변수/횟수 비교 조건 배열",
+                "needs_setup": "Studio에서 사용자 확인이 필요한 항목 배열",
+                "source_evidence": "선택 근거·timeline id·asset id 객체",
+                "workflow_id": "시각적 행동 그룹 id",
+                "workflow_label": "시각적 행동 그룹 이름",
+            },
+            "execution": {
+                "unlinked_success": "다음 순번 노드로 진행",
+                "end": "해당 흐름 안전 종료",
+                "retry": "retry_count는 추가 시도 횟수, retry_delay는 밀리초",
+                "variables": "${name} 또는 Studio가 지원하는 변수 참조를 사용하며 민감 값은 vault_get으로만 로드",
+            },
+            "coordinates": {
+                "preferred": "대상 프로그램의 client 상대 좌표",
+                "reacquire": "저장된 HWND를 사용하지 않고 exe/title/class로 실행 때마다 현재 창 재탐색",
+                "image_offset": "탐지된 PNG 중심 기준 [x,y]. 화면 위치가 바뀌어도 간격 유지",
+            },
+            "assets": {
+                "candidate": "패키지 루트 기준 상대 PNG 경로만 허용",
+                "video_rule": "JPG/MP4 프레임을 이미지 서치 자산으로 사용 금지",
+                "screen_condition": "존재 여부만 판정하며 클릭 금지",
+                "image_search": "찾으면 클릭이 필요한 경우 click_enabled=true",
+            },
+            "safety": {
+                "forbidden_fields": sorted(FORBIDDEN_KEYS),
+                "secrets": "평문 비밀번호·토큰 금지. vault_get과 보관함 이름만 사용",
+                "program_commands": "run_program/terminate_program은 needs_setup에 확인 항목 추가",
+                "loops": "무제한 flow_control 생성 금지. 종료 조건 또는 유한 반복 필수",
+            },
+        },
+        "actions": actions,
+        "triggers": deepcopy(AI_TRIGGER_TYPES),
+    }
+
+
+def ai_capability_reference_markdown(capabilities: dict[str, Any] | None = None) -> str:
+    capabilities = capabilities or ai_capabilities_document()
+    lines = [
+        "# MacroRelay Studio 전체 노드 명세",
+        "",
+        f"Studio {capabilities['studio_version']} · AI schema {capabilities['ai_schema_version']}",
+        "",
+        "AI는 녹화 동작을 그대로 나열하는 데 그치지 말고 아래 모든 기능 중 목적에 가장 맞는 노드를 선택합니다.",
+        "설정은 반드시 각 노드의 허용 필드 경로와 선택값을 사용하며 임의 필드를 만들지 않습니다.",
+        "",
+    ]
+    for action, row in capabilities["actions"].items():
+        lines.extend([
+            f"## {action} · {row['label']}",
+            "",
+            f"사용 조건: {row.get('use_when', '')}",
+            f"실행 결과: {row.get('result', '')}",
+        ])
+        if row.get("requires"):
+            lines.append("필수 조건: " + ", ".join(row["requires"]))
+        lines.extend(["", "| 필드 경로 | 화면 이름 | 형식 | 기본값/선택값 | 규칙 |", "|---|---|---|---|---|"])
+        for field in row["fields"]:
+            choices = ", ".join(str(choice["value"]) for choice in field.get("choices", []))
+            default = json.dumps(field.get("default"), ensure_ascii=False)
+            value_info = choices or default
+            rule = str(field.get("rule") or "").replace("|", "\\|")
+            lines.append(
+                f"| `{field['path']}` | {field['label']} | {field['kind']} | `{value_info}` | {rule} |"
+            )
+        lines.extend(["", "기본 params:", "```json", json.dumps(row["default_params"], ensure_ascii=False, indent=2), "```", ""])
+    lines.extend(["# 자동 실행 트리거", ""])
+    for trigger, row in capabilities.get("triggers", {}).items():
+        lines.append(f"- `{trigger}` · {row['label']}: {row['use_when']} · 필드 {json.dumps(row['fields'], ensure_ascii=False)}")
+    return "\n".join(lines)
+
+
+def relevant_ai_actions(timeline: list[dict[str, Any]] | None = None) -> list[str]:
+    event_types = {str(row.get("type") or "") for row in timeline or [] if isinstance(row, dict)}
+    actions = {"wait", "screen_condition", "flow_control", "set_var", "text_condition", "remote_notify"}
+    if event_types & {"mouse", "mouse_drag"}:
+        actions.update({"image_search", "mouse_click", "inactive_click"})
+    if event_types & {"screen_condition_marker", "screen_verification_marker", "screen_condition", "screen_verification"}:
+        actions.update({"image_search", "screen_condition"})
+    if event_types & {"text_input", "shortcut", "key"}:
+        actions.update({"type_text", "vault_get"})
+    if "workflow_branch_marker" in event_types or "workflow_branch" in event_types:
+        actions.update({"call_submacro", "flow_control"})
+    return sorted(actions)
+
+
+def write_ai_reference_files(stage: Path, timeline: list[dict[str, Any]] | None = None) -> None:
+    capabilities = ai_capabilities_document()
+    _write_json(stage / "schema.json", ai_schema_document())
+    _write_json(stage / "studio-capabilities.json", capabilities)
+    (stage / "node-reference.md").write_text(ai_capability_reference_markdown(capabilities), encoding="utf-8")
+    _write_json(stage / "recommended-actions.json", {
+        "advisory_only": True,
+        "rule": "아래 목록을 우선 검토하되 전체 studio-capabilities.json에서 더 적합한 기능을 자유롭게 선택합니다.",
+        "actions": relevant_ai_actions(timeline),
+    })
+    _write_json(stage / "generation-checklist.json", {
+        "before_return": [
+            "모든 step.action이 studio-capabilities.json에 존재",
+            "모든 params 경로와 선택값이 해당 action 명세에 존재",
+            "모든 on_success/on_fail 대상 step.id가 존재하거나 end",
+            "모든 target_ref/asset_ref가 카탈로그에 존재",
+            "screen_condition은 클릭하지 않음",
+            "image_search 클릭은 recorded PNG 중심 또는 기록된 오프셋 사용",
+            "모든 반복에는 유한 반복 횟수 또는 명확한 종료 조건 존재",
+            "민감 값은 vault_get만 사용",
+            "source_package_id가 입력 패키지 manifest의 package_id와 일치",
+        ]
+    })
 
 
 def ai_schema_document() -> dict[str, Any]:
@@ -483,10 +716,19 @@ def ai_schema_document() -> dict[str, Any]:
                     "required": ["id", "type"],
                     "properties": {
                         "id": identifier,
-                        "type": {"enum": ["manual", "image_appear"]},
+                        "type": {"enum": sorted(AI_TRIGGER_TYPES)},
                         "target_ref": {"type": "string"},
                         "asset_ref": {"type": "string"},
                         "params": {"type": "object"},
+                        "enabled": {"type": "boolean"},
+                        "interval": {"type": "number", "minimum": 0.5, "maximum": 3600},
+                        "process": {"type": "string"},
+                        "title": {"type": "string"},
+                        "time": {"type": "string", "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$"},
+                        "days": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 6}},
+                        "region": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+                        "operator": {"enum": [">=", "<=", ">", "<", "==", "!="]},
+                        "value": {"type": "number"},
                         "needs_setup": {"type": "array", "items": {"type": "string"}},
                     },
                 },
@@ -515,6 +757,9 @@ def ai_schema_document() -> dict[str, Any]:
             "setup_requirements": {"type": "array", "items": {"type": "string"}},
         },
         "additionalProperties": False,
+        "x-macrorelay-reference-files": [
+            "studio-capabilities.json", "node-reference.md", "recommended-actions.json", "generation-checklist.json"
+        ],
     }
 
 
@@ -529,6 +774,7 @@ class AIRecordingPackageBuilder:
         package_id: str | None = None,
         trigger_config: dict[str, Any] | None = None,
         video_segments: list[dict[str, int]] | None = None,
+        video_disabled: bool = False,
     ) -> tuple[Path, Path]:
         trigger_config = trigger_config or {}
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -794,8 +1040,8 @@ class AIRecordingPackageBuilder:
 
         prompt = chatgpt_prompt(identifier, packaged_trigger)
         (stage / "prompt.txt").write_text(prompt, encoding="utf-8")
-        _write_json(stage / "schema.json", ai_schema_document())
         _write_json(stage / "timeline.json", timeline)
+        write_ai_reference_files(stage, timeline)
         _write_json(stage / "workflows.json", {"workflows": workflow_rows})
         _write_json(stage / "targets.json", targets)
         _write_json(stage / "asset-manifest.json", {"assets": assets})
@@ -805,6 +1051,8 @@ class AIRecordingPackageBuilder:
             shutil.copy2(video_path, stage / "recording.mp4")
         else:
             (stage / "recording-unavailable.txt").write_text(
+                "행동 학습 고속 모드에서는 MP4를 만들지 않습니다. timeline.json과 무손실 PNG가 정확한 자동화 근거입니다."
+                if video_disabled else
                 "이 환경에서는 동작 영상 인코딩을 완료하지 못했습니다. timeline.json과 PNG 프레임은 정상입니다.",
                 encoding="utf-8",
             )
@@ -822,7 +1070,7 @@ class AIRecordingPackageBuilder:
                 "retry_count": 3, "retry_delay": 500, "after_failure": "stop", "notify": False,
             }),
             "video_available": (stage / "recording.mp4").is_file(),
-            "video_mode": "action_windows",
+            "video_mode": "disabled_structured_events" if video_disabled else "action_windows",
             "video_segment_count": len(video_segments or []),
             "text_policy": "All printable keyboard input is redacted. ChatGPT must ask for a vault name or value classification.",
             "image_policy": "Lossless native PNG candidates only; video frames are never used as search templates.",
@@ -859,7 +1107,7 @@ class AIRecordingPackageBuilder:
         if image.isNull():
             return {
                 "id": "trigger-001",
-                "type": "image_appear",
+                "type": "image_appears",
                 "params": deepcopy(AI_TRIGGER_DEFAULTS),
                 "needs_setup": ["capture_trigger_image"],
             }, None
@@ -901,7 +1149,7 @@ class AIRecordingPackageBuilder:
         params = deepcopy(AI_TRIGGER_DEFAULTS)
         trigger = {
             "id": "trigger-001",
-            "type": "image_appear",
+            "type": "image_appears",
             "target_ref": target_ref,
             "asset_ref": "trigger-image-001",
             "params": params,
@@ -1177,6 +1425,70 @@ def _items_by_id(value: Any) -> tuple[list[dict[str, Any]], dict[str, dict[str, 
     return rows, lookup
 
 
+def normalize_ai_document(payload: dict[str, Any]) -> dict[str, Any]:
+    """Repair harmless formatting drift without inventing business logic."""
+    from .action_editor import ACTION_LABELS
+
+    normalized = deepcopy(payload)
+    normalized.setdefault("schema_version", AI_SCHEMA_VERSION)
+    normalized.setdefault("source_package_id", str(normalized.pop("package_id", "") or ""))
+    normalized.setdefault("name", "AI 자동화 초안")
+    normalized.setdefault("description", "AI 녹화 패키지에서 생성한 자동화")
+    normalized.setdefault("variables", {})
+    normalized.setdefault("triggers", [{"id": "trigger-001", "type": "manual"}])
+    normalized.setdefault("setup_requirements", [])
+
+    for collection in ("targets", "assets", "workflows", "steps"):
+        rows, _lookup = _items_by_id(normalized.get(collection))
+        normalized[collection] = rows
+
+    aliases: dict[str, str] = {}
+    for action in ALLOWED_ACTIONS:
+        aliases[action.casefold()] = action
+        aliases[action.replace("_", " ").casefold()] = action
+        aliases[action.replace("_", "-").casefold()] = action
+    for action, label in ACTION_LABELS.items():
+        aliases[str(label).strip().casefold()] = action
+    aliases.update({
+        "이미지 검색": "image_search", "멀티 이미지 서치": "image_search", "멀티 이미지 검색": "image_search",
+        "화면 확인": "screen_condition", "조건": "screen_condition", "반복": "flow_control",
+        "서브 매크로": "call_submacro", "알림": "remote_notify", "프로그램 시작": "run_program",
+    })
+
+    steps = normalized["steps"]
+    seen_ids: set[str] = set()
+    for index, step in enumerate(steps, 1):
+        requested_id = str(step.get("id") or "").strip()
+        if not requested_id:
+            requested_id = f"step-{index:03d}"
+        step["id"] = requested_id
+        seen_ids.add(requested_id)
+        raw_action = str(step.get("action") or "").strip()
+        step["action"] = aliases.get(raw_action.casefold(), raw_action)
+        if "success" in step and "on_success" not in step:
+            step["on_success"] = step.pop("success")
+        if "failure" in step and "on_fail" not in step:
+            step["on_fail"] = step.pop("failure")
+        if "parameters" in step and "params" not in step and isinstance(step.get("parameters"), dict):
+            step["params"] = step.pop("parameters")
+        step.setdefault("params", {})
+
+    targets = normalized["targets"]
+    assets = normalized["assets"]
+    only_target = str(targets[0].get("id") or "") if len(targets) == 1 else ""
+    only_asset = str(assets[0].get("id") or "") if len(assets) == 1 else ""
+    target_actions = {
+        "mouse_click", "inactive_click", "image_search", "screen_condition", "type_text", "browser_action",
+        "ocr", "run_program", "terminate_program",
+    }
+    for step in steps:
+        if only_target and step.get("action") in target_actions and not str(step.get("target_ref") or ""):
+            step["target_ref"] = only_target
+        if only_asset and step.get("action") in {"image_search", "screen_condition"} and not str(step.get("asset_ref") or ""):
+            step["asset_ref"] = only_asset
+    return normalized
+
+
 def validate_ai_document(payload: Any) -> list[AIImportIssue]:
     issues: list[AIImportIssue] = []
     if not isinstance(payload, dict):
@@ -1201,14 +1513,12 @@ def validate_ai_document(payload: Any) -> list[AIImportIssue]:
     if len(asset_rows) != len(asset_lookup):
         issues.append(AIImportIssue("error", "duplicate_asset_id", "이미지 자산 ID가 비어 있거나 중복되었습니다."))
     trigger_rows = payload.get("triggers") if isinstance(payload.get("triggers"), list) else []
-    if len(trigger_rows) > 1:
-        issues.append(AIImportIssue("error", "multiple_triggers", "현재 AI 자동 매크로는 실행 조건을 하나만 사용할 수 있습니다."))
     for trigger in trigger_rows:
         if not isinstance(trigger, dict):
             issues.append(AIImportIssue("error", "trigger_type", "실행 조건 형식이 올바르지 않습니다."))
             continue
         kind = str(trigger.get("type") or "")
-        if kind not in {"manual", "image_appear", "image_appears"}:
+        if kind not in set(AI_TRIGGER_TYPES) | {"image_appear"}:
             issues.append(AIImportIssue("error", "unsupported_trigger", f"지원하지 않는 실행 조건: {kind or '(없음)'}"))
             continue
         if kind in {"image_appear", "image_appears"}:
@@ -1218,6 +1528,12 @@ def validate_ai_document(payload: Any) -> list[AIImportIssue]:
                 issues.append(AIImportIssue("error", "unknown_trigger_target", f"실행 조건 대상 `{target_ref}`를 찾을 수 없습니다."))
             if not asset_ref or asset_ref not in asset_lookup:
                 issues.append(AIImportIssue("warning", "missing_trigger_asset", "시작 화면 이미지를 확인해야 합니다."))
+        elif kind in {"process_start", "process_stop"} and not str(trigger.get("process") or "").strip():
+            issues.append(AIImportIssue("warning", "missing_trigger_process", "프로그램 트리거의 실행 파일 이름을 확인해야 합니다."))
+        elif kind == "window_appears" and not str(trigger.get("title") or "").strip():
+            issues.append(AIImportIssue("warning", "missing_trigger_title", "창 트리거의 제목 문자열을 확인해야 합니다."))
+        elif kind == "schedule" and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(trigger.get("time") or "")):
+            issues.append(AIImportIssue("warning", "invalid_trigger_time", "시간 트리거는 HH:mm 형식으로 확인해야 합니다."))
     for step in steps:
         step_id = str(step.get("id") or "")
         action = str(step.get("action") or "")
@@ -1227,6 +1543,43 @@ def validate_ai_document(payload: Any) -> list[AIImportIssue]:
         params = step.get("params") if isinstance(step.get("params"), dict) else {}
         if "params" in step and not isinstance(step.get("params"), dict):
             issues.append(AIImportIssue("error", "params_type", "params는 JSON 객체여야 합니다.", step_id))
+        if action in ALLOWED_ACTIONS and isinstance(params, dict):
+            from .action_editor import ACTION_FIELDS, get_path
+
+            specs = ACTION_FIELDS.get(action, [])
+            allowed_roots = {spec.key.split(".", 1)[0] for spec in specs}
+            for key in sorted(set(params) - allowed_roots - {"data_classification", "sensitive"}):
+                issues.append(AIImportIssue(
+                    "warning", "ignored_param",
+                    f"`{action}`에 없는 params 필드 `{key}`는 가져올 때 무시됩니다.", step_id,
+                ))
+            missing = object()
+            for spec in specs:
+                value = get_path(params, spec.key, missing)
+                if value is missing:
+                    continue
+                valid_type = True
+                if spec.kind in {"int", "duration"}:
+                    valid_type = isinstance(value, int) and not isinstance(value, bool)
+                elif spec.kind == "float":
+                    valid_type = isinstance(value, (int, float)) and not isinstance(value, bool)
+                elif spec.kind == "bool":
+                    valid_type = isinstance(value, bool)
+                elif spec.kind in {"assets", "offset"}:
+                    valid_type = isinstance(value, list)
+                elif spec.kind not in {"choice"}:
+                    valid_type = isinstance(value, str) or spec.kind in {"table"}
+                if not valid_type:
+                    issues.append(AIImportIssue(
+                        "warning", "param_type",
+                        f"`{action}.{spec.key}` 값 형식은 {spec.kind}이어야 하며 기본값으로 보정될 수 있습니다.", step_id,
+                    ))
+                if spec.options and value not in {choice_value for _label, choice_value in spec.options}:
+                    allowed = ", ".join(str(choice_value) for _label, choice_value in spec.options)
+                    issues.append(AIImportIssue(
+                        "warning", "param_choice",
+                        f"`{action}.{spec.key}` 허용값은 {allowed}입니다.", step_id,
+                    ))
         flattened.update(str(key).casefold() for key in params)
         forbidden = sorted(flattened & FORBIDDEN_KEYS)
         if forbidden:
@@ -1524,12 +1877,56 @@ def materialize_ai_document(
         if not isinstance(raw_trigger, dict):
             continue
         kind = str(raw_trigger.get("type") or "manual")
+        params = raw_trigger.get("params") if isinstance(raw_trigger.get("params"), dict) else {}
         if kind == "manual":
-            runtime_triggers.append({"id": str(raw_trigger.get("id") or "trigger-001"), "type": "manual", "enabled": True})
+            runtime_triggers.append({
+                "id": str(raw_trigger.get("id") or "trigger-001"), "type": "manual",
+                "enabled": bool(raw_trigger.get("enabled", True)),
+            })
+            continue
+        if kind in {"process_start", "process_stop"}:
+            runtime_triggers.append({
+                "id": str(raw_trigger.get("id") or "trigger-001"), "type": kind,
+                "enabled": bool(raw_trigger.get("enabled", True)),
+                "process": str(raw_trigger.get("process") or params.get("process") or ""),
+                "interval": max(0.5, float(raw_trigger.get("interval") or params.get("interval") or 1)),
+            })
+            continue
+        if kind == "window_appears":
+            runtime_triggers.append({
+                "id": str(raw_trigger.get("id") or "trigger-001"), "type": kind,
+                "enabled": bool(raw_trigger.get("enabled", True)),
+                "title": str(raw_trigger.get("title") or params.get("title") or ""),
+                "interval": max(0.5, float(raw_trigger.get("interval") or params.get("interval") or 1)),
+            })
+            continue
+        if kind == "schedule":
+            days = raw_trigger.get("days", params.get("days", list(range(7))))
+            runtime_triggers.append({
+                "id": str(raw_trigger.get("id") or "trigger-001"), "type": kind,
+                "enabled": bool(raw_trigger.get("enabled", True)),
+                "time": str(raw_trigger.get("time") or params.get("time") or "00:00"),
+                "days": [int(day) for day in days if str(day).lstrip("-").isdigit() and 0 <= int(day) <= 6]
+                if isinstance(days, list) else list(range(7)),
+                "interval": max(0.5, float(raw_trigger.get("interval") or params.get("interval") or 1)),
+            })
+            continue
+        if kind == "ocr_threshold":
+            region = raw_trigger.get("region", params.get("region", [0, 0, 0, 0]))
+            runtime_triggers.append({
+                "id": str(raw_trigger.get("id") or "trigger-001"), "type": kind,
+                "enabled": bool(raw_trigger.get("enabled", True)),
+                "region": [int(value) for value in list(region)[:4]] if isinstance(region, (list, tuple)) else [0, 0, 0, 0],
+                "operator": str(raw_trigger.get("operator") or params.get("operator") or ">="),
+                "value": float(raw_trigger.get("value", params.get("value", 0)) or 0),
+                "profile": str(raw_trigger.get("profile") or params.get("profile") or "number"),
+                "lang": str(raw_trigger.get("lang") or params.get("lang") or "eng+kor"),
+                "engine": str(raw_trigger.get("engine") or params.get("engine") or "auto"),
+                "interval": max(0.5, float(raw_trigger.get("interval") or params.get("interval") or 3)),
+            })
             continue
         if kind not in {"image_appear", "image_appears"}:
             continue
-        params = raw_trigger.get("params") if isinstance(raw_trigger.get("params"), dict) else {}
         target_ref = target_id_remap.get(
             str(raw_trigger.get("target_ref") or ""), str(raw_trigger.get("target_ref") or "")
         )
@@ -1544,7 +1941,7 @@ def materialize_ai_document(
         runtime_triggers.append({
             "id": str(raw_trigger.get("id") or "trigger-001"),
             "type": "image_appears",
-            "enabled": True,
+            "enabled": bool(raw_trigger.get("enabled", True)),
             "asset": alias,
             "asset_ref": asset_ref,
             "target_ref": target_ref,
@@ -1609,11 +2006,16 @@ def ai_draft_readiness(macro: dict[str, Any]) -> tuple[int, int, list[str]]:
     triggers = macro.get("triggers") if isinstance(macro.get("triggers"), list) else []
     automatic_triggers = [
         trigger for trigger in triggers
-        if isinstance(trigger, dict) and str(trigger.get("type") or "") in {"image_appear", "image_appears"}
+        if isinstance(trigger, dict) and str(trigger.get("type") or "manual") != "manual"
+    ]
+    image_triggers = [
+        trigger for trigger in automatic_triggers
+        if str(trigger.get("type") or "") in {"image_appear", "image_appears"}
     ]
     checks.append((
-        "시작 화면",
-        all(str(trigger.get("asset") or "") and not trigger.get("needs_setup") for trigger in automatic_triggers),
+        "자동 실행 조건",
+        all(not trigger.get("needs_setup") for trigger in automatic_triggers)
+        and all(str(trigger.get("asset") or "") for trigger in image_triggers),
     ))
     target_actions = {"mouse_click", "inactive_click", "image_search", "screen_condition", "type_text", "browser_action", "ocr", "run_program", "terminate_program"}
     needs_target = any(isinstance(step, dict) and step.get("action") in target_actions for step in steps)

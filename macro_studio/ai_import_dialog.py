@@ -8,7 +8,7 @@ from typing import Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .ai_automation import AIImportIssue, ai_draft_readiness, validate_ai_document
+from .ai_automation import AIImportIssue, ai_draft_readiness, normalize_ai_document, validate_ai_document
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
 from .image_search_test import ImageSearchTestDialog
 
@@ -38,17 +38,29 @@ def load_ai_json(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(payload, dict):
         raise ValueError("AI JSON 최상위 값은 객체여야 합니다.")
-    return payload
+    return normalize_ai_document(payload)
 
 
 def package_stage_for(root: Path, payload: dict[str, Any]) -> Path | None:
     package_id = str(payload.get("source_package_id") or "").strip()
     if package_id:
-        stage = (root / ".automation" / "ai-packages" / package_id).resolve()
-        if stage.is_dir():
-            return stage
+        for stage in (
+            (root / ".automation" / "ai-packages" / package_id).resolve(),
+            (root / ".automation" / "ai-learning" / "packages" / package_id).resolve(),
+        ):
+            if stage.is_dir():
+                return stage
     try:
         recent = json.loads((root / ".automation" / "last-ai-package.json").read_text(encoding="utf-8-sig"))
+        stage = Path(str(recent.get("stage") or "")).resolve()
+        if stage.is_dir() and (not package_id or str(recent.get("package_id") or "") == package_id):
+            return stage
+    except (OSError, TypeError, ValueError):
+        pass
+    try:
+        recent = json.loads(
+            (root / ".automation" / "ai-learning" / "last-learning-package.json").read_text(encoding="utf-8-sig")
+        )
         stage = Path(str(recent.get("stage") or "")).resolve()
         if stage.is_dir() and (not package_id or str(recent.get("package_id") or "") == package_id):
             return stage
@@ -78,19 +90,24 @@ class AIImportPreviewDialog(QtWidgets.QDialog):
         root.addWidget(title)
         root.addWidget(summary)
         raw_triggers = payload.get("triggers") if isinstance(payload.get("triggers"), list) else []
-        automatic = next(
-            (item for item in raw_triggers if isinstance(item, dict) and str(item.get("type") or "") in {"image_appear", "image_appears"}),
-            None,
+        automatic_rows = [
+            item for item in raw_triggers
+            if isinstance(item, dict) and str(item.get("type") or "manual") != "manual"
+        ]
+        image_rows = [
+            item for item in automatic_rows if str(item.get("type") or "") in {"image_appear", "image_appears"}
+        ]
+        trigger_ready = all(not item.get("needs_setup") for item in automatic_rows) and all(
+            str(item.get("asset_ref") or "") for item in image_rows
         )
-        trigger_ready = bool(automatic and str(automatic.get("asset_ref") or "") and not automatic.get("needs_setup"))
         trigger_text = (
-            "실행 조건 · ✓ 특정 화면이 나타나면 자동 실행"
-            if trigger_ready else "실행 조건 · ⚠ 시작 화면 확인 필요"
-            if automatic else "실행 조건 · ✓ 내가 직접 실행"
+            f"실행 조건 · ✓ 이벤트 자동 실행 {len(automatic_rows)}개"
+            if automatic_rows and trigger_ready else "실행 조건 · ⚠ 자동 실행 조건 확인 필요"
+            if automatic_rows else "실행 조건 · ✓ 내가 직접 실행"
         )
         trigger_label = QtWidgets.QLabel(trigger_text)
         trigger_label.setStyleSheet(
-            "color:#65E0B5; font-weight:700;" if not automatic or trigger_ready else "color:#FFB35C; font-weight:700;"
+            "color:#65E0B5; font-weight:700;" if not automatic_rows or trigger_ready else "color:#FFB35C; font-weight:700;"
         )
         root.addWidget(trigger_label)
         package_label = QtWidgets.QLabel(

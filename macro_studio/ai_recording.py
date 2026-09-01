@@ -233,9 +233,17 @@ class AIExecutionConditionDialog(QtWidgets.QDialog):
 class AIRecordingController(SmartRecordingController):
     package_completed = QtCore.Signal(str, str, list)
 
-    def __init__(self, repository, parent=None, *, ask_execution_condition: bool = True) -> None:
+    def __init__(
+        self,
+        repository,
+        parent=None,
+        *,
+        ask_execution_condition: bool = True,
+        record_video: bool = True,
+    ) -> None:
         super().__init__(repository, parent)
         self.ask_execution_condition = ask_execution_condition
+        self.record_video = record_video
         self.output = repository.root / ".automation" / f"ai-recording-{uuid.uuid4().hex}.jsonl"
         self.frame_dir = repository.root / ".automation" / f"ai-video-frames-{uuid.uuid4().hex}"
         self.frame_dir.mkdir(parents=True, exist_ok=True)
@@ -306,7 +314,8 @@ class AIRecordingController(SmartRecordingController):
         self.bar.show()
         self.process.start()
         self._capture_poll.start()
-        self._video_timer.start()
+        if self.record_video:
+            self._video_timer.start()
 
     @QtCore.Slot()
     def _request_next_workflow(self) -> None:
@@ -466,7 +475,7 @@ class AIRecordingController(SmartRecordingController):
             shutil.rmtree(self.frame_dir, ignore_errors=True)
             self.deleteLater()
             return
-        video = self._encode_video()
+        video = self._encode_video() if self.record_video else None
         if self.ask_execution_condition:
             self._show_execution_condition(events, video)
         else:
@@ -520,7 +529,11 @@ class AIRecordingController(SmartRecordingController):
     ) -> None:
         try:
             archive, stage = AIRecordingPackageBuilder(self.repository.root).build(
-                events, video, trigger_config=trigger_config, video_segments=self._video_segments
+                events,
+                video,
+                trigger_config=trigger_config,
+                video_segments=self._video_segments,
+                video_disabled=not self.record_video,
             )
         except Exception as exc:
             self.failed.emit(f"AI 분석 패키지 생성 실패: {exc}")

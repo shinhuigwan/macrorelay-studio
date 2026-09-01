@@ -1919,7 +1919,9 @@ class BuilderPage(QtWidgets.QWidget):
         self._pending_behavior_demo = (behavior_id, kind, note)
         if self._behavior_learning_dialog is not None:
             self._behavior_learning_dialog.hide()
-        controller = AIRecordingController(self.repository, self.window(), ask_execution_condition=False)
+        controller = AIRecordingController(
+            self.repository, self.window(), ask_execution_condition=False, record_video=False
+        )
         controller.package_completed.connect(self._behavior_demo_completed)
         controller.failed.connect(self._behavior_recording_failed)
         self._ai_recording_controller = controller

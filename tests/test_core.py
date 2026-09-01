@@ -2417,7 +2417,7 @@ class UiSmokeTests(unittest.TestCase):
         buffer.close()
         event = {
             "type": "mouse",
-            "t": 200,
+            "t": 1600,
             "x": 420,
             "y": 330,
             "client_x": 220,
@@ -4828,6 +4828,7 @@ class SmartRecordingUiTests(unittest.TestCase):
         }
         drafts = recording_drafts([verification, wait], include_waits=False)
         self.assertEqual(["screen_verification", "wait"], [draft["kind"] for draft in drafts])
+        self.assertEqual(2, len(recording_drafts([verification, wait])))
         with tempfile.TemporaryDirectory() as directory:
             dialog = RecordingReviewDialog([verification, wait], MacroRepository(Path(directory)))
             steps = dialog.build_steps()

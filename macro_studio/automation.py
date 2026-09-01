@@ -73,7 +73,13 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
         # Branch-mode F8 captures open an editor, so their timestamp gaps are
         # UI editing time rather than intentional macro waits. Keep those
         # candidates contiguous while still preserving their real actions.
-        if include_waits and drafts and gap >= 900 and record_mode != "branch":
+        if (
+            include_waits
+            and drafts
+            and gap >= 900
+            and record_mode != "branch"
+            and event.get("type") != "wait_marker"
+        ):
             drafts.append(
                 {
                     "kind": "wait",

@@ -8,7 +8,12 @@ from typing import Any
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .action_editor import ACTION_LABELS, ActionEditor, action_template
-from .ai_automation import AIRecordingPackageBuilder, ai_draft_readiness, materialize_ai_document
+from .ai_automation import (
+    AIRecordingPackageBuilder,
+    SHORT_CHATGPT_REQUEST,
+    ai_draft_readiness,
+    materialize_ai_document,
+)
 from .ai_import_dialog import AIDraftSetupDialog, AIImportPreviewDialog, load_ai_json, package_stage_for
 from .ai_learning import BehaviorLearningDialog, BehaviorLearningStore, DEMO_KIND_LABELS
 from .ai_recording import AIRecordingController
@@ -494,9 +499,9 @@ class BuilderPage(QtWidgets.QWidget):
             "골드 강화·퀘스트·합성처럼 행동을 나누고 각 행동을 2~3회 시연해 AI가 규칙과 복구 흐름을 추론합니다."
         )
         self.ai_learning_btn.clicked.connect(self._open_behavior_learning)
-        self.ai_video_test_btn = primary_button("◉ AI 영상 테스트")
+        self.ai_video_test_btn = primary_button("◉ AI 분석 녹화")
         self.ai_video_test_btn.setToolTip(
-            "최대 30초 동안 화면 영상과 클릭·키·휠 액션을 함께 기록해 GPT 판단 테스트 ZIP을 만듭니다."
+            "최대 30초 동안 영상·액션·무손실 PNG를 기록하고 전체 노드 명세가 내장된 GPT 생성 ZIP을 만듭니다."
         )
         self.ai_video_test_btn.clicked.connect(self._start_ai_video_test)
         self.ai_package_btn = QtWidgets.QPushButton("AI 분석 패키지 생성")
@@ -558,7 +563,7 @@ class BuilderPage(QtWidgets.QWidget):
         ai_tools.setText("AI 도구 ▾")
         ai_tools.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         ai_menu = QtWidgets.QMenu(ai_tools)
-        ai_menu.addAction("AI 30초 영상 테스트", self.ai_video_test_btn.click)
+        ai_menu.addAction("AI 30초 분석 녹화", self.ai_video_test_btn.click)
         ai_menu.addAction("AI 플레이 학습", self.ai_learning_btn.click)
         ai_menu.addAction("단일 AI 녹화 (기존 방식)", self.ai_record_btn.click)
         ai_menu.addSeparator()
@@ -2008,11 +2013,11 @@ class BuilderPage(QtWidgets.QWidget):
             return
         answer = QtWidgets.QMessageBox.question(
             self,
-            "AI 30초 영상 테스트",
+            "AI 30초 분석 녹화",
             "2초 뒤 화면 영상과 액션 기록이 동시에 시작됩니다. 평소처럼 작업하고 F10으로 끝내세요. "
             "직접 끝내지 않아도 실제 녹화 30초 뒤 자동 종료됩니다.\n\n"
-            "완료 후 작업 목적을 한 줄로 입력하면 recording.mp4와 actions.json을 ZIP으로 만듭니다. "
-            "이 테스트는 노드나 매크로 JSON을 만들지 않고 GPT가 작업을 얼마나 이해하는지만 확인합니다.\n\n"
+            "완료 후 작업 목적을 한 줄로 입력하면 영상·액션·무손실 PNG·전체 노드 명세를 하나의 ZIP으로 만듭니다. "
+            "긴 GPT 명령문은 패키지 안에 자동 포함되므로 매번 붙여넣지 않아도 됩니다.\n\n"
             "화면에 표시되는 개인정보는 영상에 포함될 수 있습니다. 시작할까요?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.Yes,
@@ -2024,25 +2029,25 @@ class BuilderPage(QtWidgets.QWidget):
         controller.failed.connect(self._ai_video_test_failed)
         self._ai_video_test_controller = controller
         controller.start()
-        self.status.emit("AI 영상 테스트 녹화 중 · 최대 30초 · F10으로 바로 종료할 수 있습니다.")
+        self.status.emit("AI 분석 녹화 중 · 최대 30초 · F10으로 바로 종료할 수 있습니다.")
 
     @QtCore.Slot(str, str, list)
     def _ai_video_test_completed(self, archive: str, stage: str, events: list[dict[str, Any]]) -> None:
         self._ai_video_test_controller = None
-        prompt_path = Path(stage) / "prompt.txt"
-        self.status.emit(f"GPT 판단 테스트 ZIP을 만들었습니다 · {Path(archive).name}")
+        self.status.emit(f"AI 노드 생성 ZIP을 만들었습니다 · {Path(archive).name}")
         if self._ai_video_test_message is not None:
             self._ai_video_test_message.close()
         message = QtWidgets.QMessageBox(self.window())
         self._ai_video_test_message = message
-        message.setWindowTitle("AI 영상 테스트 준비 완료")
+        message.setWindowTitle("AI 노드 생성 패키지 준비 완료")
         message.setIcon(QtWidgets.QMessageBox.Information)
         message.setText(
-            f"영상과 액션 {len(events)}개를 저장했습니다. ChatGPT에 ZIP을 첨부하고 ‘프롬프트 복사’를 눌러 붙여넣으세요.\n\n"
-            "이번 테스트 답변은 작업 이해도와 자동화 가능 여부만 평가하며 매크로 JSON은 만들지 않습니다."
+            f"영상·액션 {len(events)}개·무손실 이미지·Studio 전체 노드 명세를 저장했습니다.\n\n"
+            "ChatGPT에는 ZIP을 첨부하고 아래 ‘짧은 요청 복사’의 한 문장만 보내세요. "
+            "긴 생성 규칙은 ZIP의 START_HERE.txt와 prompt.txt에 이미 들어 있습니다."
         )
         message.setDetailedText(f"ZIP: {archive}\n작업 폴더: {stage}")
-        copy_button = message.addButton("프롬프트 복사", QtWidgets.QMessageBox.ActionRole)
+        copy_button = message.addButton("짧은 요청 복사", QtWidgets.QMessageBox.ActionRole)
         folder_button = message.addButton("저장 폴더 열기", QtWidgets.QMessageBox.ActionRole)
         message.addButton(QtWidgets.QMessageBox.Ok)
         message.setModal(False)
@@ -2051,10 +2056,10 @@ class BuilderPage(QtWidgets.QWidget):
         def handle_action(button: QtWidgets.QAbstractButton) -> None:
             if button is copy_button:
                 try:
-                    QtWidgets.QApplication.clipboard().setText(prompt_path.read_text(encoding="utf-8-sig"))
-                    self.status.emit("GPT 판단 테스트 프롬프트를 복사했습니다.")
-                except OSError as exc:
-                    self.status.emit(f"프롬프트를 읽지 못했습니다 · {exc}")
+                    QtWidgets.QApplication.clipboard().setText(SHORT_CHATGPT_REQUEST)
+                    self.status.emit("ChatGPT에 보낼 한 줄 요청을 복사했습니다.")
+                except Exception as exc:
+                    self.status.emit(f"요청 문장을 복사하지 못했습니다 · {exc}")
             elif button is folder_button:
                 QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(Path(archive).parent.resolve())))
             if message.isVisible():
@@ -2073,7 +2078,7 @@ class BuilderPage(QtWidgets.QWidget):
     @QtCore.Slot(str)
     def _ai_video_test_failed(self, detail: str) -> None:
         self._ai_video_test_controller = None
-        QtWidgets.QMessageBox.warning(self, "AI 영상 테스트", detail)
+        QtWidgets.QMessageBox.warning(self, "AI 분석 녹화", detail)
         self.status.emit(detail)
 
     def _start_ai_recording(self) -> None:

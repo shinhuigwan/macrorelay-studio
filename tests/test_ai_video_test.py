@@ -8,7 +8,7 @@ import zipfile
 
 
 class AIVideoTestTests(unittest.TestCase):
-    def test_package_contains_video_compact_actions_and_feasibility_prompt(self) -> None:
+    def test_package_contains_video_assets_contract_and_embedded_generation_prompt(self) -> None:
         from macro_studio.ai_video_test import AIVideoTestPackageBuilder
 
         with tempfile.TemporaryDirectory() as directory:
@@ -31,19 +31,25 @@ class AIVideoTestTests(unittest.TestCase):
 
             self.assertTrue(archive.is_file())
             self.assertTrue((stage / "recording.mp4").is_file())
-            timeline = json.loads((stage / "actions.json").read_text(encoding="utf-8"))
-            self.assertEqual("퀘스트 진행", timeline["purpose"])
-            self.assertEqual(2, timeline["action_count"])
-            self.assertNotIn("image_sample_bmp", timeline["actions"][0])
-            self.assertEqual("[REDACTED]", timeline["actions"][1]["char"])
+            manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual("퀘스트 진행", manifest["purpose"])
+            self.assertEqual("START_HERE.txt", manifest["handoff"]["start_file"])
             prompt = (stage / "prompt.txt").read_text(encoding="utf-8")
-            self.assertIn("가능 / 일부 가능 / 불가능", prompt)
-            self.assertIn("매크로 JSON이나 코드를 만들지 마세요", prompt)
+            self.assertIn("macrorelay-ai.json", prompt)
+            self.assertIn("asset-manifest.json`에 없는 이미지", prompt)
+            self.assertIn("퀘스트 진행", prompt)
+            self.assertIn("긴 프롬프트를 채팅에 다시 붙여넣을 필요는 없습니다", (stage / "START_HERE.txt").read_text(encoding="utf-8"))
             with zipfile.ZipFile(archive) as bundle:
-                self.assertEqual(
-                    {"recording.mp4", "actions.json", "manifest.json", "prompt.txt", "README.txt"},
-                    set(bundle.namelist()),
-                )
+                names = set(bundle.namelist())
+                self.assertIn("recording.mp4", names)
+                self.assertIn("timeline.json", names)
+                self.assertIn("asset-manifest.json", names)
+                self.assertIn("studio-capabilities.json", names)
+                self.assertIn("node-reference.md", names)
+                self.assertIn("schema.json", names)
+                self.assertIn("generation-checklist.json", names)
+                self.assertIn("START_HERE.txt", names)
+                self.assertIn("short-request.txt", names)
 
     def test_controller_uses_thirty_second_continuous_video_profile(self) -> None:
         from PySide6 import QtWidgets
@@ -60,7 +66,7 @@ class AIVideoTestTests(unittest.TestCase):
             self.assertFalse(controller.protect_typing)
             self.assertFalse(controller.right_click_condition)
             self.assertFalse(controller.workflow_controls)
-            self.assertFalse(controller.capture_action_images)
+            self.assertTrue(controller.capture_action_images)
 
 
 if __name__ == "__main__":

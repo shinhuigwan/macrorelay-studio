@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
-import json
 from pathlib import Path
 import shutil
 import uuid
-import zipfile
 
 from PySide6 import QtCore, QtWidgets
 
+from .ai_automation import AIRecordingPackageBuilder
 from .ai_recording import AIRecordingController
 
 
@@ -56,102 +54,39 @@ class AIVideoTestPackageBuilder:
     def build(self, events: list[dict], video: Path, purpose: str) -> tuple[Path, Path]:
         if not video.is_file():
             raise FileNotFoundError("녹화 영상을 만들지 못했습니다. OpenCV 구성요소 상태를 확인하세요.")
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        package_id = f"ai-video-test-{stamp}-{uuid.uuid4().hex[:6]}"
-        stage = self.root / ".automation" / "ai-video-tests" / package_id
-        exports = self.root / "exports" / "ai-video-tests"
-        stage.mkdir(parents=True, exist_ok=False)
-        exports.mkdir(parents=True, exist_ok=True)
-        target_video = stage / "recording.mp4"
-        shutil.copy2(video, target_video)
-        actions = compact_action_timeline(events)
-        duration_ms = max((int(item.get("t") or 0) for item in actions), default=0)
-        purpose = purpose.strip() or "영상 속 작업의 목적과 반복 자동화 가능 여부 판단"
-        timeline = {
-            "format": "macrorelay-ai-video-test-actions-v1",
-            "purpose": purpose,
-            "video": "recording.mp4",
-            "time_unit": "milliseconds_from_recording_start",
-            "duration_ms": duration_ms,
-            "action_count": len(actions),
-            "actions": actions,
-        }
-        (stage / "actions.json").write_text(
-            json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8"
+        package_id = f"ai-analysis-{uuid.uuid4().hex[:10]}"
+        return AIRecordingPackageBuilder(self.root).build(
+            events,
+            video,
+            package_id=package_id,
+            trigger_config={"type": "manual"},
+            purpose=purpose,
         )
-        manifest = {
-            "format": "macrorelay-ai-video-test-v1",
-            "package_id": package_id,
-            "purpose": purpose,
-            "duration_ms": duration_ms,
-            "action_count": len(actions),
-            "files": ["recording.mp4", "actions.json", "manifest.json", "prompt.txt", "README.txt"],
-            "privacy": {
-                "typed_characters_redacted_in_actions": True,
-                "video_may_contain_visible_personal_information": True,
-            },
-        }
-        (stage / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        prompt = self._prompt(purpose)
-        (stage / "prompt.txt").write_text(prompt, encoding="utf-8")
-        (stage / "README.txt").write_text(
-            "recording.mp4는 실제 화면, actions.json은 같은 시작점을 기준으로 한 사용자 액션입니다.\n"
-            "이 테스트 패키지는 매크로 JSON 생성용이 아니라 GPT의 작업 이해도와 자동화 가능성 판단용입니다.\n"
-            "영상에는 화면에 표시된 개인정보가 포함될 수 있으므로 전송 전에 확인하세요.\n",
-            encoding="utf-8",
-        )
-        archive = exports / f"MacroRelay-AI-Video-Test-{stamp}.zip"
-        suffix = 2
-        while archive.exists():
-            archive = exports / f"MacroRelay-AI-Video-Test-{stamp}-{suffix}.zip"
-            suffix += 1
-        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-            for path in sorted(stage.iterdir()):
-                bundle.write(path, path.name)
-        return archive, stage
-
-    @staticmethod
-    def _prompt(purpose: str) -> str:
-        return f"""첨부한 MacroRelay 테스트 ZIP을 분석해 주세요.
-
-사용자가 입력한 목적: {purpose}
-
-ZIP의 recording.mp4는 화면 녹화이고 actions.json은 동일한 시작 시점을 기준으로 기록한 클릭, 키보드, 휠, 대상 창 정보입니다. 두 파일의 시간(ms)을 함께 비교하세요. 이 단계에서는 매크로 JSON이나 코드를 만들지 마세요.
-
-다음 다섯 가지만 한국어로 답해 주세요.
-1. 영상에서 사용자가 하려던 작업을 한 문단으로 요약
-2. 시간 순서대로 추론한 핵심 행동
-3. MacroRelay로 안정적으로 자동화 가능한 부분
-4. 영상만으로 판단하기 어려운 조건, 반복 규칙, 성공·실패 기준
-5. 현재 자료만으로 자동 매크로 제작이 가능한지 `가능 / 일부 가능 / 불가능` 중 하나와 이유
-
-액션 기록에 없는 동작을 확정적으로 지어내지 말고, 추론은 추론이라고 표시하세요.
-"""
 
 
 class AIVideoTestPurposeDialog(QtWidgets.QDialog):
     def __init__(self, event_count: int, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("AI 영상 테스트 · 목적 입력")
+        self.setWindowTitle("AI 분석 녹화 · 목적 입력")
         self.setMinimumWidth(560)
         root = QtWidgets.QVBoxLayout(self)
         title = QtWidgets.QLabel("녹화가 완료되었습니다")
         title.setStyleSheet("font-size:17pt; font-weight:800;")
         root.addWidget(title)
         root.addWidget(QtWidgets.QLabel(f"영상과 액션 {event_count}개를 같은 시간축으로 저장했습니다."))
-        root.addWidget(QtWidgets.QLabel("GPT가 무엇을 판단해야 하는지 한 줄로 적어주세요."))
+        root.addWidget(QtWidgets.QLabel("GPT가 완성할 자동화의 목적을 한 줄로 적어주세요."))
         self.purpose = QtWidgets.QLineEdit()
-        self.purpose.setPlaceholderText("예: 퀘스트를 진행하는 반복 작업인지 판단")
-        self.purpose.setText("영상 속 작업의 목적과 반복 자동화 가능 여부 판단")
+        self.purpose.setPlaceholderText("예: 이벤트 보상을 확인하고 모두 수령한 뒤 종료")
+        self.purpose.setText("녹화한 작업을 안정적인 자동 매크로로 생성")
         self.purpose.selectAll()
         root.addWidget(self.purpose)
-        note = QtWidgets.QLabel("입력 내용은 분석 방향만 알려주며, 이 테스트에서는 노드나 JSON을 만들지 않습니다.")
+        note = QtWidgets.QLabel(
+            "Studio가 영상·액션·무손실 PNG·전체 노드 명세·고정 GPT 지침을 ZIP에 자동 포함합니다."
+        )
         note.setWordWrap(True)
         root.addWidget(note)
         buttons = QtWidgets.QDialogButtonBox()
-        create = buttons.addButton("테스트 패키지 만들기", QtWidgets.QDialogButtonBox.AcceptRole)
+        create = buttons.addButton("AI 노드 생성 패키지 만들기", QtWidgets.QDialogButtonBox.AcceptRole)
         buttons.addButton("취소", QtWidgets.QDialogButtonBox.RejectRole)
         create.setDefault(True)
         buttons.accepted.connect(self.accept)
@@ -160,7 +95,7 @@ class AIVideoTestPurposeDialog(QtWidgets.QDialog):
 
 
 class AIVideoTestRecordingController(AIRecordingController):
-    """Short continuous video + action timeline, intentionally without node generation."""
+    """Short continuous video plus lossless action evidence for GPT node generation."""
 
     def __init__(self, repository, parent=None) -> None:
         super().__init__(
@@ -175,7 +110,7 @@ class AIVideoTestRecordingController(AIRecordingController):
             protect_typing=False,
             right_click_condition=False,
             workflow_controls=False,
-            capture_action_images=False,
+            capture_action_images=True,
         )
         self._purpose_dialog: AIVideoTestPurposeDialog | None = None
         self._pending_test: tuple[list[dict], Path | None] | None = None
@@ -183,9 +118,9 @@ class AIVideoTestRecordingController(AIRecordingController):
     def start(self) -> None:
         super().start()
         if self.bar is not None:
-            self.bar.setWindowTitle("AI 30초 영상 테스트")
+            self.bar.setWindowTitle("AI 30초 분석 녹화")
             self.bar.label.setText("영상+액션 연속 녹화 · 최대 30초 · F10 종료")
-            self.bar.mode_badge.setText("GPT 판단 테스트")
+            self.bar.mode_badge.setText("AI 노드 생성")
             self.bar.branch_button.setVisible(False)
             self.bar.capture_button.setVisible(False)
             self.bar.setFixedWidth(730)
@@ -215,7 +150,7 @@ class AIVideoTestRecordingController(AIRecordingController):
         events, video = pending
         if result != QtWidgets.QDialog.Accepted:
             self._cleanup(video)
-            self.failed.emit("AI 영상 테스트 패키지 생성을 취소했습니다.")
+            self.failed.emit("AI 분석 패키지 생성을 취소했습니다.")
             self.deleteLater()
             return
         QtCore.QTimer.singleShot(0, lambda: self._finish_test_package(events, video, purpose))
@@ -227,7 +162,7 @@ class AIVideoTestRecordingController(AIRecordingController):
             archive, stage = AIVideoTestPackageBuilder(self.repository.root).build(events, video, purpose)
         except Exception as exc:
             self._cleanup(video)
-            self.failed.emit(f"AI 영상 테스트 패키지 생성 실패: {exc}")
+            self.failed.emit(f"AI 분석 패키지 생성 실패: {exc}")
             self.deleteLater()
             return
         self._cleanup(video)

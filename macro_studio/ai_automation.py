@@ -413,7 +413,17 @@ def load_ai_recording(path: Path) -> list[dict[str, Any]]:
     return coalesced
 
 
-def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = None) -> str:
+SHORT_CHATGPT_REQUEST = (
+    "첨부한 MacroRelay 패키지의 START_HERE.txt를 먼저 읽고, 녹화 영상·액션·무손실 PNG를 함께 분석해 "
+    "Studio에서 바로 가져올 수 있는 macrorelay-ai.json 파일을 만들어 주세요."
+)
+
+
+def chatgpt_prompt(
+    package_id: str,
+    packaged_trigger: dict[str, Any] | None = None,
+    purpose: str = "",
+) -> str:
     capabilities = ai_capabilities_document()
     field_count = sum(len(row.get("fields") or []) for row in capabilities.get("actions", {}).values())
     trigger_example = deepcopy(packaged_trigger) if packaged_trigger else {"id": "trigger-001", "type": "manual"}
@@ -446,9 +456,12 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
         }],
         "setup_requirements": [],
     }
+    purpose_text = purpose.strip() or "녹화된 행동의 목적을 추론하여 안정적인 자동 매크로로 구성"
     return f"""당신은 MacroRelay Studio 자동화 설계 도우미입니다.
 
 첨부된 AI 녹화 패키지 `{package_id}`를 분석하십시오. 이 패키지에는 사용자가 수행한 동작의 비식별 타임라인, 대상 프로그램 정보, 원본 PNG 이미지 후보와 선택적 동작 영상이 들어 있습니다.
+
+사용자가 입력한 이번 녹화 목적: {purpose_text}
 
 가장 먼저 패키지 최상단의 `studio-capabilities.json`, `node-reference.md`, `schema.json`, `generation-checklist.json`을 읽으십시오. 여기에는 현재 Studio가 실제로 지원하는 모든 노드와 {field_count}개 설정 필드의 경로·형식·기본값·허용값·사용 조건이 들어 있습니다. 녹화에 직접 나타나지 않은 OCR·변수·조건·반복·서브매크로·테이블·알림 기능도 목적 달성에 필요하면 스스로 선택하십시오. 명세에 없는 action, params 필드, 선택값은 추측하거나 만들지 마십시오.
 
@@ -470,6 +483,9 @@ def chatgpt_prompt(package_id: str, packaged_trigger: dict[str, Any] | None = No
 15. timeline의 `screen_verification_marker`는 사용자가 F6으로 표시한 ‘이전 동작 결과 확인’입니다. 같은 asset_ref의 `screen_condition`을 만들고 성공하면 다음 동작으로 진행하십시오. 실패하면 해당 작업 안의 직전 실제 동작으로 돌아가 500ms 뒤 다시 시도하되 최대 3회로 제한하고, 모두 실패하면 작업을 안전하게 종료하십시오.
 16. 작업 이름이나 작업 구분만을 위해 `flow_control` 노드를 만들지 마십시오. workflow_id와 workflow_label이 시각적 작업 레인을 만듭니다. 반복·카운터·명시적 점프가 실제로 녹화된 경우에만 flow_control을 사용하고, 녹화에 없는 대기 노드를 일괄 삽입하지 마십시오.
 17. 반환 전 `generation-checklist.json`의 모든 항목을 자체 검사하십시오. 각 step의 `source_evidence`에 선택 이유와 근거 timeline/asset id를 기록하십시오.
+18. `asset-manifest.json`에 없는 이미지 파일명이나 경로를 절대 만들지 마십시오. 녹화 자료에 없는 이미지가 있으면 가짜 `assets/*.png`를 참조하지 말고 candidate를 빈 문자열로 두고 해당 step의 `needs_setup`에 `select_asset`을 넣으십시오. 보조 판정이면 asset.required=false로 두어 가져오기를 막지 말고, 그 이미지 없이는 핵심 흐름을 실행할 수 없을 때만 required=true로 두십시오.
+19. 종료를 별도 `flow_control` 노드나 `params.operation=end`로 만들지 마십시오. 흐름 종료는 `on_success` 또는 `on_fail`에 `end`를 넣거나 마지막 연결을 비워 표현하십시오.
+20. 영상은 의도와 순서 판단용입니다. 이미지 서치 template은 반드시 `asset-manifest.json`에 등록된 무손실 PNG candidate만 사용하십시오. MP4 프레임을 잘라 만든 파일명을 반환하지 마십시오.
 
 스키마 버전은 `{AI_SCHEMA_VERSION}`입니다. 최상위 필수 키는 `schema_version`, `source_package_id`, `name`, `description`, `targets`, `assets`, `variables`, `triggers`, `steps`, `setup_requirements`이며, 작업 분기가 있으면 `workflows`도 포함하십시오.
 
@@ -775,6 +791,7 @@ class AIRecordingPackageBuilder:
         trigger_config: dict[str, Any] | None = None,
         video_segments: list[dict[str, int]] | None = None,
         video_disabled: bool = False,
+        purpose: str = "",
     ) -> tuple[Path, Path]:
         trigger_config = trigger_config or {}
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1038,8 +1055,22 @@ class AIRecordingPackageBuilder:
             preview = QtGui.QImage(str(stage / str(trigger_asset["selected_candidate"])))
             contact_rows.append(("실행 조건", preview, "특정 화면이 나타나면 자동 실행"))
 
-        prompt = chatgpt_prompt(identifier, packaged_trigger)
+        purpose = purpose.strip() or "녹화된 행동을 분석하여 MacroRelay 자동 매크로 생성"
+        prompt = chatgpt_prompt(identifier, packaged_trigger, purpose)
         (stage / "prompt.txt").write_text(prompt, encoding="utf-8")
+        (stage / "task-purpose.txt").write_text(purpose + "\n", encoding="utf-8")
+        (stage / "short-request.txt").write_text(SHORT_CHATGPT_REQUEST + "\n", encoding="utf-8")
+        (stage / "START_HERE.txt").write_text(
+            "MacroRelay Studio AI 노드 생성 패키지\n\n"
+            "1. prompt.txt의 고정 생성 규칙을 따릅니다. 사용자가 이 긴 프롬프트를 채팅에 다시 붙여넣을 필요는 없습니다.\n"
+            "2. task-purpose.txt, recording.mp4, timeline.json을 함께 분석합니다.\n"
+            "3. 이미지 검색에는 asset-manifest.json에 등록된 무손실 PNG만 사용합니다.\n"
+            "4. studio-capabilities.json, node-reference.md, schema.json 밖의 노드·필드·선택값은 만들지 않습니다.\n"
+            "5. generation-checklist.json을 통과하도록 자체 수정한 뒤 macrorelay-ai.json 파일 하나를 반환합니다.\n"
+            "6. 자료에 없는 추가 이미지는 경로를 지어내지 않고 선택적 설정 항목으로 표시합니다.\n\n"
+            f"이번 목적: {purpose}\n",
+            encoding="utf-8",
+        )
         _write_json(stage / "timeline.json", timeline)
         write_ai_reference_files(stage, timeline)
         _write_json(stage / "workflows.json", {"workflows": workflow_rows})
@@ -1074,6 +1105,12 @@ class AIRecordingPackageBuilder:
             "video_segment_count": len(video_segments or []),
             "text_policy": "All printable keyboard input is redacted. ChatGPT must ask for a vault name or value classification.",
             "image_policy": "Lossless native PNG candidates only; video frames are never used as search templates.",
+            "purpose": purpose,
+            "handoff": {
+                "start_file": "START_HERE.txt",
+                "short_request_file": "short-request.txt",
+                "expected_output": "macrorelay-ai.json",
+            },
         }
         _write_json(stage / "manifest.json", manifest)
         exports = self.root / "exports" / "ai-recordings"

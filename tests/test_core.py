@@ -5233,7 +5233,7 @@ class AIAutomationTests(unittest.TestCase):
             builder.refresh("AI 초안")
             labels = [button.text() for button in builder.findChildren(QtWidgets.QPushButton)]
             self.assertIn("✦ AI 매크로 녹화", labels)
-            self.assertIn("◉ AI 영상 테스트", labels)
+            self.assertIn("◉ AI 분석 녹화", labels)
             self.assertIn("AI 분석 패키지 생성", labels)
             self.assertIn("받은 JSON 바로 가져오기", labels)
             builder.show()

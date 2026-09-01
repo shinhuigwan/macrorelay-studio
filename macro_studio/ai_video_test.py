@@ -173,6 +173,9 @@ class AIVideoTestRecordingController(AIRecordingController):
             video_max_width=1920,
             max_duration_ms=30_000,
             protect_typing=False,
+            right_click_condition=False,
+            workflow_controls=False,
+            capture_action_images=False,
         )
         self._purpose_dialog: AIVideoTestPurposeDialog | None = None
         self._pending_test: tuple[list[dict], Path | None] | None = None
@@ -184,7 +187,9 @@ class AIVideoTestRecordingController(AIRecordingController):
             self.bar.label.setText("영상+액션 연속 녹화 · 최대 30초 · F10 종료")
             self.bar.mode_badge.setText("GPT 판단 테스트")
             self.bar.branch_button.setVisible(False)
+            self.bar.capture_button.setVisible(False)
             self.bar.setFixedWidth(730)
+        self._capture_poll.stop()
 
     def _build_recording_package(self, events: list[dict], video: Path | None, trigger_config: dict) -> None:
         self._pending_test = (list(events), video)

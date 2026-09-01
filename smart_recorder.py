@@ -363,6 +363,7 @@ class Recorder:
         sample_height: int = 240,
         right_click_condition: bool = False,
         rolling_preframes: bool = False,
+        action_images: bool = True,
     ) -> None:
         self.output = output
         self.exclude_pid = exclude_pid
@@ -378,6 +379,7 @@ class Recorder:
         self.sample_height = max(120, min(1080, int(sample_height)))
         self.right_click_condition = bool(right_click_condition)
         self.rolling_preframes = bool(rolling_preframes)
+        self.action_images = bool(action_images)
         self.record_mode = "action"
         self._mode_key_down = False
         self._branch_key_down = False
@@ -477,8 +479,9 @@ class Recorder:
                 "window": details,
                 "image_sample_bmp": capture_click_sample(
                     int(point.x), int(point.y), self.sample_width, self.sample_height
-                ),
-                "image_previous_bmps": self._recent_before_samples(int(point.x), int(point.y)),
+                ) if self.action_images else "",
+                "image_previous_bmps": self._recent_before_samples(int(point.x), int(point.y))
+                if self.action_images else [],
                 "image_sample_size": [self.sample_width, self.sample_height],
                 "image_anchor": [self.sample_width // 2, self.sample_height // 2],
                 "retry_from": "previous_action",
@@ -589,11 +592,11 @@ class Recorder:
             client_y = data.pt.y - int(origin[1]) if isinstance(origin, list) and len(origin) >= 2 else data.pt.y
             sample_width, sample_height = self.sample_width, self.sample_height
             sample = (
-                ""
-                if message == WM_MOUSEWHEEL
-                else capture_click_sample(int(data.pt.x), int(data.pt.y), sample_width, sample_height)
+                capture_click_sample(int(data.pt.x), int(data.pt.y), sample_width, sample_height)
+                if self.action_images and message != WM_MOUSEWHEEL
+                else ""
             )
-            previous_samples = [] if message == WM_MOUSEWHEEL else self._recent_before_samples(
+            previous_samples = [] if not self.action_images or message == WM_MOUSEWHEEL else self._recent_before_samples(
                 int(data.pt.x), int(data.pt.y)
             )
             self._event_counter += 1
@@ -623,7 +626,7 @@ class Recorder:
                 # as an actual click action.
                 self._down_points.pop("Right", None)
                 return 1
-            if message != WM_MOUSEWHEEL:
+            if self.action_images and message != WM_MOUSEWHEEL:
                 self._after_queue.put((event_id, int(data.pt.x), int(data.pt.y)))
         return int(user32.CallNextHookEx(self.mouse_hook, code, message, data_ptr))
 
@@ -703,8 +706,9 @@ class Recorder:
         enable_dpi_awareness()
         self.output.parent.mkdir(parents=True, exist_ok=True)
         with self.output.open("w", encoding="utf-8") as self.handle:
-            self._after_thread = threading.Thread(target=self._capture_after_worker, name="macrorelay-after-capture", daemon=True)
-            self._after_thread.start()
+            if self.action_images:
+                self._after_thread = threading.Thread(target=self._capture_after_worker, name="macrorelay-after-capture", daemon=True)
+                self._after_thread.start()
             if self.rolling_preframes:
                 self._pre_capture_stop.clear()
                 self._pre_capture_thread = threading.Thread(
@@ -770,6 +774,7 @@ def main() -> int:
     parser.add_argument("--sample-height", type=int, default=240)
     parser.add_argument("--right-click-condition", action="store_true")
     parser.add_argument("--rolling-preframes", action="store_true")
+    parser.add_argument("--no-action-images", action="store_true")
     args = parser.parse_args()
     return Recorder(
         args.out.resolve(),
@@ -786,6 +791,7 @@ def main() -> int:
         sample_height=args.sample_height,
         right_click_condition=args.right_click_condition,
         rolling_preframes=args.rolling_preframes,
+        action_images=not args.no_action_images,
     ).run()
 
 

@@ -58,6 +58,9 @@ class AIVideoTestTests(unittest.TestCase):
             self.assertEqual(1920, controller.video_max_width)
             self.assertEqual(30_000, controller.max_duration_ms)
             self.assertFalse(controller.protect_typing)
+            self.assertFalse(controller.right_click_condition)
+            self.assertFalse(controller.workflow_controls)
+            self.assertFalse(controller.capture_action_images)
 
 
 if __name__ == "__main__":

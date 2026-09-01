@@ -245,6 +245,9 @@ class AIRecordingController(SmartRecordingController):
         video_max_width: int = 1280,
         max_duration_ms: int = 0,
         protect_typing: bool = True,
+        right_click_condition: bool = True,
+        workflow_controls: bool = True,
+        capture_action_images: bool = True,
     ) -> None:
         super().__init__(repository, parent)
         self.ask_execution_condition = ask_execution_condition
@@ -254,6 +257,9 @@ class AIRecordingController(SmartRecordingController):
         self.video_max_width = max(640, int(video_max_width))
         self.max_duration_ms = max(0, int(max_duration_ms))
         self.protect_typing = protect_typing
+        self.right_click_condition = right_click_condition
+        self.workflow_controls = workflow_controls
+        self.capture_action_images = capture_action_images
         self.output = repository.root / ".automation" / f"ai-recording-{uuid.uuid4().hex}.jsonl"
         self.frame_dir = repository.root / ".automation" / f"ai-video-frames-{uuid.uuid4().hex}"
         self.frame_dir.mkdir(parents=True, exist_ok=True)
@@ -280,8 +286,7 @@ class AIRecordingController(SmartRecordingController):
             return
         self.process = QtCore.QProcess(self)
         self.process.setProgram(sys.executable)
-        self.process.setArguments(
-            [
+        arguments = [
                 str(helper),
                 "--out",
                 str(self.output),
@@ -290,11 +295,11 @@ class AIRecordingController(SmartRecordingController):
                 "--delay",
                 "2",
                 "--capture-vk",
-                str(0x77),
+                str(0x77 if self.workflow_controls else 0),
                 "--branch-vk",
-                str(0x76),
+                str(0x76 if self.workflow_controls else 0),
                 "--verify-vk",
-                str(0x75),
+                str(0x75 if self.workflow_controls else 0),
                 "--stop-vk",
                 str(0x79),
                 "--hold-vk",
@@ -305,10 +310,14 @@ class AIRecordingController(SmartRecordingController):
                 "960",
                 "--sample-height",
                 "540",
-                "--right-click-condition",
-                "--rolling-preframes",
-            ]
-        )
+        ]
+        if self.right_click_condition:
+            arguments.append("--right-click-condition")
+        if self.capture_action_images:
+            arguments.append("--rolling-preframes")
+        else:
+            arguments.append("--no-action-images")
+        self.process.setArguments(arguments)
         self.process.setWorkingDirectory(str(self.repository.root))
         self.process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
         self.process.finished.connect(self._finished)

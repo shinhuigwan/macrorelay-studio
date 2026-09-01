@@ -240,16 +240,29 @@ class AIRecordingController(SmartRecordingController):
         *,
         ask_execution_condition: bool = True,
         record_video: bool = True,
+        continuous_video: bool = False,
+        video_fps: float = 1.333333,
+        video_max_width: int = 1280,
+        max_duration_ms: int = 0,
+        protect_typing: bool = True,
     ) -> None:
         super().__init__(repository, parent)
         self.ask_execution_condition = ask_execution_condition
         self.record_video = record_video
+        self.continuous_video = continuous_video
+        self.video_fps = max(0.5, float(video_fps))
+        self.video_max_width = max(640, int(video_max_width))
+        self.max_duration_ms = max(0, int(max_duration_ms))
+        self.protect_typing = protect_typing
         self.output = repository.root / ".automation" / f"ai-recording-{uuid.uuid4().hex}.jsonl"
         self.frame_dir = repository.root / ".automation" / f"ai-video-frames-{uuid.uuid4().hex}"
         self.frame_dir.mkdir(parents=True, exist_ok=True)
         self._video_timer = QtCore.QTimer(self)
-        self._video_timer.setInterval(750)
+        self._video_timer.setInterval(max(80, round(1000 / self.video_fps)))
         self._video_timer.timeout.connect(self._capture_video_frame)
+        self._duration_timer = QtCore.QTimer(self)
+        self._duration_timer.setSingleShot(True)
+        self._duration_timer.timeout.connect(self.stop)
         self._frame_index = 0
         self._frame_ring: list[tuple[int, QtGui.QPixmap]] = []
         self._saved_frame_times: set[int] = set()
@@ -316,6 +329,8 @@ class AIRecordingController(SmartRecordingController):
         self._capture_poll.start()
         if self.record_video:
             self._video_timer.start()
+        if self.max_duration_ms:
+            self._duration_timer.start(self.max_duration_ms + 2000)
 
     @QtCore.Slot()
     def _request_next_workflow(self) -> None:
@@ -352,14 +367,14 @@ class AIRecordingController(SmartRecordingController):
         pixmap, _geometry = capture_virtual_desktop()
         if pixmap.isNull():
             return
-        width = min(1280, pixmap.width())
+        width = min(self.video_max_width, pixmap.width())
         scaled = pixmap.scaledToWidth(width, QtCore.Qt.SmoothTransformation)
         elapsed = max(0, int(self.bar.elapsed.elapsed() - 2000) if self.bar is not None else 0)
         # Protect only the short typing window. Later screens remain useful for
         # understanding success/failure while printable key values themselves
         # are never written to the timeline.
         latest_key = self._latest_key_time()
-        if 0 <= elapsed - latest_key <= 5000:
+        if self.protect_typing and 0 <= elapsed - latest_key <= 5000:
             protected = QtGui.QPixmap(scaled.size())
             protected.fill(QtGui.QColor("#0B1018"))
             painter = QtGui.QPainter(protected)
@@ -368,6 +383,9 @@ class AIRecordingController(SmartRecordingController):
             painter.drawText(protected.rect(), QtCore.Qt.AlignCenter, "민감한 키 입력 구간 · 화면 보호")
             painter.end()
             scaled = protected
+        if self.continuous_video:
+            self._save_video_frame(elapsed, scaled)
+            return
         self._frame_ring.append((elapsed, scaled.copy()))
         self._frame_ring = [(stamp, frame) for stamp, frame in self._frame_ring if stamp >= elapsed - 2200]
         latest_action = self._latest_recorded_action_time()
@@ -432,7 +450,7 @@ class AIRecordingController(SmartRecordingController):
             environment["PYTHONPATH"] = str(packages) + (os.pathsep + current if current else "")
         try:
             result = subprocess.run(
-                [str(python), str(helper), str(self.frame_dir), str(output), "--fps", "1.333333"],
+                [str(python), str(helper), str(self.frame_dir), str(output), "--fps", str(self.video_fps)],
                 cwd=str(self.repository.root),
                 env=environment,
                 check=False,
@@ -448,11 +466,13 @@ class AIRecordingController(SmartRecordingController):
     def _process_error(self, error: QtCore.QProcess.ProcessError) -> None:
         if error == QtCore.QProcess.FailedToStart:
             self._video_timer.stop()
+            self._duration_timer.stop()
             self._capture_poll.stop()
             self.failed.emit("AI 매크로 녹화 프로세스를 시작하지 못했습니다.")
 
     def _finished(self, exit_code: int, _status: QtCore.QProcess.ExitStatus) -> None:
         self._video_timer.stop()
+        self._duration_timer.stop()
         self._capture_poll.stop()
         self._flush_frame_ring()
         if self.bar is not None:

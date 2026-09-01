@@ -2639,6 +2639,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(detail.precise_search_enabled())
         self.assertTrue(any("수동 상세 편집" in button.text() for button in detail.findChildren(QtWidgets.QPushButton)))
         self.assertTrue(any("자동 누끼" in button.text() for button in detail.findChildren(QtWidgets.QPushButton)))
+        self.assertTrue(any("사용할 이미지 영역 지정" in button.text() for button in detail.findChildren(QtWidgets.QPushButton)))
         detail.click_point = QtCore.QPoint(70, 54)
         self.assertEqual(QtCore.QPoint(22, 22), detail.click_offset())
         detail.close()
@@ -4889,6 +4890,100 @@ class SmartRecordingUiTests(unittest.TestCase):
         canvas.set_nodes_collapsed([1, 2], False)
         self.assertEqual([], changed[-1])
         canvas.close()
+
+    def test_f5_and_right_click_share_the_same_screen_verification_behavior(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog, recording_drafts
+        from macro_studio.repository import MacroRepository
+
+        common = {
+            "t": 100,
+            "x": 20,
+            "y": 30,
+            "window": {"exe": "sample.exe"},
+            "image_sample_bmp": self._sample_bmp(),
+            "image_sample_size": [360, 240],
+            "image_anchor": [180, 120],
+        }
+        f5 = {**common, "type": "screen_verification", "event_id": "f5", "source_control": "F5"}
+        right = {**common, "type": "screen_verification", "event_id": "right", "source_control": "RightClick"}
+        f5_draft = recording_drafts([f5], include_waits=False)[0]
+        right_draft = recording_drafts([right], include_waits=False)[0]
+        self.assertEqual("screen_verification", f5_draft["kind"])
+        self.assertEqual(f5_draft["detail"], right_draft["detail"])
+        self.assertEqual("F5", f5_draft["source_control"])
+        self.assertEqual("RightClick", right_draft["source_control"])
+        f5["_live_links"] = {"fail": "right"}
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog([f5, right], MacroRepository(Path(directory)))
+            steps = dialog.build_steps()
+            self.assertEqual(3000, steps[0]["timeout"])
+            self.assertEqual(3000, steps[1]["timeout"])
+            self.assertEqual(2, steps[0]["on_fail"])
+            self.assertFalse(steps[0]["abort_on_fail"])
+            dialog.close()
+
+    def test_live_map_supports_cross_workflow_links_and_multi_image_merge(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingBar
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        bar = RecordingBar()
+        events = [
+            {"type": "mouse", "event_id": "a", "t": 10, "button": "Left", "x": 1, "y": 2, "workflow_id": "workflow-01", "workflow_index": 1},
+            {"type": "mouse", "event_id": "b", "t": 20, "button": "Left", "x": 3, "y": 4, "workflow_id": "workflow-02", "workflow_index": 2},
+            {"type": "mouse", "event_id": "c", "t": 30, "button": "Left", "x": 5, "y": 6, "workflow_id": "workflow-03", "workflow_index": 3},
+        ]
+        bar.update_live_events(events)
+        self.assertEqual(2, bar.live_canvas.steps[0]["on_success"])
+        self.assertEqual(3, bar.live_canvas.steps[1]["on_success"])
+        bar._connect_live_nodes(1, 3, "fail")
+        app.processEvents()
+        self.assertEqual(3, bar.live_canvas.steps[0]["on_fail"])
+        self.assertEqual("c", bar.event_links()[("a", "fail")])
+        bar._merge_live_image_nodes([1, 2])
+        app.processEvents()
+        self.assertEqual(2, len(bar.live_canvas.steps))
+        self.assertEqual("멀티 이미지 서치 2개", bar.live_canvas.steps[0]["label"])
+        self.assertEqual(bar.multi_groups()["a"], bar.multi_groups()["b"])
+        bar.close()
+
+    def test_builder_context_merge_combines_image_nodes_and_preserves_next_flow(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            image = QtGui.QImage(32, 24, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#44AA88"))
+            repository.add_asset_image(image, "first")
+            image.fill(QtGui.QColor("#AA4488"))
+            repository.add_asset_image(image, "second")
+            repository.create_macro("merge")
+            payload = repository.load_macro("merge")
+            payload["steps"] = [
+                {"action": "image_search", "asset": "first", "click": {"offset": [1, 2]}, "on_success": 2},
+                {"action": "image_search", "asset": "second", "click": {"offset": [3, 4]}, "on_success": 3},
+                {"action": "wait", "duration": 500},
+            ]
+            repository.save_macro("merge", payload)
+            builder = BuilderPage(repository)
+            builder.refresh("merge")
+            builder._merge_graph_image_nodes([1, 2])
+            app.processEvents()
+            steps = builder.current_macro["steps"]
+            self.assertEqual(2, len(steps))
+            self.assertEqual(["first", "second"], steps[0]["assets"])
+            self.assertEqual({"first": [1, 2], "second": [3, 4]}, steps[0]["asset_offsets"])
+            self.assertEqual(2, steps[0]["on_success"])
+            builder.shutdown_automation()
+            builder.deleteLater()
 
     def test_repository_removes_only_retired_ai_recording_artifacts(self) -> None:
         from macro_studio.repository import MacroRepository

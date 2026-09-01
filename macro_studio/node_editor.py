@@ -681,6 +681,14 @@ class NodeItem(QtWidgets.QGraphicsObject):
             if all(self.canvas.nodes[index].collapsed for index in selected_indexes if index in self.canvas.nodes)
             else f"선택 노드 {len(selected_indexes)}개 접기"
         )
+        selected_image_nodes = [
+            index
+            for index in selected_indexes
+            if index in self.canvas.nodes
+            and str(self.canvas.steps[index - 1].get("action") or "") == "image_search"
+        ]
+        merge_multi = menu.addAction("▦ 선택 이미지 서치를 멀티 서치로 묶기")
+        merge_multi.setEnabled(len(selected_image_nodes) >= 2 and len(selected_image_nodes) == len(selected_indexes))
         menu.addSeparator()
         duplicate = menu.addAction("노드 복제")
         archive = menu.addAction("노드 보관")
@@ -694,6 +702,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 self.canvas.nodes[index].collapsed for index in selected_indexes if index in self.canvas.nodes
             )
             self.canvas.set_nodes_collapsed(selected_indexes, should_collapse)
+        elif chosen == merge_multi:
+            self.canvas.multi_image_merge_requested.emit(selected_image_nodes)
         elif chosen == duplicate:
             self.canvas.node_duplicate_requested.emit(self.index)
         elif chosen == archive:
@@ -1068,6 +1078,7 @@ class NodeCanvas(QtWidgets.QWidget):
     start_search_group_requested = QtCore.Signal(list)
     image_edit_requested = QtCore.Signal(int)
     collapsed_changed = QtCore.Signal(list)
+    multi_image_merge_requested = QtCore.Signal(list)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)

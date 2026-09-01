@@ -704,6 +704,11 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.all_wait_duration_requested.connect(self._set_all_wait_durations)
         self.node_canvas.start_search_group_requested.connect(self._configure_start_search_candidates)
         self.node_canvas.image_edit_requested.connect(self._edit_node_search_image)
+        self.node_canvas.multi_image_merge_requested.connect(
+            lambda indexes: QtCore.QTimer.singleShot(
+                0, lambda values=list(indexes): self._merge_graph_image_nodes(values)
+            )
+        )
 
         list_page = QtWidgets.QWidget()
         list_layout = QtWidgets.QVBoxLayout(list_page)
@@ -1432,6 +1437,76 @@ class BuilderPage(QtWidgets.QWidget):
         self._persist(f"{source}번 노드의 {'실패' if kind == 'fail' else '성공'} 흐름을 {target}번에 연결했습니다.")
         self._refresh_steps(source - 1)
 
+    @QtCore.Slot(list)
+    def _merge_graph_image_nodes(self, indexes: list[int]) -> None:
+        if self.current_macro is None:
+            return
+        steps = self.current_macro.get("steps") or []
+        selected = sorted({int(index) for index in indexes if 0 < int(index) <= len(steps)})
+        if len(selected) < 2 or any(str(steps[index - 1].get("action") or "") != "image_search" for index in selected):
+            self.status.emit("이미지 서치 노드를 2개 이상 선택해 주세요.")
+            return
+        selected_set = set(selected)
+        primary_index = selected[0]
+        primary = steps[primary_index - 1]
+        aliases: list[str] = []
+        offsets: dict[str, list[int]] = {}
+        for index in selected:
+            member = steps[index - 1]
+            member_aliases = [
+                str(value) for value in member.get("assets") or [] if str(value).strip()
+            ] if isinstance(member.get("assets"), list) else []
+            member_primary = str(member.get("asset") or "").strip()
+            if member_primary and member_primary not in member_aliases:
+                member_aliases.insert(0, member_primary)
+            stored_offsets = member.get("asset_offsets") if isinstance(member.get("asset_offsets"), dict) else {}
+            click = member.get("click") if isinstance(member.get("click"), dict) else {}
+            fallback_offset = list(click.get("offset") or [0, 0])[:2]
+            for alias in member_aliases:
+                if alias not in aliases:
+                    aliases.append(alias)
+                value = stored_offsets.get(alias, fallback_offset)
+                if isinstance(value, (list, tuple)) and len(value) >= 2:
+                    offsets[alias] = [int(value[0] or 0), int(value[1] or 0)]
+        if len(aliases) < 2:
+            self.status.emit("선택한 노드에서 서로 다른 검색 이미지를 2개 이상 찾지 못했습니다.")
+            return
+
+        def external_target(field: str) -> int:
+            for index in reversed(selected):
+                target = int(steps[index - 1].get(field) or 0)
+                if target and target not in selected_set:
+                    return target
+            if field == "on_success" and selected[-1] < len(steps):
+                return selected[-1] + 1
+            return 0
+
+        success_target = external_target("on_success")
+        fail_target = external_target("on_fail")
+        primary["asset"] = aliases[0]
+        primary["assets"] = aliases
+        primary["asset_offsets"] = offsets
+        primary["engine"] = "opencv"
+        primary["label"] = f"멀티 이미지 서치 {len(aliases)}개"
+        primary.pop("stop_on_success", None)
+        if success_target:
+            primary["on_success"] = success_target
+        else:
+            primary.pop("on_success", None)
+        if fail_target:
+            primary["on_fail"] = fail_target
+        else:
+            primary.pop("on_fail", None)
+        automation = primary.get("_automation") if isinstance(primary.get("_automation"), dict) else {}
+        automation.update({"manual_multi_merge": True, "image_count": len(aliases)})
+        primary["_automation"] = automation
+        for index in reversed(selected[1:]):
+            removed = steps.pop(index - 1)
+            self.current_macro.setdefault("meta", {}).setdefault("archived_steps", []).append(removed)
+            self._normalize_edges_after_delete(index)
+        self._persist(f"이미지 서치 {len(selected)}개를 멀티 이미지 서치 {len(aliases)}개로 묶었습니다.")
+        self._refresh_steps(primary_index - 1)
+
     @QtCore.Slot(int, int, str)
     def _delete_graph_edge(self, source: int, target: int, kind: str) -> None:
         steps = (self.current_macro or {}).get("steps") or []
@@ -1821,7 +1896,7 @@ class BuilderPage(QtWidgets.QWidget):
             "Shift+` 키는 일반 액션과 순차 이미지 분기 후보 모드를 전환합니다.\n"
             "F5는 현재 커서의 이미지를 '결과 확인' 노드로, F6은 1초 대기 노드로 추가합니다.\n"
             "F7은 새 작업 분기를 시작하고, F11은 일반/분기 모드, F12는 기록 ON/OFF를 전환합니다.\n"
-            "우클릭은 실제 클릭하지 않고 해당 위치의 이미지를 화면 조건으로 기록합니다.\n"
+            "우클릭과 F5는 동일하게 실제 클릭 없이 해당 위치의 이미지를 화면 확인 노드로 기록합니다.\n"
             "분기 모드의 클릭·키 입력·텍스트도 분기 액션으로 저장되며, F8 이미지는 대체 후보로 추가됩니다.\n"
             "`과 Shift+` 키 자체는 대상 프로그램에 입력되거나 매크로 동작으로 저장되지 않습니다.\n"
             "암호·개인정보를 입력했다면 검토 화면에서 텍스트 저장을 해제하세요.\n\n"

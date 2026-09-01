@@ -109,16 +109,16 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
 
         if event.get("type") in {"screen_condition", "screen_verification"}:
             window = event.get("window") if isinstance(event.get("window"), dict) else {}
-            verification = event.get("type") == "screen_verification"
             drafts.append(
                 {
-                    "kind": "screen_verification" if verification else "screen_condition",
+                    "kind": "screen_verification",
                     "t": current_time,
                     "event": event,
                     "count": 1,
                     "strategy": "image",
                     "record_mode": record_mode,
-                    "detail": "F5 결과 확인 · 없으면 정지" if verification else "우클릭 화면 조건 · 보이면 진행",
+                    "detail": "화면 이미지 확인 · 없으면 정지",
+                    "source_control": str(event.get("source_control") or ("F5" if event.get("type") == "screen_verification" else "RightClick")),
                     "target": _window_label(window),
                     **workflow,
                 }
@@ -133,6 +133,7 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                 if (
                     following.get("type") == "mouse"
                     and str(following.get("record_mode") or "action").lower() == record_mode
+                    and str(following.get("workflow_id") or "") == str(event.get("workflow_id") or "")
                     and following.get("button") == event.get("button")
                     and abs(int(following.get("x") or 0) - int(event.get("x") or 0)) <= 4
                     and abs(int(following.get("y") or 0) - int(event.get("y") or 0)) <= 4
@@ -290,7 +291,7 @@ class RecordingBar(QtWidgets.QDialog):
         layout.addLayout(controls)
         shortcuts = QtWidgets.QLabel(
             "F5 결과 확인 · F6 1초 대기 · F7 새 작업 · F8 이미지 · F9 시작 · F10 종료 · "
-            "F11 일반/분기 · F12 기록 ON/OFF · 우클릭 화면 조건"
+            "F11 일반/분기 · F12 기록 ON/OFF · 우클릭=F5와 같은 화면 확인"
         )
         shortcuts.setObjectName("Muted")
         shortcuts.setWordWrap(True)
@@ -300,10 +301,17 @@ class RecordingBar(QtWidgets.QDialog):
         self.live_canvas = NodeCanvas(self)
         self.live_canvas.flow_label.setText("SMART RECORDING · LIVE NODE MAP")
         self.live_canvas.setMinimumHeight(300)
+        self.live_canvas.link_requested.connect(self._connect_live_nodes)
+        self.live_canvas.edge_delete_requested.connect(self._delete_live_edge)
+        self.live_canvas.multi_image_merge_requested.connect(self._merge_live_image_nodes)
         self.live_canvas.set_macro({"steps": []})
         layout.addWidget(self.live_canvas, 1)
         self._event_positions: dict[str, list[float]] = {}
         self._last_live_signature: tuple[str, ...] = ()
+        self._live_events: list[dict[str, Any]] = []
+        self._live_link_overrides: dict[tuple[str, str], str | None] = {}
+        self._live_multi_groups: dict[str, str] = {}
+        self._live_rebuild_pending = False
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self._tick)
@@ -354,7 +362,7 @@ class RecordingBar(QtWidgets.QDialog):
         if self.branch_button.isVisible():
             self.mode_badge.setText(f"작업 {self.workflow_index}")
             self.label.setText(
-                f"작업 {self.workflow_index} · 우클릭=조건 · F5=결과 확인 · F7=다음 작업 · F10=종료"
+                f"작업 {self.workflow_index} · 우클릭/F5=화면 확인 · F7=다음 작업 · F10=종료"
             )
 
     def set_gate_active(self, active: bool) -> None:
@@ -401,19 +409,49 @@ class RecordingBar(QtWidgets.QDialog):
             "_event_id": event_id,
             "workflow_id": workflow_id,
             "workflow_label": f"스마트 작업 {int(draft.get('workflow_index') or 1)}",
+            "_member_event_ids": list(draft.get("_member_event_ids") or [event_id]),
         }
         if kind == "wait":
-            return {"action": "wait", "duration": int(draft.get("duration") or 1000), **common}
+            return {**common, "action": "wait", "duration": int(draft.get("duration") or 1000)}
         if kind == "screen_verification":
-            return {"action": "screen_condition", "label": "F5 결과 확인 · 없으면 정지", **common}
+            return {**common, "action": "screen_condition", "label": "화면 이미지 확인 · 없으면 정지"}
         if kind == "screen_condition":
-            return {"action": "screen_condition", "label": "우클릭 화면 조건", **common}
+            return {**common, "action": "screen_condition", "label": "화면 이미지 확인 · 없으면 정지"}
         if kind in {"mouse", "image_capture"}:
             label = "F8 이미지 캡처" if kind == "image_capture" else str(draft.get("detail") or "클릭")
-            return {"action": "image_search", "label": label, **common}
+            return {**common, "action": "image_search", "label": label}
         if kind in {"text", "key"}:
-            return {"action": "type_text", **common}
-        return {"action": "flow_control", **common}
+            return {**common, "action": "type_text"}
+        return {**common, "action": "flow_control"}
+
+    def _group_live_drafts(self, drafts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: list[dict[str, Any]] = []
+        used_groups: set[str] = set()
+        for draft in drafts:
+            event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
+            event_id = str(event.get("event_id") or "")
+            group = self._live_multi_groups.get(event_id, "")
+            if not group:
+                grouped.append(draft)
+                continue
+            if group in used_groups:
+                continue
+            members = []
+            for candidate in drafts:
+                candidate_event = candidate.get("event") if isinstance(candidate.get("event"), dict) else {}
+                candidate_id = str(candidate_event.get("event_id") or "")
+                if self._live_multi_groups.get(candidate_id, "") == group:
+                    members.append((candidate_id, candidate))
+            if len(members) < 2:
+                grouped.append(draft)
+                continue
+            primary = dict(members[0][1])
+            primary["event"] = dict(primary.get("event") or {})
+            primary["detail"] = f"멀티 이미지 서치 {len(members)}개"
+            primary["_member_event_ids"] = [identifier for identifier, _candidate in members]
+            grouped.append(primary)
+            used_groups.add(group)
+        return grouped
 
     def _remember_live_positions(self) -> None:
         for index, node in self.live_canvas.nodes.items():
@@ -423,27 +461,93 @@ class RecordingBar(QtWidgets.QDialog):
             if event_id:
                 self._event_positions[event_id] = [round(node.pos().x(), 2), round(node.pos().y(), 2)]
 
-    def update_live_events(self, events: list[dict[str, Any]]) -> None:
-        drafts = recording_drafts(events, include_waits=False)
+    def update_live_events(self, events: list[dict[str, Any]], force: bool = False) -> None:
+        self._live_events = list(events)
+        drafts = self._group_live_drafts(recording_drafts(events, include_waits=False))
         steps = [self._live_step(draft, index) for index, draft in enumerate(drafts, start=1)]
-        signature = tuple(str(step.get("_event_id") or "") for step in steps)
-        if signature == self._last_live_signature:
+        event_ids = tuple(str(step.get("_event_id") or "") for step in steps)
+        signature = tuple(
+            f"{event_id}|{','.join(str(value) for value in step.get('_member_event_ids') or [])}"
+            for event_id, step in zip(event_ids, steps)
+        )
+        if signature == self._last_live_signature and not force:
             return
         self._remember_live_positions()
         positions = {
             str(index): self._event_positions[event_id]
-            for index, event_id in enumerate(signature, start=1)
+            for index, event_id in enumerate(event_ids, start=1)
             if event_id in self._event_positions
         }
         for index, step in enumerate(steps[:-1], start=1):
-            if str(step.get("workflow_id") or "") == str(steps[index].get("workflow_id") or ""):
-                step["on_success"] = index + 1
+            step["on_success"] = index + 1
+        event_index = {event_id: index for index, event_id in enumerate(event_ids, start=1)}
+        for (source_id, kind), target_id in self._live_link_overrides.items():
+            source_index = event_index.get(source_id)
+            if source_index is None:
+                continue
+            field = "on_fail" if kind == "fail" else "on_success"
+            if target_id is None or target_id not in event_index:
+                steps[source_index - 1].pop(field, None)
+            else:
+                steps[source_index - 1][field] = event_index[target_id]
         self.live_canvas.set_macro({"steps": steps, "graph_positions": positions})
         self._last_live_signature = signature
+
+    def _connect_live_nodes(self, source: int, target: int, kind: str) -> None:
+        if not (0 < source <= len(self.live_canvas.steps) and 0 < target <= len(self.live_canvas.steps)):
+            return
+        source_id = str(self.live_canvas.steps[source - 1].get("_event_id") or "")
+        target_id = str(self.live_canvas.steps[target - 1].get("_event_id") or "")
+        if not source_id or not target_id:
+            return
+        self._live_link_overrides[(source_id, "fail" if kind == "fail" else "success")] = target_id
+        self._schedule_live_rebuild()
+
+    def _delete_live_edge(self, source: int, _target: int, kind: str) -> None:
+        if not 0 < source <= len(self.live_canvas.steps):
+            return
+        source_id = str(self.live_canvas.steps[source - 1].get("_event_id") or "")
+        if source_id:
+            self._live_link_overrides[(source_id, "fail" if kind == "fail" else "success")] = None
+            self._schedule_live_rebuild()
+
+    def _merge_live_image_nodes(self, indexes: list[int]) -> None:
+        selected = sorted({int(index) for index in indexes if 0 < int(index) <= len(self.live_canvas.steps)})
+        if len(selected) < 2:
+            return
+        member_ids: list[str] = []
+        for index in selected:
+            step = self.live_canvas.steps[index - 1]
+            if str(step.get("action") or "") != "image_search":
+                return
+            member_ids.extend(str(value) for value in step.get("_member_event_ids") or [] if str(value))
+        if len(member_ids) < 2:
+            return
+        group_id = f"live-multi-{uuid.uuid4().hex}"
+        for event_id in member_ids:
+            self._live_multi_groups[event_id] = group_id
+        self._schedule_live_rebuild()
+
+    def _schedule_live_rebuild(self) -> None:
+        if self._live_rebuild_pending:
+            return
+        self._live_rebuild_pending = True
+
+        def rebuild() -> None:
+            self._live_rebuild_pending = False
+            self.update_live_events(self._live_events, force=True)
+
+        QtCore.QTimer.singleShot(0, rebuild)
 
     def event_positions(self) -> dict[str, list[float]]:
         self._remember_live_positions()
         return dict(self._event_positions)
+
+    def event_links(self) -> dict[tuple[str, str], str | None]:
+        return dict(self._live_link_overrides)
+
+    def multi_groups(self) -> dict[str, str]:
+        return dict(self._live_multi_groups)
 
 
 def _recorded_sample_image(event: dict[str, Any]) -> QtGui.QImage:
@@ -737,6 +841,9 @@ class RecordedImageDetailDialog(QtWidgets.QDialog):
             "현재 결과를 그대로 이어서 크게 보며 지우개, 색상 제거, 투명화, 흑백, 이진화, 밝기와 대비를 편집합니다."
         )
         self.manual_button.clicked.connect(self._manual_edit)
+        area_button = QtWidgets.QPushButton("▣ 사용할 이미지 영역 지정")
+        area_button.setToolTip("현재 이미지 안에서 실제 이미지 서치에 사용할 부분만 드래그해 잘라냅니다.")
+        area_button.clicked.connect(self._select_image_area)
         reset = QtWidgets.QPushButton("원본으로 되돌리기")
         self._original = self.image.copy()
         reset.clicked.connect(self._reset)
@@ -747,6 +854,7 @@ class RecordedImageDetailDialog(QtWidgets.QDialog):
         self.info.setObjectName("Muted")
         controls.addWidget(auto_cutout)
         controls.addWidget(self.manual_button)
+        controls.addWidget(area_button)
         controls.addWidget(reset)
         controls.addWidget(self.precise)
         controls.addStretch(1)
@@ -936,6 +1044,50 @@ class RecordedImageDetailDialog(QtWidgets.QDialog):
                 self.image = edited.convertToFormat(QtGui.QImage.Format_ARGB32)
                 self._cutout_applied = self._has_transparent_pixels(self.image)
                 self._refresh_previews()
+
+    def _select_image_area(self) -> None:
+        if self.image.isNull():
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("상세 이미지 편집 · 사용할 영역 지정")
+        dialog.resize(860, 680)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        title = QtWidgets.QLabel("이미지 서치에 사용할 영역만 남기세요.")
+        title.setStyleSheet("font-size:14pt; font-weight:800;")
+        hint = QtWidgets.QLabel(
+            "영역 안쪽 드래그: 이동 · 테두리/모서리 드래그: 크기 조절 · 휠 또는 +/−: 확대·축소"
+        )
+        hint.setObjectName("Muted")
+        canvas = RecordedCropCanvas(self.image, QtCore.QPoint(self.image.width() // 2, self.image.height() // 2))
+        canvas.set_crop_rect(self.image.rect())
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addWidget(canvas, 1)
+        size_label = QtWidgets.QLabel()
+        size_label.setStyleSheet("font-weight:800; color:#41D9D2;")
+        canvas.selection_changed.connect(
+            lambda rect: size_label.setText(f"선택 영역 {rect.width()} × {rect.height()} px")
+        )
+        size_label.setText(f"선택 영역 {canvas.crop_rect.width()} × {canvas.crop_rect.height()} px")
+        layout.addWidget(size_label)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Save).setText("이 영역만 사용")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        rect = canvas.crop_rect.normalized().intersected(self.image.rect())
+        if not rect.isValid() or rect == self.image.rect():
+            return
+        old_click = QtCore.QPoint(self.click_point) if self.click_point is not None else None
+        self.image = self.image.copy(rect).convertToFormat(QtGui.QImage.Format_ARGB32)
+        if old_click is not None and rect.contains(old_click):
+            self.click_point = old_click - rect.topLeft()
+        else:
+            self.click_point = None
+        self._cutout_applied = self._has_transparent_pixels(self.image)
+        self._refresh_previews()
 
     def _auto_cutout(self) -> None:
         with tempfile.TemporaryDirectory(prefix="macrorelay-auto-cutout-") as directory:
@@ -1369,6 +1521,8 @@ class SmartRecordingController(QtCore.QObject):
     def _finished(self, exit_code: int, _status: QtCore.QProcess.ExitStatus) -> None:
         self._capture_poll.stop()
         live_positions = self.bar.event_positions() if self.bar is not None else {}
+        live_links = self.bar.event_links() if self.bar is not None else {}
+        live_multi_groups = self.bar.multi_groups() if self.bar is not None else {}
         if self.bar is not None:
             self.bar.close()
             self.bar.deleteLater()
@@ -1381,6 +1535,15 @@ class SmartRecordingController(QtCore.QObject):
             event_id = str(event.get("event_id") or "")
             if event_id in live_positions:
                 event["_live_position"] = list(live_positions[event_id])
+            if event_id in live_multi_groups:
+                event["_review_multi_group"] = live_multi_groups[event_id]
+            event_links: dict[str, str | None] = {}
+            for kind in ("success", "fail"):
+                key = (event_id, kind)
+                if key in live_links:
+                    event_links[kind] = live_links[key]
+            if event_links:
+                event["_live_links"] = event_links
         try:
             self.output.unlink(missing_ok=True)
         except OSError:
@@ -1985,6 +2148,8 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                         "workflow_id": str(draft.get("workflow_id") or ""),
                         "workflow_label": f"스마트 작업 {int(draft.get('workflow_index') or 1)}",
                         "_live_position": list(((draft.get("event") or {}).get("_live_position") or []))[:2],
+                        "_recording_event_ids": [str(((draft.get("event") or {}).get("event_id") or ""))],
+                        "_live_links": dict(((draft.get("event") or {}).get("_live_links") or {})),
                     }
                 )
                 continue
@@ -2000,6 +2165,8 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                         "workflow_id": str(draft.get("workflow_id") or ""),
                         "workflow_label": f"스마트 작업 {int(draft.get('workflow_index') or 1)}",
                         "_live_position": list(((draft.get("event") or {}).get("_live_position") or []))[:2],
+                        "_recording_event_ids": [str(((draft.get("event") or {}).get("event_id") or ""))],
+                        "_live_links": dict(((draft.get("event") or {}).get("_live_links") or {})),
                     }
                 )
                 continue
@@ -2016,6 +2183,8 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                         "workflow_id": str(draft.get("workflow_id") or ""),
                         "workflow_label": f"스마트 작업 {int(draft.get('workflow_index') or 1)}",
                         "_live_position": list(((draft.get("event") or {}).get("_live_position") or []))[:2],
+                        "_recording_event_ids": [str(((draft.get("event") or {}).get("event_id") or ""))],
+                        "_live_links": dict(((draft.get("event") or {}).get("_live_links") or {})),
                     }
                 )
                 continue
@@ -2131,16 +2300,16 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 }
                 if kind in {"screen_condition", "screen_verification"}:
                     step["action"] = "screen_condition"
-                    step["label"] = "F5 결과 화면 확인" if kind == "screen_verification" else "우클릭 화면 조건"
+                    step["label"] = "화면 이미지 확인"
                     step["click_enabled"] = False
                     step.pop("click", None)
-                    step["timeout"] = 3000 if kind == "screen_verification" else 1200
+                    step["timeout"] = 3000
                     step["poll_delay"] = 80
                     step["abort_on_fail"] = True
                     automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
                     automation.update(
                         {
-                            "smart_recording_control": "F5" if kind == "screen_verification" else "RightClick",
+                            "smart_recording_control": str(draft.get("source_control") or "F5/RightClick"),
                             "missing_behavior": "stop",
                         }
                     )
@@ -2214,6 +2383,9 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             live_position = event.get("_live_position") if isinstance(event, dict) else None
             if isinstance(live_position, (list, tuple)) and len(live_position) >= 2:
                 step["_live_position"] = [float(live_position[0]), float(live_position[1])]
+            event_id = str(event.get("event_id") or "")
+            step["_recording_event_ids"] = [event_id] if event_id else []
+            step["_live_links"] = dict(event.get("_live_links") or {}) if isinstance(event.get("_live_links"), dict) else {}
             multi_group = str(draft.get("_review_multi_group") or "")
             if multi_group:
                 step["_recording_multi_group"] = multi_group
@@ -2239,6 +2411,12 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             }
             primary["engine"] = "opencv"
             primary["label"] = f"멀티 이미지 서치 {len(primary['assets'])}개"
+            primary["_recording_event_ids"] = [
+                event_id
+                for member in members
+                for event_id in member.get("_recording_event_ids") or []
+                if str(event_id)
+            ]
             primary["_recording_mode"] = "action"
             primary.pop("_recording_multi_group", None)
             automation = primary.get("_automation") if isinstance(primary.get("_automation"), dict) else {}
@@ -2251,8 +2429,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             step.pop("_recording_multi_group", None)
         if self.connect_steps.isChecked():
             for index, step in enumerate(steps[:-1]):
-                same_workflow = str(step.get("workflow_id") or "") == str(steps[index + 1].get("workflow_id") or "")
-                if step.get("action") != "flow_control" and same_workflow:
+                if step.get("action") != "flow_control":
                     step["on_success"] = index + 2
             # A normal image capture followed by one or more branch-mode F8
             # captures becomes a priority fallback chain. Success from any
@@ -2301,6 +2478,32 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                     )
                     step["_automation"] = automation
                 group_start = group_end + 1
+        event_to_step: dict[str, int] = {}
+        for index, step in enumerate(steps, start=1):
+            for event_id in step.get("_recording_event_ids") or []:
+                if str(event_id):
+                    event_to_step[str(event_id)] = index
+        for step in steps:
+            links = step.pop("_live_links", {})
+            step.pop("_recording_event_ids", None)
+            if not isinstance(links, dict):
+                continue
+            if "success" in links:
+                target_id = links.get("success")
+                if target_id is None:
+                    step.pop("on_success", None)
+                    step["stop_on_success"] = True
+                elif str(target_id) in event_to_step:
+                    step["on_success"] = event_to_step[str(target_id)]
+                    step.pop("stop_on_success", None)
+            if "fail" in links:
+                target_id = links.get("fail")
+                if target_id is None:
+                    step.pop("on_fail", None)
+                    step["abort_on_fail"] = True
+                elif str(target_id) in event_to_step:
+                    step["on_fail"] = event_to_step[str(target_id)]
+                    step["abort_on_fail"] = False
         return steps
 
 

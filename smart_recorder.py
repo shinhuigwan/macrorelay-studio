@@ -486,6 +486,7 @@ class Recorder:
         self.emit(
             {
                 "type": "screen_verification",
+                "source_control": "F5",
                 "event_id": f"verify-{time.perf_counter_ns()}-{self._event_counter}",
                 "x": int(point.x), "y": int(point.y),
                 "client_x": int(client_x), "client_y": int(client_y),
@@ -628,7 +629,8 @@ class Recorder:
                 self._down_points[button] = (int(data.pt.x), int(data.pt.y), event_id)
             self.emit(
                 {
-                    "type": "screen_condition" if self.right_click_condition and message == WM_RBUTTONDOWN else "mouse",
+                    "type": "screen_verification" if self.right_click_condition and message == WM_RBUTTONDOWN else "mouse",
+                    "source_control": "RightClick" if self.right_click_condition and message == WM_RBUTTONDOWN else "Mouse",
                     "event_id": event_id,
                     "button": button,
                     "wheel_delta": int(wheel_delta),
@@ -644,7 +646,7 @@ class Recorder:
                 }
             )
             if self.right_click_condition and message == WM_RBUTTONDOWN:
-                # The right click is a semantic screen-condition marker. Do
+                # Right click uses the same no-click screen verification as F5. Do
                 # not open the target application's context menu or record it
                 # as an actual click action.
                 self._down_points.pop("Right", None)

@@ -46,6 +46,39 @@ class SingleFileExportResult:
 class MacroRepository:
     """Single data gateway for macros, assets, tables, hotkeys and exports."""
 
+    _REMOVED_AI_DIRECTORIES = (
+        ".automation/ai-learning",
+        ".automation/ai-packages",
+        ".automation/ai-video-tests",
+        "exports/ai-learning",
+        "exports/ai-recordings",
+        "exports/ai-video-tests",
+        ".backups/2.33.0-before-ai-trigger-20260830-143357",
+        ".backups/2.34.0-before-capture-fix-20260830-150339",
+        ".backups/2.34.1-before-ai-auto-20260830-192228",
+        ".backups/2.35.0-before-modal-fix-20260830-193923",
+        ".backups/2.35.1-before-async-modal-fix-20260830-204500",
+        ".backups/studio-2.35.2-before-trigger-ui-20260830",
+        ".backups/studio-2.37.0-before-ai-workflows-20260831",
+        ".backups/studio-2.39.0-before-ai-verification-layout-20260831",
+        ".backups/studio-2.40.0-before-ai-image-validation-20260831",
+        ".backups/studio-2.41.0-before-ai-play-learning-20260901",
+        ".backups/studio-2.42.0-before-complete-ai-contract-20260901",
+        ".backups/studio-2.43.0-before-ai-video-test-20260901",
+        ".backups/studio-2.44.0-before-embedded-ai-prompt-20260901",
+    )
+    _REMOVED_AI_FILES = (
+        ".automation/last-ai-package.json",
+        ".automation/last-ai-recording.json",
+        "ai_video.py",
+        "macro_studio/ai_automation.py",
+        "macro_studio/ai_import_dialog.py",
+        "macro_studio/ai_learning.py",
+        "macro_studio/ai_recording.py",
+        "macro_studio/ai_video_test.py",
+        "tests/test_ai_video_test.py",
+    )
+
     def __init__(self, root: Path | None = None) -> None:
         configured = os.environ.get("MACRORELAY_HOME", "").strip() or os.environ.get("MACRO_STUDIO_HOME", "").strip()
         self.root = Path(configured).expanduser().resolve() if configured else (
@@ -65,8 +98,70 @@ class MacroRepository:
         self._opencv_probe_signature: tuple[int, int, int] | None = None
         self._opencv_probe_ok = False
         self._opencv_runtime: tuple[Path, Path] | None = None
+        self._cleanup_removed_ai_artifacts()
         for path in (self.macros_dir, self.assets_dir, self.exports_dir, self.history_dir):
             path.mkdir(parents=True, exist_ok=True)
+
+    def _cleanup_removed_ai_artifacts(self) -> None:
+        """One-time 2.46 cleanup limited to retired AI recording artifacts."""
+        automation = self.root / ".automation"
+        marker = automation / "cleanup-2.46.0.done"
+        if marker.is_file():
+            return
+        targets = [self.root / relative for relative in self._REMOVED_AI_DIRECTORIES]
+        targets.extend(self.root / relative for relative in self._REMOVED_AI_FILES)
+        if automation.is_dir():
+            targets.extend(automation.glob("ai-video-frames-*"))
+        cache = self.root / "macro_studio" / "__pycache__"
+        if cache.is_dir():
+            targets.extend(cache.glob("ai_*.pyc"))
+        ai_macro_names: set[str] = set()
+        for source in (self.root / "macros", self.root / ".archive" / "macros"):
+            if not source.is_dir():
+                continue
+            for path in source.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                except (OSError, TypeError, ValueError):
+                    continue
+                meta = payload.get("meta") if isinstance(payload, dict) and isinstance(payload.get("meta"), dict) else {}
+                if not (meta.get("ai_draft") or meta.get("ai_schema_version")):
+                    continue
+                ai_macro_names.add(str(payload.get("name") or path.stem))
+                targets.append(path)
+        history = self.root / ".history"
+        if history.is_dir():
+            for folder in history.iterdir():
+                if not folder.is_dir():
+                    continue
+                remove_history = "(AI 초안" in folder.name or folder.name in ai_macro_names
+                if not remove_history:
+                    for version in folder.glob("*.json"):
+                        try:
+                            payload = json.loads(version.read_text(encoding="utf-8-sig"))
+                        except (OSError, TypeError, ValueError):
+                            continue
+                        meta = payload.get("meta") if isinstance(payload, dict) and isinstance(payload.get("meta"), dict) else {}
+                        if meta.get("ai_draft") or meta.get("ai_schema_version"):
+                            remove_history = True
+                            break
+                if remove_history:
+                    targets.append(folder)
+        failures: list[str] = []
+        for target in targets:
+            try:
+                resolved = target.resolve(strict=False)
+                resolved.relative_to(self.root)
+                if resolved.is_symlink() or resolved.is_file():
+                    resolved.unlink(missing_ok=True)
+                elif resolved.is_dir():
+                    shutil.rmtree(resolved)
+            except (OSError, ValueError) as exc:
+                failures.append(f"{target}: {exc}")
+        if failures:
+            return
+        automation.mkdir(parents=True, exist_ok=True)
+        marker.write_text("AI recording artifacts removed by MacroRelay Studio 2.46.0.\n", encoding="utf-8")
 
     @staticmethod
     def _read_json(path: Path, default: Any) -> Any:
@@ -185,41 +280,7 @@ class MacroRepository:
         payload.setdefault("meta", {"coord_mode": "Screen"})
         payload.setdefault("steps", [])
         self._upgrade_smart_image_steps(payload)
-        self._upgrade_ai_image_steps(payload)
         return payload
-
-    @staticmethod
-    def _upgrade_ai_image_steps(payload: dict[str, Any]) -> None:
-        """Repair AI imports that inherited AHK and missing click defaults.
-
-        JSON generated by older prompts could explicitly carry the generic
-        image-search template defaults. AI recordings always need tolerance for
-        browser antialiasing and DPI changes, so their runtime baseline is the
-        managed OpenCV engine. Screen conditions remain strictly click-free.
-        """
-        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-        if not str(meta.get("ai_schema_version") or ""):
-            return
-        for step in payload.get("steps") or []:
-            if not isinstance(step, dict):
-                continue
-            action = str(step.get("action") or "")
-            if action not in {"image_search", "screen_condition"}:
-                continue
-            step["engine"] = "opencv"
-            step["search_profile"] = "balanced"
-            step["confidence"] = max(78, min(88, int(step.get("confidence") or 82)))
-            step["timeout"] = max(5000 if action == "screen_condition" else 2000, int(step.get("timeout") or 0))
-            step.setdefault("fallback_full_region", True)
-            if action == "image_search":
-                step["click_enabled"] = True
-                click = step.get("click") if isinstance(step.get("click"), dict) else {}
-                click.setdefault("mode", "inactive")
-                click.setdefault("method", "auto")
-                step["click"] = click
-            else:
-                step["click_enabled"] = False
-                step.pop("click", None)
 
     @staticmethod
     def _upgrade_smart_image_steps(payload: dict[str, Any]) -> None:
@@ -1597,12 +1658,12 @@ internal static class Program
         pending = [index for index, step in enumerate(steps, start=1) if isinstance(step, dict) and step.get("needs_setup")]
         triggers = payload.get("triggers") if isinstance(payload.get("triggers"), list) else []
         pending_trigger = any(isinstance(trigger, dict) and trigger.get("needs_setup") for trigger in triggers)
-        if bool((payload.get("meta") or {}).get("ai_draft")) or pending or pending_trigger:
+        if pending or pending_trigger:
             suffix = f" (미완성 노드: {', '.join(map(str, pending[:12]))})" if pending else ""
             if pending_trigger:
                 suffix += " (시작 화면 확인 필요)"
             raise RuntimeError(
-                "미완성 AI 초안은 정식 실행할 수 없습니다. Builder의 '미완성 설정 계속하기'에서 설정을 완료하거나 "
+                "설정이 완료되지 않은 노드는 정식 실행할 수 없습니다. 단계 상세 설정에서 필요한 값을 확인하거나 "
                 f"드라이런·이 단계만 테스트를 사용하세요.{suffix}"
             )
 

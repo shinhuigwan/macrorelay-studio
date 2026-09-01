@@ -65,7 +65,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._event_trigger_future: Future[list[tuple[str, str]]] | None = None
         self._event_trigger_timer = QtCore.QTimer(self)
         # Trigger entries apply their own low-frequency interval (500 ms for
-        # AI start-screen conditions). This short dispatcher tick avoids
+        # recorded start-screen conditions). This short dispatcher tick avoids
         # adding a full extra second of UI-side latency.
         self._event_trigger_timer.setInterval(250)
         self._event_trigger_timer.timeout.connect(self._poll_event_triggers)

@@ -8,16 +8,6 @@ from typing import Any
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .action_editor import ACTION_LABELS, ActionEditor, action_template
-from .ai_automation import (
-    AIRecordingPackageBuilder,
-    SHORT_CHATGPT_REQUEST,
-    ai_draft_readiness,
-    materialize_ai_document,
-)
-from .ai_import_dialog import AIDraftSetupDialog, AIImportPreviewDialog, load_ai_json, package_stage_for
-from .ai_learning import BehaviorLearningDialog, BehaviorLearningStore, DEMO_KIND_LABELS
-from .ai_recording import AIRecordingController
-from .ai_video_test import AIVideoTestRecordingController
 from .automation import (
     AutomationAnalyzer,
     AutomationOverlay,
@@ -437,23 +427,12 @@ class BuilderPage(QtWidgets.QWidget):
         self._action_settings_dialog: ActionEditorDialog | None = None
         self._log_dialog: MacroLogDialog | None = None
         self._recording_controller: SmartRecordingController | None = None
-        self._ai_recording_controller: AIRecordingController | None = None
-        self._ai_video_test_controller: AIVideoTestRecordingController | None = None
-        self._ai_completion_message: QtWidgets.QMessageBox | None = None
-        self._ai_video_test_message: QtWidgets.QMessageBox | None = None
-        self._behavior_learning_store = BehaviorLearningStore(self.repository.root)
-        self._behavior_learning_dialog: BehaviorLearningDialog | None = None
-        self._pending_behavior_demo: tuple[str, str, str] | None = None
         self._automation_overlay: AutomationOverlay | None = None
         self._collapsed_groups: set[str] = set()
         self._last_recording_path = self.repository.root / ".automation" / "last-recording.json"
-        self._last_ai_recording_path = self.repository.root / ".automation" / "last-ai-recording.json"
-        self._last_ai_package_path = self.repository.root / ".automation" / "last-ai-package.json"
         self._handle_profiles_path = self.repository.root / ".automation" / "inactive-click-profiles.json"
         self._inactive_handle_profiles = self._load_inactive_handle_profiles()
         self._last_recording_events = self._load_last_recording()
-        self._last_ai_recording_events = self._load_last_ai_recording()
-        self._last_ai_package = self._load_last_ai_package()
         self._subflow_parent_stack: list[tuple[str, int]] = []
         self.shortcut_buttons: dict[str, QtWidgets.QPushButton] = {}
 
@@ -489,33 +468,6 @@ class BuilderPage(QtWidgets.QWidget):
         self.branch_group_btn.clicked.connect(
             lambda: self._configure_start_search_candidates(self.node_canvas.selected_indexes())
         )
-        self.ai_record_btn = primary_button("✦ AI 매크로 녹화")
-        self.ai_record_btn.setToolTip(
-            "화면 영상·PNG·클릭·키보드·대상 창을 기록합니다. 우클릭=화면 조건, F7=다음 독립 작업, F10=종료."
-        )
-        self.ai_record_btn.clicked.connect(self._start_ai_recording)
-        self.ai_learning_btn = primary_button("✦ AI 플레이 학습")
-        self.ai_learning_btn.setToolTip(
-            "골드 강화·퀘스트·합성처럼 행동을 나누고 각 행동을 2~3회 시연해 AI가 규칙과 복구 흐름을 추론합니다."
-        )
-        self.ai_learning_btn.clicked.connect(self._open_behavior_learning)
-        self.ai_video_test_btn = primary_button("◉ AI 분석 녹화")
-        self.ai_video_test_btn.setToolTip(
-            "최대 30초 동안 영상·액션·무손실 PNG를 기록하고 전체 노드 명세가 내장된 GPT 생성 ZIP을 만듭니다."
-        )
-        self.ai_video_test_btn.clicked.connect(self._start_ai_video_test)
-        self.ai_package_btn = QtWidgets.QPushButton("AI 분석 패키지 생성")
-        self.ai_package_btn.setToolTip("마지막 AI 녹화의 ChatGPT 분석 ZIP을 확인하거나 다시 생성합니다.")
-        self.ai_package_btn.clicked.connect(self._generate_ai_package)
-        self.ai_prompt_btn = QtWidgets.QPushButton("ChatGPT 요청 복사")
-        self.ai_prompt_btn.setToolTip("ChatGPT가 설명 없이 다운로드 가능한 macrorelay-ai.json 파일만 만들도록 요청합니다.")
-        self.ai_prompt_btn.clicked.connect(self._copy_ai_prompt)
-        self.ai_folder_btn = QtWidgets.QPushButton("패키지 저장 폴더 열기")
-        self.ai_folder_btn.clicked.connect(self._open_ai_package_folder)
-        self.ai_import_btn = QtWidgets.QPushButton("받은 JSON 바로 가져오기")
-        self.ai_import_btn.clicked.connect(self._import_ai_json)
-        self.ai_continue_btn = QtWidgets.QPushButton("미완성 설정 계속하기")
-        self.ai_continue_btn.clicked.connect(self._continue_ai_setup)
         self.action_combo = QtWidgets.QComboBox()
         self._populate_action_combo(self.action_combo)
         self.action_combo.setMinimumWidth(145)
@@ -559,28 +511,10 @@ class BuilderPage(QtWidgets.QWidget):
         recording_menu.addAction("비활성 클릭 핸들 실험실", self.inactive_handle_lab_btn.click)
         recording_menu.addAction("선택 노드 분기 묶기", self.branch_group_btn.click)
         recording_tools.setMenu(recording_menu)
-        ai_tools = QtWidgets.QToolButton()
-        ai_tools.setText("AI 도구 ▾")
-        ai_tools.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        ai_menu = QtWidgets.QMenu(ai_tools)
-        ai_menu.addAction("AI 30초 분석 녹화", self.ai_video_test_btn.click)
-        ai_menu.addAction("AI 플레이 학습", self.ai_learning_btn.click)
-        ai_menu.addAction("단일 AI 녹화 (기존 방식)", self.ai_record_btn.click)
-        ai_menu.addSeparator()
-        ai_menu.addAction("AI 분석 패키지 생성", self.ai_package_btn.click)
-        ai_menu.addAction("ChatGPT 요청 복사", self.ai_prompt_btn.click)
-        ai_menu.addAction("패키지 저장 폴더 열기", self.ai_folder_btn.click)
-        ai_menu.addSeparator()
-        ai_menu.addAction("받은 JSON 바로 가져오기", self.ai_import_btn.click)
-        ai_menu.addAction("미완성 설정 계속하기", self.ai_continue_btn.click)
-        ai_tools.setMenu(ai_menu)
         # Keep these command buttons alive for shortcuts and UI automation. Their
-        # visible entry points live in the compact menus above.
+        # visible entry points live in the compact recording menu above.
         for command_button in (
             self.review_recording_btn, self.inactive_handle_lab_btn, self.branch_group_btn,
-            self.ai_record_btn,
-            self.ai_package_btn, self.ai_prompt_btn, self.ai_folder_btn,
-            self.ai_import_btn, self.ai_continue_btn,
         ):
             command_button.setParent(self)
             command_button.hide()
@@ -588,9 +522,6 @@ class BuilderPage(QtWidgets.QWidget):
         action_label.setObjectName("Muted")
         toolbar_tools.addWidget(self.record_btn)
         toolbar_tools.addWidget(recording_tools)
-        toolbar_tools.addWidget(self.ai_video_test_btn)
-        toolbar_tools.addWidget(self.ai_learning_btn)
-        toolbar_tools.addWidget(ai_tools)
         toolbar_tools.addSpacing(8)
         toolbar_tools.addWidget(action_label)
         toolbar_tools.addWidget(self.action_combo)
@@ -1821,11 +1752,7 @@ class BuilderPage(QtWidgets.QWidget):
         if not self.current_macro:
             self.status.emit("녹화한 노드를 추가할 매크로를 먼저 선택하세요.")
             return
-        if (
-            self._recording_controller is not None
-            or self._ai_recording_controller is not None
-            or self._ai_video_test_controller is not None
-        ):
+        if self._recording_controller is not None:
             self.status.emit("다른 녹화가 이미 실행 중입니다.")
             return
         if not self._confirm_smart_recording():
@@ -1888,406 +1815,6 @@ class BuilderPage(QtWidgets.QWidget):
             return
         self._append_automation_steps(steps, f"스마트 녹화에서 노드 {len(steps)}개를 추가했습니다.")
         self.data_changed.emit()
-
-    def _load_last_ai_recording(self) -> list[dict[str, Any]]:
-        try:
-            payload = json.loads(self._last_ai_recording_path.read_text(encoding="utf-8-sig"))
-        except (OSError, TypeError, ValueError):
-            return []
-        return [dict(item) for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
-
-    def _load_last_ai_package(self) -> dict[str, Any]:
-        try:
-            payload = json.loads(self._last_ai_package_path.read_text(encoding="utf-8-sig"))
-        except (OSError, TypeError, ValueError):
-            return {}
-        return dict(payload) if isinstance(payload, dict) else {}
-
-    def _remember_last_ai_recording(self, events: list[dict[str, Any]]) -> None:
-        self._last_ai_recording_events = deepcopy(events)
-        try:
-            self._last_ai_recording_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._last_ai_recording_path.with_suffix(".json.tmp")
-            temporary.write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(self._last_ai_recording_path)
-        except OSError:
-            pass
-
-    def _open_behavior_learning(self) -> None:
-        if self._behavior_learning_dialog is None:
-            dialog = BehaviorLearningDialog(self._behavior_learning_store, self.window())
-            dialog.record_requested.connect(self._start_behavior_demo)
-            dialog.import_requested.connect(self._import_ai_json)
-            dialog.status.connect(self.status.emit)
-            dialog.finished.connect(lambda _result: None)
-            self._behavior_learning_dialog = dialog
-        self._behavior_learning_dialog.refresh()
-        self._behavior_learning_dialog.show()
-        self._behavior_learning_dialog.raise_()
-        self._behavior_learning_dialog.activateWindow()
-
-    @QtCore.Slot(str, str, str)
-    def _start_behavior_demo(self, behavior_id: str, kind: str, note: str) -> None:
-        if (
-            self._ai_recording_controller is not None
-            or self._recording_controller is not None
-            or self._ai_video_test_controller is not None
-        ):
-            self.status.emit("다른 녹화가 이미 실행 중입니다.")
-            return
-        behavior = self._behavior_learning_store.behavior(behavior_id)
-        if behavior is None:
-            self.status.emit("시연을 저장할 행동을 찾지 못했습니다.")
-            return
-        self._pending_behavior_demo = (behavior_id, kind, note)
-        if self._behavior_learning_dialog is not None:
-            self._behavior_learning_dialog.hide()
-        controller = AIRecordingController(
-            self.repository, self.window(), ask_execution_condition=False, record_video=False
-        )
-        controller.package_completed.connect(self._behavior_demo_completed)
-        controller.failed.connect(self._behavior_recording_failed)
-        self._ai_recording_controller = controller
-        controller.start()
-        if controller.bar is not None:
-            controller.bar.setWindowTitle(f"AI 행동 시연 · {behavior.get('name')}")
-            controller.bar.label.setText(
-                f"{behavior.get('name')} · 실제 행동을 보여주세요 · 우클릭=조건 · F6=결과 확인 · F10=종료"
-            )
-            controller.bar.mode_badge.setText(DEMO_KIND_LABELS.get(kind, "행동 시연"))
-        self.status.emit(f"'{behavior.get('name')}' 시연 녹화를 시작했습니다 · F10으로 종료")
-
-    @QtCore.Slot(str, str, list)
-    def _behavior_demo_completed(self, archive: str, stage: str, events: list[dict[str, Any]]) -> None:
-        self._ai_recording_controller = None
-        pending = self._pending_behavior_demo
-        self._pending_behavior_demo = None
-        self._remember_last_ai_recording(events)
-        self._last_ai_package = self._load_last_ai_package()
-        if pending is None:
-            self.status.emit("시연은 완료됐지만 연결된 행동 정보를 찾지 못했습니다.")
-            return
-        behavior_id, kind, note = pending
-        try:
-            self._behavior_learning_store.add_demo(behavior_id, archive, stage, len(events), kind, note)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "행동 시연 저장 실패", str(exc))
-            return
-        behavior = self._behavior_learning_store.behavior(behavior_id) or {}
-        if self._behavior_learning_dialog is not None:
-            self._behavior_learning_dialog.refresh(behavior_id)
-            self._behavior_learning_dialog.show()
-            self._behavior_learning_dialog.raise_()
-            self._behavior_learning_dialog.activateWindow()
-        demo_count = len(behavior.get("demos") or [])
-        self.status.emit(f"'{behavior.get('name')}' 시연 {demo_count}회를 저장했습니다.")
-        message = QtWidgets.QMessageBox(self.window())
-        message.setWindowTitle("행동 시연 저장 완료")
-        if demo_count < 2:
-            message.setText("첫 시연을 저장했습니다. 같은 행동을 다른 상황에서 한 번 더 보여주세요.")
-        elif demo_count == 2:
-            message.setText("분석 가능한 2회 시연이 모였습니다. 변형 또는 실패·복구 시연 1회를 더 추가하면 더 안정적입니다.")
-        else:
-            message.setText(f"{demo_count}회 시연이 준비됐습니다. 학습 패키지를 생성할 수 있습니다.")
-        message.setModal(False)
-        message.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
-        message.show()
-
-    @QtCore.Slot(str)
-    def _behavior_recording_failed(self, detail: str) -> None:
-        self._ai_recording_controller = None
-        self._pending_behavior_demo = None
-        if self._behavior_learning_dialog is not None:
-            self._behavior_learning_dialog.show()
-            self._behavior_learning_dialog.raise_()
-        QtWidgets.QMessageBox.warning(self, "AI 행동 시연", detail)
-        self.status.emit(detail)
-
-    def _start_ai_video_test(self) -> None:
-        if (
-            self._ai_video_test_controller is not None
-            or self._ai_recording_controller is not None
-            or self._recording_controller is not None
-        ):
-            self.status.emit("다른 녹화가 이미 실행 중입니다.")
-            return
-        answer = QtWidgets.QMessageBox.question(
-            self,
-            "AI 30초 분석 녹화",
-            "2초 뒤 화면 영상과 액션 기록이 동시에 시작됩니다. 평소처럼 작업하고 F10으로 끝내세요. "
-            "직접 끝내지 않아도 실제 녹화 30초 뒤 자동 종료됩니다.\n\n"
-            "완료 후 작업 목적을 한 줄로 입력하면 영상·액션·무손실 PNG·전체 노드 명세를 하나의 ZIP으로 만듭니다. "
-            "긴 GPT 명령문은 패키지 안에 자동 포함되므로 매번 붙여넣지 않아도 됩니다.\n\n"
-            "화면에 표시되는 개인정보는 영상에 포함될 수 있습니다. 시작할까요?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.Yes,
-        )
-        if answer != QtWidgets.QMessageBox.Yes:
-            return
-        controller = AIVideoTestRecordingController(self.repository, self.window())
-        controller.package_completed.connect(self._ai_video_test_completed)
-        controller.failed.connect(self._ai_video_test_failed)
-        self._ai_video_test_controller = controller
-        controller.start()
-        self.status.emit("AI 분석 녹화 중 · 최대 30초 · F10으로 바로 종료할 수 있습니다.")
-
-    @QtCore.Slot(str, str, list)
-    def _ai_video_test_completed(self, archive: str, stage: str, events: list[dict[str, Any]]) -> None:
-        self._ai_video_test_controller = None
-        self.status.emit(f"AI 노드 생성 ZIP을 만들었습니다 · {Path(archive).name}")
-        if self._ai_video_test_message is not None:
-            self._ai_video_test_message.close()
-        message = QtWidgets.QMessageBox(self.window())
-        self._ai_video_test_message = message
-        message.setWindowTitle("AI 노드 생성 패키지 준비 완료")
-        message.setIcon(QtWidgets.QMessageBox.Information)
-        message.setText(
-            f"영상·액션 {len(events)}개·무손실 이미지·Studio 전체 노드 명세를 저장했습니다.\n\n"
-            "ChatGPT에는 ZIP을 첨부하고 아래 ‘짧은 요청 복사’의 한 문장만 보내세요. "
-            "긴 생성 규칙은 ZIP의 START_HERE.txt와 prompt.txt에 이미 들어 있습니다."
-        )
-        message.setDetailedText(f"ZIP: {archive}\n작업 폴더: {stage}")
-        copy_button = message.addButton("짧은 요청 복사", QtWidgets.QMessageBox.ActionRole)
-        folder_button = message.addButton("저장 폴더 열기", QtWidgets.QMessageBox.ActionRole)
-        message.addButton(QtWidgets.QMessageBox.Ok)
-        message.setModal(False)
-        message.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
-
-        def handle_action(button: QtWidgets.QAbstractButton) -> None:
-            if button is copy_button:
-                try:
-                    QtWidgets.QApplication.clipboard().setText(SHORT_CHATGPT_REQUEST)
-                    self.status.emit("ChatGPT에 보낼 한 줄 요청을 복사했습니다.")
-                except Exception as exc:
-                    self.status.emit(f"요청 문장을 복사하지 못했습니다 · {exc}")
-            elif button is folder_button:
-                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(Path(archive).parent.resolve())))
-            if message.isVisible():
-                message.accept()
-
-        def clear_message(_result: int) -> None:
-            if self._ai_video_test_message is message:
-                self._ai_video_test_message = None
-
-        message.buttonClicked.connect(handle_action)
-        message.finished.connect(clear_message)
-        message.show()
-        message.raise_()
-        message.activateWindow()
-
-    @QtCore.Slot(str)
-    def _ai_video_test_failed(self, detail: str) -> None:
-        self._ai_video_test_controller = None
-        QtWidgets.QMessageBox.warning(self, "AI 분석 녹화", detail)
-        self.status.emit(detail)
-
-    def _start_ai_recording(self) -> None:
-        if (
-            self._ai_recording_controller is not None
-            or self._recording_controller is not None
-            or self._ai_video_test_controller is not None
-        ):
-            self.status.emit("다른 녹화가 이미 실행 중입니다.")
-            return
-        answer = QtWidgets.QMessageBox.question(
-            self,
-            "AI 자동 매크로 제작 녹화",
-            "2초 뒤 녹화가 자동으로 시작됩니다. 첫 작업을 녹화하고, 다른 작업으로 나눌 때 F7 또는 녹화 바의 "
-            "‘다음 작업’을 누르세요. 우클릭은 해당 작업의 화면 조건이며 F10으로 전체 녹화를 종료합니다.\n\n"
-            "영상은 동작 순서 분석용이며, 이미지 서치 후보는 클릭 시점의 무손실 PNG로 따로 저장됩니다. "
-            "키 입력은 분석 패키지에서 마스킹되지만 비밀번호 입력 화면은 가능하면 녹화에서 제외하세요.\n\n"
-            "AI 녹화를 시작할까요?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.Yes,
-        )
-        if answer != QtWidgets.QMessageBox.Yes:
-            return
-        controller = AIRecordingController(self.repository, self.window())
-        controller.package_completed.connect(self._ai_package_completed)
-        controller.failed.connect(self._ai_recording_failed)
-        self._ai_recording_controller = controller
-        controller.start()
-        self.status.emit("AI 녹화 시작 · 우클릭은 화면 조건, F7은 다음 작업 분기, F10은 종료입니다.")
-
-    @QtCore.Slot(str, str, list)
-    def _ai_package_completed(self, archive: str, stage: str, events: list[dict[str, Any]]) -> None:
-        self._ai_recording_controller = None
-        self._remember_last_ai_recording(events)
-        self._last_ai_package = self._load_last_ai_package()
-        self.status.emit(f"AI 분석 패키지를 생성했습니다 · {Path(archive).name}")
-        if self._ai_completion_message is not None:
-            self._ai_completion_message.close()
-        message = QtWidgets.QMessageBox(self.window())
-        self._ai_completion_message = message
-        message.setWindowTitle("AI 분석 패키지 생성 완료")
-        message.setIcon(QtWidgets.QMessageBox.Information)
-        message.setText(
-            "ChatGPT에 ZIP 파일과 복사한 요청을 전달하세요. ChatGPT가 만든 macrorelay-ai.json을 내려받아 "
-            "‘받은 JSON 바로 가져오기’로 선택하면 됩니다."
-        )
-        message.setDetailedText(f"ZIP: {archive}\n작업 폴더: {stage}")
-        copy_button = message.addButton("프롬프트 복사", QtWidgets.QMessageBox.ActionRole)
-        folder_button = message.addButton("저장 폴더 열기", QtWidgets.QMessageBox.ActionRole)
-        message.addButton(QtWidgets.QMessageBox.Ok)
-        message.setModal(False)
-        message.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
-
-        def handle_action(button: QtWidgets.QAbstractButton) -> None:
-            if button is copy_button:
-                self._copy_ai_prompt()
-            elif button is folder_button:
-                self._open_ai_package_folder()
-            if message.isVisible():
-                message.accept()
-
-        def clear_message(_result: int) -> None:
-            if self._ai_completion_message is message:
-                self._ai_completion_message = None
-
-        message.buttonClicked.connect(handle_action)
-        message.finished.connect(clear_message)
-        # This notice is deliberately non-modal. Even if Windows fails to
-        # activate or paint it, Studio must remain clickable and closable.
-        message.show()
-        message.raise_()
-        message.activateWindow()
-
-    @QtCore.Slot(str)
-    def _ai_recording_failed(self, detail: str) -> None:
-        self._ai_recording_controller = None
-        QtWidgets.QMessageBox.warning(self, "AI 매크로 녹화", detail)
-        self.status.emit(detail)
-
-    def _generate_ai_package(self) -> None:
-        record = self._load_last_ai_package()
-        archive = Path(str(record.get("archive") or "")) if record else Path()
-        if record and archive.is_file():
-            self._last_ai_package = record
-            self.status.emit(f"마지막 AI 분석 패키지가 준비되어 있습니다 · {archive.name}")
-            QtWidgets.QMessageBox.information(self, "AI 분석 패키지", f"마지막 패키지가 준비되어 있습니다.\n\n{archive}")
-            return
-        events = self._last_ai_recording_events or self._load_last_ai_recording()
-        if not events:
-            QtWidgets.QMessageBox.information(self, "AI 분석 패키지", "먼저 AI 매크로 녹화를 진행하세요.")
-            return
-        try:
-            archive, _stage = AIRecordingPackageBuilder(self.repository.root).build(events)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "패키지 생성 실패", str(exc))
-            return
-        self._last_ai_package = self._load_last_ai_package()
-        self.status.emit(f"AI 분석 패키지를 다시 생성했습니다 · {archive.name}")
-
-    def _copy_ai_prompt(self) -> None:
-        record = self._load_last_ai_package()
-        prompt = Path(str(record.get("prompt") or "")) if record else Path()
-        if not prompt.is_file():
-            QtWidgets.QMessageBox.information(self, "ChatGPT용 프롬프트", "먼저 AI 분석 패키지를 생성하세요.")
-            return
-        try:
-            text = prompt.read_text(encoding="utf-8-sig")
-        except OSError as exc:
-            QtWidgets.QMessageBox.warning(self, "프롬프트 복사 실패", str(exc))
-            return
-        QtWidgets.QApplication.clipboard().setText(text)
-        self.status.emit("ChatGPT용 프롬프트를 클립보드에 복사했습니다.")
-
-    def _open_ai_package_folder(self) -> None:
-        record = self._load_last_ai_package()
-        archive = Path(str(record.get("archive") or "")) if record else Path()
-        folder = archive.parent if archive.is_file() else self.repository.exports_dir / "ai-recordings"
-        folder.mkdir(parents=True, exist_ok=True)
-        if not QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder.resolve()))):
-            self.status.emit(f"패키지 폴더를 열지 못했습니다 · {folder}")
-
-    def _unique_ai_macro_name(self, requested: str) -> str:
-        base = requested.strip() or "AI 자동화 초안"
-        candidate = base
-        suffix = 2
-        while self.repository.macro_path(candidate).exists():
-            candidate = f"{base} (AI 초안 {suffix})"
-            suffix += 1
-        return candidate
-
-    def _import_ai_json(self) -> None:
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "MacroRelay AI JSON 불러오기",
-            str(self.repository.exports_dir),
-            "JSON 파일 (*.json)",
-        )
-        if not selected:
-            return
-        path = Path(selected)
-        try:
-            payload = load_ai_json(path)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            QtWidgets.QMessageBox.warning(self, "AI JSON 불러오기 실패", str(exc))
-            return
-        stage = package_stage_for(self.repository.root, payload)
-        preview = AIImportPreviewDialog(payload, self.repository, stage, self.window())
-        if preview.exec() != QtWidgets.QDialog.Accepted:
-            return
-        try:
-            macro, issues = materialize_ai_document(payload, self.repository, stage)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "AI JSON 변환 실패", str(exc))
-            return
-        errors = [issue.detail for issue in issues if issue.severity == "error"]
-        if errors:
-            QtWidgets.QMessageBox.warning(self, "AI JSON 변환 실패", "\n".join(f"• {item}" for item in errors))
-            return
-        name = self._unique_ai_macro_name(str(macro.get("name") or "AI 자동화 초안"))
-        macro["name"] = name
-        try:
-            self.repository.create_macro(name, str(macro.get("description") or ""))
-            self.repository.save_macro(name, macro)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "AI 초안 저장 실패", str(exc))
-            return
-        self.refresh(name)
-        self.data_changed.emit()
-        self.status.emit(f"'{name}'을(를) AI 초안으로 가져왔습니다.")
-        self._open_ai_setup()
-
-    def _apply_ai_draft_change(self, macro: dict[str, Any]) -> None:
-        if not self.current_name:
-            return
-        self.current_macro = deepcopy(macro)
-        self.current_macro["name"] = self.current_name
-        self.repository.save_macro(self.current_name, self.current_macro)
-        self._last_persisted_macro = deepcopy(self.current_macro)
-        self._refresh_steps(max(0, self.steps_table.currentRow()))
-        self._data_change_timer.start()
-
-    def _edit_ai_step(self, index: int) -> None:
-        steps = (self.current_macro or {}).get("steps") or []
-        if not 0 < index <= len(steps):
-            return
-        self.steps_table.selectRow(index - 1)
-        self._load_step(index - 1)
-        self._open_action_settings()
-
-    def _run_ai_inactive_lab(self, dialog: AIDraftSetupDialog) -> None:
-        if self._open_inactive_handle_lab():
-            profile = dict(self._inactive_handle_profiles[-1]) if self._inactive_handle_profiles else {}
-            dialog.apply_inactive_profile(profile)
-
-    def _open_ai_setup(self) -> None:
-        if not self.current_macro or not bool((self.current_macro.get("meta") or {}).get("ai_draft")):
-            self.status.emit("현재 매크로는 미완성 AI 초안이 아닙니다.")
-            return
-        dialog = AIDraftSetupDialog(self.current_macro, self.repository, self.window())
-        dialog.macro_changed.connect(self._apply_ai_draft_change)
-        dialog.step_edit_requested.connect(self._edit_ai_step)
-        dialog.inactive_lab_requested.connect(lambda: self._run_ai_inactive_lab(dialog))
-        dialog.dry_run_requested.connect(self._run_dry_run)
-        dialog.exec()
-        if self.current_name:
-            self.refresh(self.current_name)
-
-    def _continue_ai_setup(self) -> None:
-        self._open_ai_setup()
 
     def _load_last_recording(self) -> list[dict[str, Any]]:
         try:
@@ -2434,12 +1961,6 @@ class BuilderPage(QtWidgets.QWidget):
         return True
 
     def _stop_smart_recording(self) -> None:
-        if self._ai_video_test_controller is not None:
-            self._ai_video_test_controller.stop()
-            return
-        if self._ai_recording_controller is not None:
-            self._ai_recording_controller.stop()
-            return
         if self._recording_controller is not None:
             self._recording_controller.stop()
             return
@@ -2977,29 +2498,12 @@ class BuilderPage(QtWidgets.QWidget):
             return None
         return {"kind": "macro_step", "name": name, "payload": snapshot}
 
-    def _block_unfinished_ai_run(self) -> bool:
-        macro = self.current_macro or {}
-        if not bool((macro.get("meta") or {}).get("ai_draft")):
-            return False
-        complete, total, pending = ai_draft_readiness(macro)
-        detail = "\n".join(f"• {item}" for item in pending) if pending else "• 설정 완료 버튼으로 AI 초안을 확정하세요."
-        QtWidgets.QMessageBox.warning(
-            self,
-            "AI 초안 실행 차단",
-            f"이 매크로는 아직 AI 초안입니다. 준비도 {complete}/{total}\n\n{detail}\n\n"
-            "드라이런과 이 단계만 테스트는 사용할 수 있습니다.",
-        )
-        self.status.emit("미완성 AI 초안의 정식 실행을 차단했습니다.")
-        return True
-
     def _run_current(self) -> None:
         if not self.run_button.isEnabled():
             self.status.emit("이미 매크로가 실행 중입니다. 새로 실행하려면 먼저 정지해 주세요.")
             return
         if not self.current_name:
             self.status.emit("실행할 매크로를 먼저 선택하세요.")
-            return
-        if self._block_unfinished_ai_run():
             return
         row = self.steps_table.currentRow()
         steps = (self.current_macro or {}).get("steps") or []
@@ -3030,8 +2534,6 @@ class BuilderPage(QtWidgets.QWidget):
     def _run_from_selected_step(self) -> None:
         if not self.current_name or self.current_macro is None:
             self.status.emit("실행할 매크로를 먼저 선택하세요.")
-            return
-        if self._block_unfinished_ai_run():
             return
         index = self.node_canvas.selected_index()
         if index <= 0:
@@ -3326,12 +2828,6 @@ class BuilderPage(QtWidgets.QWidget):
         self._update_history_buttons()
 
     def shutdown_automation(self) -> None:
-        if self._ai_video_test_controller is not None:
-            self._ai_video_test_controller.stop()
-            self._ai_video_test_controller = None
-        if self._ai_recording_controller is not None:
-            self._ai_recording_controller.stop()
-            self._ai_recording_controller = None
         if self._recording_controller is not None:
             self._recording_controller.stop()
             self._recording_controller = None

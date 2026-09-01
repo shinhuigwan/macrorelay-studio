@@ -191,8 +191,6 @@ class EventTriggerEngine:
         fired: list[tuple[str, str]] = []
         for summary in self.repository.list_macros():
             macro = self.repository.load_macro(summary.name)
-            if bool((macro.get("meta") or {}).get("ai_draft")):
-                continue
             triggers = macro.get("triggers") if isinstance(macro.get("triggers"), list) else []
             for index, trigger in enumerate(triggers):
                 if not isinstance(trigger, dict) or not trigger.get("enabled", True) or trigger.get("needs_setup"):

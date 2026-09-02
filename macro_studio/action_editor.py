@@ -338,6 +338,9 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("y", "Y 좌표", "int", 0, -100_000, 100_000),
         FieldSpec("button", "마우스 버튼", "choice", "Left", options=choice(("왼쪽", "Left"), ("오른쪽", "Right"), ("가운데", "Middle"), ("휠 위", "WheelUp"), ("휠 아래", "WheelDown"))),
         FieldSpec("count", "클릭 횟수", "int", 1, 1, 50),
+        FieldSpec("action_type", "동작", "choice", "click", options=choice(("클릭", "click"), ("드래그", "drag"))),
+        FieldSpec("drag_to.0", "드래그 끝 X", "int", 0, -100_000, 100_000, section="드래그"),
+        FieldSpec("drag_to.1", "드래그 끝 Y", "int", 0, -100_000, 100_000, section="드래그"),
         FieldSpec("sleep_after", "클릭 후 대기", "duration", 0, 0, 600_000),
     ],
     "inactive_click": [

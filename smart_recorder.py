@@ -414,7 +414,7 @@ class Recorder:
         self._pre_capture_lock = threading.Lock()
         self._pre_capture_frames: deque[tuple[float, int, int, str]] = deque(maxlen=4)
         self._event_counter = 0
-        self._down_points: dict[str, tuple[int, int, str]] = {}
+        self._down_points: dict[str, tuple[int, int, str, dict[str, object], int, int]] = {}
 
     def _write_payload(self, payload: dict[str, object]) -> None:
         if self.handle is None:
@@ -586,17 +586,23 @@ class Recorder:
             if up_button:
                 down = self._down_points.pop(up_button, None)
                 if down is not None:
-                    start_x, start_y, source_event_id = down
+                    start_x, start_y, source_event_id, start_window, start_client_x, start_client_y = down
                     if abs(int(data.pt.x) - start_x) > 5 or abs(int(data.pt.y) - start_y) > 5:
                         details = window_details(int(user32.WindowFromPoint(data.pt) or 0))
+                        end_origin = details.get("client_origin") if isinstance(details, dict) else None
+                        end_client_x = int(data.pt.x) - int(end_origin[0]) if isinstance(end_origin, list) and len(end_origin) >= 2 else int(data.pt.x)
+                        end_client_y = int(data.pt.y) - int(end_origin[1]) if isinstance(end_origin, list) and len(end_origin) >= 2 else int(data.pt.y)
                         self.emit(
                             {
                                 "type": "mouse_drag",
+                                "event_id": f"drag-{time.perf_counter_ns()}-{self._event_counter}",
                                 "button": up_button,
                                 "from_screen": [start_x, start_y],
                                 "to_screen": [int(data.pt.x), int(data.pt.y)],
+                                "from_client": [start_client_x, start_client_y],
+                                "to_client": [end_client_x, end_client_y],
                                 "source_event_id": source_event_id,
-                                "window": details,
+                                "window": start_window or details,
                             }
                         )
                 return int(user32.CallNextHookEx(self.mouse_hook, code, message, data_ptr))
@@ -626,7 +632,9 @@ class Recorder:
             self._event_counter += 1
             event_id = f"mouse-{time.perf_counter_ns()}-{self._event_counter}"
             if message != WM_MOUSEWHEEL:
-                self._down_points[button] = (int(data.pt.x), int(data.pt.y), event_id)
+                self._down_points[button] = (
+                    int(data.pt.x), int(data.pt.y), event_id, dict(details or {}), int(client_x), int(client_y)
+                )
             self.emit(
                 {
                     "type": "screen_verification" if self.right_click_condition and message == WM_RBUTTONDOWN else "mouse",

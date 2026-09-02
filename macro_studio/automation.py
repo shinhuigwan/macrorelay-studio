@@ -50,7 +50,7 @@ def load_recording(path: Path) -> list[dict[str, Any]]:
         except (TypeError, ValueError):
             continue
         if isinstance(payload, dict) and payload.get("type") in {
-            "mouse", "key", "screen_condition", "screen_verification", "wait_marker"
+            "mouse", "mouse_drag", "key", "screen_condition", "screen_verification", "wait_marker"
         }:
             events.append(payload)
     return sorted(events, key=lambda item: int(item.get("t") or 0))
@@ -59,6 +59,14 @@ def load_recording(path: Path) -> list[dict[str, Any]]:
 def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -> list[dict[str, Any]]:
     """Compress raw hook events into editable, meaningful automation actions."""
     drafts: list[dict[str, Any]] = []
+    # A drag starts as a mouse-down event and is only known to be a drag when
+    # the button is released.  Suppress that source click so one gesture never
+    # becomes both a click node and a drag node.
+    drag_source_ids = {
+        str(event.get("source_event_id") or "")
+        for event in events
+        if event.get("type") == "mouse_drag" and str(event.get("source_event_id") or "")
+    }
     index = 0
     previous_time = 0
     while index < len(events):
@@ -126,6 +134,32 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
             previous_time = current_time
             index += 1
             continue
+        if event.get("type") == "mouse" and str(event.get("event_id") or "") in drag_source_ids:
+            index += 1
+            continue
+        if event.get("type") == "mouse_drag":
+            window = event.get("window") if isinstance(event.get("window"), dict) else {}
+            start = event.get("from_screen") if isinstance(event.get("from_screen"), list) else [0, 0]
+            end = event.get("to_screen") if isinstance(event.get("to_screen"), list) else [0, 0]
+            drafts.append(
+                {
+                    "kind": "mouse_drag",
+                    "t": current_time,
+                    "event": event,
+                    "count": 1,
+                    "strategy": "window",
+                    "record_mode": record_mode,
+                    "detail": (
+                        f"{event.get('button', 'Left')} 드래그 · "
+                        f"{int(start[0] or 0)}, {int(start[1] or 0)} → {int(end[0] or 0)}, {int(end[1] or 0)}"
+                    ),
+                    "target": _window_label(window),
+                    **workflow,
+                }
+            )
+            previous_time = current_time
+            index += 1
+            continue
         if event.get("type") == "mouse":
             count = 1
             if index + 1 < len(events):
@@ -143,6 +177,12 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                     index += 1
                     current_time = int(following.get("t") or current_time)
             window = event.get("window") if isinstance(event.get("window"), dict) else {}
+            button_name = str(event.get("button") or "Left")
+            if button_name in {"WheelUp", "WheelDown"}:
+                count = max(count, max(1, abs(int(event.get("wheel_delta") or 120)) // 120))
+                detail = f"{'휠 위' if button_name == 'WheelUp' else '휠 아래'} · {count}칸"
+            else:
+                detail = f"{button_name} {'더블 클릭' if count == 2 else '클릭'} · {event.get('x')}, {event.get('y')}"
             draft = {
                     "kind": "mouse",
                     "t": current_time,
@@ -150,7 +190,7 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                     "count": count,
                     "strategy": "window",
                     "record_mode": record_mode,
-                    "detail": f"{event.get('button', 'Left')} {'더블 클릭' if count == 2 else '클릭'} · {event.get('x')}, {event.get('y')}",
+                    "detail": detail,
                     "target": _window_label(window),
                     **workflow,
                 }
@@ -420,6 +460,8 @@ class RecordingBar(QtWidgets.QDialog):
         if kind in {"mouse", "image_capture"}:
             label = "F8 이미지 캡처" if kind == "image_capture" else str(draft.get("detail") or "클릭")
             return {**common, "action": "image_search", "label": label}
+        if kind == "mouse_drag":
+            return {**common, "action": "inactive_click", "label": str(draft.get("detail") or "드래그")}
         if kind in {"text", "key"}:
             return {**common, "action": "type_text"}
         return {**common, "action": "flow_control"}
@@ -478,8 +520,30 @@ class RecordingBar(QtWidgets.QDialog):
             for index, event_id in enumerate(event_ids, start=1)
             if event_id in self._event_positions
         }
-        for index, step in enumerate(steps[:-1], start=1):
-            step["on_success"] = index + 1
+        workflow_groups: list[list[int]] = []
+        workflow_lookup: dict[str, int] = {}
+        for index, step in enumerate(steps, start=1):
+            workflow_id = str(step.get("workflow_id") or "workflow-01")
+            if workflow_id not in workflow_lookup:
+                workflow_lookup[workflow_id] = len(workflow_groups)
+                workflow_groups.append([])
+            workflow_groups[workflow_lookup[workflow_id]].append(index)
+        if len(workflow_groups) > 1:
+            first_indexes = [indexes[0] for indexes in workflow_groups if indexes]
+            for indexes in workflow_groups:
+                for position, index in enumerate(indexes):
+                    if position + 1 < len(indexes):
+                        steps[index - 1]["on_success"] = indexes[position + 1]
+                    else:
+                        steps[index - 1]["stop_on_success"] = True
+            for position, index in enumerate(first_indexes):
+                steps[index - 1]["abort_on_fail"] = True
+                if position + 1 < len(first_indexes):
+                    steps[index - 1]["on_fail"] = first_indexes[position + 1]
+                    steps[index - 1]["abort_on_fail"] = False
+        else:
+            for index, step in enumerate(steps[:-1], start=1):
+                step["on_success"] = index + 1
         event_index = {event_id: index for index, event_id in enumerate(event_ids, start=1)}
         for (source_id, kind), target_id in self._live_link_overrides.items():
             source_index = event_index.get(source_id)
@@ -490,7 +554,12 @@ class RecordingBar(QtWidgets.QDialog):
                 steps[source_index - 1].pop(field, None)
             else:
                 steps[source_index - 1][field] = event_index[target_id]
-        self.live_canvas.set_macro({"steps": steps, "graph_positions": positions})
+        macro = {"steps": steps, "graph_positions": positions}
+        if len(workflow_groups) > 1:
+            candidates = [indexes[0] for indexes in workflow_groups if indexes]
+            macro["graph_start_step"] = candidates[0]
+            macro["start_search_candidates"] = candidates
+        self.live_canvas.set_macro(macro)
         self._last_live_signature = signature
 
     def _connect_live_nodes(self, source: int, target: int, kind: str) -> None:
@@ -1573,8 +1642,10 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self.detail_images: dict[int, QtGui.QImage] = {}
         self.detail_precise_rows: set[int] = set()
         self.detail_click_offsets: dict[int, QtCore.QPoint] = {}
+        self.search_regions: dict[int, list[int]] = {}
         self.preview_labels: dict[int, QtWidgets.QLabel] = {}
         self.preview_buttons: dict[int, QtWidgets.QPushButton] = {}
+        self.search_region_buttons: dict[int, QtWidgets.QPushButton] = {}
         for row, draft in enumerate(self.drafts):
             event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
             saved_rect = event.get("_review_crop_rect") if isinstance(event.get("_review_crop_rect"), list) else []
@@ -1593,9 +1664,14 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             click_offset = event.get("_review_detail_click_offset") if isinstance(event.get("_review_detail_click_offset"), list) else []
             if len(click_offset) >= 2:
                 self.detail_click_offsets[row] = QtCore.QPoint(int(click_offset[0] or 0), int(click_offset[1] or 0))
+            saved_search_region = event.get("_review_search_region") if isinstance(event.get("_review_search_region"), list) else []
+            if len(saved_search_region) >= 4:
+                values = [int(value or 0) for value in saved_search_region[:4]]
+                if values[2] > values[0] and values[3] > values[1]:
+                    self.search_regions[row] = values
         self.setWindowTitle("스마트 녹화 검토")
-        self.resize(1440, 820)
-        self.setMinimumSize(1180, 680)
+        self.resize(1540, 840)
+        self.setMinimumSize(1280, 700)
         layout = QtWidgets.QVBoxLayout(self)
         self.title_label = QtWidgets.QLabel()
         self.title_label.setStyleSheet("font-size:15pt; font-weight:800;")
@@ -1648,7 +1724,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self.table.setColumnWidth(1, 82)
         self.table.setColumnWidth(3, 250)
         self.table.setColumnWidth(4, 240)
-        self.table.setColumnWidth(5, 245)
+        self.table.setColumnWidth(5, 420)
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.delete_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Delete, self.table)
         self.delete_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
@@ -1660,8 +1736,12 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self.include_text = QtWidgets.QCheckBox("입력한 텍스트를 노드에 저장")
         self.include_text.setChecked(True)
         self.include_text.setToolTip("암호나 개인정보를 입력했다면 체크를 해제하세요.")
-        self.connect_steps = QtWidgets.QCheckBox("생성 노드를 순서대로 자동 연결")
+        self.connect_steps = QtWidgets.QCheckBox("작업 내부 자동 연결 · 첫 조건끼리 우선순위 검사")
         self.connect_steps.setChecked(True)
+        self.connect_steps.setToolTip(
+            "F7로 나눈 각 작업 안쪽만 순서대로 연결합니다. 작업 1·2·3의 첫 노드는 위에서부터 검사하고, "
+            "최초로 성공한 작업 하나만 끝까지 실행합니다. 전부 실패하면 종료합니다."
+        )
         self.background_clicks = QtWidgets.QCheckBox("모든 클릭을 백그라운드 클릭으로 생성")
         self.background_clicks.setChecked(True)
         self.background_clicks.setToolTip(
@@ -1682,7 +1762,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        QtCore.QTimer.singleShot(0, lambda: self._apply_background_click_mode(True))
+        self._apply_background_click_mode(True)
 
     def _update_title(self) -> None:
         self.title_label.setText(f"기록된 동작 {len(self.events)}개를 자동화 노드 {len(self.drafts)}개로 정리했습니다.")
@@ -1700,8 +1780,10 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self.table.setRowCount(len(self.drafts))
         self.preview_labels.clear()
         self.preview_buttons.clear()
+        self.search_region_buttons.clear()
         kind_labels = {
             "mouse": "클릭",
+            "mouse_drag": "드래그",
             "image_capture": "이미지",
             "screen_condition": "화면 조건",
             "screen_verification": "결과 확인",
@@ -1750,7 +1832,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                     f"대상 창 좌표: {int(profile.get('x') or 0)}, {int(profile.get('y') or 0)}"
                 )
             self.table.setItem(row, 3, target_item)
-            if draft.get("kind") in {"mouse", "image_capture", "screen_condition", "screen_verification"}:
+            if draft.get("kind") in {"mouse", "mouse_drag", "image_capture", "screen_condition", "screen_verification"}:
                 combo = QtWidgets.QComboBox()
                 if draft.get("kind") in {"screen_condition", "screen_verification"}:
                     combo.addItem("이미지가 보이는지 확인 · 클릭 안 함", "image")
@@ -1765,6 +1847,10 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                     if not image.isNull() and row not in self.crop_rects:
                         self.crop_sizes[row] = image.size()
                         self.crop_rects[row] = image.rect()
+                elif draft.get("kind") == "mouse_drag":
+                    combo.addItem("창 활성화 후 드래그 · 위치 변경 대응", "window")
+                    combo.addItem("백그라운드 드래그 · 호환 앱 전용", "inactive")
+                    combo.addItem("화면 절대 좌표 드래그", "screen")
                 else:
                     combo.addItem("창 활성화 후 클릭 · 권장", "window")
                     combo.addItem("이미지 찾아 클릭 · 위치 변경 대응", "image")
@@ -1777,8 +1863,13 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 if saved_index >= 0:
                     combo.setCurrentIndex(saved_index)
                 self.table.setCellWidget(row, 4, combo)
-                self.table.setCellWidget(row, 5, self._build_image_preview_cell(row))
-                self.table.setRowHeight(row, 62)
+                event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
+                is_wheel = str(event.get("button") or "") in {"WheelUp", "WheelDown"}
+                if draft.get("kind") == "mouse_drag" or is_wheel:
+                    self.table.setItem(row, 5, QtWidgets.QTableWidgetItem("—"))
+                else:
+                    self.table.setCellWidget(row, 5, self._build_image_preview_cell(row))
+                    self.table.setRowHeight(row, 62)
             else:
                 self.table.setItem(row, 4, QtWidgets.QTableWidgetItem("자동 정리"))
                 self.table.setItem(row, 5, QtWidgets.QTableWidgetItem("—"))
@@ -1874,6 +1965,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         old_detail_images = dict(self.detail_images)
         old_detail_precise = set(self.detail_precise_rows)
         old_detail_click_offsets = dict(self.detail_click_offsets)
+        old_search_regions = dict(self.search_regions)
         remaining: list[dict[str, Any]] = []
         self.crop_sizes = {}
         self.crop_rects = {}
@@ -1881,6 +1973,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self.detail_images = {}
         self.detail_precise_rows = set()
         self.detail_click_offsets = {}
+        self.search_regions = {}
         new_row = 0
         for old_row, draft in enumerate(self.drafts):
             if old_row in removed:
@@ -1898,6 +1991,8 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 self.detail_precise_rows.add(new_row)
             if old_row in old_detail_click_offsets:
                 self.detail_click_offsets[new_row] = old_detail_click_offsets[old_row]
+            if old_row in old_search_regions:
+                self.search_regions[new_row] = old_search_regions[old_row]
             new_row += 1
         self.drafts = remaining
         self._populate_table()
@@ -1905,6 +2000,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self._update_title()
         if self.drafts:
             self.table.selectRow(min(rows[0], len(self.drafts) - 1))
+        self.events_changed.emit(self.events)
 
     def _edit_selected_row(self) -> None:
         rows = self._selected_rows()
@@ -1979,7 +2075,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
     def _apply_background_click_mode(self, enabled: bool) -> None:
         """Apply one recording-wide click policy without hiding per-row overrides."""
         for row, draft in enumerate(self.drafts):
-            if draft.get("kind") != "mouse":
+            if draft.get("kind") not in {"mouse", "mouse_drag"}:
                 continue
             combo = self.table.cellWidget(row, 4)
             if not isinstance(combo, QtWidgets.QComboBox):
@@ -2004,15 +2100,112 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         preview.setFixedSize(72, 48)
         preview.setAlignment(QtCore.Qt.AlignCenter)
         preview.setStyleSheet("background:#0D1017; border:1px solid #3B4355; border-radius:6px; color:#8F99AD;")
-        edit = QtWidgets.QPushButton("확인·영역 편집")
-        edit.setToolTip("실제로 저장될 이미지를 확인하고 이미지 서치 영역을 조절합니다.")
+        edit = QtWidgets.QPushButton("확인 이미지 편집")
+        edit.setToolTip("실제로 저장될 이미지 표본을 확인하고 자르기·누끼·클릭 오프셋을 편집합니다.")
         edit.clicked.connect(lambda _checked=False, target_row=row: self._adjust_image_crop(target_row))
+        search_region = QtWidgets.QPushButton("서치 영역 지정")
+        search_region.setToolTip(
+            "현재 대상 프로그램의 클라이언트 화면에서 검색할 범위를 드래그합니다. 창을 이동해도 상대 영역이 유지됩니다."
+        )
+        search_region.clicked.connect(lambda _checked=False, target_row=row: self._select_search_region(target_row))
         layout.addWidget(preview)
         layout.addWidget(edit)
+        layout.addWidget(search_region)
         self.preview_labels[row] = preview
         self.preview_buttons[row] = edit
+        self.search_region_buttons[row] = search_region
+        if row in self.search_regions:
+            region = self.search_regions[row]
+            search_region.setText(f"서치 영역 {region[2] - region[0]}×{region[3] - region[1]}")
         QtCore.QTimer.singleShot(0, lambda target_row=row: self._refresh_row_preview(target_row))
         return holder
+
+    @staticmethod
+    def _live_client_rect(window: dict[str, Any]) -> QtCore.QRect:
+        """Resolve the current client rectangle instead of trusting recording-time screen coordinates."""
+        if sys.platform != "win32" or not window:
+            return QtCore.QRect()
+        try:
+            from .image_search_test import _find_window
+
+            saved_hwnd = int(window.get("hwnd") or 0)
+            user32 = ctypes.windll.user32
+            hwnd = saved_hwnd if saved_hwnd and user32.IsWindow(saved_hwnd) else _find_window(
+                str(window.get("exe") or ""), _window_token(window)
+            )
+            if not hwnd:
+                return QtCore.QRect()
+            rect = wintypes.RECT()
+            origin = wintypes.POINT(0, 0)
+            if not user32.GetClientRect(hwnd, ctypes.byref(rect)) or not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+                return QtCore.QRect()
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            return QtCore.QRect(int(origin.x), int(origin.y), width, height) if width >= 4 and height >= 4 else QtCore.QRect()
+        except Exception:
+            return QtCore.QRect()
+
+    def _select_search_region(self, row: int) -> None:
+        if not 0 <= row < len(self.drafts):
+            return
+        draft = self.drafts[row]
+        event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
+        window = event.get("window") if isinstance(event.get("window"), dict) else {}
+        client_rect = self._live_client_rect(window)
+        if not client_rect.isValid():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "서치 영역 지정",
+                "녹화한 대상 프로그램의 현재 창을 찾지 못했습니다. 대상 프로그램을 실행한 뒤 다시 눌러 주세요.",
+            )
+            return
+        self.hide()
+        QtWidgets.QApplication.processEvents()
+        pixmap, desktop_geometry = capture_virtual_desktop()
+        if pixmap.isNull() or not desktop_geometry.isValid():
+            self.show()
+            return
+        clipped = client_rect.intersected(desktop_geometry)
+        if not clipped.isValid():
+            self.show()
+            QtWidgets.QMessageBox.warning(self, "서치 영역 지정", "대상 프로그램의 클라이언트 화면이 현재 모니터에 보이지 않습니다.")
+            return
+        local = clipped.translated(-desktop_geometry.topLeft())
+        client_pixmap = pixmap.copy(local)
+        picker = ScreenCaptureDialog(client_pixmap, clipped, accept_on_release=False)
+        try:
+            if picker.exec() != QtWidgets.QDialog.Accepted:
+                return
+            selected = picker.selected_screen_rect().intersected(client_rect)
+            if selected.width() < 4 or selected.height() < 4:
+                return
+            region = [
+                selected.left() - client_rect.left(),
+                selected.top() - client_rect.top(),
+                selected.left() - client_rect.left() + selected.width(),
+                selected.top() - client_rect.top() + selected.height(),
+            ]
+            self.search_regions[row] = region
+            event["_review_search_region"] = list(region)
+            combo = self.table.cellWidget(row, 4)
+            if isinstance(combo, QtWidgets.QComboBox):
+                image_index = combo.findData("image")
+                if image_index >= 0:
+                    combo.setCurrentIndex(image_index)
+                    draft["_review_strategy"] = "image"
+            button = self.search_region_buttons.get(row)
+            if button is not None:
+                button.setText(f"서치 영역 {region[2] - region[0]}×{region[3] - region[1]}")
+                button.setToolTip(
+                    f"클라이언트 상대 범위 · 왼쪽 {region[0]}, 위 {region[1]}, 오른쪽 {region[2]}, 아래 {region[3]}\n"
+                    "다시 클릭하면 현재 창에서 범위를 재지정합니다."
+                )
+            self.events_changed.emit(self.events)
+        finally:
+            picker.deleteLater()
+            self.show()
+            self.raise_()
+            self.activateWindow()
 
     def _refresh_row_preview(self, row: int) -> None:
         if not 0 <= row < len(self.drafts):
@@ -2193,7 +2386,71 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             profile = draft.get("handle_profile") if isinstance(draft.get("handle_profile"), dict) else {}
             button = str(event.get("button") or "Left")
             count = int(draft.get("count") or 1)
-            if strategy == "screen":
+            if kind == "mouse_drag":
+                start_screen = event.get("from_screen") if isinstance(event.get("from_screen"), list) else [0, 0]
+                end_screen = event.get("to_screen") if isinstance(event.get("to_screen"), list) else [0, 0]
+                start_client = event.get("from_client") if isinstance(event.get("from_client"), list) else []
+                end_client = event.get("to_client") if isinstance(event.get("to_client"), list) else []
+                origin = window.get("client_origin") if isinstance(window.get("client_origin"), list) else [0, 0]
+                if len(start_client) < 2:
+                    start_client = [int(start_screen[0] or 0) - int(origin[0] or 0), int(start_screen[1] or 0) - int(origin[1] or 0)]
+                if len(end_client) < 2:
+                    end_client = [int(end_screen[0] or 0) - int(origin[0] or 0), int(end_screen[1] or 0) - int(origin[1] or 0)]
+                if strategy == "screen" or not window:
+                    step = {
+                        "action": "mouse_click",
+                        "label": f"화면 드래그 {order}",
+                        "coordinate_scope": "screen",
+                        "x": int(start_screen[0] or 0),
+                        "y": int(start_screen[1] or 0),
+                        "button": button,
+                        "count": 1,
+                        "action_type": "drag",
+                        "drag_to": [int(end_screen[0] or 0), int(end_screen[1] or 0)],
+                    }
+                elif strategy == "inactive" or self.background_clicks.isChecked():
+                    step = {
+                        "action": "inactive_click",
+                        "label": f"백그라운드 드래그 {order}",
+                        "window": _window_token(window),
+                        "window_exe": str(window.get("exe") or ""),
+                        "x": int(start_client[0] or 0),
+                        "y": int(start_client[1] or 0),
+                        "button": button,
+                        "clicks": 1,
+                        "method": "auto",
+                        "target_class": str(window.get("class") or ""),
+                        "options": "NA",
+                        "action_type": "drag",
+                        "drag_to": [int(end_client[0] or 0), int(end_client[1] or 0)],
+                        "drag_click_after": False,
+                        "retry_count": 2,
+                        "retry_delay": 100,
+                    }
+                else:
+                    step = {
+                        "action": "mouse_click",
+                        "label": f"창 활성화 후 드래그 {order}",
+                        "window": _window_token(window),
+                        "window_exe": str(window.get("exe") or ""),
+                        "window_hwnd": int(window.get("hwnd") or 0),
+                        "coordinate_scope": "client",
+                        "x": int(start_client[0] or 0),
+                        "y": int(start_client[1] or 0),
+                        "button": button,
+                        "count": 1,
+                        "action_type": "drag",
+                        "drag_to": [int(end_client[0] or 0), int(end_client[1] or 0)],
+                        "activate_timeout": 1200,
+                    }
+                step["_automation"] = {
+                    "recorded_drag_screen": [
+                        int(start_screen[0] or 0), int(start_screen[1] or 0),
+                        int(end_screen[0] or 0), int(end_screen[1] or 0),
+                    ],
+                    "recorded_window": window,
+                }
+            elif strategy == "screen":
                 step = {
                     "action": "mouse_click",
                     "label": f"녹화 클릭 {order}",
@@ -2232,8 +2489,9 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                     capture_size = [0, 0]
                 capture_scope = str(window.get("capture_scope") or "client") if window else "screen"
                 full_region = [0, 0, int(capture_size[0] or 0), int(capture_size[1] or 0)]
-                regions: list[list[int]] = []
-                if window and full_region[2] > 0 and full_region[3] > 0:
+                custom_region = self.search_regions.get(row)
+                regions: list[list[int]] = [list(custom_region)] if custom_region else []
+                if not custom_region and window and full_region[2] > 0 and full_region[3] > 0:
                     center_x = int(event.get("client_x") or 0)
                     center_y = int(event.get("client_y") or 0)
                     local_region = [
@@ -2293,7 +2551,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                     "region_window": _window_token(window) if window else "",
                     "region_window_exe": str(window.get("exe") or ""),
                     "regions": regions if window else [],
-                    "fallback_full_region": bool(window),
+                    "fallback_full_region": bool(window) and not bool(custom_region),
                     "click_enabled": True,
                     "click": click,
                     "abort_on_fail": False,
@@ -2428,9 +2686,53 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         for step in steps:
             step.pop("_recording_multi_group", None)
         if self.connect_steps.isChecked():
-            for index, step in enumerate(steps[:-1]):
-                if step.get("action") != "flow_control":
-                    step["on_success"] = index + 2
+            workflow_groups: list[list[int]] = []
+            workflow_lookup: dict[str, int] = {}
+            for index, step in enumerate(steps):
+                workflow_id = str(step.get("workflow_id") or "").strip() or "workflow-01"
+                if workflow_id not in workflow_lookup:
+                    workflow_lookup[workflow_id] = len(workflow_groups)
+                    workflow_groups.append([])
+                workflow_groups[workflow_lookup[workflow_id]].append(index)
+
+            if len(workflow_groups) > 1:
+                # F7 starts independent jobs.  Their first nodes form a
+                # priority condition chain; success enters only that job,
+                # while failure tries the next job.  Finishing one job never
+                # falls through into the next lane.
+                first_indexes = [indexes[0] for indexes in workflow_groups if indexes]
+                for indexes in workflow_groups:
+                    for position, step_index in enumerate(indexes):
+                        step = steps[step_index]
+                        step.pop("on_success", None)
+                        step.pop("stop_on_success", None)
+                        if position + 1 < len(indexes) and step.get("action") != "flow_control":
+                            step["on_success"] = indexes[position + 1] + 1
+                        elif step.get("action") != "flow_control":
+                            step["stop_on_success"] = True
+                for position, step_index in enumerate(first_indexes):
+                    step = steps[step_index]
+                    step["_start_search_candidate"] = True
+                    step["abort_on_fail"] = True
+                    if position + 1 < len(first_indexes):
+                        step["on_fail"] = first_indexes[position + 1] + 1
+                        step["abort_on_fail"] = False
+                    else:
+                        step.pop("on_fail", None)
+                    automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+                    automation.update(
+                        {
+                            "start_workflow_candidate": True,
+                            "candidate_position": position + 1,
+                            "candidate_count": len(first_indexes),
+                            "all_failed_behavior": "stop",
+                        }
+                    )
+                    step["_automation"] = automation
+            else:
+                for index, step in enumerate(steps[:-1]):
+                    if step.get("action") != "flow_control":
+                        step["on_success"] = index + 2
             # A normal image capture followed by one or more branch-mode F8
             # captures becomes a priority fallback chain. Success from any
             # candidate joins the recorded common path; failure alone advances

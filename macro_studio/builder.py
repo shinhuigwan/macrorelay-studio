@@ -1361,6 +1361,10 @@ class BuilderPage(QtWidgets.QWidget):
             self.status.emit(f"'{target}' 서브플로우 내부를 열었습니다. 상위 흐름 버튼으로 돌아갈 수 있습니다.")
             return
         self.label_edit.setFocus(QtCore.Qt.MouseFocusReason)
+        # A node double-click is an explicit request to edit it.  Open the
+        # roomy editor immediately instead of merely focusing the narrow side
+        # inspector where the user can miss the change.
+        QtCore.QTimer.singleShot(0, self._open_action_settings)
 
     def _toggle_builder_side(self, side: str, force_open: bool = False) -> None:
         if not hasattr(self, "builder_splitter"):
@@ -1814,6 +1818,10 @@ class BuilderPage(QtWidgets.QWidget):
             self.current_macro.pop("graph_routes", None)
         base = len(steps)
         prepared = deepcopy(new_steps)
+        start_candidate_offsets: list[int] = []
+        for offset, step in enumerate(prepared, start=1):
+            if bool(step.pop("_start_search_candidate", False)):
+                start_candidate_offsets.append(offset)
         for step in prepared:
             for field in ("on_success", "on_fail", "target_step", "jump_to"):
                 target = int(step.get(field) or 0)
@@ -1853,6 +1861,10 @@ class BuilderPage(QtWidgets.QWidget):
             if isinstance(previous, dict) and previous.get("action") != "flow_control" and not int(previous.get("on_success") or 0):
                 previous["on_success"] = base + 1
         steps.extend(prepared)
+        if start_candidate_offsets and base == 0:
+            candidates = [base + offset for offset in start_candidate_offsets]
+            self.current_macro["start_search_candidates"] = candidates
+            self.current_macro["graph_start_step"] = candidates[0]
         self.current_macro.setdefault("meta", {})["automation_test_version"] = "2.19.17-test"
         # Image-mode recording may have created assets moments ago. Refresh
         # the inspector before loading the generated step so its asset is not

@@ -501,6 +501,23 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn('DllCall("ClientToScreen"', script)
         self.assertIn("MouseClick, Left, %ClickX%, %ClickY%, 1", script)
 
+    def test_foreground_mouse_drag_uses_client_relative_endpoints(self) -> None:
+        step = {
+            "action": "mouse_click",
+            "coordinate_scope": "client",
+            "window_exe": "sample.exe",
+            "x": 20,
+            "y": 30,
+            "button": "Left",
+            "action_type": "drag",
+            "drag_to": [240, 260],
+        }
+        script = "\n".join(self.engine.render_mouse_click(step))
+        self.assertIn("__recorded_drag_end", script)
+        self.assertIn("MouseClickDrag, Left", script)
+        self.assertIn("240", script)
+        self.assertIn("260", script)
+
     def test_image_search_defaults_to_full_virtual_desktop(self) -> None:
         step = {"action": "image_search", "asset": "target", "engine": "ahk", "timeout": 0}
         script = "\n".join(self.engine.render_image_search(step, {"target": {"file": "target.png"}}, 1))
@@ -4938,8 +4955,10 @@ class SmartRecordingUiTests(unittest.TestCase):
             {"type": "mouse", "event_id": "c", "t": 30, "button": "Left", "x": 5, "y": 6, "workflow_id": "workflow-03", "workflow_index": 3},
         ]
         bar.update_live_events(events)
-        self.assertEqual(2, bar.live_canvas.steps[0]["on_success"])
-        self.assertEqual(3, bar.live_canvas.steps[1]["on_success"])
+        self.assertEqual(2, bar.live_canvas.steps[0]["on_fail"])
+        self.assertEqual(3, bar.live_canvas.steps[1]["on_fail"])
+        self.assertTrue(bar.live_canvas.steps[0]["stop_on_success"])
+        self.assertEqual([1, 2, 3], bar.live_canvas.macro["start_search_candidates"])
         bar._connect_live_nodes(1, 3, "fail")
         app.processEvents()
         self.assertEqual(3, bar.live_canvas.steps[0]["on_fail"])
@@ -4950,6 +4969,106 @@ class SmartRecordingUiTests(unittest.TestCase):
         self.assertEqual("멀티 이미지 서치 2개", bar.live_canvas.steps[0]["label"])
         self.assertEqual(bar.multi_groups()["a"], bar.multi_groups()["b"])
         bar.close()
+
+    def test_workflow_first_nodes_compete_and_only_successful_lane_continues(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        events = []
+        for workflow, base in enumerate((100, 300, 500), start=1):
+            common = {
+                "workflow_id": f"workflow-{workflow:02d}",
+                "workflow_index": workflow,
+                "record_mode": "action",
+                "window": {
+                    "exe": "sample.exe", "title": "Sample", "client_origin": [0, 0],
+                    "client_size": [800, 600], "capture_size": [800, 600], "capture_scope": "client",
+                },
+                "image_sample_bmp": self._sample_bmp(),
+                "image_sample_size": [360, 240],
+                "image_anchor": [180, 120],
+                "x": 200, "y": 150, "client_x": 200, "client_y": 150,
+            }
+            events.append({**common, "type": "screen_verification", "event_id": f"condition-{workflow}", "t": base})
+            events.append({
+                "type": "wait_marker", "event_id": f"wait-{workflow}", "t": base + 50,
+                "duration": 500, "record_mode": "action", "workflow_id": f"workflow-{workflow:02d}",
+                "workflow_index": workflow,
+            })
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog(events, MacroRepository(Path(directory)))
+            steps = dialog.build_steps()
+            self.assertEqual([1, 3, 5], [index + 1 for index, step in enumerate(steps) if step.get("_start_search_candidate")])
+            self.assertEqual(3, steps[0]["on_fail"])
+            self.assertEqual(5, steps[2]["on_fail"])
+            self.assertNotIn("on_fail", steps[4])
+            self.assertTrue(steps[4]["abort_on_fail"])
+            self.assertEqual(2, steps[0]["on_success"])
+            self.assertEqual(4, steps[2]["on_success"])
+            self.assertEqual(6, steps[4]["on_success"])
+            self.assertTrue(steps[1]["stop_on_success"])
+            self.assertTrue(steps[3]["stop_on_success"])
+            self.assertTrue(steps[5]["stop_on_success"])
+            dialog.close()
+
+    def test_custom_client_search_region_overrides_auto_region_without_full_fallback(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        event = {
+            "type": "screen_verification", "event_id": "verify-region", "t": 10,
+            "x": 300, "y": 200, "client_x": 180, "client_y": 120,
+            "window": {
+                "exe": "sample.exe", "title": "Sample", "client_size": [800, 600],
+                "capture_size": [800, 600], "capture_scope": "client",
+            },
+            "image_sample_bmp": self._sample_bmp(), "image_sample_size": [360, 240], "image_anchor": [180, 120],
+            "_review_search_region": [40, 50, 440, 350],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog([event], MacroRepository(Path(directory)))
+            buttons = [button.text() for button in dialog.findChildren(QtWidgets.QPushButton)]
+            self.assertTrue(any(text.startswith("서치 영역") for text in buttons))
+            step = dialog.build_steps()[0]
+            self.assertEqual([[40, 50, 440, 350]], step["regions"])
+            self.assertFalse(step["fallback_full_region"])
+            dialog.close()
+
+    def test_drag_and_wheel_are_preserved_as_separate_smart_recording_nodes(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog, recording_drafts
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        window = {"exe": "sample.exe", "title": "Sample", "client_origin": [100, 100], "client_size": [800, 600]}
+        events = [
+            {"type": "mouse", "event_id": "drag-source", "t": 10, "button": "Left", "x": 120, "y": 130, "client_x": 20, "client_y": 30, "window": window},
+            {
+                "type": "mouse_drag", "event_id": "drag-1", "source_event_id": "drag-source", "t": 80,
+                "button": "Left", "from_screen": [120, 130], "to_screen": [340, 360],
+                "from_client": [20, 30], "to_client": [240, 260], "window": window,
+            },
+            {"type": "mouse", "event_id": "wheel-1", "t": 120, "button": "WheelDown", "wheel_delta": -240, "x": 300, "y": 300, "client_x": 200, "client_y": 200, "window": window},
+        ]
+        drafts = recording_drafts(events, include_waits=False)
+        self.assertEqual(["mouse_drag", "mouse"], [draft["kind"] for draft in drafts])
+        self.assertIn("2칸", drafts[1]["detail"])
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog(events, MacroRepository(Path(directory)))
+            steps = dialog.build_steps()
+            self.assertEqual("inactive_click", steps[0]["action"])
+            self.assertEqual("drag", steps[0]["action_type"])
+            self.assertEqual([240, 260], steps[0]["drag_to"])
+            self.assertEqual("WheelDown", steps[1]["button"])
+            self.assertEqual(2, steps[1]["clicks"])
+            dialog.close()
 
     def test_builder_context_merge_combines_image_nodes_and_preserves_next_flow(self) -> None:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -4982,6 +5101,53 @@ class SmartRecordingUiTests(unittest.TestCase):
             self.assertEqual(["first", "second"], steps[0]["assets"])
             self.assertEqual({"first": [1, 2], "second": [3, 4]}, steps[0]["asset_offsets"])
             self.assertEqual(2, steps[0]["on_success"])
+            builder.shutdown_automation()
+            builder.deleteLater()
+
+    def test_builder_persists_recorded_workflow_start_candidates(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("workflow")
+            builder = BuilderPage(repository)
+            builder.refresh("workflow")
+            builder._append_automation_steps(
+                [
+                    {"action": "screen_condition", "_start_search_candidate": True, "on_success": 2, "on_fail": 3},
+                    {"action": "wait", "duration": 100, "stop_on_success": True},
+                    {"action": "screen_condition", "_start_search_candidate": True, "on_success": 4, "abort_on_fail": True},
+                    {"action": "wait", "duration": 100, "stop_on_success": True},
+                ],
+                "workflow test",
+            )
+            self.assertEqual([1, 3], builder.current_macro["start_search_candidates"])
+            self.assertEqual(1, builder.current_macro["graph_start_step"])
+            self.assertFalse(any("_start_search_candidate" in step for step in builder.current_macro["steps"]))
+            builder.shutdown_automation()
+            builder.deleteLater()
+
+    def test_node_double_click_requests_roomy_settings_dialog(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from unittest import mock
+        from PySide6 import QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("double-click")
+            builder = BuilderPage(repository)
+            builder.refresh("double-click")
+            with mock.patch.object(builder, "_open_action_settings") as open_settings:
+                builder._focus_inspector(1)
+                app.processEvents()
+                open_settings.assert_called_once()
             builder.shutdown_automation()
             builder.deleteLater()
 

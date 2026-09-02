@@ -705,6 +705,8 @@ def render_mouse_click(step: Dict[str, Any]) -> List[str]:
     window = str(step.get("window") or "")
     window_exe = str(step.get("window_exe") or "")
     window_hwnd = int(step.get("window_hwnd") or 0)
+    action_type = str(step.get("action_type") or "click").lower()
+    drag_to = step.get("drag_to") if isinstance(step.get("drag_to"), list) else []
     if coordinate_scope == "client" and x is not None and y is not None and (window or window_exe or window_hwnd):
         lines: List[str] = []
         if window_hwnd:
@@ -743,20 +745,33 @@ def render_mouse_click(step: Dict[str, Any]) -> List[str]:
         lines.append('ClickX := NumGet(__recorded_point, 0, "Int")')
         lines.append('ClickY := NumGet(__recorded_point, 4, "Int")')
         lines.append("CoordMode, Mouse, Screen")
-        lines.append(f"MouseClick, {button}, %ClickX%, %ClickY%, {count}")
-        lines.append('SetLastClick(ClickX, ClickY, "foreground")')
+        if action_type == "drag" and len(drag_to) >= 2:
+            lines.append("VarSetCapacity(__recorded_drag_end, 8, 0)")
+            lines.append(f'NumPut({int(drag_to[0])}, __recorded_drag_end, 0, "Int")')
+            lines.append(f'NumPut({int(drag_to[1])}, __recorded_drag_end, 4, "Int")')
+            lines.append('DllCall("ClientToScreen", "ptr", TargetHwnd, "ptr", &__recorded_drag_end)')
+            lines.append('DragEndX := NumGet(__recorded_drag_end, 0, "Int")')
+            lines.append('DragEndY := NumGet(__recorded_drag_end, 4, "Int")')
+            lines.append(f"MouseClickDrag, {button}, %ClickX%, %ClickY%, %DragEndX%, %DragEndY%, 12")
+            lines.append('SetLastClick(DragEndX, DragEndY, "foreground-drag")')
+        else:
+            lines.append(f"MouseClick, {button}, %ClickX%, %ClickY%, {count}")
+            lines.append('SetLastClick(ClickX, ClickY, "foreground")')
         lines.append("CoordMode, Mouse, %MacroMouseCoordMode%")
         lines.append(f'Log("foreground client click: {ahk_quote(window_exe or window)} at " . ClickX . "," . ClickY)')
         sleep = step.get("sleep_after")
         if sleep:
             lines.append(f"Sleep, {sleep}")
         return lines
-    args = ["MouseClick", button]
-    if x is not None and y is not None:
-        args.append(str(x))
-        args.append(str(y))
-    args.append(str(count))
-    lines = [", ".join(args)]
+    if action_type == "drag" and x is not None and y is not None and len(drag_to) >= 2:
+        lines = [f"MouseClickDrag, {button}, {int(x)}, {int(y)}, {int(drag_to[0])}, {int(drag_to[1])}, 12"]
+    else:
+        args = ["MouseClick", button]
+        if x is not None and y is not None:
+            args.append(str(x))
+            args.append(str(y))
+        args.append(str(count))
+        lines = [", ".join(args)]
     lines.append("CoordMode, Mouse, Screen")
     lines.append("MouseGetPos, __LastClickX, __LastClickY")
     lines.append('SetLastClick(__LastClickX, __LastClickY, "foreground")')

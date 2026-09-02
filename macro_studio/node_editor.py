@@ -952,10 +952,11 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             # Keep close, forward links inside the gap between nodes.  A large
             # minimum bend makes their control points cross over each other and
             # produces the small loops seen when nodes are placed close by.
-            bend = min(110.0, max(18.0, distance * 0.42))
+            vertical = end.y() - start.y()
+            bend = min(145.0, max(30.0, distance * 0.48 + abs(vertical) * 0.14))
             lane_offset = (self.condition_index + 1) * 34.0 if self.is_condition else 0.0
-            c1 = QtCore.QPointF(start.x() + bend, start.y() + lane_offset)
-            c2 = QtCore.QPointF(end.x() - bend, end.y() + lane_offset)
+            c1 = QtCore.QPointF(start.x() + bend, start.y() + vertical * 0.16 + lane_offset)
+            c2 = QtCore.QPointF(end.x() - bend, end.y() - vertical * 0.16 + lane_offset)
             path = QtGui.QPainterPath(start)
             path.cubicTo(c1, c2, end)
         self.setPath(path)
@@ -984,6 +985,9 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             delay_key = "on_success_delay" if self.kind == "success" else "on_fail_delay"
             delay = int(step.get(delay_key) or 0)
             text = "성공" if self.kind == "success" else "실패"
+            success_candidates = step.get("success_candidates") or []
+            if self.kind == "success" and isinstance(success_candidates, list) and self.target in success_candidates:
+                text = f"성공 후보 {success_candidates.index(self.target) + 1}/{len(success_candidates)}"
             candidate_position = self.canvas.start_candidate_position(self.source)
             if candidate_position:
                 text = "탐지 성공" if self.kind == "success" else "미탐지 → 다음 후보"
@@ -1099,6 +1103,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.collapsed_nodes: set[int] = set()
         self._temp_edge: QtWidgets.QGraphicsPathItem | None = None
         self._temp_start = QtCore.QPointF()
+        self._retargeting_edge: tuple[int, int, str] | None = None
         self.rubber_selecting = False
         self._asset_preview_paths: dict[str, Path] = {}
         self._preview_popup = ImagePreviewPopup(self)
@@ -1387,11 +1392,16 @@ class NodeCanvas(QtWidgets.QWidget):
         indegree = {index: 0 for index in range(1, total + 1)}
         for index, step in enumerate(self.steps, start=1):
             targets: list[int] = []
-            success = int(step.get("on_success") or 0)
-            if success:
-                targets.append(success)
+            success_candidates = step.get("success_candidates") or []
+            if isinstance(success_candidates, list) and success_candidates:
+                targets.extend(int(value) for value in success_candidates if str(value).lstrip("-").isdigit())
             elif index < total and not bool(step.get("stop_on_success")):
-                targets.append(index + 1)
+                success = int(step.get("on_success") or 0)
+                targets.append(success if success else index + 1)
+            else:
+                success = int(step.get("on_success") or 0)
+                if success:
+                    targets.append(success)
             failure = int(step.get("on_fail") or 0)
             if failure:
                 targets.append(failure)
@@ -1553,8 +1563,22 @@ class NodeCanvas(QtWidgets.QWidget):
                 pass
         self.edges = []
         for index, step in enumerate(self.steps, start=1):
+            candidates = step.get("success_candidates") or []
+            candidate_targets = []
+            if isinstance(candidates, list):
+                candidate_targets = [int(value) for value in candidates if str(value).lstrip("-").isdigit()]
+            for target in candidate_targets:
+                if index in self.nodes and target in self.nodes:
+                    edge = EdgeItem(self, index, target, "success")
+                    self.scene.addItem(edge)
+                    self.edges.append(edge)
             for field, kind in (("on_success", "success"), ("on_fail", "fail")):
                 target = int(step.get(field) or 0)
+                automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+                if kind == "success" and candidate_targets:
+                    continue
+                if kind == "fail" and bool(automation.get("hide_candidate_fail_edge")):
+                    continue
                 if index in self.nodes and target in self.nodes:
                     edge = EdgeItem(self, index, target, kind)
                     self.scene.addItem(edge)
@@ -1745,6 +1769,12 @@ class NodeCanvas(QtWidgets.QWidget):
         self.begin_link(source, edge.kind, port.mapToScene(port.rect().center()))
         edge.setOpacity(0.22)
 
+    def retargeting_target(self, source: int, kind: str) -> int:
+        value = self._retargeting_edge
+        if value and value[0] == source and value[2] == kind:
+            return value[1]
+        return 0
+
     def _target_at(self, scene_pos: QtCore.QPointF, source: NodeItem) -> NodeItem | None:
         for item in self.scene.items(scene_pos):
             candidate = item
@@ -1776,7 +1806,11 @@ class NodeCanvas(QtWidgets.QWidget):
             if edge.is_condition:
                 self.edge_condition_retarget_requested.emit(edge.source, edge.condition_index, target.index)
             else:
-                self.link_requested.emit(edge.source, target.index, edge.kind)
+                self._retargeting_edge = (edge.source, edge.target, edge.kind)
+                try:
+                    self.link_requested.emit(edge.source, target.index, edge.kind)
+                finally:
+                    self._retargeting_edge = None
         else:
             self.remove_edge(edge.source, edge.target, edge.kind, edge.condition_index)
             if edge.is_condition:

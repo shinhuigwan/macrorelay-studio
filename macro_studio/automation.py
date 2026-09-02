@@ -21,6 +21,87 @@ from .theme import COLORS
 from .widgets import WheelSafeSpinBox
 
 
+def configure_success_candidates(
+    steps: list[dict[str, Any]], source: int, candidates: list[int]
+) -> list[int]:
+    """Configure an ordered fan-out from one success port.
+
+    The source enters the first candidate. A failed candidate advances to the
+    next one, while a successful candidate keeps its own success flow. Original
+    failure settings are saved so removing the fan-out is reversible.
+    """
+    if not 0 < source <= len(steps):
+        return []
+    source_step = steps[source - 1]
+    previous = source_step.get("success_candidates") or []
+    if isinstance(previous, list):
+        for value in previous:
+            try:
+                target = int(value)
+            except (TypeError, ValueError):
+                continue
+            if not 0 < target <= len(steps):
+                continue
+            candidate = steps[target - 1]
+            automation = candidate.get("_automation")
+            if not isinstance(automation, dict) or int(automation.get("success_candidate_source") or 0) != source:
+                continue
+            if automation.pop("candidate_original_fail_present", False):
+                candidate["on_fail"] = int(automation.pop("candidate_original_on_fail", 0) or 0)
+            else:
+                candidate.pop("on_fail", None)
+                automation.pop("candidate_original_on_fail", None)
+            if automation.pop("candidate_original_abort_present", False):
+                candidate["abort_on_fail"] = bool(automation.pop("candidate_original_abort_on_fail", False))
+            else:
+                candidate.pop("abort_on_fail", None)
+                automation.pop("candidate_original_abort_on_fail", None)
+            for key in ("success_candidate_source", "success_candidate_position", "success_candidate_count"):
+                automation.pop(key, None)
+            if automation:
+                candidate["_automation"] = automation
+            else:
+                candidate.pop("_automation", None)
+
+    normalized: list[int] = []
+    for value in candidates:
+        try:
+            target = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < target <= len(steps) and target != source and target not in normalized:
+            normalized.append(target)
+    if not normalized:
+        source_step.pop("success_candidates", None)
+        source_step.pop("on_success", None)
+        return []
+    source_step["on_success"] = normalized[0]
+    if len(normalized) == 1:
+        source_step.pop("success_candidates", None)
+        return normalized
+
+    source_step["success_candidates"] = normalized
+    for position, target in enumerate(normalized):
+        candidate = steps[target - 1]
+        automation = candidate.get("_automation") if isinstance(candidate.get("_automation"), dict) else {}
+        automation["candidate_original_fail_present"] = "on_fail" in candidate
+        automation["candidate_original_on_fail"] = int(candidate.get("on_fail") or 0)
+        automation["candidate_original_abort_present"] = "abort_on_fail" in candidate
+        automation["candidate_original_abort_on_fail"] = bool(candidate.get("abort_on_fail", False))
+        automation.update(
+            {
+                "success_candidate_source": source,
+                "success_candidate_position": position + 1,
+                "success_candidate_count": len(normalized),
+            }
+        )
+        candidate["_automation"] = automation
+        if position + 1 < len(normalized):
+            candidate["on_fail"] = normalized[position + 1]
+            candidate["abort_on_fail"] = False
+    return normalized
+
+
 def _window_label(window: dict[str, Any]) -> str:
     return str(window.get("exe") or window.get("title") or "대상 창")
 
@@ -349,7 +430,7 @@ class RecordingBar(QtWidgets.QDialog):
         self._event_positions: dict[str, list[float]] = {}
         self._last_live_signature: tuple[str, ...] = ()
         self._live_events: list[dict[str, Any]] = []
-        self._live_link_overrides: dict[tuple[str, str], str | None] = {}
+        self._live_link_overrides: dict[tuple[str, str], str | list[str] | None] = {}
         self._live_multi_groups: dict[str, str] = {}
         self._live_rebuild_pending = False
         self.timer = QtCore.QTimer(self)
@@ -538,6 +619,9 @@ class RecordingBar(QtWidgets.QDialog):
                         steps[index - 1]["stop_on_success"] = True
             for position, index in enumerate(first_indexes):
                 steps[index - 1]["abort_on_fail"] = True
+                automation = steps[index - 1].get("_automation") if isinstance(steps[index - 1].get("_automation"), dict) else {}
+                automation.update({"start_workflow_candidate": True, "hide_candidate_fail_edge": True})
+                steps[index - 1]["_automation"] = automation
                 if position + 1 < len(first_indexes):
                     steps[index - 1]["on_fail"] = first_indexes[position + 1]
                     steps[index - 1]["abort_on_fail"] = False
@@ -548,6 +632,13 @@ class RecordingBar(QtWidgets.QDialog):
         for (source_id, kind), target_id in self._live_link_overrides.items():
             source_index = event_index.get(source_id)
             if source_index is None:
+                continue
+            if kind == "success" and isinstance(target_id, list):
+                configure_success_candidates(
+                    steps,
+                    source_index,
+                    [event_index[value] for value in target_id if value in event_index],
+                )
                 continue
             field = "on_fail" if kind == "fail" else "on_success"
             if target_id is None or target_id not in event_index:
@@ -569,7 +660,27 @@ class RecordingBar(QtWidgets.QDialog):
         target_id = str(self.live_canvas.steps[target - 1].get("_event_id") or "")
         if not source_id or not target_id:
             return
-        self._live_link_overrides[(source_id, "fail" if kind == "fail" else "success")] = target_id
+        normalized_kind = "fail" if kind == "fail" else "success"
+        if normalized_kind == "success":
+            old_target = self.live_canvas.retargeting_target(source, normalized_kind)
+            current = self._live_link_overrides.get((source_id, normalized_kind))
+            if isinstance(current, list):
+                candidates = list(current)
+            else:
+                candidates = []
+                current_target = int(self.live_canvas.steps[source - 1].get("on_success") or 0)
+                if 0 < current_target <= len(self.live_canvas.steps):
+                    current_id = str(self.live_canvas.steps[current_target - 1].get("_event_id") or "")
+                    if current_id:
+                        candidates.append(current_id)
+            if old_target:
+                old_id = str(self.live_canvas.steps[old_target - 1].get("_event_id") or "") if old_target <= len(self.live_canvas.steps) else ""
+                candidates = [target_id if value == old_id else value for value in candidates]
+            elif target_id not in candidates:
+                candidates.append(target_id)
+            self._live_link_overrides[(source_id, normalized_kind)] = candidates if len(candidates) > 1 else target_id
+        else:
+            self._live_link_overrides[(source_id, normalized_kind)] = target_id
         self._schedule_live_rebuild()
 
     def _delete_live_edge(self, source: int, _target: int, kind: str) -> None:
@@ -577,7 +688,17 @@ class RecordingBar(QtWidgets.QDialog):
             return
         source_id = str(self.live_canvas.steps[source - 1].get("_event_id") or "")
         if source_id:
-            self._live_link_overrides[(source_id, "fail" if kind == "fail" else "success")] = None
+            normalized_kind = "fail" if kind == "fail" else "success"
+            key = (source_id, normalized_kind)
+            current = self._live_link_overrides.get(key)
+            if normalized_kind == "success" and isinstance(current, list):
+                target_id = ""
+                if 0 < _target <= len(self.live_canvas.steps):
+                    target_id = str(self.live_canvas.steps[_target - 1].get("_event_id") or "")
+                remaining = [value for value in current if value != target_id]
+                self._live_link_overrides[key] = remaining if len(remaining) > 1 else (remaining[0] if remaining else None)
+            else:
+                self._live_link_overrides[key] = None
             self._schedule_live_rebuild()
 
     def _merge_live_image_nodes(self, indexes: list[int]) -> None:
@@ -612,7 +733,7 @@ class RecordingBar(QtWidgets.QDialog):
         self._remember_live_positions()
         return dict(self._event_positions)
 
-    def event_links(self) -> dict[tuple[str, str], str | None]:
+    def event_links(self) -> dict[tuple[str, str], str | list[str] | None]:
         return dict(self._live_link_overrides)
 
     def multi_groups(self) -> dict[str, str]:
@@ -1606,11 +1727,15 @@ class SmartRecordingController(QtCore.QObject):
                 event["_live_position"] = list(live_positions[event_id])
             if event_id in live_multi_groups:
                 event["_review_multi_group"] = live_multi_groups[event_id]
-            event_links: dict[str, str | None] = {}
+            event_links: dict[str, Any] = {}
             for kind in ("success", "fail"):
                 key = (event_id, kind)
                 if key in live_links:
-                    event_links[kind] = live_links[key]
+                    value = live_links[key]
+                    if kind == "success" and isinstance(value, list):
+                        event_links["success_candidates"] = list(value)
+                    else:
+                        event_links[kind] = value
             if event_links:
                 event["_live_links"] = event_links
         try:
@@ -2726,6 +2851,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                             "candidate_position": position + 1,
                             "candidate_count": len(first_indexes),
                             "all_failed_behavior": "stop",
+                            "hide_candidate_fail_edge": True,
                         }
                     )
                     step["_automation"] = automation
@@ -2785,7 +2911,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             for event_id in step.get("_recording_event_ids") or []:
                 if str(event_id):
                     event_to_step[str(event_id)] = index
-        for step in steps:
+        for step_index, step in enumerate(steps, start=1):
             links = step.pop("_live_links", {})
             step.pop("_recording_event_ids", None)
             if not isinstance(links, dict):
@@ -2798,6 +2924,12 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 elif str(target_id) in event_to_step:
                     step["on_success"] = event_to_step[str(target_id)]
                     step.pop("stop_on_success", None)
+            if isinstance(links.get("success_candidates"), list):
+                configure_success_candidates(
+                    steps,
+                    step_index,
+                    [event_to_step[str(value)] for value in links["success_candidates"] if str(value) in event_to_step],
+                )
             if "fail" in links:
                 target_id = links.get("fail")
                 if target_id is None:
@@ -2839,6 +2971,22 @@ class AutomationAnalyzer:
                     issues.append(
                         AutomationIssue("error", "잘못된 연결", f"{field} 목적지 {target}번이 없습니다.", index, f"clear:{index}:{field}")
                     )
+            candidates = step.get("success_candidates") or []
+            if isinstance(candidates, list):
+                for target in candidates:
+                    try:
+                        candidate_target = int(target)
+                    except (TypeError, ValueError):
+                        candidate_target = 0
+                    if not 1 <= candidate_target <= total:
+                        issues.append(
+                            AutomationIssue(
+                                "error",
+                                "잘못된 성공 후보",
+                                f"성공 후보 목적지 {target}번이 없습니다.",
+                                index,
+                            )
+                        )
             if action == "image_search":
                 image_aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
                 alias = str(step.get("asset") or "")

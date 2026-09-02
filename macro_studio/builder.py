@@ -15,6 +15,7 @@ from .automation import (
     QuickActionWizard,
     RecordingReviewDialog,
     SmartRecordingController,
+    configure_success_candidates,
 )
 from .log_dialog import MacroLogDialog
 from .inactive_click_lab import HandlePointPicker, InactiveClickLabDialog
@@ -427,6 +428,7 @@ class BuilderPage(QtWidgets.QWidget):
         self._action_settings_dialog: ActionEditorDialog | None = None
         self._log_dialog: MacroLogDialog | None = None
         self._recording_controller: SmartRecordingController | None = None
+        self._recording_review_dialog: RecordingReviewDialog | None = None
         self._automation_overlay: AutomationOverlay | None = None
         self._collapsed_groups: set[str] = set()
         self._last_recording_path = self.repository.root / ".automation" / "last-recording.json"
@@ -1263,11 +1265,17 @@ class BuilderPage(QtWidgets.QWidget):
         self.steps_table.blockSignals(True)
         self.steps_table.setRowCount(len(steps))
         for row, step in enumerate(steps):
+            success_candidates = step.get("success_candidates") or []
+            success_text = (
+                "후보 " + ",".join(str(int(value)) for value in success_candidates)
+                if isinstance(success_candidates, list) and len(success_candidates) > 1
+                else str(step.get("on_success") or "자동")
+            )
             values = [
                 str(row + 1),
                 str(step.get("action") or ""),
                 str(step.get("label") or self._step_summary(step)),
-                str(step.get("on_success") or "자동"),
+                success_text,
                 str(step.get("on_fail") or "자동"),
             ]
             for column, value in enumerate(values):
@@ -1436,10 +1444,22 @@ class BuilderPage(QtWidgets.QWidget):
             return
         field = "on_fail" if kind == "fail" else "on_success"
         delay_field = "on_fail_delay" if kind == "fail" else "on_success_delay"
-        steps[source - 1][field] = target
+        if kind == "success":
+            old_target = self.node_canvas.retargeting_target(source, kind)
+            current = steps[source - 1].get("success_candidates") or []
+            candidates = [int(value) for value in current if str(value).lstrip("-").isdigit()] if isinstance(current, list) else []
+            if not candidates and int(steps[source - 1].get("on_success") or 0):
+                candidates = [int(steps[source - 1]["on_success"])]
+            if old_target:
+                candidates = [target if value == old_target else value for value in candidates]
+            elif target not in candidates:
+                candidates.append(target)
+            configure_success_candidates(steps, source, candidates)
+        else:
+            steps[source - 1][field] = target
         steps[source - 1].setdefault(delay_field, 300)
         self._persist(f"{source}번 노드의 {'실패' if kind == 'fail' else '성공'} 흐름을 {target}번에 연결했습니다.")
-        self._refresh_steps(source - 1)
+        QtCore.QTimer.singleShot(0, lambda: self._refresh_steps(source - 1))
 
     @QtCore.Slot(list)
     def _merge_graph_image_nodes(self, indexes: list[int]) -> None:
@@ -1518,12 +1538,17 @@ class BuilderPage(QtWidgets.QWidget):
             return
         field = "on_fail" if kind == "fail" else "on_success"
         delay_field = "on_fail_delay" if kind == "fail" else "on_success_delay"
-        if int(steps[source - 1].get(field) or 0) != target:
-            return
-        steps[source - 1].pop(field, None)
-        steps[source - 1].pop(delay_field, None)
+        candidates = steps[source - 1].get("success_candidates") or []
+        if kind == "success" and isinstance(candidates, list) and target in [int(value) for value in candidates]:
+            configure_success_candidates(steps, source, [int(value) for value in candidates if int(value) != target])
+        else:
+            if int(steps[source - 1].get(field) or 0) != target:
+                return
+            steps[source - 1].pop(field, None)
+        if kind != "success" or not steps[source - 1].get("success_candidates"):
+            steps[source - 1].pop(delay_field, None)
         self._persist(f"{source}번 노드의 연결을 끊었습니다.")
-        self._refresh_steps(source - 1)
+        QtCore.QTimer.singleShot(0, lambda: self._refresh_steps(source - 1))
 
     @QtCore.Slot(int, int, str)
     def _set_graph_edge_delay(self, source: int, target: int, kind: str) -> None:
@@ -1531,7 +1556,10 @@ class BuilderPage(QtWidgets.QWidget):
         if not 0 < source <= len(steps):
             return
         field = "on_fail" if kind == "fail" else "on_success"
-        if int(steps[source - 1].get(field) or 0) != target:
+        candidate_targets = steps[source - 1].get("success_candidates") or []
+        if int(steps[source - 1].get(field) or 0) != target and not (
+            kind == "success" and isinstance(candidate_targets, list) and target in [int(value) for value in candidate_targets]
+        ):
             return
         delay_field = "on_fail_delay" if kind == "fail" else "on_success_delay"
         step = steps[source - 1]
@@ -1551,7 +1579,7 @@ class BuilderPage(QtWidgets.QWidget):
         else:
             step.pop("edge_conditions", None)
         self._persist("노드라인 딜레이와 조건 분기를 저장했습니다.")
-        self._refresh_steps(source - 1)
+        QtCore.QTimer.singleShot(0, lambda: self._refresh_steps(source - 1))
 
     @QtCore.Slot(int, int)
     def _delete_graph_condition(self, source: int, condition_index: int) -> None:
@@ -1827,6 +1855,13 @@ class BuilderPage(QtWidgets.QWidget):
                 target = int(step.get(field) or 0)
                 if target:
                     step[field] = target + base
+            if isinstance(step.get("success_candidates"), list):
+                step["success_candidates"] = [int(value) + base for value in step["success_candidates"]]
+            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+            for field in ("success_candidate_source", "candidate_original_on_fail"):
+                value = int(automation.get(field) or 0)
+                if value:
+                    automation[field] = value + base
             conditions = step.get("edge_conditions") or []
             if isinstance(conditions, list):
                 for rule in conditions:
@@ -1931,16 +1966,35 @@ class BuilderPage(QtWidgets.QWidget):
         self._recording_controller = None
         events = self._apply_saved_handle_profiles(events)
         self._remember_last_recording(events)
-        dialog = RecordingReviewDialog(events, self.repository, self.window())
-        dialog.events_changed.connect(self._remember_last_recording)
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            self.status.emit("검토창을 닫았습니다. '최근 녹화 검토'에서 다시 열 수 있습니다.")
+        if self._recording_review_dialog is not None:
+            self._recording_review_dialog.show()
+            self._recording_review_dialog.raise_()
+            self._recording_review_dialog.activateWindow()
             return
+        dialog = RecordingReviewDialog(events, self.repository, self.window())
+        dialog.setWindowModality(QtCore.Qt.NonModal)
+        self._recording_review_dialog = dialog
+        dialog.events_changed.connect(self._remember_last_recording)
+        dialog.accepted.connect(lambda: QtCore.QTimer.singleShot(0, lambda: self._finish_smart_recording_review(dialog)))
+        dialog.rejected.connect(lambda: self._close_smart_recording_review(dialog))
+        dialog.show()
+
+    def _close_smart_recording_review(self, dialog: RecordingReviewDialog) -> None:
+        if self._recording_review_dialog is dialog:
+            self._recording_review_dialog = None
+        dialog.deleteLater()
+        self.status.emit("검토창을 닫았습니다. '최근 녹화 검토'에서 다시 열 수 있습니다.")
+
+    def _finish_smart_recording_review(self, dialog: RecordingReviewDialog) -> None:
         try:
             steps = dialog.build_steps()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "녹화 변환 실패", str(exc))
+            self._close_smart_recording_review(dialog)
             return
+        if self._recording_review_dialog is dialog:
+            self._recording_review_dialog = None
+        dialog.deleteLater()
         self._append_automation_steps(steps, f"스마트 녹화에서 노드 {len(steps)}개를 추가했습니다.")
         self.data_changed.emit()
 
@@ -2248,6 +2302,39 @@ class BuilderPage(QtWidgets.QWidget):
                     step[field] = mapping[target]
                 else:
                     step.pop(field, None)
+            candidates = step.get("success_candidates") or []
+            if isinstance(candidates, list):
+                remapped_candidates = [mapping[int(value)] for value in candidates if int(value) in mapping]
+                if len(remapped_candidates) > 1:
+                    step["success_candidates"] = remapped_candidates
+                    step["on_success"] = remapped_candidates[0]
+                else:
+                    step.pop("success_candidates", None)
+                    if remapped_candidates:
+                        step["on_success"] = remapped_candidates[0]
+            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+            candidate_source = int(automation.get("success_candidate_source") or 0)
+            if candidate_source:
+                if candidate_source in mapping:
+                    automation["success_candidate_source"] = mapping[candidate_source]
+                else:
+                    for field in (
+                        "success_candidate_source",
+                        "success_candidate_position",
+                        "success_candidate_count",
+                        "candidate_original_fail_present",
+                        "candidate_original_on_fail",
+                        "candidate_original_abort_present",
+                        "candidate_original_abort_on_fail",
+                    ):
+                        automation.pop(field, None)
+            original_fail = int(automation.get("candidate_original_on_fail") or 0)
+            if original_fail:
+                if original_fail in mapping:
+                    automation["candidate_original_on_fail"] = mapping[original_fail]
+                else:
+                    automation["candidate_original_on_fail"] = 0
+                    automation["candidate_original_fail_present"] = False
             conditions = step.get("edge_conditions") or []
             if isinstance(conditions, list):
                 normalized = []
@@ -2323,6 +2410,15 @@ class BuilderPage(QtWidgets.QWidget):
         valid_keys: set[str] = set()
         steps = self.current_macro.get("steps") or []
         for source, step in enumerate(steps, start=1):
+            candidates = step.get("success_candidates") or []
+            if isinstance(candidates, list):
+                for value in candidates:
+                    try:
+                        target = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if 1 <= target <= len(steps):
+                        valid_keys.add(f"{source}:success:{target}:-1")
             for field, kind in (("on_success", "success"), ("on_fail", "fail")):
                 target = int(step.get(field) or 0)
                 if 1 <= target <= len(steps):
@@ -2363,12 +2459,38 @@ class BuilderPage(QtWidgets.QWidget):
         steps = (self.current_macro or {}).get("steps") or []
         old_count = len(steps) + 1
         for step in steps:
+            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+            if int(automation.get("success_candidate_source") or 0) == deleted:
+                if automation.pop("candidate_original_fail_present", False):
+                    step["on_fail"] = int(automation.pop("candidate_original_on_fail", 0) or 0)
+                else:
+                    step.pop("on_fail", None)
+                    automation.pop("candidate_original_on_fail", None)
+                if automation.pop("candidate_original_abort_present", False):
+                    step["abort_on_fail"] = bool(automation.pop("candidate_original_abort_on_fail", False))
+                else:
+                    step.pop("abort_on_fail", None)
+                    automation.pop("candidate_original_abort_on_fail", None)
+                for field in ("success_candidate_source", "success_candidate_position", "success_candidate_count"):
+                    automation.pop(field, None)
             for field in ("on_success", "on_fail", "target_step", "jump_to"):
                 value = int(step.get(field) or 0)
                 if value == deleted:
                     step.pop(field, None)
                 elif value > deleted:
                     step[field] = value - 1
+            if isinstance(step.get("success_candidates"), list):
+                step["success_candidates"] = [
+                    int(value) - 1 if int(value) > deleted else int(value)
+                    for value in step["success_candidates"]
+                    if int(value) != deleted
+                ]
+            for field in ("success_candidate_source", "candidate_original_on_fail"):
+                value = int(automation.get(field) or 0)
+                if value == deleted:
+                    automation[field] = 0
+                elif value > deleted:
+                    automation[field] = value - 1
             conditions = step.get("edge_conditions") or []
             if isinstance(conditions, list):
                 normalized_rules = []
@@ -2436,6 +2558,10 @@ class BuilderPage(QtWidgets.QWidget):
                 for old_index in range(1, old_count + 1)
                 if old_index != deleted
             }
+        for source, step in enumerate(steps, start=1):
+            candidates = step.get("success_candidates") or []
+            if isinstance(candidates, list) and candidates:
+                configure_success_candidates(steps, source, [int(value) for value in candidates])
         self._remap_graph_routes(mapping)
         self._remap_graph_collapsed(mapping)
 
@@ -2455,6 +2581,13 @@ class BuilderPage(QtWidgets.QWidget):
                 value = int(step.get(field) or 0)
                 if value in mapping:
                     step[field] = mapping[value]
+            if isinstance(step.get("success_candidates"), list):
+                step["success_candidates"] = [mapping.get(int(value), int(value)) for value in step["success_candidates"]]
+            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+            for field in ("success_candidate_source", "candidate_original_on_fail"):
+                value = int(automation.get(field) or 0)
+                if value in mapping:
+                    automation[field] = mapping[value]
             conditions = step.get("edge_conditions") or []
             if isinstance(conditions, list):
                 for rule in conditions:

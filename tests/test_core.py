@@ -2153,6 +2153,7 @@ class UiSmokeTests(unittest.TestCase):
     def test_recorded_image_strategy_uses_click_time_sample(self) -> None:
         from PySide6 import QtCore, QtGui, QtTest, QtWidgets
         from macro_studio.automation import RecordingReviewDialog
+        from macro_studio.node_editor import NodeCanvas
         from macro_studio.repository import MacroRepository
 
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -4970,10 +4971,97 @@ class SmartRecordingUiTests(unittest.TestCase):
         self.assertEqual(bar.multi_groups()["a"], bar.multi_groups()["b"])
         bar.close()
 
+    def test_success_port_fans_out_to_ordered_candidates_in_live_and_normal_canvas(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingBar, configure_success_candidates
+        from macro_studio.builder import BuilderPage
+        from macro_studio.node_editor import NodeCanvas
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        steps = [
+            {"action": "wait", "on_success": 2},
+            {"action": "image_search", "on_success": 5},
+            {"action": "image_search", "on_success": 5},
+            {"action": "image_search", "on_success": 5},
+            {"action": "wait"},
+        ]
+        self.assertEqual([2, 3, 4], configure_success_candidates(steps, 1, [2, 3, 4]))
+        self.assertEqual([2, 3, 4], steps[0]["success_candidates"])
+        self.assertEqual(3, steps[1]["on_fail"])
+        self.assertEqual(4, steps[2]["on_fail"])
+        self.assertEqual(5, steps[1]["on_success"], "candidate success must keep its own downstream flow")
+        canvas = NodeCanvas()
+        canvas.set_macro({"steps": steps})
+        source_success_targets = sorted(edge.target for edge in canvas.edges if edge.source == 1 and edge.kind == "success")
+        self.assertEqual([2, 3, 4], source_success_targets)
+        canvas.close()
+
+        bar = RecordingBar()
+        events = [
+            {"type": "mouse", "event_id": value, "t": index * 1000, "button": "Left", "x": index * 250, "y": 20, "workflow_id": "workflow-01"}
+            for index, value in enumerate(("a", "b", "c"), start=1)
+        ]
+        bar.update_live_events(events)
+        bar._connect_live_nodes(1, 3, "success")
+        app.processEvents()
+        self.assertEqual(["b", "c"], bar.event_links()[("a", "success")])
+        self.assertEqual([2, 3], bar.live_canvas.steps[0]["success_candidates"])
+        bar.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("fan-out")
+            payload = repository.load_macro("fan-out")
+            payload["steps"] = [
+                {"action": "screen_condition", "on_success": 2},
+                {"action": "screen_condition", "on_success": 4},
+                {"action": "screen_condition", "on_success": 4},
+                {"action": "wait", "duration": 10},
+            ]
+            repository.save_macro("fan-out", payload)
+            builder = BuilderPage(repository)
+            builder.refresh("fan-out")
+            builder._connect_graph_nodes(1, 3, "success")
+            app.processEvents()
+            self.assertEqual([2, 3], builder.current_macro["steps"][0]["success_candidates"])
+            self.assertEqual(3, builder.current_macro["steps"][1]["on_fail"])
+            builder.close()
+
+    def test_smart_recording_review_is_non_modal_and_finishes_after_accept(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("review-nonmodal")
+            builder = BuilderPage(repository)
+            builder.refresh("review-nonmodal")
+            event = {
+                "type": "wait_marker", "event_id": "wait-1", "t": 10, "duration": 1000,
+                "workflow_id": "workflow-01", "workflow_index": 1,
+            }
+            builder._review_smart_recording([event])
+            dialog = builder._recording_review_dialog
+            self.assertIsNotNone(dialog)
+            self.assertEqual(QtCore.Qt.NonModal, dialog.windowModality())
+            self.assertTrue(builder.window().isEnabled(), "review must never leave the Studio parent disabled")
+            dialog.accept()
+            app.processEvents()
+            app.processEvents()
+            self.assertIsNone(builder._recording_review_dialog)
+            self.assertEqual("wait", builder.current_macro["steps"][0]["action"])
+            builder.close()
+
     def test_workflow_first_nodes_compete_and_only_successful_lane_continues(self) -> None:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6 import QtWidgets
         from macro_studio.automation import RecordingReviewDialog
+        from macro_studio.node_editor import NodeCanvas
         from macro_studio.repository import MacroRepository
 
         _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -5012,6 +5100,11 @@ class SmartRecordingUiTests(unittest.TestCase):
             self.assertTrue(steps[1]["stop_on_success"])
             self.assertTrue(steps[3]["stop_on_success"])
             self.assertTrue(steps[5]["stop_on_success"])
+            self.assertTrue(steps[0]["_automation"]["hide_candidate_fail_edge"])
+            canvas = NodeCanvas()
+            canvas.set_macro({"steps": steps})
+            self.assertFalse(any(edge.kind == "fail" and edge.source in {1, 3} for edge in canvas.edges))
+            canvas.close()
             dialog.close()
 
     def test_custom_client_search_region_overrides_auto_region_without_full_fallback(self) -> None:

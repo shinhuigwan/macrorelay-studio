@@ -1,0 +1,58 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+plugins {
+    id "com.android.application"
+}
+
+def releaseKeystore = System.getenv("MACRORELAY_KEYSTORE_PATH")
+def endpointFile = rootProject.file("../remote/endpoint.json")
+def defaultRelayUrl = ""
+if (endpointFile.isFile()) {
+    def endpoint = new JsonSlurper().parse(endpointFile)
+    defaultRelayUrl = endpoint.relay_url ?: ""
+}
+
+android {
+    namespace "studio.macrorelay.remote"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "studio.macrorelay.remote"
+        minSdk 24
+        targetSdk 35
+        versionCode 22500
+        versionName "2.25.0"
+        buildConfigField "String", "DEFAULT_RELAY_URL", JsonOutput.toJson(defaultRelayUrl)
+    }
+
+    signingConfigs {
+        release {
+            if (releaseKeystore) {
+                storeFile file(releaseKeystore)
+                storePassword System.getenv("MACRORELAY_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("MACRORELAY_KEY_ALIAS")
+                keyPassword System.getenv("MACRORELAY_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            if (releaseKeystore) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+}

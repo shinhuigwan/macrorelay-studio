@@ -1,0 +1,10 @@
+{
+  "name": "MacroRelay Remote",
+  "short_name": "Relay Remote",
+  "description": "MacroRelay Studio 모바일 원격 제어",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07111f",
+  "theme_color": "#07111f",
+  "icons": [{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
+}

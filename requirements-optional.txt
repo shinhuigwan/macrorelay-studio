@@ -1,0 +1,6 @@
+# Optional integrations. Install only when those features are needed.
+opencv-python>=4.9
+pywin32>=306
+pywinauto>=0.6.8
+uiautomation>=2.0
+

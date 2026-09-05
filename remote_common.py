@@ -1,0 +1,202 @@
+"""Shared configuration and HTTP helpers for MacroRelay Remote."""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import secrets
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_RELAY_URL = "http://127.0.0.1:8765"
+REMOTE_SECRET_NAME = "macrorelay.remote.device_secret"
+
+
+def _vault_secret(root: Path, value: str | None = None) -> str:
+    """Read/write the remote device secret using the Studio DPAPI vault.
+
+    The import remains optional because remote_common.py is also copied into
+    lightweight notification bundles. Studio installations on Windows always
+    have the vault module and therefore never need the plaintext fallback.
+    """
+    try:
+        from macro_studio.credential_vault import CredentialVault
+
+        vault = CredentialVault(root)
+        if value is not None:
+            vault.set(REMOTE_SECRET_NAME, value)
+            return value
+        return vault.get(REMOTE_SECRET_NAME)
+    except Exception:
+        return ""
+
+
+def bundled_cloud_url(root: Path | None = None) -> str:
+    path = (root or Path(__file__).resolve().parent) / "remote" / "endpoint.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ""
+    value = str(payload.get("relay_url") or "").strip().rstrip("/") if isinstance(payload, dict) else ""
+    return value if value.startswith("https://") else ""
+
+
+def config_path(root: Path | None = None) -> Path:
+    direct = (root or Path(__file__).resolve().parent) / "remote_config.json"
+    if direct.is_file():
+        return direct
+    current = (root or Path(__file__).resolve().parent).resolve()
+    for parent in [current, *current.parents]:
+        candidate = parent / "remote_config.json"
+        if candidate.is_file():
+            return candidate
+    return direct
+
+
+def default_config() -> dict[str, Any]:
+    return {
+        # New installations connect as soon as Studio opens. Users can still
+        # turn mobile access off explicitly in Settings.
+        "enabled": True,
+        "relay_url": DEFAULT_RELAY_URL,
+        "prefer_cloud": True,
+        "device_name": platform.node() or "MacroRelay PC",
+        "device_id": uuid.uuid4().hex,
+        "device_secret": secrets.token_urlsafe(32),
+        "allow_remote_run": True,
+        "allow_remote_stop": True,
+        "allowed_macros": [],
+    }
+
+
+def load_config(root: Path | None = None, create: bool = True) -> dict[str, Any]:
+    root_path = (root or Path(__file__).resolve().parent).resolve()
+    path = config_path(root_path)
+    payload: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, ValueError):
+            payload = {}
+    changed = False
+    defaults = default_config()
+    generated_secret = str(defaults.pop("device_secret"))
+    for key, value in defaults.items():
+        if key not in payload:
+            payload[key] = value
+            changed = True
+    plaintext_secret = str(payload.pop("device_secret", "") or "").strip()
+    secured_secret = _vault_secret(root_path)
+    if not secured_secret:
+        secured_secret = plaintext_secret or generated_secret
+        if create and _vault_secret(root_path, secured_secret):
+            changed = True
+        elif plaintext_secret:
+            # Non-Windows/standalone compatibility fallback. Studio on
+            # Windows never takes this branch because DPAPI is available.
+            payload["device_secret"] = plaintext_secret
+    elif plaintext_secret:
+        # Existing plaintext configuration has now been migrated.
+        changed = True
+    payload["device_secret"] = secured_secret
+    cloud_url = bundled_cloud_url(root)
+    configured_url = str(payload.get("relay_url") or "").rstrip("/")
+    if payload.get("prefer_cloud", True) and cloud_url and configured_url in {"", DEFAULT_RELAY_URL}:
+        payload["relay_url"] = cloud_url
+        payload["enabled"] = True
+        changed = True
+    if create and (changed or not path.exists()):
+        save_config(payload, root)
+    return payload
+
+
+def save_config(payload: dict[str, Any], root: Path | None = None) -> Path:
+    root_path = (root or Path(__file__).resolve().parent).resolve()
+    path = config_path(root_path)
+    stored = dict(payload)
+    secret = str(stored.pop("device_secret", "") or "").strip()
+    if secret and not _vault_secret(root_path, secret):
+        stored["device_secret"] = secret
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(stored, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def request_json(
+    relay_url: str,
+    method: str,
+    route: str,
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    base = str(relay_url or DEFAULT_RELAY_URL).rstrip("/")
+    url = base + (route if route.startswith("/") else "/" + route)
+    data = None
+    merged_headers = {"Accept": "application/json", "User-Agent": "MacroRelay-Remote/1"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        merged_headers["Content-Type"] = "application/json; charset=utf-8"
+    merged_headers.update(headers or {})
+    request = urllib.request.Request(url, data=data, headers=merged_headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw or "{}")
+            return parsed if isinstance(parsed, dict) else {"ok": False, "error": "invalid_response"}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = {"error": raw or str(exc)}
+        parsed.setdefault("ok", False)
+        parsed.setdefault("status", exc.code)
+        return parsed
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        return {"ok": False, "error": "connection_failed", "detail": str(reason)}
+
+
+def agent_headers(config: dict[str, Any]) -> dict[str, str]:
+    return {
+        "X-MacroRelay-Device": str(config.get("device_id") or ""),
+        "X-MacroRelay-Secret": str(config.get("device_secret") or ""),
+    }
+
+
+def post_agent_event(
+    config: dict[str, Any],
+    event_type: str,
+    message: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+    return request_json(
+        str(config.get("relay_url") or DEFAULT_RELAY_URL),
+        "POST",
+        "/api/agent/events",
+        {"type": event_type, "message": message, "payload": payload or {}},
+        agent_headers(config),
+        timeout,
+    )

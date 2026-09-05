@@ -1,0 +1,571 @@
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from .repository import MacroRepository
+from .diagnostics import build_diagnostic_bundle
+from .theme import COLORS
+
+
+class MacroLogDialog(QtWidgets.QDialog):
+    """가벼운 파일 감시 방식으로 Studio와 매크로 실행 로그를 보여줍니다."""
+
+    MAX_BYTES = 512 * 1024
+
+    def __init__(self, repository: MacroRepository, parent=None) -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.setWindowTitle("실행 로그 · MacroRelay Studio")
+        self.setWindowModality(QtCore.Qt.NonModal)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        self.resize(980, 760)
+
+        self.sources: list[tuple[str, tuple[Path, ...]]] = [
+            (
+                "통합 로그",
+                (
+                    repository.exports_dir / "studio_run.log",
+                    repository.exports_dir / "macro_log.txt",
+                ),
+            ),
+            ("Studio 실행", (repository.exports_dir / "studio_run.log",)),
+            ("매크로 실행", (repository.exports_dir / "macro_log.txt",)),
+            ("단계 실행 추적", (repository.exports_dir / "execution_trace.log",)),
+            ("Quick Slots", (repository.root / "runtime" / "runner.log",)),
+            ("브라우저", (repository.exports_dir / "browser_action_log.txt",)),
+            ("비활성 클릭", (repository.exports_dir / "inactive_click_test.log",)),
+        ]
+        self._signature: tuple[tuple[str, int, int], ...] = ()
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
+        title = QtWidgets.QLabel("실행 로그")
+        title.setStyleSheet("font-size: 17pt; font-weight: 750;")
+        subtitle = QtWidgets.QLabel("실행 요청, 시작 PID, 종료 코드와 매크로 단계별 기록을 자동으로 갱신합니다.")
+        subtitle.setObjectName("Muted")
+        root.addWidget(title)
+        root.addWidget(subtitle)
+
+        debugger = QtWidgets.QGroupBox("실행 디버거")
+        debugger_layout = QtWidgets.QVBoxLayout(debugger)
+        debugger_header = QtWidgets.QHBoxLayout()
+        self.debug_status = QtWidgets.QLabel("실행 대기")
+        self.debug_status.setStyleSheet("font-weight:700; color:#9DA7BA;")
+        pause_btn = QtWidgets.QPushButton("Ⅱ 일시정지")
+        step_btn = QtWidgets.QPushButton("▷ 한 단계")
+        resume_btn = QtWidgets.QPushButton("▶ 재개")
+        variable_btn = QtWidgets.QPushButton("✎ 변수값 테스트")
+        stop_btn = QtWidgets.QPushButton("■ 중단")
+        pause_btn.clicked.connect(lambda: self._invoke_host("pause_running_macros"))
+        step_btn.clicked.connect(lambda: self._invoke_host("step_running_macros"))
+        resume_btn.clicked.connect(lambda: self._invoke_host("resume_running_macros"))
+        variable_btn.clicked.connect(self._override_variable)
+        stop_btn.clicked.connect(lambda: self._invoke_host("stop_running_macros"))
+        self.debug_control_buttons = (pause_btn, step_btn, resume_btn, variable_btn, stop_btn)
+        debugger_header.addWidget(self.debug_status, 1)
+        debugger_header.addWidget(pause_btn)
+        debugger_header.addWidget(step_btn)
+        debugger_header.addWidget(resume_btn)
+        debugger_header.addWidget(variable_btn)
+        debugger_header.addWidget(stop_btn)
+        debugger_layout.addLayout(debugger_header)
+        debugger_split = QtWidgets.QSplitter()
+        self.timeline_table = QtWidgets.QTableWidget(0, 5)
+        self.timeline_table.setHorizontalHeaderLabels(["노드", "동작", "상태", "소요 시간", "결과 상세"])
+        self.timeline_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.timeline_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.timeline_table.verticalHeader().setVisible(False)
+        self.timeline_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        self.timeline_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        self.timeline_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        self.timeline_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        self.timeline_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
+        self.variable_table = QtWidgets.QTableWidget(0, 2)
+        self.variable_table.setHorizontalHeaderLabels(["변수", "현재 값"])
+        self.variable_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.variable_table.verticalHeader().setVisible(False)
+        self.variable_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        self.variable_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        debugger_split.addWidget(self.timeline_table)
+        debugger_split.addWidget(self.variable_table)
+        debugger_split.setSizes([680, 240])
+        debugger_layout.addWidget(debugger_split)
+        performance_box = QtWidgets.QGroupBox("성능 분석")
+        performance_layout = QtWidgets.QVBoxLayout(performance_box)
+        self.performance_summary = QtWidgets.QLabel("실행 데이터가 쌓이면 느린 노드와 실패율을 분석합니다.")
+        self.performance_summary.setObjectName("Muted")
+        self.performance_summary.setWordWrap(True)
+        self.performance_table = QtWidgets.QTableWidget(0, 6)
+        self.performance_table.setHorizontalHeaderLabels(["노드", "동작", "실행", "평균", "최대", "실패율"])
+        self.performance_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.performance_table.verticalHeader().setVisible(False)
+        for column in (0, 2, 3, 4, 5):
+            self.performance_table.horizontalHeader().setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeToContents)
+        self.performance_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.performance_table.setMaximumHeight(170)
+        performance_layout.addWidget(self.performance_summary)
+        performance_layout.addWidget(self.performance_table)
+        debugger_layout.addWidget(performance_box)
+        root.addWidget(debugger, 1)
+
+        controls = QtWidgets.QHBoxLayout()
+        self.source_combo = QtWidgets.QComboBox()
+        for label, _paths in self.sources:
+            self.source_combo.addItem(label)
+        self.source_combo.currentIndexChanged.connect(self.refresh)
+        refresh_btn = QtWidgets.QPushButton("새로고침")
+        refresh_btn.clicked.connect(lambda: self.refresh(force=True))
+        clear_btn = QtWidgets.QPushButton("현재 로그 지우기")
+        clear_btn.clicked.connect(self._clear_current)
+        bundle_btn = QtWidgets.QPushButton("진단 자료 저장")
+        bundle_btn.setToolTip("로그·실행 추적·엔진 상태를 개인정보 제거 후 ZIP으로 저장")
+        bundle_btn.clicked.connect(self._save_diagnostic_bundle)
+        controls.addWidget(self.source_combo, 1)
+        controls.addWidget(refresh_btn)
+        controls.addWidget(clear_btn)
+        controls.addWidget(bundle_btn)
+        root.addLayout(controls)
+
+        self.path_label = QtWidgets.QLabel()
+        self.path_label.setObjectName("Muted")
+        self.path_label.setWordWrap(True)
+        root.addWidget(self.path_label)
+
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        fixed_font.setPointSize(10)
+        self.log_view.setFont(fixed_font)
+        self.log_view.setStyleSheet(
+            f"QPlainTextEdit {{ background:#0C0F15; border-color:{COLORS['border']}; color:#DCE5F2; }}"
+        )
+        self.log_view.setMaximumHeight(230)
+        root.addWidget(self.log_view)
+
+        hint = QtWidgets.QLabel("로그가 비어 있으면 실행 버튼을 누른 뒤 이 창에서 실패 지점과 종료 코드를 확인하세요.")
+        hint.setObjectName("Muted")
+        root.addWidget(hint)
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(750)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start()
+        self.refresh(force=True)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._place_next_to_parent()
+        self.refresh(force=True)
+
+    def _place_next_to_parent(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        host = parent.window().frameGeometry()
+        screen = QtGui.QGuiApplication.screenAt(host.center()) or QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        size = self.frameGeometry().size()
+        x = host.right() + 12
+        if x + size.width() > available.right() + 1:
+            x = host.left() - size.width() - 12
+        if x < available.left():
+            x = available.right() - size.width() + 1
+        y = max(available.top(), min(host.top() + 48, available.bottom() - size.height() + 1))
+        self.move(x, y)
+
+    def _current_paths(self) -> tuple[Path, ...]:
+        index = max(0, min(self.source_combo.currentIndex(), len(self.sources) - 1))
+        return self.sources[index][1]
+
+    def _file_signature(self, paths: tuple[Path, ...]) -> tuple[tuple[str, int, int], ...]:
+        result: list[tuple[str, int, int]] = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                result.append((str(path), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                result.append((str(path), 0, 0))
+        return tuple(result)
+
+    @QtCore.Slot()
+    def refresh(self, force: bool = False) -> None:
+        self._refresh_debugger()
+        paths = self._current_paths()
+        signature = self._file_signature(paths)
+        if not force and signature == self._signature:
+            return
+        self._signature = signature
+        self.path_label.setText("  ·  ".join(str(path) for path in paths))
+        blocks: list[str] = []
+        for path in paths:
+            label = next((name for name, source_paths in self.sources[1:] if path in source_paths), path.name)
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(max(0, path.stat().st_size - self.MAX_BYTES))
+                    raw = handle.read()
+                content = raw.decode("utf-8-sig", errors="replace").strip()
+            except OSError:
+                content = "(아직 기록된 로그가 없습니다.)"
+            blocks.append(f"[{label}]\n{content or '(로그가 비어 있습니다.)'}")
+        self.log_view.setPlainText("\n\n".join(blocks))
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+        self.log_view.setTextCursor(cursor)
+
+    def _invoke_host(self, method_name: str) -> None:
+        host = self.parentWidget()
+        method = getattr(host, method_name, None)
+        if callable(method):
+            method()
+        self._refresh_debugger()
+
+    def _override_variable(self) -> None:
+        host = self.parentWidget()
+        setter = getattr(host, "set_running_variable", None)
+        if not callable(setter):
+            return
+        selected = self.variable_table.currentRow()
+        default_name = self.variable_table.item(selected, 0).text() if selected >= 0 and self.variable_table.item(selected, 0) else ""
+        default_value = self.variable_table.item(selected, 1).text() if selected >= 0 and self.variable_table.item(selected, 1) else ""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("실행 중 변수값 테스트")
+        dialog.setMinimumWidth(480)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        form = QtWidgets.QFormLayout()
+        name_edit = QtWidgets.QLineEdit(default_name)
+        name_edit.setPlaceholderText("예: run_count")
+        value_edit = QtWidgets.QLineEdit(default_value)
+        form.addRow("변수", name_edit)
+        form.addRow("임시 값", value_edit)
+        layout.addLayout(form)
+        impact = QtWidgets.QLabel()
+        impact.setWordWrap(True)
+        impact.setStyleSheet("background:#101722; border:1px solid #2E3B50; border-radius:8px; padding:10px;")
+        layout.addWidget(impact)
+
+        def update_impact() -> None:
+            impact.setText(self._variable_impact(name_edit.text(), value_edit.text()))
+
+        name_edit.textChanged.connect(update_impact)
+        value_edit.textChanged.connect(update_impact)
+        update_impact()
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Apply | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Apply).setText("다음 노드부터 적용")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        if not setter(name_edit.text(), value_edit.text()):
+            QtWidgets.QMessageBox.warning(dialog, "변수 변경 실패", "실행 중인 매크로가 없거나 변수 이름이 올바르지 않습니다.")
+
+    def _variable_impact(self, name: str, value: str) -> str:
+        variable = str(name or "").strip().lstrip("$")
+        host = self.parentWidget()
+        builder = getattr(host, "pages", {}).get("builder") if host is not None else None
+        macro = getattr(builder, "current_macro", None) if builder is not None else None
+        usages: list[str] = []
+        try:
+            numeric = float(value)
+        except ValueError:
+            numeric = None
+        for index, step in enumerate((macro or {}).get("steps") or [], start=1):
+            if str(step.get("repeat_var") or "").strip().lstrip("$") == variable:
+                result = max(1, int(numeric)) if numeric is not None else "숫자 변환 실패"
+                usages.append(f"{index}번 노드 반복 횟수 → {result}")
+            for rule in step.get("edge_conditions") or []:
+                if not isinstance(rule, dict) or str(rule.get("source") or "") != "variable":
+                    continue
+                if str(rule.get("variable") or "").strip().lstrip("$") != variable:
+                    continue
+                operator = str(rule.get("operator") or "==")
+                expected = rule.get("value", 0)
+                result_text = "문자열 비교"
+                if numeric is not None:
+                    try:
+                        expected_number = float(expected)
+                        checks = {
+                            ">=": numeric >= expected_number,
+                            "<=": numeric <= expected_number,
+                            ">": numeric > expected_number,
+                            "<": numeric < expected_number,
+                            "==": numeric == expected_number,
+                            "!=": numeric != expected_number,
+                        }
+                        result_text = "조건 성립" if checks.get(operator, False) else "조건 불성립"
+                    except (TypeError, ValueError):
+                        pass
+                usages.append(f"{index}번 {operator} {expected} → {result_text}")
+        if not variable:
+            return "변수 이름을 입력하세요. 영문, 숫자, 밑줄만 사용할 수 있습니다."
+        if usages:
+            return "다음 체크포인트에서 적용됩니다.\n" + "\n".join(f"• {item}" for item in usages)
+        return "다음 체크포인트에서 값을 변경합니다. 현재 매크로의 반복/조건 직접 사용처는 없습니다."
+
+    @staticmethod
+    def _parse_trace_timestamp(value: str) -> datetime | None:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    def _refresh_debugger(self) -> None:
+        host = self.parentWidget()
+        running = bool(getattr(host, "_running_macro_processes", {}))
+        for button in self.debug_control_buttons:
+            button.setEnabled(running)
+        path = self.repository.exports_dir / "execution_trace.log"
+        try:
+            raw_lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        except OSError:
+            raw_lines = []
+        rows: list[dict[str, object]] = []
+        open_rows: dict[int, int] = {}
+        variables: dict[str, str] = {}
+        captures: list[str] = []
+        resource_samples: list[dict[str, float]] = []
+        for raw in raw_lines:
+            parts = raw.split("|", 4)
+            if len(parts) != 5:
+                continue
+            stamp_text, step_text, status_text, label, detail = parts
+            try:
+                step = int(step_text)
+            except ValueError:
+                continue
+            status = status_text.strip().upper()
+            stamp = self._parse_trace_timestamp(stamp_text)
+            if status == "RESOURCE":
+                fields: dict[str, float] = {}
+                for token in detail.split(";"):
+                    if "=" not in token:
+                        continue
+                    key, value = token.strip().split("=", 1)
+                    try:
+                        fields[key.strip()] = float(value.strip())
+                    except ValueError:
+                        continue
+                if fields:
+                    resource_samples.append(fields)
+                continue
+            if status == "START" and step > 0:
+                rows.append(
+                    {"step": step, "label": label, "status": "RUNNING", "start": stamp, "duration": 0, "detail": ""}
+                )
+                open_rows[step] = len(rows) - 1
+            elif status in {"SUCCESS", "FAIL"} and step > 0:
+                row_index = open_rows.get(step)
+                if row_index is None:
+                    rows.append(
+                        {"step": step, "label": label, "status": status, "start": stamp, "duration": 0, "detail": ""}
+                    )
+                    row_index = len(rows) - 1
+                row = rows[row_index]
+                started = row.get("start")
+                duration = (
+                    max(0, round((stamp - started).total_seconds() * 1000))
+                    if isinstance(stamp, datetime) and isinstance(started, datetime)
+                    else 0
+                )
+                row["status"] = status
+                row["duration"] = duration
+                open_rows.pop(step, None)
+            elif status == "DETAIL" and step > 0:
+                row_index = open_rows.get(step)
+                if row_index is None:
+                    row_index = next((index for index in range(len(rows) - 1, -1, -1) if rows[index]["step"] == step), None)
+                if row_index is not None:
+                    existing = str(rows[row_index].get("detail") or "")
+                    rows[row_index]["detail"] = f"{existing} · {detail}".strip(" ·")
+                marker = "; var:"
+                variable_payload = detail.split(marker, 1)[1] if marker in detail else detail[4:] if detail.startswith("var:") else ""
+                if "=" in variable_payload:
+                    name, value = variable_payload.split("=", 1)
+                    if name.strip():
+                        variables[name.strip()] = value.split(";", 1)[0].strip()
+            elif status == "CAPTURE" and detail:
+                captures.append(detail)
+
+        self.timeline_table.setRowCount(len(rows))
+        status_labels = {"RUNNING": "실행 중", "SUCCESS": "성공", "FAIL": "실패"}
+        status_colors = {"RUNNING": "#38E7FF", "SUCCESS": COLORS["success"], "FAIL": COLORS["danger"]}
+        for row_index, row in enumerate(rows):
+            status = str(row.get("status") or "")
+            values = [
+                str(row.get("step") or ""),
+                str(row.get("label") or ""),
+                status_labels.get(status, status),
+                f"{int(row.get('duration') or 0)} ms" if status != "RUNNING" else "—",
+                str(row.get("detail") or ""),
+            ]
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if column == 2:
+                    item.setForeground(QtGui.QColor(status_colors.get(status, COLORS["muted"])))
+                self.timeline_table.setItem(row_index, column, item)
+        self.variable_table.setRowCount(len(variables))
+        for row_index, (name, value) in enumerate(sorted(variables.items())):
+            self.variable_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(name))
+            self.variable_table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(value))
+        aggregates: dict[tuple[int, str], dict[str, int]] = {}
+        for row in rows:
+            status = str(row.get("status") or "")
+            if status == "RUNNING":
+                continue
+            key = (int(row.get("step") or 0), str(row.get("label") or ""))
+            item = aggregates.setdefault(key, {"count": 0, "total": 0, "max": 0, "fail": 0})
+            duration = int(row.get("duration") or 0)
+            item["count"] += 1
+            item["total"] += duration
+            item["max"] = max(item["max"], duration)
+            item["fail"] += int(status == "FAIL")
+        ranked = sorted(aggregates.items(), key=lambda entry: entry[1]["total"] / max(1, entry[1]["count"]), reverse=True)
+        self.performance_table.setRowCount(len(ranked))
+        for row_index, ((step, label), item) in enumerate(ranked):
+            average = round(item["total"] / max(1, item["count"]))
+            failure_rate = item["fail"] / max(1, item["count"])
+            values = [str(step), label, str(item["count"]), f"{average} ms", f"{item['max']} ms", f"{failure_rate:.0%}"]
+            for column, value in enumerate(values):
+                cell = QtWidgets.QTableWidgetItem(value)
+                if column == 5 and failure_rate > 0:
+                    cell.setForeground(QtGui.QColor(COLORS["danger"]))
+                self.performance_table.setItem(row_index, column, cell)
+        total_runs = sum(item["count"] for item in aggregates.values())
+        total_failures = sum(item["fail"] for item in aggregates.values())
+        slowest = ranked[0] if ranked else None
+        slow_text = (
+            f"가장 느린 노드: {slowest[0][0]}번 {slowest[0][1]} · 평균 {round(slowest[1]['total'] / max(1, slowest[1]['count']))} ms"
+            if slowest
+            else "분석할 완료 노드가 없습니다."
+        )
+        image_durations: dict[str, list[float]] = {}
+        ocr_engines: dict[str, list[bool]] = {}
+        traced_captures = 0
+        traced_reuses = 0
+        traced_capture_rows = 0
+        for row in rows:
+            detail = str(row.get("detail") or "")
+            fields: dict[str, str] = {}
+            for token in detail.split(";"):
+                if "=" in token:
+                    key, value = token.strip().split("=", 1); fields[key.strip()] = value.strip()
+            if fields.get("image"):
+                image_durations.setdefault(fields["image"], []).append(float(fields.get("elapsed_ms") or row.get("duration") or 0))
+            if fields.get("engine"):
+                ocr_engines.setdefault(fields["engine"], []).append(str(row.get("status") or "") == "SUCCESS")
+            if "captures" in fields or "capture_reuse" in fields:
+                try:
+                    traced_captures += int(float(fields.get("captures") or 0))
+                    traced_reuses += int(float(fields.get("capture_reuse") or 0))
+                    traced_capture_rows += 1
+                except ValueError:
+                    pass
+        image_text = ""
+        if image_durations:
+            slow_image, durations = max(image_durations.items(), key=lambda item: sum(item[1]) / max(1, len(item[1])))
+            image_text = f" · 이미지 {slow_image} 평균 {sum(durations) / len(durations):.0f} ms"
+        ocr_text = ""
+        if ocr_engines:
+            ocr_text = " · OCR " + ", ".join(f"{engine} {sum(values) / len(values):.0%}" for engine, values in sorted(ocr_engines.items()))
+        capture_text = ""
+        if traced_capture_rows:
+            capture_text = f" · 실행 캡처 {traced_captures}회/재사용 {traced_reuses}회"
+        else:
+            try:
+                from vision_engine import send_request
+                vision = send_request(9235, {"cmd": "status"}, timeout=0.12)
+                capture_count = int(vision.get("capture_count") or 0)
+                reuse_count = int(vision.get("capture_reuse_count") or 0)
+                capture_text = f" · 캡처 {capture_count}회/재사용 {reuse_count}회"
+            except Exception:
+                pass
+        resource_text = ""
+        if resource_samples:
+            latest = resource_samples[-1]
+            resource_text = (
+                f" · CPU 평균 {latest.get('cpu_avg', 0):.1f}%/최대 {latest.get('cpu_max', 0):.1f}%"
+                f" · 메모리 최대 {latest.get('memory_max_mb', latest.get('memory_mb', 0)):.1f} MB"
+            )
+        self.performance_summary.setText(
+            f"{slow_text} · 전체 {total_runs}회 · 실패 {total_failures}회 ({total_failures / max(1, total_runs):.0%}){image_text}{ocr_text}{capture_text}{resource_text}"
+        )
+        current = next((row for row in reversed(rows) if row.get("status") == "RUNNING"), None)
+        if current is not None:
+            self.debug_status.setText(f"● {current['step']}번 노드 실행 중 · {current['label']}")
+            self.debug_status.setStyleSheet("font-weight:700; color:#38E7FF;")
+        elif rows:
+            last = rows[-1]
+            label = status_labels.get(str(last.get("status") or ""), str(last.get("status") or ""))
+            capture_note = f" · 실패 화면 {len(captures)}장" if captures else ""
+            self.debug_status.setText(f"{last['step']}번 노드 {label} · {int(last.get('duration') or 0)} ms{capture_note}")
+            self.debug_status.setStyleSheet(
+                f"font-weight:700; color:{status_colors.get(str(last.get('status') or ''), COLORS['muted'])};"
+            )
+        else:
+            self.debug_status.setText("실행 대기")
+            self.debug_status.setStyleSheet("font-weight:700; color:#9DA7BA;")
+
+    def _clear_current(self) -> None:
+        paths = self._current_paths()
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "로그 지우기",
+            f"현재 선택한 로그 {len(paths)}개를 비울까요?",
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        for path in paths:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("", encoding="utf-8")
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(self, "로그 지우기 실패", str(exc))
+                break
+        self.refresh(force=True)
+
+    def _save_diagnostic_bundle(self) -> None:
+        stamp = QtCore.QDateTime.currentDateTime().toString("yyyyMMdd-HHmmss")
+        default = self.repository.root / "exports" / f"MacroRelay-diagnostics-{stamp}.zip"
+        selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "진단 자료 저장",
+            str(default),
+            "ZIP 파일 (*.zip)",
+        )
+        if not selected:
+            return
+        destination = Path(selected)
+        if destination.suffix.casefold() != ".zip":
+            destination = destination.with_suffix(".zip")
+        screens = [
+            {
+                "name": screen.name(),
+                "geometry": [screen.geometry().x(), screen.geometry().y(), screen.geometry().width(), screen.geometry().height()],
+                "available": [
+                    screen.availableGeometry().x(),
+                    screen.availableGeometry().y(),
+                    screen.availableGeometry().width(),
+                    screen.availableGeometry().height(),
+                ],
+                "device_pixel_ratio": screen.devicePixelRatio(),
+                "logical_dpi": screen.logicalDotsPerInch(),
+            }
+            for screen in QtGui.QGuiApplication.screens()
+        ]
+        try:
+            saved = build_diagnostic_bundle(self.repository.root, destination, screens)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "진단 자료 저장 실패", str(exc))
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "진단 자료 저장 완료",
+            f"개인정보와 인증 키를 제거한 진단 자료를 저장했습니다.\n\n{saved}",
+        )

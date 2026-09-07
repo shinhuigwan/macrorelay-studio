@@ -4514,8 +4514,6 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
         lines.append(f'if (!TargetHwnd_{step_index})')
         lines.append(f'    TargetHwnd_{step_index} := WinExist("A")')
         lines.append(f'if (TargetHwnd_{step_index}) {{')
-        lines.append(f'    WinActivate, ahk_id %TargetHwnd_{step_index}%')
-        lines.append(f'    WinWaitActive, ahk_id %TargetHwnd_{step_index}%, , 0.5')
         if region_mode == "window":
             lines.append(f'    WinGetPos, __ps_base_x_{step_index}, __ps_base_y_{step_index},,, ahk_id %TargetHwnd_{step_index}%')
         else:

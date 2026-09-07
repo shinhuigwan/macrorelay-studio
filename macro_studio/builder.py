@@ -15,6 +15,7 @@ from .action_editor import (
     action_template,
     korean_contains,
 )
+from .ai_macro_plan import validate_compiled_draft
 from .automation import (
     AutomationAnalyzer,
     AutomationOverlay,
@@ -871,6 +872,7 @@ class BuilderPage(QtWidgets.QWidget):
     stop_macros = QtCore.Signal()
     open_export = QtCore.Signal(str)
     edit_committed = QtCore.Signal()
+    ai_macro_save_result = QtCore.Signal(bool, str)
 
     def __init__(self, repository: MacroRepository, parent=None) -> None:
         super().__init__(parent)
@@ -3006,6 +3008,8 @@ class BuilderPage(QtWidgets.QWidget):
         dialog.events_changed.connect(self._remember_last_recording)
         dialog.accepted.connect(lambda: QtCore.QTimer.singleShot(0, lambda: self._finish_smart_recording_review(dialog)))
         dialog.rejected.connect(lambda: self._close_smart_recording_review(dialog))
+        dialog.ai_macro_ready.connect(self._create_macro_from_ai_plan)
+        self.ai_macro_save_result.connect(dialog._on_ai_macro_save_result)
         dialog.show()
 
     def _close_smart_recording_review(self, dialog: RecordingReviewDialog) -> None:
@@ -3014,14 +3018,50 @@ class BuilderPage(QtWidgets.QWidget):
         dialog.deleteLater()
         self.status.emit("검토창을 닫았습니다. '녹화 상세편집'에서 다시 열 수 있습니다.")
 
+    def _create_macro_from_ai_plan(self, draft: dict[str, Any]) -> None:
+        try:
+            validate_compiled_draft(draft)
+            base_name = str(draft.get("name") or "AI자동매크로").strip()
+            payload = {
+                "name": base_name,
+                "description": f"스마트 녹화 기반 AI 생성 매크로 ({draft.get('meta', {}).get('recording_id', '')})",
+                "steps": draft.get("steps", []),
+                "graph_start_step": draft.get("graph_start_step", 1),
+                "graph_positions": draft.get("graph_positions", {}),
+                "meta": draft.get("meta", {}),
+            }
+            name, path = self.repository.create_macro_unique(base_name, payload)
+        except Exception as exc:
+            msg = str(exc)
+            self.ai_macro_save_result.emit(False, msg)
+            return
+
+        self.ai_macro_save_result.emit(True, f"'{name}' 매크로가 성공적으로 생성되었습니다.")
+        self.refresh(name)
+        self.data_changed.emit()
+        self.status.emit(f"AI 매크로 '{name}' 생성 완료 (노드 {len(payload['steps'])}개). 상단 '🛡️ 드라이런'으로 먼저 안전하게 테스트하세요.")
+        QtWidgets.QMessageBox.information(
+            self,
+            "AI 매크로 생성 완료",
+            f"'{name}' 매크로가 성공적으로 생성되어 캔버스에 로드되었습니다.\n\n"
+            f"• 총 {len(payload['steps'])}개의 노드와 분기선(성공/실패)이 자동 연결되었습니다.\n"
+            f"• 안전을 위해 매크로가 자동으로 실행되지 않습니다.\n"
+            f"• 상단 툴바의 '🛡️ 드라이런' 또는 단계별 디버깅을 사용하여 안전하게 동작을 검증하세요.",
+        )
+
     def _finish_smart_recording_review(self, dialog: RecordingReviewDialog) -> None:
+        target_mode = getattr(dialog, "target_mode", "append")
+        if target_mode == "ai_plan":
+            if self._recording_review_dialog is dialog:
+                self._recording_review_dialog = None
+            dialog.deleteLater()
+            return
         try:
             steps = dialog.build_steps()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "녹화 변환 실패", str(exc))
-            self._close_smart_recording_review(dialog)
             return
-        target_mode = getattr(dialog, "target_mode", "append")
+
         if self._recording_review_dialog is dialog:
             self._recording_review_dialog = None
         dialog.deleteLater()
@@ -3824,7 +3864,7 @@ class BuilderPage(QtWidgets.QWidget):
 
     def delete_selected(self) -> dict[str, Any] | None:
         focus = QtWidgets.QApplication.focusWidget()
-        if focus is self.macro_list or (focus is not None and self.macro_list.isAncestorOf(focus)):
+        if focus is self.macro_list or (isinstance(focus, QtWidgets.QWidget) and self.macro_list.isAncestorOf(focus)):
             names = self._selected_macro_names() or ([self.current_name] if self.current_name else [])
             return self._archive_macros(names, confirm=False)
         # 1. First priority: Check if any NodeGroupItem is selected on the canvas
@@ -3841,7 +3881,7 @@ class BuilderPage(QtWidgets.QWidget):
 
         indexes = self.node_canvas.selected_indexes()
         if not indexes:
-            if focus is not None and (focus is self.node_canvas or self.node_canvas.isAncestorOf(focus)):
+            if isinstance(focus, QtWidgets.QWidget) and (focus is self.node_canvas or self.node_canvas.isAncestorOf(focus)):
                 return None
             indexes = sorted({model_index.row() + 1 for model_index in self.steps_table.selectionModel().selectedRows()})
         if not indexes or self.current_macro is None:

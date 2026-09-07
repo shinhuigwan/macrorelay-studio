@@ -3855,6 +3855,16 @@ class NodeCanvas(QtWidgets.QWidget):
                 edge.route_side = side
                 edge.route_lane = lane
 
+        # Offset converging forward edges so their labels/paths do not overlap
+        incoming_targets: dict[tuple[int, str], list[EdgeItem]] = {}
+        for edge in self.edges:
+            if not edge.route_side and not edge.is_return_link() and not edge.is_row_wrap_link():
+                incoming_targets.setdefault((edge.target, edge.kind), []).append(edge)
+        for (tgt, kind), in_edges in incoming_targets.items():
+            if len(in_edges) > 1:
+                for idx, e in enumerate(sorted(in_edges, key=lambda x: (x.source, x.condition_index))):
+                    e.target_offset_y = (idx - (len(in_edges) - 1) / 2.0) * 16.0
+
         # 2-Pass update: Pass 1 primary edges, Pass 2 secondary candidate edges (so they branch from primary edge midpoint)
         for edge in self.edges:
             if not getattr(edge, "is_secondary_candidate", False):

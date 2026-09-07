@@ -43,24 +43,39 @@ class SelectionRubberBand(QtWidgets.QRubberBand):
         self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        super().paintEvent(event)
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.setPen(QtGui.QPen(QtGui.QColor("#D9FFFF"), 1))
-        painter.setBrush(QtGui.QColor("#19D7D0"))
-        rect = self.rect().adjusted(1, 1, -2, -2)
-        points = (
-            rect.topLeft(),
-            QtCore.QPoint(rect.center().x(), rect.top()),
-            rect.topRight(),
-            QtCore.QPoint(rect.left(), rect.center().y()),
-            QtCore.QPoint(rect.right(), rect.center().y()),
-            rect.bottomLeft(),
-            QtCore.QPoint(rect.center().x(), rect.bottom()),
-            rect.bottomRight(),
-        )
-        for point in points:
-            painter.drawRect(QtCore.QRect(point.x() - 4, point.y() - 4, 9, 9))
+        if not self.isVisible() or self.width() < 10 or self.height() < 10:
+            return
+        try:
+            super().paintEvent(event)
+        except Exception:
+            return
+        painter = QtGui.QPainter()
+        if not painter.begin(self):
+            return
+        try:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#D9FFFF"), 1))
+            painter.setBrush(QtGui.QColor("#19D7D0"))
+            rect = self.rect().adjusted(1, 1, -2, -2)
+            if not rect.isValid():
+                return
+            points = (
+                rect.topLeft(),
+                QtCore.QPoint(rect.center().x(), rect.top()),
+                rect.topRight(),
+                QtCore.QPoint(rect.left(), rect.center().y()),
+                QtCore.QPoint(rect.right(), rect.center().y()),
+                rect.bottomLeft(),
+                QtCore.QPoint(rect.center().x(), rect.bottom()),
+                rect.bottomRight(),
+            )
+            for point in points:
+                painter.drawRect(QtCore.QRect(point.x() - 4, point.y() - 4, 9, 9))
+        except Exception:
+            pass
+        finally:
+            if painter.isActive():
+                painter.end()
 
 
 class PrecisionImageView(QtWidgets.QLabel):
@@ -120,6 +135,7 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         self._drag_mode = ""
         self._drag_start = QtCore.QPoint()
         self._drag_rect = QtCore.QRect()
+        self._closing = False
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
         self.setGeometry(geometry)
         self.setCursor(QtCore.Qt.CrossCursor)
@@ -283,19 +299,63 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
                 mode = self._hit_test(self._selection, event.position().toPoint())
                 self.canvas.setCursor(self._cursor_for_mode(mode))
                 if self._accept_on_release and self._selection.width() >= 4 and self._selection.height() >= 4:
-                    QtCore.QTimer.singleShot(0, self.accept)
+                    if not getattr(self, "_closing", False):
+                        QtCore.QTimer.singleShot(0, self.accept)
                 return True
             if event.type() == QtCore.QEvent.MouseButtonDblClick and self._selection.width() >= 4:
                 self.accept()
                 return True
+            if event.type() == QtCore.QEvent.KeyPress:
+                if event.key() == QtCore.Qt.Key_Escape:
+                    event.accept()
+                    self._cancel_and_reject()
+                    return True
+                if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                    if self._selection.width() >= 4 and self._selection.height() >= 4:
+                        event.accept()
+                        self.accept()
+                        return True
         return super().eventFilter(obj, event)
 
-    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) and self._selection.width() >= 4:
-            self.accept()
+    def _cancel_and_reject(self) -> None:
+        if getattr(self, "_closing", False):
             return
+        self._closing = True
+        self._origin = None
+        self._selection = QtCore.QRect()
+        try:
+            if hasattr(self, "rubber") and self.rubber is not None:
+                self.rubber.hide()
+        except Exception:
+            pass
+        self.reject()
+
+    def accept(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        super().accept()
+
+    def reject(self) -> None:
+        self._closing = True
+        self._origin = None
+        self._selection = QtCore.QRect()
+        try:
+            if hasattr(self, "rubber") and self.rubber is not None:
+                self.rubber.hide()
+        except Exception:
+            pass
+        super().reject()
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            if self._selection.width() >= 4 and self._selection.height() >= 4:
+                event.accept()
+                self.accept()
+                return
         if event.key() == QtCore.Qt.Key_Escape:
-            self.reject()
+            event.accept()
+            self._cancel_and_reject()
             return
         super().keyPressEvent(event)
 

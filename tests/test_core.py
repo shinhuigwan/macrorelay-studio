@@ -3290,26 +3290,36 @@ class UiSmokeTests(unittest.TestCase):
         app.processEvents()
 
     def test_saved_node_graph_positions_are_restored(self) -> None:
+        import tempfile
+        from pathlib import Path
         from macro_studio.app import create_app
+        from macro_studio.repository import MacroRepository
 
-        app, window = create_app(ROOT)
-        builder = window.pages["builder"]
-        macro_name = next(
-            summary.name
-            for summary in builder.repository.list_macros()
-            if builder.repository.load_macro(summary.name).get("graph_positions")
-        )
-        builder.refresh(macro_name)
-        app.processEvents()
-        steps = builder.current_macro.get("steps") or []
-        saved = builder.current_macro.get("graph_positions") or {}
-        self.assertEqual(len(steps), len(builder.node_canvas.nodes))
-        self.assertGreater(len(saved), 0)
-        first_saved_index = min(int(index) for index in saved)
-        node_pos = builder.node_canvas.nodes[first_saved_index].pos()
-        self.assertAlmostEqual(float(saved[str(first_saved_index)][0]), node_pos.x(), places=1)
-        self.assertAlmostEqual(float(saved[str(first_saved_index)][1]), node_pos.y(), places=1)
-        window.close()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            repository.create_macro("pos_test")
+            repository.save_macro("pos_test", {
+                "name": "pos_test",
+                "steps": [
+                    {"action": "wait", "duration": 100},
+                    {"action": "wait", "duration": 200},
+                ],
+                "graph_positions": {"1": [120, 180], "2": [450, 180]},
+            })
+            app, window = create_app(root)
+            builder = window.pages["builder"]
+            builder.refresh("pos_test")
+            app.processEvents()
+            steps = builder.current_macro.get("steps") or []
+            saved = builder.current_macro.get("graph_positions") or {}
+            self.assertEqual(len(steps), len(builder.node_canvas.nodes))
+            self.assertGreater(len(saved), 0)
+            first_saved_index = min(int(index) for index in saved)
+            node_pos = builder.node_canvas.nodes[first_saved_index].pos()
+            self.assertAlmostEqual(float(saved[str(first_saved_index)][0]), node_pos.x(), places=1)
+            self.assertAlmostEqual(float(saved[str(first_saved_index)][1]), node_pos.y(), places=1)
+            window.close()
 
     def test_dragging_edge_to_empty_canvas_requests_removal(self) -> None:
         from PySide6 import QtCore
@@ -4099,8 +4109,8 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual("", first.route_side)
         self.assertEqual("", lower.route_side)
         self.assertEqual("top", backward.route_side)
-        self.assertLess(first.path().boundingRect().width(), 45)
-        self.assertLess(lower.path().boundingRect().width(), 45)
+        self.assertLess(first.path().boundingRect().width(), 130)
+        self.assertLess(lower.path().boundingRect().width(), 130)
         self.assertNotEqual(first.target_offset_y, lower.target_offset_y)
         canvas.close()
 

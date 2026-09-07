@@ -526,7 +526,10 @@ class PixelColorPickerDialog(QtWidgets.QDialog):
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() == QtCore.Qt.Key_Escape:
+            event.accept()
             self.reject()
+            return
+        super().keyPressEvent(event)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
@@ -693,12 +696,17 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            event.accept()
             if self._points:
                 self.accept()
             else:
                 self.reject()
+            return
         elif event.key() == QtCore.Qt.Key_Escape:
+            event.accept()
             self.reject()
+            return
+        super().keyPressEvent(event)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
@@ -2310,9 +2318,15 @@ class RecordedImageCropDialog(QtWidgets.QDialog):
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() in {QtCore.Qt.Key_Plus, QtCore.Qt.Key_Equal}:
             self._resize_crop(1)
+            event.accept()
             return
         if event.key() in {QtCore.Qt.Key_Minus, QtCore.Qt.Key_Underscore}:
             self._resize_crop(-1)
+            event.accept()
+            return
+        if event.key() == QtCore.Qt.Key_Escape:
+            event.accept()
+            self.reject()
             return
         super().keyPressEvent(event)
 
@@ -2466,34 +2480,37 @@ class SmartRecordingController(QtCore.QObject):
                     if not pixmap.isNull() and geometry.isValid():
                         hint_text = "[ OCR 인식 영역 지정 ] 드래그 선택 후 Enter (Esc 취소)"
                         picker = ScreenCaptureDialog(pixmap, geometry, hint_text=hint_text)
-                        if picker.exec() == QtWidgets.QDialog.Accepted:
-                            screen_rect = picker.selected_screen_rect()
-                            image = picker.captured_image()
-                            if not image.isNull() and screen_rect.isValid():
-                                payload = QtCore.QByteArray()
-                                buffer = QtCore.QBuffer(payload)
-                                buffer.open(QtCore.QIODevice.WriteOnly)
-                                image.save(buffer, "PNG")
-                                buffer.close()
-                                client_rect = _resolve_live_client_rect(window)
-                                search_region = [
-                                    screen_rect.left() - client_rect.left() if client_rect.isValid() else screen_rect.left(),
-                                    screen_rect.top() - client_rect.top() if client_rect.isValid() else screen_rect.top(),
-                                    screen_rect.right() - client_rect.left() if client_rect.isValid() else screen_rect.right(),
-                                    screen_rect.bottom() - client_rect.top() if client_rect.isValid() else screen_rect.bottom(),
-                                ]
-                                alias = f"ocr-sample-{datetime.now():%Y%m%d-%H%M%S}"
-                                self.repository.add_asset_image(image, alias)
-                                event.update({
-                                    "asset": alias,
-                                    "selected_screen_rect": [screen_rect.x(), screen_rect.y(), screen_rect.width(), screen_rect.height()],
-                                    "image_sample_bmp": base64.b64encode(bytes(payload)).decode("ascii"),
-                                    "image_sample_size": [image.width(), image.height()],
-                                    "search_region": search_region,
-                                    "region": search_region,
-                                    "_review_search_region": search_region,
-                                    "detail": f"OCR 영역 인식 ({image.width()}×{image.height()})",
-                                })
+                        try:
+                            if picker.exec() == QtWidgets.QDialog.Accepted:
+                                screen_rect = picker.selected_screen_rect()
+                                image = picker.captured_image()
+                                if not image.isNull() and screen_rect.isValid():
+                                    payload = QtCore.QByteArray()
+                                    buffer = QtCore.QBuffer(payload)
+                                    buffer.open(QtCore.QIODevice.WriteOnly)
+                                    image.save(buffer, "PNG")
+                                    buffer.close()
+                                    client_rect = _resolve_live_client_rect(window)
+                                    search_region = [
+                                        screen_rect.left() - client_rect.left() if client_rect.isValid() else screen_rect.left(),
+                                        screen_rect.top() - client_rect.top() if client_rect.isValid() else screen_rect.top(),
+                                        screen_rect.right() - client_rect.left() if client_rect.isValid() else screen_rect.right(),
+                                        screen_rect.bottom() - client_rect.top() if client_rect.isValid() else screen_rect.bottom(),
+                                    ]
+                                    alias = f"ocr-sample-{datetime.now():%Y%m%d-%H%M%S}"
+                                    self.repository.add_asset_image(image, alias)
+                                    event.update({
+                                        "asset": alias,
+                                        "selected_screen_rect": [screen_rect.x(), screen_rect.y(), screen_rect.width(), screen_rect.height()],
+                                        "image_sample_bmp": base64.b64encode(bytes(payload)).decode("ascii"),
+                                        "image_sample_size": [image.width(), image.height()],
+                                        "search_region": search_region,
+                                        "region": search_region,
+                                        "_review_search_region": search_region,
+                                        "detail": f"OCR 영역 인식 ({image.width()}×{image.height()})",
+                                    })
+                        finally:
+                            picker.deleteLater()
                 finally:
                     if self.bar is not None:
                         self.bar.show()
@@ -2544,19 +2561,22 @@ class SmartRecordingController(QtCore.QObject):
                                 hint_text="[ 검색 영역 지정 ] 드래그로 검색 범위 선택 (전체 화면은 Enter, 취소는 Esc)"
                             )
                             search_region = [0, 0, 0, 0]
-                            if region_picker.exec() == QtWidgets.QDialog.Accepted:
-                                s_rect = region_picker.selected_screen_rect()
-                                if s_rect.isValid() and s_rect.width() > 5 and s_rect.height() > 5:
-                                    client_rect = _resolve_live_client_rect(window)
-                                    if client_rect.isValid():
-                                        search_region = [
-                                            max(0, s_rect.left() - client_rect.left()),
-                                            max(0, s_rect.top() - client_rect.top()),
-                                            s_rect.right() - client_rect.left(),
-                                            s_rect.bottom() - client_rect.top(),
-                                        ]
-                                    else:
-                                        search_region = [s_rect.left(), s_rect.top(), s_rect.right(), s_rect.bottom()]
+                            try:
+                                if region_picker.exec() == QtWidgets.QDialog.Accepted:
+                                    s_rect = region_picker.selected_screen_rect()
+                                    if s_rect.isValid() and s_rect.width() > 5 and s_rect.height() > 5:
+                                        client_rect = _resolve_live_client_rect(window)
+                                        if client_rect.isValid():
+                                            search_region = [
+                                                max(0, s_rect.left() - client_rect.left()),
+                                                max(0, s_rect.top() - client_rect.top()),
+                                                s_rect.right() - client_rect.left(),
+                                                s_rect.bottom() - client_rect.top(),
+                                            ]
+                                        else:
+                                            search_region = [s_rect.left(), s_rect.top(), s_rect.right(), s_rect.bottom()]
+                            finally:
+                                region_picker.deleteLater()
                             event.update({
                                 "color": color_hex,
                                 "search_region": search_region,
@@ -2579,32 +2599,38 @@ class SmartRecordingController(QtCore.QObject):
                             pixmap, geometry,
                             hint_text="[ OCR 추적: 1단계 ] 추적할 기준 이미지/박스 드래그 선택 후 Enter (Esc 취소)"
                         )
-                        if picker1.exec() == QtWidgets.QDialog.Accepted:
-                            track_rect = picker1.selected_screen_rect()
-                            track_img = picker1.captured_image()
-                            if not track_img.isNull() and track_rect.isValid():
-                                alias = f"track-target-{datetime.now():%Y%m%d-%H%M%S}"
-                                self.repository.add_asset_image(track_img, alias)
-                                # Step 2: Capture OCR area relative to tracking target
-                                picker2 = ScreenCaptureDialog(
-                                    pixmap, geometry,
-                                    hint_text="[ OCR 추적: 2단계 ] OCR 수행할 텍스트 영역 드래그 선택 후 Enter (Esc 취소)"
-                                )
-                                ocr_rect = track_rect
-                                if picker2.exec() == QtWidgets.QDialog.Accepted:
-                                    sel_ocr = picker2.selected_screen_rect()
-                                    if sel_ocr.isValid() and sel_ocr.width() > 2:
-                                        ocr_rect = sel_ocr
-                                offset_x = ocr_rect.left() - track_rect.left()
-                                offset_y = ocr_rect.top() - track_rect.top()
-                                event.update({
-                                    "tracking_asset": alias,
-                                    "ocr_offset_x": offset_x,
-                                    "ocr_offset_y": offset_y,
-                                    "ocr_width": ocr_rect.width(),
-                                    "ocr_height": ocr_rect.height(),
-                                    "detail": f"OCR 추적 ({alias})",
-                                })
+                        try:
+                            if picker1.exec() == QtWidgets.QDialog.Accepted:
+                                track_rect = picker1.selected_screen_rect()
+                                track_img = picker1.captured_image()
+                                if not track_img.isNull() and track_rect.isValid():
+                                    alias = f"track-target-{datetime.now():%Y%m%d-%H%M%S}"
+                                    self.repository.add_asset_image(track_img, alias)
+                                    # Step 2: Capture OCR area relative to tracking target
+                                    picker2 = ScreenCaptureDialog(
+                                        pixmap, geometry,
+                                        hint_text="[ OCR 추적: 2단계 ] OCR 수행할 텍스트 영역 드래그 선택 후 Enter (Esc 취소)"
+                                    )
+                                    try:
+                                        ocr_rect = track_rect
+                                        if picker2.exec() == QtWidgets.QDialog.Accepted:
+                                            sel_ocr = picker2.selected_screen_rect()
+                                            if sel_ocr.isValid() and sel_ocr.width() > 2:
+                                                ocr_rect = sel_ocr
+                                        offset_x = ocr_rect.left() - track_rect.left()
+                                        offset_y = ocr_rect.top() - track_rect.top()
+                                        event.update({
+                                            "tracking_asset": alias,
+                                            "ocr_offset_x": offset_x,
+                                            "ocr_offset_y": offset_y,
+                                            "ocr_width": ocr_rect.width(),
+                                            "ocr_height": ocr_rect.height(),
+                                            "detail": f"OCR 추적 ({alias})",
+                                        })
+                                    finally:
+                                        picker2.deleteLater()
+                        finally:
+                            picker1.deleteLater()
                 finally:
                     if self.bar is not None:
                         self.bar.show()
@@ -3075,11 +3101,13 @@ class SmartRecordingController(QtCore.QObject):
 
 class RecordingReviewDialog(QtWidgets.QDialog):
     events_changed = QtCore.Signal(list)
+    ai_macro_ready = QtCore.Signal(dict)
 
     def __init__(self, events: list[dict[str, Any]], repository, parent=None) -> None:
         super().__init__(parent)
         self.repository = repository
         self.events = events
+        self._ai_macro_dialog = None
         self.drafts = recording_drafts(events, include_waits=False)
         self.crop_sizes: dict[int, QtCore.QSize] = {}
         self.crop_rects: dict[int, QtCore.QRect] = {}
@@ -3206,6 +3234,13 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.setSpacing(8)
 
+        self.btn_ai_macro = QtWidgets.QPushButton("🤖 녹화로 자동 매크로 만들기")
+        self.btn_ai_macro.setToolTip("녹화된 동작과 이미지를 기반으로 GPT 계획(plan.json)을 생성하고 자동 분기 매크로를 만듭니다.")
+        self.btn_ai_macro.setStyleSheet(
+            "background:#7C4DFF; color:#FFFFFF; font-weight:800; padding:6px 14px; border-radius:4px;"
+        )
+        self.btn_ai_macro.clicked.connect(self._open_ai_macro_dialog)
+
         self.btn_append = QtWidgets.QPushButton("✚ 기존 매크로에 추가")
         self.btn_append.setToolTip("현재 편집 중인 매크로 뒤에 녹화 노드를 추가합니다.")
         self.btn_append.clicked.connect(self._accept_append)
@@ -3220,12 +3255,81 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self.btn_cancel = QtWidgets.QPushButton("취소")
         self.btn_cancel.clicked.connect(self.reject)
 
+        button_layout.addWidget(self.btn_ai_macro)
         button_layout.addStretch(1)
         button_layout.addWidget(self.btn_append)
         button_layout.addWidget(self.btn_create_new)
         button_layout.addWidget(self.btn_cancel)
         layout.addLayout(button_layout)
         self._apply_background_click_mode(True)
+
+    def _is_ai_macro_dialog_alive(self) -> bool:
+        if self._ai_macro_dialog is None:
+            return False
+        try:
+            import shiboken6
+            if not shiboken6.isValid(self._ai_macro_dialog):
+                self._ai_macro_dialog = None
+                return False
+        except (ImportError, RuntimeError):
+            self._ai_macro_dialog = None
+            return False
+        return True
+
+    def _cleanup_ai_macro_dialog(self, dialog=None) -> None:
+        if dialog is None or self._ai_macro_dialog is dialog:
+            self._ai_macro_dialog = None
+
+    def _open_ai_macro_dialog(self) -> None:
+        if self._is_ai_macro_dialog_alive():
+            dialog = self._ai_macro_dialog
+            if not dialog.isVisible():
+                dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        try:
+            steps = self.build_steps()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "녹화 변환 오류", f"단계 생성 중 오류가 발생했습니다: {exc}")
+            return
+        from .ai_macro_supplement_dialog import AiMacroSupplementDialog as AiMacroDialog
+
+        dialog = AiMacroDialog(self.repository, steps, parent=self.window())
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        self._ai_macro_dialog = dialog
+        dialog.macro_ready.connect(self._on_ai_macro_ready)
+        dialog.destroyed.connect(lambda *_: self._cleanup_ai_macro_dialog(dialog))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_ai_macro_ready(self, draft: dict[str, Any]) -> None:
+        self.ai_macro_ready.emit(draft)
+
+    def _on_ai_macro_save_result(self, success: bool, message: str) -> None:
+        if success:
+            self.target_mode = "ai_plan"
+            if self._is_ai_macro_dialog_alive():
+                self._ai_macro_dialog.on_save_success()
+            self._ai_macro_dialog = None
+            self.accept()
+        else:
+            if self._is_ai_macro_dialog_alive():
+                self._ai_macro_dialog.on_save_failed(message)
+            QtWidgets.QMessageBox.warning(self, "AI 매크로 저장 실패", message)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._is_ai_macro_dialog_alive():
+            self._ai_macro_dialog.close()
+        self._ai_macro_dialog = None
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        if self._is_ai_macro_dialog_alive():
+            self._ai_macro_dialog.close()
+        self._ai_macro_dialog = None
+        super().reject()
 
     def _accept_append(self) -> None:
         self.target_mode = "append"
@@ -3411,6 +3515,9 @@ class RecordingReviewDialog(QtWidgets.QDialog):
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
             self._remove_rows_from_shortcut()
+            event.accept()
+            return
+        if event.key() == QtCore.Qt.Key_Escape:
             event.accept()
             return
         super().keyPressEvent(event)
@@ -3666,14 +3773,17 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 "녹화한 대상 프로그램의 현재 창을 찾지 못했습니다. 대상 프로그램을 실행한 뒤 다시 눌러 주세요.",
             )
             return
-        self.hide()
+        orig_opacity = self.windowOpacity()
+        self.setWindowOpacity(0.0)
         QtWidgets.QApplication.processEvents()
         pixmap, desktop_geometry = capture_virtual_desktop()
         if pixmap.isNull() or not desktop_geometry.isValid():
+            self.setWindowOpacity(orig_opacity if orig_opacity > 0 else 1.0)
             self.show()
             return
         clipped = client_rect.intersected(desktop_geometry)
         if not clipped.isValid():
+            self.setWindowOpacity(orig_opacity if orig_opacity > 0 else 1.0)
             self.show()
             QtWidgets.QMessageBox.warning(self, "서치 영역 지정", "대상 프로그램의 클라이언트 화면이 현재 모니터에 보이지 않습니다.")
             return
@@ -3709,7 +3819,11 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 )
             self.events_changed.emit(self.events)
         finally:
-            picker.deleteLater()
+            try:
+                picker.deleteLater()
+            except Exception:
+                pass
+            self.setWindowOpacity(orig_opacity if orig_opacity > 0 else 1.0)
             self.show()
             self.raise_()
             self.activateWindow()
@@ -4712,10 +4826,13 @@ class QuickActionWizard:
                 accept_on_release=True,
                 hint_text=hint,
             )
-            if dialog.exec() != QtWidgets.QDialog.Accepted:
-                return None
-            image = dialog.captured_image()
-            rect = dialog.selected_screen_rect()
+            try:
+                if dialog.exec() != QtWidgets.QDialog.Accepted:
+                    return None
+                image = dialog.captured_image()
+                rect = dialog.selected_screen_rect()
+            finally:
+                dialog.deleteLater()
             if image.isNull() or not rect.isValid():
                 return None
             prefix = "cond" if is_cond else "img"
@@ -4765,10 +4882,13 @@ class QuickActionWizard:
                 accept_on_release=True,
                 hint_text="⬚ OCR 텍스트를 인식할 영역을 드래그하세요 (마우스 놓기 / Enter 확정, Esc 취소)",
             )
-            if dialog.exec() != QtWidgets.QDialog.Accepted:
-                return None
-            image = dialog.captured_image()
-            rect = dialog.selected_screen_rect()
+            try:
+                if dialog.exec() != QtWidgets.QDialog.Accepted:
+                    return None
+                image = dialog.captured_image()
+                rect = dialog.selected_screen_rect()
+            finally:
+                dialog.deleteLater()
             if image.isNull() or not rect.isValid():
                 return None
             alias = f"ocr_sample_{datetime.now():%m%d_%H%M%S}"
@@ -4826,18 +4946,24 @@ class QuickActionWizard:
         if action == "ocr_tracking":
             pixmap, geometry = capture_virtual_desktop()
             p1 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="[ 1단계 ] 추적할 대상 이미지를 드래그 선택 후 Enter")
-            if p1.exec() != QtWidgets.QDialog.Accepted:
-                return None
-            img = p1.captured_image()
-            if img.isNull():
-                return None
-            alias = f"track-{datetime.now():%Y%m%d-%H%M%S}"
-            repository.add_asset_image(img, alias)
-            ref_rect = p1.selected_screen_rect()
-            p2 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="[ 2단계 ] 인식할 OCR 텍스트 영역을 드래그 선택 후 Enter")
-            if p2.exec() != QtWidgets.QDialog.Accepted:
-                return None
-            ocr_rect = p2.selected_screen_rect()
+            try:
+                if p1.exec() != QtWidgets.QDialog.Accepted:
+                    return None
+                img = p1.captured_image()
+                if img.isNull():
+                    return None
+                alias = f"track-{datetime.now():%Y%m%d-%H%M%S}"
+                repository.add_asset_image(img, alias)
+                ref_rect = p1.selected_screen_rect()
+                p2 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="[ 2단계 ] 인식할 OCR 텍스트 영역을 드래그 선택 후 Enter")
+                try:
+                    if p2.exec() != QtWidgets.QDialog.Accepted:
+                        return None
+                    ocr_rect = p2.selected_screen_rect()
+                finally:
+                    p2.deleteLater()
+            finally:
+                p1.deleteLater()
             step.update(
                 {
                     "tracking_asset": alias,
@@ -4880,9 +5006,12 @@ class QuickActionWizard:
             if not color:
                 return None
             p2 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="게이지(체력바) 영역을 드래그 선택 후 Enter")
-            if p2.exec() != QtWidgets.QDialog.Accepted or not p2.selected_screen_rect().isValid():
-                return None
-            r = p2.selected_screen_rect()
+            try:
+                if p2.exec() != QtWidgets.QDialog.Accepted or not p2.selected_screen_rect().isValid():
+                    return None
+                r = p2.selected_screen_rect()
+            finally:
+                p2.deleteLater()
             step.update(
                 {
                     "target_color": color.name().upper(),

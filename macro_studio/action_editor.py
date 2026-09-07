@@ -1948,6 +1948,7 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         self._confidence = max(1, min(100, int(confidence or 86)))
         self._asset_confidences = dict(asset_confidences or {})
         self._search_region = list(search_region) if isinstance(search_region, list) and len(search_region) >= 4 else None
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
         self.setWindowTitle("이미지 서치 · 신뢰도 및 검색 영역 설정")
         self.resize(700, 520 if len(self.aliases) > 1 else 480)
         self.setStyleSheet("QDialog { background: #11151F; color: #E2E8F0; }")
@@ -2173,11 +2174,12 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         self.setWindowOpacity(0.0)
         QtCore.QThread.msleep(150)
         QtWidgets.QApplication.processEvents()
+        picker: ScreenCaptureDialog | None = None
         try:
             pixmap, geometry = capture_virtual_desktop()
             if pixmap.isNull() or not geometry.isValid():
                 return
-            picker = ScreenCaptureDialog(pixmap, geometry, parent=None, hint_text="검색 범위를 마우스로 드래그하세요 (완료 시 Enter)")
+            picker = ScreenCaptureDialog(pixmap, geometry, parent=None, hint_text="검색 범위를 마우스로 드래그하세요 (완료 시 Enter, 취소 시 Esc)")
             if picker.exec() == QtWidgets.QDialog.Accepted:
                 rect = picker.selected_screen_rect()
                 if rect.isValid() and rect.width() >= 4 and rect.height() >= 4:
@@ -2199,11 +2201,21 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
                     if hasattr(self, "notice_lbl"):
                         self.notice_lbl.setText(f"✔ 클라이언트 상대 영역 {w_text} 지정 완료!\n창 아래쪽 [✔ 신뢰도 설정 저장] 또는 [⚡ 즉시 저장]을 누르면 완료됩니다.")
                         self.notice_lbl.setVisible(True)
+        except Exception as exc:
+            import logging
+            logging.warning("검색 영역 지정 중 예외: %s", exc)
         finally:
+            if picker is not None:
+                try:
+                    picker.deleteLater()
+                except Exception:
+                    pass
             for h in hosts:
-                h.show()
+                try:
+                    h.show()
+                except Exception:
+                    pass
             self.setWindowOpacity(orig_opacity if orig_opacity > 0 else 1.0)
-            self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
             self.show()
             self.raise_()
             self.activateWindow()
@@ -3379,8 +3391,11 @@ class ActionEditor(QtWidgets.QWidget):
             self._restore_host_windows(hosts)
             return
         picker = ScreenCaptureDialog(pixmap, geometry, hint_text="추적할 대상 이미지를 드래그 선택 후 Enter")
-        accepted = picker.exec() == QtWidgets.QDialog.Accepted
-        img = picker.captured_image() if accepted else QtGui.QImage()
+        try:
+            accepted = picker.exec() == QtWidgets.QDialog.Accepted
+            img = picker.captured_image() if accepted else QtGui.QImage()
+        finally:
+            picker.deleteLater()
         self._restore_host_windows(hosts)
         if accepted and not img.isNull():
             alias = f"track-target-{datetime.now():%Y%m%d-%H%M%S}"
@@ -3396,13 +3411,19 @@ class ActionEditor(QtWidgets.QWidget):
             self._restore_host_windows(hosts)
             return
         picker1 = ScreenCaptureDialog(pixmap, geometry, hint_text="[ 1단계 ] 추적 기준 영역 드래그 선택 후 Enter")
-        if picker1.exec() != QtWidgets.QDialog.Accepted:
-            self._restore_host_windows(hosts)
-            return
-        ref_rect = picker1.selected_screen_rect()
+        try:
+            if picker1.exec() != QtWidgets.QDialog.Accepted:
+                self._restore_host_windows(hosts)
+                return
+            ref_rect = picker1.selected_screen_rect()
+        finally:
+            picker1.deleteLater()
         picker2 = ScreenCaptureDialog(pixmap, geometry, hint_text="[ 2단계 ] OCR 수행할 텍스트 영역 드래그 선택 후 Enter")
-        accepted = picker2.exec() == QtWidgets.QDialog.Accepted
-        ocr_rect = picker2.selected_screen_rect() if accepted else QtCore.QRect()
+        try:
+            accepted = picker2.exec() == QtWidgets.QDialog.Accepted
+            ocr_rect = picker2.selected_screen_rect() if accepted else QtCore.QRect()
+        finally:
+            picker2.deleteLater()
         self._restore_host_windows(hosts)
         if accepted and ref_rect.isValid() and ocr_rect.isValid():
             self._set_field_value(action, "ocr_offset_x", ocr_rect.left() - ref_rect.left())
@@ -3540,8 +3561,11 @@ class ActionEditor(QtWidgets.QWidget):
             self._restore_host_windows(hosts)
             return
         picker = ScreenCaptureDialog(pixmap, geometry)
-        accepted = picker.exec() == QtWidgets.QDialog.Accepted
-        rect = picker.selected_screen_rect() if accepted else QtCore.QRect()
+        try:
+            accepted = picker.exec() == QtWidgets.QDialog.Accepted
+            rect = picker.selected_screen_rect() if accepted else QtCore.QRect()
+        finally:
+            picker.deleteLater()
         self._restore_host_windows(hosts)
         if rect.isValid() and rect.width() >= 4 and rect.height() >= 4:
             # Check if this action uses client/relative coordinates
@@ -3710,12 +3734,15 @@ class ActionEditor(QtWidgets.QWidget):
             self._restore_host_windows(hosts)
             return QtGui.QImage()
         picker = ScreenCaptureDialog(pixmap, geometry)
-        accepted = picker.exec() == QtWidgets.QDialog.Accepted
-        image = picker.captured_image() if accepted else QtGui.QImage()
-        if accepted:
-            self._last_capture_rect = picker.selected_screen_rect()
-            if self._last_capture_rect.isValid():
-                self._last_capture_target = self._window_target_at(self._last_capture_rect.center(), ignored_hwnds)
+        try:
+            accepted = picker.exec() == QtWidgets.QDialog.Accepted
+            image = picker.captured_image() if accepted else QtGui.QImage()
+            if accepted:
+                self._last_capture_rect = picker.selected_screen_rect()
+                if self._last_capture_rect.isValid():
+                    self._last_capture_target = self._window_target_at(self._last_capture_rect.center(), ignored_hwnds)
+        finally:
+            picker.deleteLater()
         self._restore_host_windows(hosts)
         return image
 

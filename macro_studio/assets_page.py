@@ -324,8 +324,11 @@ class AssetsPage(QtWidgets.QWidget):
             host.show()
             return
         picker = ScreenCaptureDialog(pixmap, geometry)
-        accepted = picker.exec() == QtWidgets.QDialog.Accepted
-        captured = picker.captured_image() if accepted else QtGui.QImage()
+        try:
+            accepted = picker.exec() == QtWidgets.QDialog.Accepted
+            captured = picker.captured_image() if accepted else QtGui.QImage()
+        finally:
+            picker.deleteLater()
         host.show()
         host.raise_()
         host.activateWindow()

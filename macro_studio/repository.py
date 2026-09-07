@@ -479,6 +479,36 @@ class MacroRepository:
         self._append_macro_order(path.stem)
         return path
 
+    def create_macro_unique(self, base_name: str, payload: dict[str, Any]) -> tuple[str, Path]:
+        """Create a macro file with a guaranteed unique name without overwriting any existing file.
+
+        Tries base_name, base_name_1, base_name_2, ... using atomic exclusive creation ('x' mode).
+        Even corrupted or empty JSON files on disk are recognized and not overwritten.
+        Updates macro order and returns (final_name, path).
+        """
+        clean_base = self.safe_name(base_name).strip() or "새 매크로"
+        candidate_name = clean_base
+        counter = 1
+
+        payload_copy = deepcopy(payload)
+        payload_copy.setdefault("meta", {})["created_at"] = datetime.utcnow().isoformat() + "Z"
+        payload_copy.setdefault("steps", [])
+
+        while True:
+            target_path = self.macro_path(candidate_name)
+            if not target_path.exists():
+                payload_copy["name"] = candidate_name
+                content = json.dumps(payload_copy, ensure_ascii=False, indent=2)
+                try:
+                    with open(target_path, "x", encoding="utf-8") as f:
+                        f.write(content)
+                    self._append_macro_order(candidate_name)
+                    return candidate_name, target_path
+                except FileExistsError:
+                    pass
+            candidate_name = f"{clean_base}_{counter}"
+            counter += 1
+
     def duplicate_macro(self, source: str, target: str) -> Path:
         payload = self.load_macro(source)
         payload["name"] = target

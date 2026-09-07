@@ -497,33 +497,37 @@ class MainWindow(QtWidgets.QMainWindow):
             current = self.stack.currentWidget() if hasattr(self, "stack") else None
             managed = current in (self.pages.get("builder"), self.pages.get("assets"), self.pages.get("hotkeys")) if hasattr(self, "pages") else False
             if managed and not self._is_editing_widget(QtWidgets.QApplication.focusWidget()):
-                modifiers = event.modifiers()
-                builder = self.pages.get("builder") if hasattr(self, "pages") else None
-                macro_list = getattr(builder, "macro_list", None)
-                on_macro_list = bool(
-                    current is builder
-                    and macro_list is not None
-                    and (watched is macro_list or macro_list.isAncestorOf(watched))
-                )
-                if on_macro_list and event.key() == QtCore.Qt.Key_Delete and modifiers == QtCore.Qt.NoModifier:
-                    builder._delete_macro_list_selection()
-                    return True
-                if on_macro_list and event.key() == QtCore.Qt.Key_Z and modifiers == QtCore.Qt.ControlModifier:
-                    self._restore_last_deletion()
-                    return True
-                if event.key() == QtCore.Qt.Key_Delete and modifiers == QtCore.Qt.NoModifier:
-                    self._archive_current_selection()
-                    return True
-                if event.key() == QtCore.Qt.Key_Z and modifiers == QtCore.Qt.ControlModifier:
-                    if self._undo_deletions:
+                key = event.key()
+                if key in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Z, QtCore.Qt.Key_Y):
+                    modifiers = event.modifiers()
+                    builder = self.pages.get("builder") if hasattr(self, "pages") else None
+                    macro_list = getattr(builder, "macro_list", None)
+                    is_widget = isinstance(watched, QtWidgets.QWidget)
+                    on_macro_list = bool(
+                        current is builder
+                        and macro_list is not None
+                        and is_widget
+                        and (watched is macro_list or macro_list.isAncestorOf(watched))
+                    )
+                    if on_macro_list and key == QtCore.Qt.Key_Delete and modifiers == QtCore.Qt.NoModifier:
+                        builder._delete_macro_list_selection()
+                        return True
+                    if on_macro_list and key == QtCore.Qt.Key_Z and modifiers == QtCore.Qt.ControlModifier:
                         self._restore_last_deletion()
-                    elif current is self.pages.get("builder"):
-                        current.undo_edit()
-                    return True
-                if event.key() == QtCore.Qt.Key_Y and modifiers == QtCore.Qt.ControlModifier:
-                    if current is self.pages.get("builder"):
-                        current.redo_edit()
-                    return True
+                        return True
+                    if key == QtCore.Qt.Key_Delete and modifiers == QtCore.Qt.NoModifier:
+                        self._archive_current_selection()
+                        return True
+                    if key == QtCore.Qt.Key_Z and modifiers == QtCore.Qt.ControlModifier:
+                        if self._undo_deletions:
+                            self._restore_last_deletion()
+                        elif current is self.pages.get("builder"):
+                            current.undo_edit()
+                        return True
+                    if key == QtCore.Qt.Key_Y and modifiers == QtCore.Qt.ControlModifier:
+                        if current is self.pages.get("builder"):
+                            current.redo_edit()
+                        return True
         return super().eventFilter(watched, event)
 
     @QtCore.Slot(str)

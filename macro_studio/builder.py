@@ -1425,9 +1425,15 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.start_search_group_requested.connect(self._configure_start_search_candidates)
         self.node_canvas.log_requested.connect(self._open_logs)
         self.node_canvas.image_edit_requested.connect(self._edit_node_search_image)
+        self.node_canvas.color_visual_test_requested.connect(self._open_node_color_visual_test)
         self.node_canvas.multi_image_merge_requested.connect(
             lambda indexes: QtCore.QTimer.singleShot(
                 0, lambda values=list(indexes): self._merge_graph_image_nodes(values)
+            )
+        )
+        self.node_canvas.multi_color_merge_requested.connect(
+            lambda indexes: QtCore.QTimer.singleShot(
+                0, lambda values=list(indexes): self._merge_graph_color_nodes(values)
             )
         )
         self.node_canvas.node_title_changed.connect(self._graph_node_title_changed)
@@ -2305,6 +2311,123 @@ class BuilderPage(QtWidgets.QWidget):
             self._normalize_edges_after_delete(index)
         self._persist(f"이미지 서치 {len(selected)}개를 멀티 이미지 서치 {len(aliases)}개로 묶었습니다.")
         self._refresh_steps(primary_index - 1)
+
+    def _merge_graph_color_nodes(self, indexes: list[int]) -> None:
+        if self.current_macro is None:
+            return
+        steps = self.current_macro.get("steps") or []
+        selected = sorted({int(index) for index in indexes if 0 < int(index) <= len(steps)})
+        if len(selected) < 2 or any(str(steps[index - 1].get("action") or "") != "pixel_search" for index in selected):
+            self.status.emit("색상 서치 노드를 2개 이상 선택해 주세요.")
+            return
+        selected_set = set(selected)
+        primary_index = selected[0]
+        primary = steps[primary_index - 1]
+        colors: list[str] = []
+        tolerances: dict[str, int] = {}
+        regions: dict[str, list[int]] = {}
+        for index in selected:
+            member = steps[index - 1]
+            member_colors = [
+                str(c).strip() for c in member.get("colors") or [] if str(c).strip()
+            ] if isinstance(member.get("colors"), list) else []
+            member_primary = str(member.get("color") or "").strip()
+            if member_primary and member_primary not in member_colors:
+                member_colors.insert(0, member_primary)
+            member_tols = member.get("color_tolerances") if isinstance(member.get("color_tolerances"), dict) else {}
+            fallback_tol = int(member.get("tolerance") or 10)
+            member_regs = member.get("color_regions") if isinstance(member.get("color_regions"), dict) else {}
+            fallback_reg = member.get("search_region") or member.get("region")
+            if not isinstance(fallback_reg, list) or len(fallback_reg) < 4:
+                fallback_reg = [0, 0, 0, 0]
+            for c in member_colors:
+                if c not in colors:
+                    colors.append(c)
+                tolerances[c] = int(member_tols.get(c, fallback_tol))
+                if c in member_regs and isinstance(member_regs[c], list) and len(member_regs[c]) >= 4:
+                    regions[c] = list(member_regs[c][:4])
+                else:
+                    regions[c] = list(fallback_reg[:4])
+
+        if len(colors) < 2:
+            self.status.emit("선택한 노드에서 서로 다른 검색 색상을 2개 이상 찾지 못했습니다.")
+            return
+
+        def external_target(field: str) -> int:
+            for index in reversed(selected):
+                target = int(steps[index - 1].get(field) or 0)
+                if target and target not in selected_set:
+                    return target
+            if field == "on_success" and selected[-1] < len(steps):
+                return selected[-1] + 1
+            return 0
+
+        success_target = external_target("on_success")
+        fail_target = external_target("on_fail")
+        primary["color"] = colors[0]
+        primary["colors"] = colors
+        primary["color_tolerances"] = tolerances
+        primary["color_regions"] = regions
+        primary["tolerance"] = tolerances.get(colors[0], 10)
+        primary["label"] = f"멀티 색상 서치 {len(colors)}개"
+        primary["match_condition"] = "all_matched"
+        primary["required_count"] = len(colors)
+        primary.pop("stop_on_success", None)
+        if success_target:
+            primary["on_success"] = success_target
+        else:
+            primary.pop("on_success", None)
+        if fail_target:
+            primary["on_fail"] = fail_target
+        else:
+            primary.pop("on_fail", None)
+
+        valid_regs = [r for r in regions.values() if isinstance(r, (list, tuple)) and len(r) >= 4 and (r[0] or r[1] or r[2] or r[3])]
+        if valid_regs:
+            min_l = min(int(r[0]) for r in valid_regs)
+            min_t = min(int(r[1]) for r in valid_regs)
+            max_r = max(int(r[2]) for r in valid_regs)
+            max_b = max(int(r[3]) for r in valid_regs)
+            primary["search_region"] = [min_l, min_t, max_r, max_b]
+            primary["region"] = [min_l, min_t, max_r, max_b]
+
+        automation = primary.get("_automation") if isinstance(primary.get("_automation"), dict) else {}
+        automation.update({"manual_multi_merge": True, "color_count": len(colors)})
+        primary["_automation"] = automation
+        for index in reversed(selected[1:]):
+            removed = steps.pop(index - 1)
+            self.current_macro.setdefault("meta", {}).setdefault("archived_steps", []).append(removed)
+            self._normalize_edges_after_delete(index)
+        self._persist(f"색상 서치 {len(selected)}개를 멀티 색상 서치 {len(colors)}개로 묶었습니다.")
+        self._refresh_steps(primary_index - 1)
+
+    def _open_node_color_visual_test(self, step_index: int) -> None:
+        steps = list((self.current_macro or {}).get("steps") or [])
+        row = int(step_index) - 1
+        if not 0 <= row < len(steps):
+            return
+        step = steps[row]
+        if str(step.get("action") or "") != "pixel_search":
+            return
+        from .region_visual_test import RegionVisualTestDialog
+        dlg = RegionVisualTestDialog(step, self.repository, parent=self.window())
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            updated_color_regs = dlg.get_color_regions()
+            if updated_color_regs:
+                step["color_regions"] = updated_color_regs
+            updated_tols = dlg.get_color_tolerances()
+            if updated_tols:
+                step["color_tolerances"] = updated_tols
+                if step.get("color") in updated_tols:
+                    step["tolerance"] = updated_tols[step["color"]]
+                elif updated_tols:
+                    step["tolerance"] = next(iter(updated_tols.values()))
+            bounding = dlg.get_bounding_region()
+            if bounding:
+                step["search_region"] = bounding
+                step["region"] = bounding
+            self._persist(f"{step_index}번 노드의 색상 및 검색 영역을 보정했습니다.")
+            self._refresh_steps(row)
 
     @QtCore.Slot(int, int, str)
     def _delete_graph_edge(self, source: int, target: int, kind: str) -> None:

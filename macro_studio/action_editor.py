@@ -9,6 +9,7 @@ from typing import Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .color_widgets import ColorToleranceBarWidget
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop, virtual_desktop_geometry
 from .repository import MacroRepository
 from .widgets import WheelSafeSpinBox
@@ -580,11 +581,18 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
     ],
     "pixel_search": [
         FieldSpec("color", "검색 색상 (HEX)", "text", "#FF0000", placeholder="예: #FF3A2B 또는 0xFF3A2B"),
-        FieldSpec("tolerance", "색상 허용 오차", "int", 10, 0, 255, tooltip="낮을수록 더 정확하고 엄격하게 일치합니다."),
+        FieldSpec("tolerance", "색상 허용 오차", "color_tolerance", 10, 0, 255, tooltip="기준 색상 위치와 허용 오차(±Tolerance)를 시각적 색상 바에서 휠이나 드래그, 숫자로 조절합니다."),
         FieldSpec("search_region.0", "검색 왼쪽", "int", 0, -100_000, 100_000, section="검색 범위"),
         FieldSpec("search_region.1", "검색 위", "int", 0, -100_000, 100_000, section="검색 범위"),
         FieldSpec("search_region.2", "검색 오른쪽", "int", 0, -100_000, 100_000, section="검색 범위"),
         FieldSpec("search_region.3", "검색 아래", "int", 0, -100_000, 100_000, section="검색 범위"),
+        FieldSpec("match_condition", "일치 조건 (성공 판정)", "choice", "all_matched", options=choice(
+            ("모든 색상 일치 시 참 (AND)", "all_matched"),
+            ("1개 이상 일치 시 참 (OR)", "at_least_1"),
+            ("N개 이상 일치 시 참", "at_least_n"),
+            ("정확히 N개 일치 시 참", "exact_n"),
+        ), section="조건 분기", tooltip="멀티 색상 서치 시 성공(참)으로 판정할 조건입니다."),
+        FieldSpec("required_count", "요구 개수 (N개)", "int", 1, 1, 100, section="조건 분기", tooltip="N개 이상 또는 정확히 N개 일치 조건일 때 기준 개수입니다."),
         FieldSpec("action_on_found", "발견 시 동작", "choice", "click", options=choice(
             ("발견 위치 클릭", "click"),
             ("좌표만 변수 저장", "store_var"),
@@ -592,6 +600,7 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         ), section="동작 설정"),
         FieldSpec("store_x_var", "X좌표 저장 변수", "text", "PixelFoundX", section="동작 설정"),
         FieldSpec("store_y_var", "Y좌표 저장 변수", "text", "PixelFoundY", section="동작 설정"),
+        FieldSpec("store_count_var", "일치 개수 저장 변수", "text", "PixelMatchCount", section="동작 설정"),
         FieldSpec("timeout", "검색 제한 시간", "duration", 3000, 0, 600_000, section="타이밍"),
         FieldSpec("poll_delay", "반복 간격", "duration", 50, 10, 60_000, section="타이밍"),
         FieldSpec("click_offset_x", "클릭 오프셋 X", "int", 0, -10000, 10000, section="클릭 옵션", tooltip="발견된 픽셀 X좌표 기준 상대 클릭 오프셋 (px). 0이면 픽셀 위치 그대로 클릭"),
@@ -3000,8 +3009,10 @@ class ActionEditor(QtWidgets.QWidget):
             buttons.append(("▶ OCR 테스트", lambda: self._test_ocr(action)))
             buttons.append(("🎨 OCR 필터 튜닝", lambda: self._open_ocr_filter_tuner(action)))
         elif action == "pixel_search":
+            buttons.append(("🔍 색상 검색 영역 검증 및 실시간 검사", self._open_region_visual_test))
             buttons.append(("🎯 색상 스포이트 (돋보기 좌클릭)", lambda: self._pick_pixel_color(action)))
             buttons.append(("▣ 검색 영역 잡기 (드래그)", lambda: self._pick_region(action, "search_region")))
+            buttons.append(("🎯 멀티 전체 발견 시 참(성공) 설정", self._preset_color_multi_count_all))
         elif action == "ocr_tracking":
             buttons.append(("🎯 1단계: 추적 대상 이미지 캡처", lambda: self._pick_ocr_track_target(action)))
             buttons.append(("🎨 1단계-B: 추적 색상 스포이트", lambda: self._pick_ocr_track_color(action)))
@@ -3151,6 +3162,10 @@ class ActionEditor(QtWidgets.QWidget):
         spec = next((item for item in ACTION_FIELDS.get(action, []) if item.key == key), None)
         if widget is not None and spec is not None:
             self._set_widget_value(widget, spec, value)
+        if action == "pixel_search" and key == "color" and value:
+            tol_w = self.widgets.get("pixel_search", {}).get("tolerance")
+            if isinstance(tol_w, ColorToleranceBarWidget):
+                tol_w.set_color(str(value).strip())
 
     def _use_full_virtual_screen(self) -> None:
         self._set_field_value("image_search", "region_mode", "screen")
@@ -3527,7 +3542,15 @@ class ActionEditor(QtWidgets.QWidget):
         color = picker.selected_color()
         self._restore_host_windows(hosts)
         if accepted and color:
-            self._set_field_value(action, "color", color.name().upper())
+            hex_val = color.name().upper()
+            self._set_field_value(action, "color", hex_val)
+            tol_w = self.widgets.get(action, {}).get("tolerance")
+            if isinstance(tol_w, ColorToleranceBarWidget):
+                tol_w.set_color(hex_val)
+
+    def _preset_color_multi_count_all(self) -> None:
+        self._set_field_value("pixel_search", "match_condition", "all_matched")
+        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "멀티 색상 모두 발견 시 성공으로 설정되었습니다.")
 
     def _pick_wait_color(self, action: str) -> None:
         from .automation import capture_virtual_desktop, PixelColorPickerDialog
@@ -4135,6 +4158,23 @@ class ActionEditor(QtWidgets.QWidget):
         dlg = RegionVisualTestDialog(step, self.repository, parent=self.window())
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
+        if self.current_action == "pixel_search":
+            updated_color_regs = dlg.get_color_regions()
+            updated_tols = dlg.get_color_tolerances()
+            if updated_tols:
+                tol_val = next(iter(updated_tols.values()))
+                self._set_field_value("pixel_search", "tolerance", tol_val)
+            bounding = dlg.get_bounding_region()
+            if bounding:
+                for offset, val in enumerate(bounding):
+                    self._set_field_value("pixel_search", f"search_region.{offset}", val)
+            QtWidgets.QMessageBox.information(
+                self,
+                "색상 및 영역 보정 완료",
+                "검색 영역 검사기에서 조절한 허용 오차 및 검색 영역이 노드에 성공적으로 적용되었습니다!",
+            )
+            return
+
         updated_regs = dlg.get_asset_regions()
         if updated_regs:
             picker = self.widgets.get("image_search", {}).get("assets")
@@ -4227,6 +4267,8 @@ class ActionEditor(QtWidgets.QWidget):
                 widget.setSuffix(" ms")
         elif spec.kind == "offset":
             widget = OffsetEditor()
+        elif spec.kind == "color_tolerance":
+            widget = ColorToleranceBarWidget(tolerance=int(spec.default or 10))
         elif spec.kind == "assets":
             widget = MultiAssetPicker()
         elif spec.kind == "bool":
@@ -4586,6 +4628,11 @@ class ActionEditor(QtWidgets.QWidget):
             target.set_value(value)
         elif isinstance(target, MultiAssetPicker):
             target.set_value(value)
+        elif isinstance(target, ColorToleranceBarWidget):
+            try:
+                target.set_tolerance(int(value or spec.default or 10))
+            except (TypeError, ValueError):
+                target.set_tolerance(int(spec.default or 10))
         elif isinstance(target, QtWidgets.QSpinBox):
             try:
                 target.setValue(int(value or 0))
@@ -4624,6 +4671,8 @@ class ActionEditor(QtWidgets.QWidget):
             return target.value()
         if isinstance(target, MultiAssetPicker):
             return target.value()
+        if isinstance(target, ColorToleranceBarWidget):
+            return target.tolerance()
         if isinstance(target, QtWidgets.QSpinBox):
             return target.value()
         if isinstance(target, QtWidgets.QCheckBox):

@@ -504,6 +504,30 @@ class NodeImagePreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
         super().mousePressEvent(event)
 
 
+class NodeColorPreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
+    """Interactive color preview badge on node cards."""
+
+    def __init__(
+        self,
+        canvas: "NodeCanvas",
+        colors: list[str],
+        step_index: int | None = None,
+        parent=None,
+    ) -> None:
+        super().__init__("🎨" if len(colors) > 1 else "◈", parent)
+        self.canvas = canvas
+        self.colors = colors
+        self.step_index = step_index
+        self.setAcceptHoverEvents(True)
+
+    def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton and self.step_index is not None:
+            self.canvas.color_visual_test_requested.emit(self.step_index)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class TriggerNodeItem(QtWidgets.QGraphicsObject):
     """Visual-only card for a macro-level image trigger.
 
@@ -743,12 +767,18 @@ class NodeItem(QtWidgets.QGraphicsObject):
             str(step.get("action") or "") == "image_search"
             and len(step.get("assets") or []) > 1
         )
+        self.is_multi_color = (
+            str(step.get("action") or "") == "pixel_search"
+            and len(step.get("colors") or []) > 1
+        )
         custom_label = str(step.get("label") or step.get("name") or "").strip()
         self.display_title = (
             custom_label
             if custom_label
             else "멀티 이미지 서치"
             if self.is_multi
+            else f"멀티 색상 서치 · {len(step.get('colors') or [])}개"
+            if self.is_multi_color
             else "서브플로우"
             if str(step.get("action") or "") == "call_submacro"
             else ACTION_TITLES.get(str(step.get("action") or "step"), str(step.get("action") or "step"))
@@ -772,7 +802,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
 
         self._sync_compact_geometry()
 
-        self.preview_badge: NodeImagePreviewBadge | None = None
+        self.preview_badge: QtWidgets.QGraphicsSimpleTextItem | None = None
         if str(step.get("action") or "") in {"image_search", "screen_condition"}:
             aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
             primary = str(step.get("asset") or "").strip()
@@ -802,6 +832,24 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 badge.setToolTip(f"<b>캡처 이미지</b><br>{live_pixmap.width()}×{live_pixmap.height()}{region_hint}<br>커서를 올리면 미리보기")
             else:
                 badge.setToolTip("이미지 미선택")
+            self.preview_badge = badge
+            badge.setVisible(not self.collapsed)
+        elif str(step.get("action") or "") == "pixel_search":
+            colors = [str(value).strip() for value in (step.get("colors") or []) if str(value).strip()]
+            primary = str(step.get("color") or "#FF0000").strip()
+            if primary and primary not in colors:
+                colors.insert(0, primary)
+            badge = NodeColorPreviewBadge(canvas, colors, index, self)
+            font = QtGui.QFont("Segoe UI Symbol", 9)
+            font.setBold(True)
+            badge.setFont(font)
+            first_c = colors[0] if colors else "#FF6B9D"
+            badge.setBrush(QtGui.QColor(first_c) if QtGui.QColor(first_c).isValid() else QtGui.QColor("#FF6B9D"))
+            badge.setPos(self.current_width() - 22, 6)
+            badge.setZValue(8)
+            badge.setCursor(QtCore.Qt.PointingHandCursor)
+            title = f"멀티 색상 서치 ({len(colors)}개)" if len(colors) > 1 else "색상 서치"
+            badge.setToolTip(f"<b>{title}</b><br>색상: {', '.join(colors)}<br>클릭하면 실시간 영역 검증 및 미세조정")
             self.preview_badge = badge
             badge.setVisible(not self.collapsed)
 
@@ -1524,6 +1572,17 @@ class NodeItem(QtWidgets.QGraphicsObject):
         ]
         merge_multi = menu.addAction("▦ 선택 이미지 서치를 멀티 서치로 묶기")
         merge_multi.setEnabled(len(selected_image_nodes) >= 2 and len(selected_image_nodes) == len(selected_indexes))
+        selected_color_nodes = [
+            index
+            for index in selected_indexes
+            if index in self.canvas.nodes
+            and str(self.canvas.steps[index - 1].get("action") or "") == "pixel_search"
+        ]
+        merge_color_multi = menu.addAction("🎨 선택 색상 서치를 멀티 색상 서치로 묶기")
+        merge_color_multi.setEnabled(len(selected_color_nodes) >= 2 and len(selected_color_nodes) == len(selected_indexes))
+        act_color_test = None
+        if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") == "pixel_search":
+            act_color_test = menu.addAction("🔍 색상 검색 영역 검증 및 실시간 검사...")
         menu.addSeparator()
         if len(selected_indexes) >= 2:
             act_branch = menu.addAction(f"🔀 선택 노드 {len(selected_indexes)}개를 순차 분기로 연결 (실패 시 다음 분기)")
@@ -1596,6 +1655,10 @@ class NodeItem(QtWidgets.QGraphicsObject):
             self.canvas.all_wait_duration_requested.emit()
         elif chosen == merge_multi:
             self.canvas.multi_image_merge_requested.emit(selected_image_nodes)
+        elif chosen == merge_color_multi:
+            self.canvas.multi_color_merge_requested.emit(selected_color_nodes)
+        elif act_color_test is not None and chosen == act_color_test:
+            self.canvas.color_visual_test_requested.emit(self.index)
         elif chosen == duplicate:
             self.canvas.node_duplicate_requested.emit(self.index)
         elif chosen == archive:
@@ -3019,8 +3082,10 @@ class NodeCanvas(QtWidgets.QWidget):
     all_wait_duration_requested = QtCore.Signal()
     start_search_group_requested = QtCore.Signal(list)
     image_edit_requested = QtCore.Signal(int)
+    color_visual_test_requested = QtCore.Signal(int)
     collapsed_changed = QtCore.Signal(list)
     multi_image_merge_requested = QtCore.Signal(list)
+    multi_color_merge_requested = QtCore.Signal(list)
     log_requested = QtCore.Signal()
     node_title_changed = QtCore.Signal(int, str)
     archive_requested = QtCore.Signal()

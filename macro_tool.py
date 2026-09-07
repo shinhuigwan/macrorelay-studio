@@ -4410,52 +4410,115 @@ def render_datetime_condition(step: Dict[str, Any], step_index: int) -> List[str
     return lines
 
 
-def render_pixel_search(step: Dict[str, Any]) -> List[str]:
-    """Render AHK PixelSearch command for color search."""
-    color_raw = str(step.get("color") or "#FF0000").strip()
-    if color_raw.startswith("#"):
-        color_hex = "0x" + color_raw[1:].upper()
-    elif color_raw.startswith("0x") or color_raw.startswith("0X"):
-        color_hex = "0x" + color_raw[2:].upper()
-    else:
-        color_hex = "0x" + color_raw.upper()
-    tolerance = int(step.get("tolerance") or 10)
-    region = step.get("search_region") or [0, 0, 0, 0]
-    if isinstance(region, (list, tuple)) and len(region) >= 4:
-        left, top, right, bottom = int(region[0]), int(region[1]), int(region[2]), int(region[3])
-    else:
-        left, top, right, bottom = 0, 0, 0, 0
-    # If region is 0,0,0,0, search entire primary screen
-    if left == 0 and top == 0 and right == 0 and bottom == 0:
-        right, bottom = "A_ScreenWidth", "A_ScreenHeight"
+def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
+    """Render AHK PixelSearch command for single or multi color search with conditions."""
+    raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
+    colors = [str(c).strip() for c in raw_colors if str(c).strip()]
+    primary_color = str(step.get("color") or "").strip()
+    if primary_color and primary_color not in colors:
+        colors.insert(0, primary_color)
+    if not colors:
+        colors = ["#FF0000"]
+
+    color_tolerances = step.get("color_tolerances") if isinstance(step.get("color_tolerances"), dict) else {}
+    base_tol = int(step.get("tolerance") or 10)
+
+    color_regions = step.get("color_regions") if isinstance(step.get("color_regions"), dict) else {}
+    base_region = step.get("search_region") or step.get("region") or [0, 0, 0, 0]
+
+    match_condition = str(step.get("match_condition") or "all_matched").strip()
+    total_colors = len(colors)
+    required_count = int(step.get("required_count") or (1 if match_condition == "at_least_1" else total_colors))
+
     action_on_found = str(step.get("action_on_found") or "click")
     store_x = str(step.get("store_x_var") or "PixelFoundX")
     store_y = str(step.get("store_y_var") or "PixelFoundY")
+    store_count_var = str(step.get("store_count_var") or "").strip()
+
     timeout = int(step.get("timeout") or 3000)
     poll_delay = int(step.get("poll_delay") or 50)
     click_offset_x = int(step.get("click_offset_x") or 0)
     click_offset_y = int(step.get("click_offset_y") or 0)
     sleep_after = int(step.get("sleep_after") or 0)
+
+    found_var = f"__pixel_search_success_{step_index}" if step_index else "__pixel_search_success"
+
     lines: List[str] = []
-    lines.append("; ── 픽셀 색상 서치 ──")
-    lines.append(f'PixelSearch_Color := "{color_hex}"')
-    lines.append(f"PixelSearch_Tolerance := {tolerance}")
-    lines.append(f"PixelSearch_Timeout := {timeout}")
-    lines.append(f"PixelSearch_PollDelay := {poll_delay}")
-    lines.append("PixelSearch_Start := A_TickCount")
-    lines.append("PixelSearch_Found := false")
+    lines.append(f"; ── 픽셀 색상 서치 ({'멀티 ' + str(total_colors) + '개' if total_colors > 1 else '단일'}) ──")
+    lines.append(f"{found_var} := 0")
+    lines.append(f"PixelSearch_Timeout_{step_index} := {timeout}")
+    lines.append(f"PixelSearch_PollDelay_{step_index} := {poll_delay}")
+    lines.append(f"PixelSearch_Start_{step_index} := A_TickCount")
+    lines.append(f"PixelSearch_MatchCount_{step_index} := 0")
+    lines.append(f"PixelSearch_FirstX_{step_index} := 0")
+    lines.append(f"PixelSearch_FirstY_{step_index} := 0")
+
     lines.append("Loop {")
-    lines.append(f"    PixelSearch, {store_x}, {store_y}, {left}, {top}, {right}, {bottom}, %PixelSearch_Color%, %PixelSearch_Tolerance%, Fast RGB")
-    lines.append("    if (ErrorLevel = 0) {")
-    lines.append("        PixelSearch_Found := true")
+    lines.append(f"    PixelSearch_MatchCount_{step_index} := 0")
+
+    for idx, c in enumerate(colors, 1):
+        c_str = c
+        if c_str.startswith("#"):
+            c_hex = "0x" + c_str[1:].upper()
+        elif c_str.startswith("0x") or c_str.startswith("0X"):
+            c_hex = "0x" + c_str[2:].upper()
+        else:
+            c_hex = "0x" + c_str.upper()
+        tol = int(color_tolerances.get(c, base_tol))
+        reg = color_regions.get(c, base_region)
+        if isinstance(reg, (list, tuple)) and len(reg) >= 4:
+            left, top, right, bottom = int(reg[0]), int(reg[1]), int(reg[2]), int(reg[3])
+        else:
+            left, top, right, bottom = 0, 0, 0, 0
+        if left == 0 and top == 0 and right == 0 and bottom == 0:
+            right_val, bottom_val = "A_ScreenWidth", "A_ScreenHeight"
+        else:
+            right_val, bottom_val = str(right), str(bottom)
+
+        cur_x = f"__ps_x_{step_index}_{idx}"
+        cur_y = f"__ps_y_{step_index}_{idx}"
+        lines.append(f"    PixelSearch, {cur_x}, {cur_y}, {left}, {top}, {right_val}, {bottom_val}, {c_hex}, {tol}, Fast RGB")
+        lines.append("    if (ErrorLevel = 0) {")
+        lines.append(f"        PixelSearch_MatchCount_{step_index} += 1")
+        lines.append(f"        if (PixelSearch_FirstX_{step_index} = 0 && PixelSearch_FirstY_{step_index} = 0) {{")
+        lines.append(f"            PixelSearch_FirstX_{step_index} := {cur_x}")
+        lines.append(f"            PixelSearch_FirstY_{step_index} := {cur_y}")
+        lines.append("        }")
+        lines.append("    }")
+
+    if match_condition == "all_matched":
+        lines.append(f"    if (PixelSearch_MatchCount_{step_index} >= {total_colors}) {{")
+        lines.append(f"        {found_var} := 1")
+        lines.append("        break")
+        lines.append("    }")
+    elif match_condition == "at_least_1":
+        lines.append(f"    if (PixelSearch_MatchCount_{step_index} >= 1) {{")
+        lines.append(f"        {found_var} := 1")
+        lines.append("        break")
+        lines.append("    }")
+    elif match_condition == "exact_n":
+        lines.append(f"    if (PixelSearch_MatchCount_{step_index} = {required_count}) {{")
+        lines.append(f"        {found_var} := 1")
+        lines.append("        break")
+        lines.append("    }")
+    else:  # at_least_n
+        lines.append(f"    if (PixelSearch_MatchCount_{step_index} >= {required_count}) {{")
+        lines.append(f"        {found_var} := 1")
+        lines.append("        break")
+        lines.append("    }")
+
+    lines.append(f"    if (A_TickCount - PixelSearch_Start_{step_index} >= PixelSearch_Timeout_{step_index})")
     lines.append("        break")
-    lines.append("    }")
-    lines.append("    if (A_TickCount - PixelSearch_Start >= PixelSearch_Timeout)")
-    lines.append("        break")
-    lines.append("    Sleep, %PixelSearch_PollDelay%")
+    lines.append(f"    Sleep, %PixelSearch_PollDelay_{step_index}%")
     lines.append("}")
+
+    lines.append(f"{store_x} := PixelSearch_FirstX_{step_index}")
+    lines.append(f"{store_y} := PixelSearch_FirstY_{step_index}")
+    if store_count_var:
+        lines.append(f"{store_count_var} := PixelSearch_MatchCount_{step_index}")
+
     if action_on_found == "click":
-        lines.append("if (PixelSearch_Found) {")
+        lines.append(f"if ({found_var}) {{")
         if click_offset_x or click_offset_y:
             lines.append(f"    __click_x := {store_x} + {click_offset_x}")
             lines.append(f"    __click_y := {store_y} + {click_offset_y}")
@@ -4838,7 +4901,7 @@ def render_step(
     if action == "datetime_condition":
         return render_datetime_condition(step, step_index)
     if action == "pixel_search":
-        return render_pixel_search(step)
+        return render_pixel_search(step, step_index)
     if action == "ocr_tracking":
         return render_ocr_tracking(step, assets)
     if action == "multi_pixel_check":
@@ -5231,10 +5294,12 @@ def render_macro_script(
             lines.append("")
             continue
 
-        if action in {"image_search", "screen_condition", "ocr", "datetime_condition"}:
+        if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search"}:
             found_var = (
                 f"__step_found_{count}"
                 if action in {"image_search", "screen_condition"}
+                else f"__pixel_search_success_{count}"
+                if action == "pixel_search"
                 else f"__time_condition_success_{count}"
                 if action == "datetime_condition"
                 else "__ocr_success"
@@ -5248,6 +5313,10 @@ def render_macro_script(
             if action in {"image_search", "screen_condition"}:
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; confidence=" . OpenCvBestScore . "; x=" . FoundX . "; y=" . FoundY . "; scale=" . Round(FoundScaleX, 3) . "x" . Round(FoundScaleY, 3) . "; elapsed_ms=" . VisionElapsed . "; cache=" . VisionCacheHit . "; captures=" . VisionCaptures . "; capture_reuse=" . VisionCaptureReuses)'
+                )
+            elif action == "pixel_search":
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "matches=" . PixelSearch_MatchCount_{count} . "; first_x=" . PixelSearch_FirstX_{count} . "; first_y=" . PixelSearch_FirstY_{count})'
                 )
             elif action == "ocr":
                 store_var = normalize_variable_name(step.get("store_var"))
@@ -5285,6 +5354,10 @@ def render_macro_script(
             if action in {"image_search", "screen_condition"}:
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; best_confidence=" . OpenCvBestScore . "; result=not_found")'
+                )
+            elif action == "pixel_search":
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "matches=" . PixelSearch_MatchCount_{count} . "; result=not_found_or_condition_failed")'
                 )
             elif action == "ocr":
                 lines.append(

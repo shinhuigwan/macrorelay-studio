@@ -12,8 +12,22 @@ import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .color_widgets import ColorToleranceBarWidget, ToleranceSpectrumBar
 from .repository import MacroRepository
 from .theme import COLORS
+
+
+def hex_to_bgr(hex_str: str) -> tuple[int, int, int]:
+    h = str(hex_str).strip().lstrip("#").lower()
+    if h.startswith("0x"):
+        h = h[2:]
+    if len(h) == 6:
+        try:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return (b, g, r)
+        except ValueError:
+            pass
+    return (0, 0, 255)
 
 
 def _ensure_interactive_desktop() -> None:
@@ -375,10 +389,14 @@ class InteractiveCanvas(QtWidgets.QWidget):
             painter.drawRect(rect)
 
             # Label above box
-            status_text = f"[{idx + 1}] {alias} · {score:.0%} {'✅' if found else '❌'}"
+            if res.get("is_color"):
+                cnt = int(res.get("match_count", 0))
+                status_text = f"[{idx + 1}] {alias} · 일치 {cnt}px {'✅' if found else '❌'}"
+            else:
+                status_text = f"[{idx + 1}] {alias} · {score:.0%} {'✅' if found else '❌'}"
             painter.setPen(QtGui.QColor("#FFFFFF"))
             painter.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold))
-            label_bg = QtCore.QRectF(rect.left(), max(0.0, rect.top() - 20), max(rect.width(), 130.0), 18)
+            label_bg = QtCore.QRectF(rect.left(), max(0.0, rect.top() - 20), max(rect.width(), 140.0), 18)
             painter.fillRect(label_bg, QtGui.QColor(20, 25, 35, 210))
             painter.drawText(label_bg.adjusted(4, 0, 0, 0), QtCore.Qt.AlignVCenter, status_text)
 
@@ -386,18 +404,23 @@ class InteractiveCanvas(QtWidgets.QWidget):
             if found and "hit_x" in res and "hit_y" in res:
                 hx = float(res["hit_x"]) * s
                 hy = float(res["hit_y"]) * s
-                painter.setPen(QtGui.QPen(QtGui.QColor("#22C55E"), 2.0))
+                cross_clr = QtGui.QColor("#22C55E")
+                painter.setPen(QtGui.QPen(cross_clr, 2.0))
                 painter.drawLine(QtCore.QPointF(hx - 6, hy), QtCore.QPointF(hx + 6, hy))
                 painter.drawLine(QtCore.QPointF(hx, hy - 6), QtCore.QPointF(hx, hy + 6))
-                painter.setBrush(QtGui.QBrush(QtGui.QColor("#22C55E")))
+                painter.setBrush(QtGui.QBrush(cross_clr))
                 painter.drawEllipse(QtCore.QPointF(hx, hy), 3, 3)
 
             # Draw hint box if missed inside region but found somewhere else on screen!
             if not found and res.get("full_found") and "full_x" in res and "full_y" in res:
                 fx = float(res["full_x"]) * s
                 fy = float(res["full_y"]) * s
-                fw = float(res.get("tmpl_w", 24)) * s
-                fh = float(res.get("tmpl_h", 24)) * s
+                if res.get("is_color"):
+                    fw = 32.0 * s
+                    fh = 32.0 * s
+                else:
+                    fw = float(res.get("tmpl_w", 24)) * s
+                    fh = float(res.get("tmpl_h", 24)) * s
                 hint_rect = QtCore.QRectF(fx - fw / 2, fy - fh / 2, fw, fh)
                 dash_pen = QtGui.QPen(QtGui.QColor("#FBBF24"), 2.0, QtCore.Qt.DashLine)
                 painter.setPen(dash_pen)
@@ -405,7 +428,11 @@ class InteractiveCanvas(QtWidgets.QWidget):
                 painter.drawRect(hint_rect)
                 painter.setPen(QtGui.QColor("#FDE047"))
                 painter.setFont(QtGui.QFont("Segoe UI", 8, QtGui.QFont.Bold))
-                painter.drawText(QtCore.QPointF(hint_rect.left(), max(12.0, hint_rect.top() - 4)), f"실제 위치 ({res.get('full_score', 0):.0%})")
+                if res.get("is_color"):
+                    cnt = int(res.get("full_count", 0))
+                    painter.drawText(QtCore.QPointF(hint_rect.left(), max(12.0, hint_rect.top() - 4)), f"실제 색상 발견 ({cnt}px)")
+                else:
+                    painter.drawText(QtCore.QPointF(hint_rect.left(), max(12.0, hint_rect.top() - 4)), f"실제 위치 ({res.get('full_score', 0):.0%})")
 
         # 2. Draw active dragging box
         if self._drag_start and self._drag_current:
@@ -457,8 +484,43 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.step = dict(step)
         self.repository = repository
-        self._asset_regions: dict[str, list[int]] = dict(asset_regions or step.get("asset_regions") or {})
-        self._aliases: list[str] = self._extract_aliases(step)
+        self._is_color_mode: bool = (
+            str(step.get("action") or "") == "pixel_search"
+            or bool(step.get("colors"))
+            or (bool(step.get("color")) and not step.get("asset") and not step.get("assets"))
+        )
+        if self._is_color_mode:
+            raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
+            colors = [str(c).strip() for c in raw_colors if str(c).strip()]
+            primary_color = str(step.get("color") or "").strip()
+            if primary_color and primary_color not in colors:
+                colors.insert(0, primary_color)
+            if not colors:
+                colors = ["#FF0000"]
+            self._colors: list[str] = list(dict.fromkeys(colors))
+            self._color_tolerances: dict[str, int] = dict(step.get("color_tolerances") or {})
+            fallback_tol = int(step.get("tolerance") or 10)
+            for c in self._colors:
+                if c not in self._color_tolerances:
+                    self._color_tolerances[c] = fallback_tol
+            self._color_regions: dict[str, list[int]] = dict(step.get("color_regions") or {})
+            fallback_reg = step.get("search_region") or step.get("region")
+            for c in self._colors:
+                if c not in self._color_regions:
+                    if isinstance(fallback_reg, list) and len(fallback_reg) >= 4:
+                        self._color_regions[c] = list(fallback_reg[:4])
+                    else:
+                        self._color_regions[c] = [0, 0, 0, 0]
+            self._aliases: list[str] = list(self._colors)
+            self._asset_regions: dict[str, list[int]] = self._color_regions
+        else:
+            self._colors = []
+            self._color_tolerances = {}
+            self._color_regions = {}
+            self._asset_regions = dict(asset_regions or step.get("asset_regions") or {})
+            self._aliases = self._extract_aliases(step)
+
+        self._color_card_labels: dict[str, dict[str, QtWidgets.QLabel]] = {}
         self._bgr_frame: np.ndarray | None = None
         self._base_x: int = 0
         self._base_y: int = 0
@@ -467,7 +529,8 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._required_count: int = int(step.get("required_count") or len(self._aliases))
         self._match_condition: str = str(step.get("match_condition") or "all_matched").strip()
 
-        self.setWindowTitle("🔍 검색 영역 시각화 및 실시간 화면 검사기")
+        win_title = "🎨 색상 검색 영역 시각화 및 실시간 화면 검사기" if self._is_color_mode else "🔍 검색 영역 시각화 및 실시간 화면 검사기"
+        self.setWindowTitle(win_title)
         self.resize(1180, 740)
         self.setStyleSheet("QDialog { background: #11151F; color: #E2E8F0; }")
 
@@ -484,7 +547,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         # Title & Target Info
         title_box = QtWidgets.QHBoxLayout()
-        title_lbl = QtWidgets.QLabel("검색 영역 실시간 검증")
+        title_lbl = QtWidgets.QLabel("색상 검색 영역 실시간 검증" if self._is_color_mode else "검색 영역 실시간 검증")
         title_lbl.setStyleSheet("font-size: 13pt; font-weight: 800; color: #FFFFFF;")
         title_box.addWidget(title_lbl)
         btn_refresh = QtWidgets.QPushButton("🔄 다시 캡처")
@@ -546,7 +609,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         left_layout.addWidget(tools_group)
 
         # Per-Image Cards Scroll Area
-        scroll_lbl = QtWidgets.QLabel("이미지별 지정 영역 및 검증 결과:")
+        scroll_lbl = QtWidgets.QLabel("색상별 지정 영역 및 허용 오차 조절:" if self._is_color_mode else "이미지별 지정 영역 및 검증 결과:")
         scroll_lbl.setStyleSheet("font-weight: 700; color: #CBD5E1; font-size: 10pt;")
         left_layout.addWidget(scroll_lbl)
 
@@ -582,7 +645,12 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         # Canvas toolbar
         canv_tools = QtWidgets.QHBoxLayout()
-        hint = QtWidgets.QLabel("💡 화면에서 마우스로 드래그하면 선택된 이미지의 검색 영역을 직접 다시 지정할 수 있습니다.")
+        hint_msg = (
+            "💡 화면에서 마우스로 드래그하면 선택된 색상의 검색 영역을 직접 다시 지정할 수 있습니다."
+            if self._is_color_mode
+            else "💡 화면에서 마우스로 드래그하면 선택된 이미지의 검색 영역을 직접 다시 지정할 수 있습니다."
+        )
+        hint = QtWidgets.QLabel(hint_msg)
         hint.setStyleSheet("color: #70C5FF; font-size: 9pt;")
         canv_tools.addWidget(hint, 1)
 
@@ -644,6 +712,9 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._refresh_ui()
 
     def _evaluate_all_regions(self) -> None:
+        if self._is_color_mode:
+            self._evaluate_all_colors()
+            return
         if self._bgr_frame is None:
             return
         frame = self._bgr_frame
@@ -732,6 +803,70 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         self._test_results = results
 
+    def _evaluate_all_colors(self) -> None:
+        if self._bgr_frame is None:
+            return
+        frame = self._bgr_frame
+        fh, fw = frame.shape[:2]
+        results: dict[str, dict[str, Any]] = {}
+
+        for color_hex in self._colors:
+            tol = int(self._color_tolerances.get(color_hex, self.step.get("tolerance") or 10))
+            target_bgr = np.array(hex_to_bgr(color_hex), dtype=np.int16)
+
+            reg = self._color_regions.get(color_hex)
+            if not reg or len(reg) < 4 or (reg[0] == 0 and reg[1] == 0 and reg[2] == 0 and reg[3] == 0):
+                reg = [0, 0, fw, fh]
+
+            l, t, r, b = [int(x) for x in reg[:4]]
+            cl = max(0, min(l, fw - 1))
+            ct = max(0, min(t, fh - 1))
+            cr = max(cl + 1, min(r, fw))
+            cb = max(ct + 1, min(b, fh))
+
+            crop = frame[ct:cb, cl:cr]
+            diff = np.abs(crop.astype(np.int16) - target_bgr)
+            mask = np.all(diff <= tol, axis=2)
+            match_count = int(np.count_nonzero(mask))
+            found = (match_count > 0)
+
+            hit_x, hit_y = 0, 0
+            if found:
+                ys, xs = np.where(mask)
+                hit_x = cl + int(xs[0])
+                hit_y = ct + int(ys[0])
+
+            # Full frame search if not found in region
+            full_found = False
+            full_x, full_y = 0, 0
+            full_count = 0
+            full_diff = np.abs(frame.astype(np.int16) - target_bgr)
+            full_mask = np.all(full_diff <= tol, axis=2)
+            full_count = int(np.count_nonzero(full_mask))
+            if full_count > 0:
+                full_found = True
+                fys, fxs = np.where(full_mask)
+                full_x = int(fxs[0])
+                full_y = int(fys[0])
+
+            results[color_hex] = {
+                "found": found,
+                "score": float(match_count),
+                "threshold": tol,
+                "hit_x": hit_x,
+                "hit_y": hit_y,
+                "match_count": match_count,
+                "full_found": full_found,
+                "full_x": full_x,
+                "full_y": full_y,
+                "full_count": full_count,
+                "region": [cl, ct, cr, cb],
+                "color_hex": color_hex,
+                "is_color": True,
+            }
+
+        self._test_results = results
+
     def _refresh_ui(self) -> None:
         active = self.canvas._active_alias or (self._aliases[0] if self._aliases else "")
         self.canvas.set_data(self._asset_regions, self._test_results, active_alias=active)
@@ -741,19 +876,31 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         matched_count = sum(1 for r in self._test_results.values() if r.get("found"))
         req = self._required_count if self._required_count > 0 else total
 
-        is_success = (matched_count == req) if self._match_condition == "exact_n" else (matched_count >= req)
+        target_name = "색상" if self._is_color_mode else "이미지"
+        if self._match_condition == "all_matched":
+            is_success = (matched_count == total)
+            cond_desc = f"모든 {target_name}({total}개) 일치 필요"
+        elif self._match_condition == "at_least_1":
+            is_success = (matched_count >= 1)
+            cond_desc = "최소 1개 이상 일치 시 참"
+        elif self._match_condition == "exact_n":
+            is_success = (matched_count == req)
+            cond_desc = f"정확히 {req}개 일치 시 참"
+        else:
+            is_success = (matched_count >= req)
+            cond_desc = f"최소 {req}개 이상 일치 시 참"
 
         if is_success:
             self.banner_box.setStyleSheet("background: #064E3B; border: 1px solid #059669; border-radius: 8px; padding: 8px;")
-            self.lbl_banner_main.setText(f"✅ 탐지 성공! ({matched_count}/{total}개 일치 ➔ 참 판정)")
+            self.lbl_banner_main.setText(f"✅ 탐지 성공! ({matched_count}/{total}개 {target_name} 일치 ➔ 참 판정)")
             self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #34D399;")
-            self.lbl_banner_sub.setText(f"요구 조건({req}개)을 만족하여 [성공(참) 분기]로 정상 이동합니다.")
+            self.lbl_banner_sub.setText(f"조건: {cond_desc} 만족 ➔ [성공(참) 분기]로 정상 이동합니다.")
             self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #A7F3D0;")
         else:
             self.banner_box.setStyleSheet("background: #450A0A; border: 1px solid #DC2626; border-radius: 8px; padding: 8px;")
-            self.lbl_banner_main.setText(f"❌ 조건 미달 ({matched_count}/{total}개 일치 ➔ 거짓 판정)")
+            self.lbl_banner_main.setText(f"❌ 조건 미달 ({matched_count}/{total}개 {target_name} 일치 ➔ 거짓 판정)")
             self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #F87171;")
-            self.lbl_banner_sub.setText(f"요구 기준은 {req}개이나 {matched_count}개만 발견되어 [실패(거짓) 분기]로 이동합니다.")
+            self.lbl_banner_sub.setText(f"조건: {cond_desc} (현재 {matched_count}개 일치) ➔ [실패(거짓) 분기]로 이동합니다.")
             self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #FECACA;")
 
         # Rebuild Cards
@@ -762,10 +909,140 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             if item.widget():
                 item.widget().deleteLater()
 
+        self._color_card_labels.clear()
         for idx, alias in enumerate(self._aliases, 1):
-            card = self._build_image_card(idx, alias)
+            if self._is_color_mode:
+                card = self._build_color_card(idx, alias)
+            else:
+                card = self._build_image_card(idx, alias)
             self.cards_layout.addWidget(card)
         self.cards_layout.addStretch(1)
+
+    def _build_color_card(self, idx: int, color_hex: str) -> QtWidgets.QWidget:
+        card = QtWidgets.QFrame()
+        is_active = (color_hex == self.canvas._active_alias)
+        res = self._test_results.get(color_hex, {})
+        found = bool(res.get("found", False))
+        match_count = int(res.get("match_count", 0))
+
+        border_color = "#38BDF8" if is_active else ("#059669" if found else "#7F1D1D")
+        bg_color = "#1E293B" if is_active else ("#14241E" if found else "#1C1618")
+        card.setStyleSheet(f"QFrame {{ background: {bg_color}; border: 1.5px solid {border_color}; border-radius: 6px; padding: 6px; }}")
+
+        vbox = QtWidgets.QVBoxLayout(card)
+        vbox.setContentsMargins(6, 6, 6, 6)
+        vbox.setSpacing(4)
+
+        # Header Row
+        top_row = QtWidgets.QHBoxLayout()
+        swatch = QtWidgets.QLabel()
+        swatch.setFixedSize(18, 18)
+        swatch.setStyleSheet(f"background: {color_hex}; border: 1px solid #FFFFFF; border-radius: 3px;")
+        top_row.addWidget(swatch)
+
+        lbl_name = QtWidgets.QLabel(f"<b>[{idx}] {color_hex}</b>")
+        lbl_name.setStyleSheet("color: #FFFFFF; font-size: 9.5pt;")
+        top_row.addWidget(lbl_name)
+
+        top_row.addStretch(1)
+        lbl_status = QtWidgets.QLabel(f"일치: {match_count}px {'✅' if found else '❌'}")
+        lbl_status.setStyleSheet("font-weight: 700; color: #34D399;" if found else "font-weight: 700; color: #F87171;")
+        top_row.addWidget(lbl_status)
+        vbox.addLayout(top_row)
+
+        # Region Coordinates
+        reg = self._color_regions.get(color_hex)
+        reg_str = f"[{reg[0]}, {reg[1]}, {reg[2]}, {reg[3]}]" if (reg and len(reg) >= 4 and (reg[0] or reg[1] or reg[2] or reg[3])) else "전체 화면"
+        lbl_reg = QtWidgets.QLabel(f"검색 영역: {reg_str}")
+        lbl_reg.setStyleSheet("color: #94A3B8; font-size: 8.5pt;")
+        vbox.addWidget(lbl_reg)
+
+        self._color_card_labels[color_hex] = {
+            "status": lbl_status,
+            "region": lbl_reg,
+        }
+
+        # Tolerance Bar Widget
+        cur_tol = int(self._color_tolerances.get(color_hex, 10))
+        tol_bar = ColorToleranceBarWidget(color_hex, cur_tol, parent=card)
+        tol_bar.valueChanged.connect(lambda val, c=color_hex: self._on_color_tolerance_changed(c, val))
+        vbox.addWidget(tol_bar)
+
+        # Missed Hint
+        if not found:
+            if res.get("full_found"):
+                fx = int(res.get("full_x", 0))
+                fy = int(res.get("full_y", 0))
+                cnt = int(res.get("full_count", 0))
+                hint_lbl = QtWidgets.QLabel(f"💡 화면 다른 곳에서 발견! (X: {fx}, Y: {fy}, {cnt}px)")
+                hint_lbl.setStyleSheet("color: #FDE047; font-size: 8.5pt; font-weight: 600;")
+                vbox.addWidget(hint_lbl)
+            else:
+                hint_lbl = QtWidgets.QLabel("⚠️ 화면 전체에서도 해당 색상을 찾지 못했습니다. (오차 조절 필요)")
+                hint_lbl.setStyleSheet("color: #FCA5A5; font-size: 8.5pt;")
+                vbox.addWidget(hint_lbl)
+
+        # Buttons
+        btn_box = QtWidgets.QHBoxLayout()
+        btn_sel = QtWidgets.QPushButton("선택 (캔버스 드래그 대상)")
+        btn_sel.setStyleSheet("background: #0F172A; border: 1px solid #334155; color: #70C5FF; padding: 3px 6px; border-radius: 4px; font-size: 8.5pt;")
+        btn_sel.clicked.connect(lambda _, a=color_hex: self._select_active_alias(a))
+        btn_box.addWidget(btn_sel)
+
+        if not found and res.get("full_found"):
+            btn_snap = QtWidgets.QPushButton("🎯 실제 위치로 맞춤")
+            btn_snap.setStyleSheet("background: #065F46; border: 1px solid #059669; color: #A7F3D0; font-weight: 700; padding: 3px 6px; border-radius: 4px; font-size: 8.5pt;")
+            btn_snap.clicked.connect(lambda _, a=color_hex: self._snap_single_to_actual(a))
+            btn_box.addWidget(btn_snap)
+
+        vbox.addLayout(btn_box)
+        return card
+
+    def _on_color_tolerance_changed(self, color_hex: str, val: int) -> None:
+        self._color_tolerances[color_hex] = val
+        self._evaluate_all_regions()
+        active = self.canvas._active_alias or (self._aliases[0] if self._aliases else "")
+        self.canvas.set_data(self._asset_regions, self._test_results, active_alias=active)
+
+        # Update Banner
+        total = len(self._aliases)
+        matched_count = sum(1 for r in self._test_results.values() if r.get("found"))
+        req = self._required_count if self._required_count > 0 else total
+        if self._match_condition == "all_matched":
+            is_success = (matched_count == total)
+            cond_desc = f"모든 색상({total}개) 일치 필요"
+        elif self._match_condition == "at_least_1":
+            is_success = (matched_count >= 1)
+            cond_desc = "최소 1개 이상 일치 시 참"
+        elif self._match_condition == "exact_n":
+            is_success = (matched_count == req)
+            cond_desc = f"정확히 {req}개 일치 시 참"
+        else:
+            is_success = (matched_count >= req)
+            cond_desc = f"최소 {req}개 이상 일치 시 참"
+
+        if is_success:
+            self.banner_box.setStyleSheet("background: #064E3B; border: 1px solid #059669; border-radius: 8px; padding: 8px;")
+            self.lbl_banner_main.setText(f"✅ 탐지 성공! ({matched_count}/{total}개 색상 일치 ➔ 참 판정)")
+            self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #34D399;")
+            self.lbl_banner_sub.setText(f"조건: {cond_desc} 만족 ➔ [성공(참) 분기]로 정상 이동합니다.")
+            self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #A7F3D0;")
+        else:
+            self.banner_box.setStyleSheet("background: #450A0A; border: 1px solid #DC2626; border-radius: 8px; padding: 8px;")
+            self.lbl_banner_main.setText(f"❌ 조건 미달 ({matched_count}/{total}개 색상 일치 ➔ 거짓 판정)")
+            self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #F87171;")
+            self.lbl_banner_sub.setText(f"조건: {cond_desc} (현재 {matched_count}개 일치) ➔ [실패(거짓) 분기]로 이동합니다.")
+            self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #FECACA;")
+
+        # Update card status label in place
+        res = self._test_results.get(color_hex, {})
+        found = bool(res.get("found", False))
+        match_count = int(res.get("match_count", 0))
+        if color_hex in self._color_card_labels:
+            lbl_status = self._color_card_labels[color_hex].get("status")
+            if lbl_status:
+                lbl_status.setText(f"일치: {match_count}px {'✅' if found else '❌'}")
+                lbl_status.setStyleSheet("font-weight: 700; color: #34D399;" if found else "font-weight: 700; color: #F87171;")
 
     def _build_image_card(self, idx: int, alias: str) -> QtWidgets.QWidget:
         card = QtWidgets.QFrame()
@@ -802,12 +1079,12 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         reg_lbl.setStyleSheet("color: #94A3B8; font-size: 8.5pt;")
         vbox.addWidget(reg_lbl)
 
-        # Row 3: Diagnosis / Hint if missed
+        # Row 3: Diagnostic / Hint
         if not found:
             reason = res.get("reason")
             if reason:
                 hint_lbl = QtWidgets.QLabel(f"⚠️ {reason}")
-                hint_lbl.setStyleSheet("color: #FCA5A5; font-size: 8.5pt;")
+                hint_lbl.setStyleSheet("color: #F87171; font-size: 8.5pt;")
                 vbox.addWidget(hint_lbl)
             elif res.get("full_found"):
                 fy = res.get("full_y", 0)
@@ -843,6 +1120,8 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
     def _on_canvas_region_dragged(self, alias: str, reg: list[int]) -> None:
         self._asset_regions[alias] = reg
+        if self._is_color_mode:
+            self._color_regions[alias] = reg
         self._evaluate_all_regions()
         self._refresh_ui()
 
@@ -850,6 +1129,9 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         for alias, reg in list(self._asset_regions.items()):
             if reg and len(reg) >= 4:
                 self._asset_regions[alias] = [reg[0] + dx, reg[1] + dy, reg[2] + dx, reg[3] + dy]
+        if self._is_color_mode:
+            for k, v in self._asset_regions.items():
+                self._color_regions[k] = v
         self._evaluate_all_regions()
         self._refresh_ui()
 
@@ -857,6 +1139,9 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         for alias, reg in list(self._asset_regions.items()):
             if reg and len(reg) >= 4:
                 self._asset_regions[alias] = [reg[0], max(0, reg[1] - margin), reg[2], reg[3] + margin]
+        if self._is_color_mode:
+            for k, v in self._asset_regions.items():
+                self._color_regions[k] = v
         self._evaluate_all_regions()
         self._refresh_ui()
 
@@ -865,11 +1150,17 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         if res.get("full_found"):
             fx = int(res["full_x"])
             fy = int(res["full_y"])
-            tw = int(res.get("tmpl_w", 24))
-            th = int(res.get("tmpl_h", 24))
-            pad_x = max(16, tw)
-            pad_y = max(14, th)
+            if res.get("is_color"):
+                pad_x = 30
+                pad_y = 30
+            else:
+                tw = int(res.get("tmpl_w", 24))
+                th = int(res.get("tmpl_h", 24))
+                pad_x = max(16, tw)
+                pad_y = max(14, th)
             self._asset_regions[alias] = [max(0, fx - pad_x), max(0, fy - pad_y), fx + pad_x, fy + pad_y]
+            if self._is_color_mode:
+                self._color_regions[alias] = self._asset_regions[alias]
             self._evaluate_all_regions()
             self._refresh_ui()
 
@@ -880,18 +1171,26 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             if res.get("full_found"):
                 fx = int(res["full_x"])
                 fy = int(res["full_y"])
-                tw = int(res.get("tmpl_w", 24))
-                th = int(res.get("tmpl_h", 24))
-                pad_x = max(16, tw)
-                pad_y = max(14, th)
+                if res.get("is_color"):
+                    pad_x = 30
+                    pad_y = 30
+                else:
+                    tw = int(res.get("tmpl_w", 24))
+                    th = int(res.get("tmpl_h", 24))
+                    pad_x = max(16, tw)
+                    pad_y = max(14, th)
                 self._asset_regions[alias] = [max(0, fx - pad_x), max(0, fy - pad_y), fx + pad_x, fy + pad_y]
+                if self._is_color_mode:
+                    self._color_regions[alias] = self._asset_regions[alias]
                 snapped_count += 1
         if snapped_count > 0:
             self._evaluate_all_regions()
             self._refresh_ui()
-            QtWidgets.QMessageBox.information(self, "자동 맞춤 완료", f"총 {snapped_count}개 이미지의 영역을 실제 발견 위치로 자동 보정했습니다!")
+            item_name = "색상" if self._is_color_mode else "이미지"
+            QtWidgets.QMessageBox.information(self, "자동 맞춤 완료", f"총 {snapped_count}개 {item_name}의 영역을 실제 발견 위치로 자동 보정했습니다!")
         else:
-            QtWidgets.QMessageBox.warning(self, "자동 맞춤 불가", "화면 전체에서 일치하는 이미지를 찾지 못했습니다.")
+            item_name = "색상" if self._is_color_mode else "이미지"
+            QtWidgets.QMessageBox.warning(self, "자동 맞춤 불가", f"화면 전체에서 일치하는 {item_name}을(를) 찾지 못했습니다.")
 
     def _zoom_fit(self) -> None:
         if not self.canvas._pixmap or self.canvas._pixmap.isNull():
@@ -909,6 +1208,20 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
     def get_asset_regions(self) -> dict[str, list[int]]:
         return dict(self._asset_regions)
+
+    def get_color_regions(self) -> dict[str, list[int]]:
+        return dict(self._color_regions if self._is_color_mode else self._asset_regions)
+
+    def get_color_tolerances(self) -> dict[str, int]:
+        return dict(self._color_tolerances)
+
+    def get_tolerance(self) -> int:
+        if self._color_tolerances:
+            return next(iter(self._color_tolerances.values()))
+        return int(self.step.get("tolerance") or 10)
+
+    def get_search_region(self) -> list[int] | None:
+        return self.get_bounding_region()
 
     def get_bounding_region(self) -> list[int] | None:
         valid_regs = [r for r in self._asset_regions.values() if isinstance(r, (list, tuple)) and len(r) >= 4]

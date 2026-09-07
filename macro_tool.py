@@ -4458,9 +4458,13 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
         colors = ["#FF0000"]
 
     color_tolerances = step.get("color_tolerances") if isinstance(step.get("color_tolerances"), dict) else {}
+    norm_color_tolerances = {str(k).strip().upper(): v for k, v in color_tolerances.items()}
+    tolerances_list = step.get("tolerances") if isinstance(step.get("tolerances"), list) else []
     base_tol = int(step.get("tolerance") or 10)
 
     color_regions = step.get("color_regions") if isinstance(step.get("color_regions"), dict) else {}
+    norm_color_regions = {str(k).strip().upper(): v for k, v in color_regions.items()}
+    regions_list = step.get("regions") if isinstance(step.get("regions"), list) else []
     base_region = step.get("search_region") or step.get("region") or [0, 0, 0, 0]
 
     match_condition = str(step.get("match_condition") or "all_matched").strip()
@@ -4527,7 +4531,15 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
 
     # Emit search variables for each color
     for idx, c in enumerate(colors, 1):
-        reg = color_regions.get(c, base_region)
+        c_clean = str(c).strip().upper()
+        if idx - 1 < len(regions_list) and isinstance(regions_list[idx - 1], (list, tuple)) and len(regions_list[idx - 1]) >= 4:
+            reg = regions_list[idx - 1]
+        elif c_clean in norm_color_regions:
+            reg = norm_color_regions[c_clean]
+        elif c in color_regions:
+            reg = color_regions[c]
+        else:
+            reg = base_region
         if isinstance(reg, (list, tuple)) and len(reg) >= 4:
             left, top, right, bottom = int(reg[0]), int(reg[1]), int(reg[2]), int(reg[3])
         else:
@@ -4570,7 +4582,15 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
             c_hex = "0x" + c_str[2:].upper()
         else:
             c_hex = "0x" + c_str.upper()
-        tol = int(color_tolerances.get(c, base_tol))
+        c_clean = str(c).strip().upper()
+        if idx - 1 < len(tolerances_list):
+            tol = int(tolerances_list[idx - 1])
+        elif c_clean in norm_color_tolerances:
+            tol = int(norm_color_tolerances[c_clean])
+        elif c in color_tolerances:
+            tol = int(color_tolerances[c])
+        else:
+            tol = base_tol
         cur_x = f"__ps_x_{step_index}_{idx}"
         cur_y = f"__ps_y_{step_index}_{idx}"
         lines.append(f"    PixelSearch, {cur_x}, {cur_y}, %__ps_sx1_{step_index}_{idx}%, %__ps_sy1_{step_index}_{idx}%, %__ps_sx2_{step_index}_{idx}%, %__ps_sy2_{step_index}_{idx}%, {c_hex}, {tol}, Fast RGB")
@@ -5390,9 +5410,10 @@ def render_macro_script(
         else:
             lines.extend(render_step(step, assets, count, browser_fast))
         if end_step and count == end_step:
-            lines.append("Return")
-            lines.append("")
-            continue
+            if action not in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search"}:
+                lines.append("Return")
+                lines.append("")
+                continue
 
         if action == "text_condition":
             lines.append("")
@@ -5443,7 +5464,10 @@ def render_macro_script(
                     lines.append(f"    Sleep, {repeat_on_success_delay}")
                 lines.append(f"    Goto, Step{count}")
             lines.extend(render_edge_conditions(step, count, "success", "    "))
-            if on_success:
+            if end_step and count == end_step:
+                lines.append('    SetRunResult("SUCCESS", "COMPLETED", "단계 테스트 성공 (조건 충족)")')
+                lines.append("    Return")
+            elif on_success:
                 if on_success_delay > 0:
                     lines.append(f"    Sleep, {on_success_delay}")
                 lines.append(f"    Goto, Step{on_success}")
@@ -5490,7 +5514,10 @@ def render_macro_script(
                 if repeat_var:
                     lines.append(f"    __rep_limit{count} := \"\"")
             lines.extend(render_edge_conditions(step, count, "fail", "    "))
-            if on_fail:
+            if end_step and count == end_step:
+                lines.append('    SetRunResult("FAILED", "CONDITION_UNMET", "단계 테스트 실패 (조건 미충족)")')
+                lines.append("    Return")
+            elif on_fail:
                 if on_fail_delay > 0:
                     lines.append(f"    Sleep, {on_fail_delay}")
                 lines.append(f"    Goto, Step{on_fail}")
@@ -5499,6 +5526,9 @@ def render_macro_script(
             elif count >= total_steps:
                 lines.append("    Return")
             lines.append("}")
+            if end_step and count == end_step:
+                lines.append("")
+                continue
         elif has_repeat:
             lines.append(f"__node_retry_{count} := 0")
             lines.extend(render_subflow_success(step))

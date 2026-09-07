@@ -35,7 +35,7 @@ class CaptureMetadataDialog(QtWidgets.QDialog):
 
         info_lbl = QtWidgets.QLabel(
             "캡처한 이미지의 라벨(목적)과 보완 설명을 입력하세요.\n"
-            "이 정보는 manifest에 포함되어 GPT가 조건과 영역을 정확히 파악하도록 전달됩니다."
+            "이 정보는 manifest에 포함되어 Antigravity AI가 조건과 영역을 정확히 파악하도록 전달됩니다."
         )
         info_lbl.setStyleSheet("color: #A0AEC0; margin-bottom: 6px; font-size: 11px;")
         layout.addWidget(info_lbl)
@@ -171,7 +171,7 @@ class AiMacroSupplementDialog(AiMacroDialog):
         self.notes.textChanged.connect(self._update_resend_button_state)
         box.addWidget(self.notes)
 
-        self.resend_btn = QtWidgets.QPushButton("보완 이미지·설명을 포함한 GPT 전달 ZIP 저장")
+        self.resend_btn = QtWidgets.QPushButton("보완 이미지·설명을 포함한 AI 패키지 저장 (Antigravity용)")
         self.resend_btn.clicked.connect(self._export_revision)
         box.addWidget(self.resend_btn)
 
@@ -300,7 +300,7 @@ class AiMacroSupplementDialog(AiMacroDialog):
             self._update_resend_button_state()
 
     def import_plan(self):
-        filename, _ = QtWidgets.QFileDialog.getOpenFileName(self, "GPT plan.json 선택", "", "JSON (*.json)")
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(self, "plan.json 선택", "", "JSON (*.json)")
         if not filename:
             return
         try:
@@ -593,10 +593,10 @@ class AiMacroSupplementDialog(AiMacroDialog):
                 "background: #553C9A; color: #FAF5FF; font-weight: 700; font-size: 13px; "
                 "padding: 10px; border-radius: 6px; border: 1px solid #9F7AEA;"
             )
-            self.resend_btn.setText(f"📦 보완 이미지({total_supplied}건)·설명을 포함한 GPT 전달 ZIP 저장 (준비 완료)")
+            self.resend_btn.setText(f"📦 보완 이미지({total_supplied}건)·설명을 포함한 AI 패키지 저장 (준비 완료)")
         else:
             self.resend_btn.setStyleSheet("")
-            self.resend_btn.setText("보완 이미지·설명을 포함한 GPT 전달 ZIP 저장")
+            self.resend_btn.setText("보완 이미지·설명을 포함한 AI 패키지 저장 (Antigravity용)")
 
     def _pick_png(self):
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(self, "캡처·편집한 원본 PNG", "", "PNG (*.png)")
@@ -644,7 +644,7 @@ class AiMacroSupplementDialog(AiMacroDialog):
         self.accept_draft.setEnabled(False)
         self._select_request(self.requests.currentRow())
         self._update_resend_button_state()
-        self.status.setText(f"✔ {rid} 확인용 이미지 연결 완료. 보완 ZIP을 저장하고 GPT에 다시 전달하세요.")
+        self.status.setText(f"✔ {rid} 확인용 이미지 연결 완료. 보완 패키지를 저장하거나 Antigravity에 알려주세요.")
 
     def _export_revision(self):
         if self._private is None:
@@ -662,7 +662,7 @@ class AiMacroSupplementDialog(AiMacroDialog):
                 self.status.setText(f"기록 파일 로드 실패: {exc}")
                 return
 
-        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "보완본 패키지 ZIP 저장 위치")
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "보완본 패키지 저장 위치")
         if not directory:
             return
         try:
@@ -677,16 +677,20 @@ class AiMacroSupplementDialog(AiMacroDialog):
             self.local_recording = local
             self.draft = None
             self.accept_draft.setEnabled(False)
+            try:
+                QtGui.QGuiApplication.clipboard().setText(str(local.parent))
+            except Exception:
+                pass
             self.status.setText(
-                f"🎉 보완 패키지 ZIP 저장 완료!\n"
+                f"🎉 보완 패키지 저장 완료! (폴더 경로가 클립보드에 자동 복사됨)\n"
                 f"파일: {package}\n\n"
-                f"👉 이 ZIP 파일을 GPT에게 전달하고, GPT가 수정해 준 plan.json을 [2. 받은 plan.json 가져오기]로 불러오세요."
+                f"👉 Antigravity에 알려주시면 맞춤 플랜이 생성되며, 생성 후 [⚡ Antigravity 최신 플랜 즉시 동기화]를 누르세요."
             )
             QtWidgets.QMessageBox.information(
-                self, "보완 ZIP 저장 완료",
-                f"보완 패키지가 성공적으로 생성되었습니다.\n\n"
+                self, "보완 패키지 저장 완료",
+                f"보완 패키지가 성공적으로 생성되었습니다.\n(폴더 경로가 클립보드에 자동 복사되었습니다)\n\n"
                 f"위치:\n{package}\n\n"
-                f"이 압축파일을 GPT에게 전달하세요."
+                f"Antigravity에 이 내용을 전달하세요."
             )
         except Exception as exc:
             self.status.setText(f"보완본 저장 실패: {exc}")

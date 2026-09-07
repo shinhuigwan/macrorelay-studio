@@ -307,6 +307,38 @@ class AiMacroStudioIntegrationTests(unittest.TestCase):
         self.assertFalse(dry_run_spy.called)
         self.assertFalse(step_spy.called)
 
+    def test_sync_desktop_plan(self):
+        steps = [{"action": "image_search", "asset": "test_btn", "click_enabled": True, "click": {"offset": [0, 0]}}]
+        dialog = AiMacroDialog(self.repo, steps)
+        self.addCleanup(dialog.deleteLater)
+
+        export_dir = self.root / "export"
+        package = export_recording(steps, "테스트", export_dir, self.repo.asset_path)
+        dialog.local_recording = export_dir / "private-recording.json"
+        private = json.loads(dialog.local_recording.read_text(encoding="utf-8"))
+
+        plan = {
+            "schema": VERSION,
+            "recording_id": private["recording_id"],
+            "name": "데스크톱플랜",
+            "entry": "n1",
+            "nodes": [{"id": "n1", "record": "r001", "mode": "check", "success": "STOP", "failure": "STOP"}],
+            "missing_images": [],
+        }
+
+        mock_desktop = self.root / "Desktop"
+        mock_desktop.mkdir(parents=True, exist_ok=True)
+        desktop_plan_path = mock_desktop / "plan.json"
+        desktop_plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+        with mock.patch("pathlib.Path.home", return_value=self.root):
+            dialog.sync_desktop_plan()
+
+        self.assertIsNotNone(dialog.draft)
+        self.assertEqual(2, len(dialog.draft["steps"]))
+        self.assertTrue(dialog.accept_draft.isEnabled())
+
 
 if __name__ == "__main__":
     unittest.main()
+

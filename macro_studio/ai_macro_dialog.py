@@ -2,7 +2,7 @@
 from datetime import datetime
 from pathlib import Path
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from .ai_macro_plan import compile_plan, export_recording, load_plan, load_private_recording
 
@@ -30,18 +30,31 @@ class AiMacroDialog(QtWidgets.QDialog):
         self.root_layout.addWidget(self.main_panel, stretch=1)
         layout = self.main_layout
 
-        info = QtWidgets.QLabel("녹화 목적 입력 → 패키지를 GPT에 전달 → plan.json 가져오기 → 자동 연결된 초안 확인")
+        info = QtWidgets.QLabel("녹화 목적 입력 → Antigravity AI 플랜 동기화 → 자동 연결된 초안 확인")
         info.setWordWrap(True)
         layout.addWidget(info)
         self.purpose = QtWidgets.QPlainTextEdit()
         self.purpose.setPlaceholderText("예: 빨간 알림이 있는 이벤트의 보상을 모두 받고 창을 닫아줘.")
         self.purpose.setMaximumHeight(95)
         layout.addWidget(self.purpose)
-        for title, handler in [("1. GPT 전달 패키지 저장", self.export),
-                               ("2. 받은 plan.json 가져오기", self.import_plan)]:
-            button = QtWidgets.QPushButton(title)
-            button.clicked.connect(handler)
-            layout.addWidget(button)
+
+        # 1. Primary One-Click Sync Button
+        self.btn_sync_desktop = QtWidgets.QPushButton("⚡ Antigravity 최신 플랜 즉시 동기화 (바탕화면)")
+        self.btn_sync_desktop.setStyleSheet("background: #2B6CB0; color: white; font-weight: bold; padding: 8px; border-radius: 4px; font-size: 13px;")
+        self.btn_sync_desktop.setToolTip("바탕화면에 생성된 최신 plan.json을 파일 탐색기 없이 원클릭으로 즉시 동기화하여 초안 테이블에 적용합니다.")
+        self.btn_sync_desktop.clicked.connect(self.sync_desktop_plan)
+        layout.addWidget(self.btn_sync_desktop)
+
+        # 2. Package & Import row
+        sub_row = QtWidgets.QHBoxLayout()
+        btn_export = QtWidgets.QPushButton("📦 1. AI 패키지 저장 (Antigravity용)")
+        btn_export.clicked.connect(self.export)
+        btn_import = QtWidgets.QPushButton("📂 2. plan.json 직접 선택")
+        btn_import.clicked.connect(self.import_plan)
+        sub_row.addWidget(btn_export)
+        sub_row.addWidget(btn_import)
+        layout.addLayout(sub_row)
+
         self.status = QtWidgets.QLabel("동작과 PNG가 포함됩니다. 전송 전 화면에 민감한 정보가 없는지 확인하세요.")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -67,10 +80,67 @@ class AiMacroDialog(QtWidgets.QDialog):
             self.draft = None
             self.accept_draft.setEnabled(False)
             self.table.setRowCount(0)
-            self.status.setText(f"GPT에는 이 ZIP만 첨부하세요:\n{package}\n"
-                                "private-recording.json은 원본 동작 연결용이므로 PC에 보관하세요.")
+            try:
+                QtGui.QGuiApplication.clipboard().setText(str(destination))
+            except Exception:
+                pass
+            self.status.setText(f"✔ AI 패키지 저장 완료! (폴더 경로가 클립보드에 자동 복사됨)\n{destination}\n"
+                                "Antigravity에 요청하시면 플랜이 생성되며, 생성 후 [⚡ Antigravity 최신 플랜 즉시 동기화]를 누르세요.")
         except Exception as exc:
             self.status.setText(f"내보내기 실패: {exc}")
+
+    def sync_desktop_plan(self):
+        """Auto-sync plan.json from Desktop without opening file picker."""
+        desktop_plan = Path.home() / "Desktop" / "plan.json"
+        if not desktop_plan.is_file():
+            self.status.setText("⚠ 바탕화면에 plan.json이 없습니다. Antigravity에 요청하여 플랜을 먼저 생성하세요.")
+            return
+
+        try:
+            plan = load_plan(desktop_plan)
+            plan_rec_id = plan.get("recording_id")
+
+            private = None
+            if self.local_recording and Path(self.local_recording).is_file():
+                try:
+                    candidate_private = load_private_recording(self.local_recording)
+                    if candidate_private.get("recording_id") == plan_rec_id:
+                        private = candidate_private
+                except Exception:
+                    pass
+
+            if private is None and hasattr(self, "_private") and self._private and self._private.get("recording_id") == plan_rec_id:
+                private = self._private
+
+            if private is None:
+                desktop = Path.home() / "Desktop"
+                for folder in sorted(desktop.glob("recording*"), reverse=True):
+                    priv_file = folder / "private-recording.json"
+                    if priv_file.is_file():
+                        try:
+                            candidate_private = load_private_recording(priv_file)
+                            if candidate_private.get("recording_id") == plan_rec_id:
+                                private = candidate_private
+                                self.local_recording = priv_file
+                                if hasattr(self, "_private"):
+                                    self._private = private
+                                break
+                        except Exception:
+                            continue
+
+            if private is None:
+                self.status.setText(f"⚠ plan.json의 녹화 ID({plan_rec_id})와 일치하는 녹화 파일을 찾지 못했습니다. [2. plan.json 직접 선택]을 이용하세요.")
+                return
+
+            self.draft = compile_plan(plan, private, self.repository.asset_path)
+            self.table.setRowCount(len(self.draft["steps"]))
+            for row, step in enumerate(self.draft["steps"]):
+                for col, text in enumerate([row+1, step["label"], step.get("on_success", "종료"), step.get("on_fail", "종료")]):
+                    self.table.setItem(row, col, QtWidgets.QTableWidgetItem(str(text)))
+            self.status.setText(f"✔ Antigravity 플랜 자동 동기화 완료! ({len(self.draft['steps'])}개 단계 검증 완료)")
+            self.accept_draft.setEnabled(True)
+        except Exception as exc:
+            self.status.setText(f"동기화 실패: {exc}")
 
     def import_plan(self):
         self.draft = None
@@ -81,7 +151,7 @@ class AiMacroDialog(QtWidgets.QDialog):
             if not filename:
                 return
             self.local_recording = Path(filename)
-        filename, _ = QtWidgets.QFileDialog.getOpenFileName(self, "GPT가 만든 plan.json", "", "JSON (*.json)")
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(self, "plan.json 선택", "", "JSON (*.json)")
         if not filename:
             return
         try:

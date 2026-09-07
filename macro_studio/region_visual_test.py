@@ -3,7 +3,9 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import logging
+import os
 from pathlib import Path
+import re
 from typing import Any
 
 import cv2
@@ -14,48 +16,202 @@ from .repository import MacroRepository
 from .theme import COLORS
 
 
+def _ensure_interactive_desktop() -> None:
+    """Attach current thread to the interactive desktop if running under an isolated desktop station."""
+    try:
+        user32 = ctypes.windll.user32
+        hdesk = user32.OpenInputDesktop(0, False, 0x01FF)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+    except Exception:
+        pass
+
+
+_ensure_interactive_desktop()
+
+
+def _read_image_unicode(path: Path | str) -> np.ndarray | None:
+    """Read an image from path supporting Windows Unicode/Korean paths and convert to BGR 3-channel."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        data = np.fromfile(str(p.resolve()), dtype=np.uint8)
+        if data.size == 0:
+            return None
+        img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+        if img is None or img.size == 0:
+            return None
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        elif img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        return img
+    except Exception:
+        return None
+
+
+def _get_window_info(hwnd: int) -> dict[str, Any]:
+    """Retrieve detailed metadata for a given HWND."""
+    if not hwnd or not ctypes.windll.user32.IsWindow(hwnd):
+        return {}
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+    title_buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, title_buf, 512)
+    title = title_buf.value.strip()
+
+    cls_buf = ctypes.create_unicode_buffer(512)
+    user32.GetClassNameW(hwnd, cls_buf, 512)
+    cls_name = cls_buf.value.strip()
+
+    proc_name = ""
+    handle = kernel32.OpenProcess(0x1000, False, pid.value)
+    if handle:
+        try:
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                proc_name = Path(buffer.value).name
+        finally:
+            kernel32.CloseHandle(handle)
+    return {
+        "hwnd": hwnd,
+        "pid": pid.value,
+        "title": title,
+        "class_name": cls_name,
+        "exe_name": proc_name,
+    }
+
+
 def _find_target_window(exe_name: str, window_token: str) -> int:
     token = str(window_token or "").strip()
-    if token.casefold().startswith("ahk_id"):
-        raw = token.split(None, 1)[1].strip() if " " in token else ""
+    m_id = re.search(r"ahk_id\s+([^\s,]+)", token, re.IGNORECASE)
+    if m_id:
         try:
-            hwnd = int(raw, 0)
+            hwnd = int(m_id.group(1).strip(), 0)
             if hwnd and ctypes.windll.user32.IsWindow(hwnd):
                 return hwnd
         except (ValueError, OSError):
             pass
-    wanted = Path(str(exe_name or "")).name.casefold()
-    if not wanted:
-        return 0
-    matches: list[int] = []
+
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
+
+
+    wanted_exe = Path(str(exe_name or "")).name.casefold()
+    wanted_class = ""
+    wanted_pid = 0
+
+    m_exe = re.search(r"ahk_exe\s+([^\s,]+)", token, re.IGNORECASE)
+    if m_exe:
+        wanted_exe = Path(m_exe.group(1)).name.casefold()
+
+    m_class = re.search(r"ahk_class\s+([^\s,]+)", token, re.IGNORECASE)
+    if m_class:
+        wanted_class = m_class.group(1).strip()
+
+    m_pid = re.search(r"ahk_pid\s+([^\s,]+)", token, re.IGNORECASE)
+    if m_pid:
+        try:
+            wanted_pid = int(m_pid.group(1).strip(), 0)
+        except ValueError:
+            pass
+
+    cleaned_title = re.sub(r"ahk_(?:id|pid|class|exe)\s+[^\s,]+", "", token, flags=re.IGNORECASE).strip()
+    wanted_title = cleaned_title
+
+    matches: list[tuple[int, int]] = []  # (hwnd, score)
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def callback(hwnd: int, _lparam: int) -> bool:
         if not user32.IsWindowVisible(hwnd):
             return True
+        crect = wintypes.RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(crect))
+        cw = crect.right - crect.left
+        ch = crect.bottom - crect.top
+        # Filter out tiny helper windows / tooltips
+        if cw < 30 or ch < 30:
+            return True
+
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        handle = kernel32.OpenProcess(0x1000, False, pid.value)
-        if not handle:
+        if wanted_pid and pid.value != wanted_pid:
             return True
-        try:
-            size = wintypes.DWORD(32768)
-            buffer = ctypes.create_unicode_buffer(size.value)
-            if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-                if Path(buffer.value).name.casefold() == wanted:
-                    matches.append(int(hwnd))
-                    return False
-        finally:
-            kernel32.CloseHandle(handle)
+
+        cls_buf = ctypes.create_unicode_buffer(512)
+        user32.GetClassNameW(hwnd, cls_buf, 512)
+        cur_class = cls_buf.value.strip()
+        if wanted_class and wanted_class.casefold() != cur_class.casefold():
+            return True
+
+        title_buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, title_buf, 512)
+        cur_title = title_buf.value.strip()
+        if wanted_title and wanted_title.casefold() not in cur_title.casefold():
+            return True
+
+        proc_match = False
+        if wanted_exe:
+            handle = kernel32.OpenProcess(0x1000, False, pid.value)
+            if handle:
+                try:
+                    size = wintypes.DWORD(32768)
+                    buffer = ctypes.create_unicode_buffer(size.value)
+                    if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                        if Path(buffer.value).name.casefold() == wanted_exe:
+                            proc_match = True
+                finally:
+                    kernel32.CloseHandle(handle)
+            if not proc_match:
+                return True
+        elif not wanted_class and not wanted_title and not wanted_pid:
+            return True
+
+        # Score window relevance
+        score = 10
+        if cur_title:
+            score += 20
+        if cw * ch > 100000:
+            score += 30
+        if wanted_class and wanted_class.casefold() == cur_class.casefold():
+            score += 50
+        matches.append((int(hwnd), score))
         return True
 
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    hdesk = None
     try:
-        user32.EnumWindows(callback, 0)
+        hdesk = user32.OpenInputDesktop(0, False, 0x01FF)
+    except Exception:
+        pass
+
+    try:
+        if hdesk:
+            user32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, WNDENUMPROC, wintypes.LPARAM]
+            user32.EnumDesktopWindows.restype = wintypes.BOOL
+            user32.EnumDesktopWindows(hdesk, WNDENUMPROC(callback), 0)
+        else:
+            user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+            user32.EnumWindows.restype = wintypes.BOOL
+            user32.EnumWindows(WNDENUMPROC(callback), 0)
     except Exception:
         return 0
-    return matches[0] if matches else 0
+    finally:
+        if hdesk:
+            try:
+                user32.CloseDesktop(hdesk)
+            except Exception:
+                pass
+
+    if not matches:
+        return 0
+    matches.sort(key=lambda item: item[1], reverse=True)
+    return matches[0][0]
 
 
 def capture_target_area(step: dict[str, Any]) -> tuple[np.ndarray | None, int, int, str]:
@@ -63,15 +219,23 @@ def capture_target_area(step: dict[str, Any]) -> tuple[np.ndarray | None, int, i
     Returns (bgr_frame, base_x, base_y, description).
     """
     mode = str(step.get("region_mode") or "screen").casefold()
+    win_exe = str(step.get("region_window_exe") or (step.get("click") or {}).get("window_exe") or "")
+    win_token = str(step.get("region_window") or (step.get("click") or {}).get("window") or "")
     hwnd = 0
     if mode != "screen":
-        hwnd = _find_target_window(
-            str(step.get("region_window_exe") or (step.get("click") or {}).get("window_exe") or ""),
-            str(step.get("region_window") or (step.get("click") or {}).get("window") or ""),
-        )
+        hwnd = _find_target_window(win_exe, win_token)
 
     user32 = ctypes.windll.user32
     if hwnd and user32.IsWindow(hwnd):
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+
+        info = _get_window_info(hwnd)
+        pname = info.get("exe_name") or win_exe or "창"
+        cname = info.get("class_name") or ""
+        hhex = f"0x{hwnd:X}"
+        class_tag = f" · {cname}" if cname else ""
+
         if mode == "client":
             crect = wintypes.RECT()
             origin = wintypes.POINT(0, 0)
@@ -82,7 +246,8 @@ def capture_target_area(step: dict[str, Any]) -> tuple[np.ndarray | None, int, i
                 if cw > 4 and ch > 4:
                     from opencv_search import capture_region
                     frame = capture_region(bx, by, bx + cw, by + ch)
-                    return frame, bx, by, f"클라이언트 · {cw}×{ch} (기준점 {bx},{by})"
+                    desc = f"클라이언트 [{pname} · HWND: {hhex}{class_tag}] · {cw}×{ch} (기준점 {bx},{by})"
+                    return frame, bx, by, desc
         else:
             wrect = wintypes.RECT()
             if user32.GetWindowRect(hwnd, ctypes.byref(wrect)):
@@ -92,16 +257,34 @@ def capture_target_area(step: dict[str, Any]) -> tuple[np.ndarray | None, int, i
                 if ww > 4 and wh > 4:
                     from opencv_search import capture_region
                     frame = capture_region(bx, by, bx + ww, by + wh)
-                    return frame, bx, by, f"창 전체 · {ww}×{wh} (기준점 {bx},{by})"
+                    desc = f"창 전체 [{pname} · HWND: {hhex}{class_tag}] · {ww}×{wh} (기준점 {bx},{by})"
+                    return frame, bx, by, desc
 
     # Fallback to screen capture
     geom = QtCore.QRect()
     for s in QtGui.QGuiApplication.screens():
         geom = geom.united(s.geometry())
-    l, t, r, b = geom.left(), geom.top(), geom.right() + 1, geom.bottom() + 1
+    if geom.isEmpty() or geom.width() <= 0 or geom.height() <= 0:
+        l = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        t = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        w = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        h = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        if w <= 0 or h <= 0:
+            w = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+            h = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+            l, t = 0, 0
+        r, b = l + max(1, w), t + max(1, h)
+    else:
+        l, t, r, b = geom.left(), geom.top(), geom.right() + 1, geom.bottom() + 1
+
     from opencv_search import capture_region
     frame = capture_region(l, t, r, b)
-    return frame, l, t, f"전체 화면 · {r - l}×{b - t}"
+    target_str = win_exe or win_token
+    if mode != "screen" and target_str:
+        desc = f"⚠️ 대상 창({target_str}) 미발견 ➔ 전체 화면 대체 · {r - l}×{b - t}"
+    else:
+        desc = f"전체 화면 · {r - l}×{b - t}"
+    return frame, l, t, desc
 
 
 class InteractiveCanvas(QtWidgets.QWidget):
@@ -476,7 +659,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             if not path or not Path(path).is_file():
                 results[alias] = {"found": False, "score": 0.0, "reason": "이미지 파일 없음"}
                 continue
-            tmpl = cv2.imread(str(path))
+            tmpl = _read_image_unicode(path)
             if tmpl is None or tmpl.size == 0:
                 results[alias] = {"found": False, "score": 0.0, "reason": "이미지 디코딩 실패"}
                 continue
@@ -501,6 +684,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             best_score = 0.0
             hit_x, hit_y = 0, 0
             found = False
+            region_reason = ""
 
             if crop.shape[0] >= th and crop.shape[1] >= tw:
                 match_res = cv2.matchTemplate(crop, tmpl, cv2.TM_CCOEFF_NORMED)
@@ -512,6 +696,10 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
                     hit_y = ct + max_loc[1] + th // 2
             else:
                 best_score = 0.0
+                rw = cr - cl
+                rh = cb - ct
+                if rw < tw or rh < th:
+                    region_reason = f"지정 영역({rw}×{rh})이 이미지({tw}×{th})보다 작음"
 
             # 2. Full frame search to find where the image ACTUALLY is if missed
             full_found = False
@@ -539,6 +727,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
                 "full_y": full_y,
                 "full_score": full_score,
                 "region": [cl, ct, cr, cb],
+                "reason": region_reason,
             }
 
         self._test_results = results
@@ -615,7 +804,12 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         # Row 3: Diagnosis / Hint if missed
         if not found:
-            if res.get("full_found"):
+            reason = res.get("reason")
+            if reason:
+                hint_lbl = QtWidgets.QLabel(f"⚠️ {reason}")
+                hint_lbl.setStyleSheet("color: #FCA5A5; font-size: 8.5pt;")
+                vbox.addWidget(hint_lbl)
+            elif res.get("full_found"):
                 fy = res.get("full_y", 0)
                 diff = fy - (reg[1] + (reg[3] - reg[1]) // 2)
                 dir_str = f"아래로 {diff}px" if diff > 0 else f"위로 {abs(diff)}px"

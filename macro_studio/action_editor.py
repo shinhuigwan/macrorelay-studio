@@ -582,6 +582,17 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
     "pixel_search": [
         FieldSpec("color", "검색 색상 (HEX)", "text", "#FF0000", placeholder="예: #FF3A2B 또는 0xFF3A2B"),
         FieldSpec("tolerance", "색상 허용 오차", "color_tolerance", 10, 0, 255, tooltip="기준 색상 위치와 허용 오차(±Tolerance)를 시각적 색상 바에서 휠이나 드래그, 숫자로 조절합니다."),
+        FieldSpec("region_mode", "범위 기준", "choice", "screen", options=choice(
+            ("전체 화면 · 모든 모니터", "screen"),
+            ("클라이언트 (앱플레이어 내부)", "client"),
+            ("창 전체", "window"),
+        ), section="검색 범위", tooltip="• 클라이언트: 앱플레이어나 게임 창의 내부 화면만을 기준으로 검색 (창 이동/해상도 변화에 안전)\n• 전체 화면: 모니터 바탕화면 절대 좌표 기준으로 검색"),
+        FieldSpec("region_coords", "좌표 해석", "choice", "screen", options=choice(
+            ("화면 절대 좌표", "screen"),
+            ("대상 기준 상대 좌표", "relative"),
+        ), section="검색 범위"),
+        FieldSpec("region_window", "검색 대상 창", "text", "", section="검색 범위", placeholder="예: ahk_exe dnplayer.exe 또는 창 제목"),
+        FieldSpec("region_window_exe", "검색 대상 프로그램", "text", "", section="검색 범위", placeholder="예: dnplayer.exe"),
         FieldSpec("search_region.0", "검색 왼쪽", "int", 0, -100_000, 100_000, section="검색 범위"),
         FieldSpec("search_region.1", "검색 위", "int", 0, -100_000, 100_000, section="검색 범위"),
         FieldSpec("search_region.2", "검색 오른쪽", "int", 0, -100_000, 100_000, section="검색 범위"),
@@ -4160,6 +4171,15 @@ class ActionEditor(QtWidgets.QWidget):
         from .region_visual_test import RegionVisualTestDialog
 
         step = self.build_step()
+        if self.current_action == "pixel_search" and not step.get("region_window_exe"):
+            orig_exe = str(self.original.get("region_window_exe") or (self.original.get("click") or {}).get("window_exe") or "")
+            orig_win = str(self.original.get("region_window") or (self.original.get("click") or {}).get("window") or "")
+            if orig_exe:
+                step["region_window_exe"] = orig_exe
+                step["region_window"] = orig_win
+                step.setdefault("region_mode", "client")
+                step.setdefault("region_coords", "relative")
+
         dlg = RegionVisualTestDialog(step, self.repository, parent=self.window())
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
@@ -4169,6 +4189,22 @@ class ActionEditor(QtWidgets.QWidget):
             if updated_tols:
                 tol_val = next(iter(updated_tols.values()))
                 self._set_field_value("pixel_search", "tolerance", tol_val)
+                self.original["color_tolerances"] = updated_tols
+            if updated_color_regs:
+                self.original["color_regions"] = updated_color_regs
+            if dlg.step.get("region_window_exe"):
+                we = str(dlg.step["region_window_exe"])
+                w = str(dlg.step.get("region_window", ""))
+                rm = str(dlg.step.get("region_mode", "client"))
+                rc = str(dlg.step.get("region_coords", "relative"))
+                self._set_field_value("pixel_search", "region_window_exe", we)
+                self._set_field_value("pixel_search", "region_window", w)
+                self._set_field_value("pixel_search", "region_mode", rm)
+                self._set_field_value("pixel_search", "region_coords", rc)
+                self.original["region_window_exe"] = we
+                self.original["region_window"] = w
+                self.original["region_mode"] = rm
+                self.original["region_coords"] = rc
             bounding = dlg.get_bounding_region()
             if bounding:
                 for offset, val in enumerate(bounding):
@@ -4176,7 +4212,7 @@ class ActionEditor(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(
                 self,
                 "색상 및 영역 보정 완료",
-                "검색 영역 검사기에서 조절한 허용 오차 및 검색 영역이 노드에 성공적으로 적용되었습니다!",
+                "검색 영역 검사기에서 조절한 대상 창, 허용 오차 및 검색 영역이 노드에 성공적으로 적용되었습니다!",
             )
             return
 

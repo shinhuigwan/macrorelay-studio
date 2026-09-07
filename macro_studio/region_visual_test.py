@@ -232,9 +232,13 @@ def capture_target_area(step: dict[str, Any]) -> tuple[np.ndarray | None, int, i
     """Capture target client area (or virtual screen) as a BGR numpy array.
     Returns (bgr_frame, base_x, base_y, description).
     """
-    mode = str(step.get("region_mode") or "screen").casefold()
     win_exe = str(step.get("region_window_exe") or (step.get("click") or {}).get("window_exe") or "")
     win_token = str(step.get("region_window") or (step.get("click") or {}).get("window") or "")
+    raw_mode = step.get("region_mode")
+    if not raw_mode and win_exe:
+        mode = "client"
+    else:
+        mode = str(raw_mode or "screen").casefold()
     hwnd = 0
     if mode != "screen":
         hwnd = _find_target_window(win_exe, win_token)
@@ -529,6 +533,36 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._required_count: int = int(step.get("required_count") or len(self._aliases))
         self._match_condition: str = str(step.get("match_condition") or "all_matched").strip()
 
+        # Auto-inherit target window from repository / candidate steps / running emulator if missing
+        if not self.step.get("region_window_exe"):
+            cand_exe = ""
+            cand_win = ""
+            if self.repository:
+                try:
+                    for m in self.repository.load_macros():
+                        for s in m.get("steps", []):
+                            we = str(s.get("region_window_exe") or (s.get("click") or {}).get("window_exe") or s.get("window_exe") or "")
+                            w = str(s.get("region_window") or (s.get("click") or {}).get("window") or s.get("window") or "")
+                            if we:
+                                cand_exe = we
+                                cand_win = w
+                                break
+                        if cand_exe:
+                            break
+                except Exception:
+                    pass
+            if not cand_exe:
+                for cname in ("dnplayer.exe", "HD-Player.exe", "Nox.exe", "MuMuPlayer.exe"):
+                    if _find_target_window(cname, ""):
+                        cand_exe = cname
+                        cand_win = f"ahk_exe {cname}"
+                        break
+            if cand_exe:
+                self.step["region_window_exe"] = cand_exe
+                self.step["region_window"] = cand_win
+                self.step.setdefault("region_mode", "client")
+                self.step.setdefault("region_coords", "relative")
+
         win_title = "🎨 색상 검색 영역 시각화 및 실시간 화면 검사기" if self._is_color_mode else "🔍 검색 영역 시각화 및 실시간 화면 검사기"
         self.setWindowTitle(win_title)
         self.resize(1180, 740)
@@ -551,9 +585,14 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         title_lbl.setStyleSheet("font-size: 13pt; font-weight: 800; color: #FFFFFF;")
         title_box.addWidget(title_lbl)
         btn_refresh = QtWidgets.QPushButton("🔄 다시 캡처")
-        btn_refresh.setStyleSheet("background: #1E293B; border: 1px solid #3B4A6B; color: #70C5FF; font-weight: 700; padding: 4px 10px; border-radius: 5px;")
+        btn_refresh.setStyleSheet("background: #1E293B; border: 1px solid #3B4A6B; color: #70C5FF; font-weight: 700; padding: 4px 8px; border-radius: 5px;")
         btn_refresh.clicked.connect(self._do_capture_and_test)
         title_box.addWidget(btn_refresh)
+
+        self.btn_toggle_mode = QtWidgets.QPushButton("🎯 대상 전환")
+        self.btn_toggle_mode.setStyleSheet("background: #1E293B; border: 1px solid #38BDF8; color: #38BDF8; font-weight: 700; padding: 4px 8px; border-radius: 5px;")
+        self.btn_toggle_mode.clicked.connect(self._toggle_target_mode)
+        title_box.addWidget(self.btn_toggle_mode)
         left_layout.addLayout(title_box)
 
         self.lbl_target_info = QtWidgets.QLabel("대상: 확인 중…")
@@ -701,6 +740,15 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._capture_desc = desc
         self.lbl_target_info.setText(f"대상: {desc}")
 
+        if hasattr(self, "btn_toggle_mode"):
+            mode = str(self.step.get("region_mode") or "screen").casefold()
+            if mode == "client":
+                self.btn_toggle_mode.setText("🖥️ 전체 화면 전환")
+                self.btn_toggle_mode.setToolTip("현재 앱플레이어 내부를 캡처 중입니다. 클릭하면 모니터 전체 화면 모드로 전환합니다.")
+            else:
+                self.btn_toggle_mode.setText("🎯 앱플레이어 전환")
+                self.btn_toggle_mode.setToolTip("현재 전체 화면을 캡처 중입니다. 클릭하면 실행 중인 앱플레이어(LDPlayer 등) 핸들 캡처로 전환합니다.")
+
         if frame is None or frame.size == 0:
             self.lbl_banner_main.setText("❌ 화면 캡처 실패")
             self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #F87171;")
@@ -710,6 +758,50 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self.canvas.set_frame(frame)
         self._evaluate_all_regions()
         self._refresh_ui()
+
+    def _toggle_target_mode(self) -> None:
+        """Toggle between client window mode and full screen mode with coordinate conversion."""
+        cur_mode = str(self.step.get("region_mode") or "screen").casefold()
+        old_bx, old_by = self._base_x, self._base_y
+
+        if cur_mode == "client":
+            self.step["region_mode"] = "screen"
+            self.step["region_coords"] = "screen"
+            for alias, reg in list(self._asset_regions.items()):
+                if isinstance(reg, (list, tuple)) and len(reg) >= 4 and (reg[0] or reg[1] or reg[2] or reg[3]):
+                    self._asset_regions[alias] = [reg[0] + old_bx, reg[1] + old_by, reg[2] + old_bx, reg[3] + old_by]
+            self._do_capture_and_test()
+        else:
+            win_exe = str(self.step.get("region_window_exe") or "")
+            win_token = str(self.step.get("region_window") or "")
+            if not win_exe:
+                for cname in ("dnplayer.exe", "HD-Player.exe", "Nox.exe", "MuMuPlayer.exe"):
+                    if _find_target_window(cname, ""):
+                        win_exe = cname
+                        win_token = f"ahk_exe {cname}"
+                        break
+            if win_exe:
+                self.step["region_window_exe"] = win_exe
+                self.step["region_window"] = win_token
+                self.step["region_mode"] = "client"
+                self.step["region_coords"] = "relative"
+                frame, new_bx, new_by, desc = capture_target_area(self.step)
+                if frame is not None and (new_bx or new_by):
+                    fh, fw = frame.shape[:2]
+                    for alias, reg in list(self._asset_regions.items()):
+                        if isinstance(reg, (list, tuple)) and len(reg) >= 4 and (reg[0] or reg[1] or reg[2] or reg[3]):
+                            x1 = max(0, min(fw, reg[0] - new_bx))
+                            y1 = max(0, min(fh, reg[1] - new_by))
+                            x2 = max(0, min(fw, reg[2] - new_bx))
+                            y2 = max(0, min(fh, reg[3] - new_by))
+                            self._asset_regions[alias] = [x1, y1, x2, y2]
+                self._do_capture_and_test()
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "대상 창 없음",
+                    "실행 중인 앱플레이어(LDPlayer 등) 또는 대상 창을 찾지 못했습니다.\n창을 먼저 띄운 후 다시 시도해주세요."
+                )
 
     def _evaluate_all_regions(self) -> None:
         if self._is_color_mode:

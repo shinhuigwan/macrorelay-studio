@@ -4442,9 +4442,13 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
     sleep_after = int(step.get("sleep_after") or 0)
 
     found_var = f"__pixel_search_success_{step_index}" if step_index else "__pixel_search_success"
+    is_client_mode = str(step.get("region_mode") or "").casefold() == "client"
 
     lines: List[str] = []
     lines.append(f"; ── 픽셀 색상 서치 ({'멀티 ' + str(total_colors) + '개' if total_colors > 1 else '단일'}) ──")
+    if is_client_mode:
+        lines.append("CoordMode, Pixel, Client")
+        lines.append("CoordMode, Mouse, Client")
     lines.append(f"{found_var} := 0")
     lines.append(f"PixelSearch_Timeout_{step_index} := {timeout}")
     lines.append(f"PixelSearch_PollDelay_{step_index} := {poll_delay}")
@@ -4526,6 +4530,9 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
         else:
             lines.append(f"    Click, %{store_x}%, %{store_y}%")
         lines.append("}")
+    if is_client_mode:
+        lines.append("CoordMode, Pixel, Screen")
+        lines.append("CoordMode, Mouse, %MacroMouseCoordMode%")
     if sleep_after > 0:
         lines.append(f"Sleep, {sleep_after}")
     return lines

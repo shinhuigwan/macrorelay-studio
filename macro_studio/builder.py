@@ -2394,6 +2394,16 @@ class BuilderPage(QtWidgets.QWidget):
         automation = primary.get("_automation") if isinstance(primary.get("_automation"), dict) else {}
         automation.update({"manual_multi_merge": True, "color_count": len(colors)})
         primary["_automation"] = automation
+        if not primary.get("region_window_exe"):
+            for s in steps:
+                c_exe = str(s.get("window_exe") or s.get("region_window_exe") or (s.get("click") or {}).get("window_exe") or "")
+                c_win = str(s.get("window") or s.get("region_window") or (s.get("click") or {}).get("window") or "")
+                if c_exe:
+                    primary["region_mode"] = "client"
+                    primary["region_coords"] = "relative"
+                    primary["region_window_exe"] = c_exe
+                    primary["region_window"] = c_win
+                    break
         for index in reversed(selected[1:]):
             removed = steps.pop(index - 1)
             self.current_macro.setdefault("meta", {}).setdefault("archived_steps", []).append(removed)
@@ -2409,9 +2419,25 @@ class BuilderPage(QtWidgets.QWidget):
         step = steps[row]
         if str(step.get("action") or "") != "pixel_search":
             return
+        # Auto-inherit target window from macro if not set
+        if not step.get("region_window_exe"):
+            for candidate in reversed(steps):
+                c_exe = str(candidate.get("window_exe") or candidate.get("region_window_exe") or (candidate.get("click") or {}).get("window_exe") or "")
+                c_win = str(candidate.get("window") or candidate.get("region_window") or (candidate.get("click") or {}).get("window") or "")
+                if c_exe:
+                    step["region_mode"] = "client"
+                    step["region_coords"] = "relative"
+                    step["region_window_exe"] = c_exe
+                    step["region_window"] = c_win
+                    break
         from .region_visual_test import RegionVisualTestDialog
         dlg = RegionVisualTestDialog(step, self.repository, parent=self.window())
         if dlg.exec() == QtWidgets.QDialog.Accepted:
+            if dlg.step.get("region_window_exe"):
+                step["region_window_exe"] = dlg.step["region_window_exe"]
+                step["region_window"] = dlg.step.get("region_window", "")
+                step["region_mode"] = dlg.step.get("region_mode", "client")
+                step["region_coords"] = dlg.step.get("region_coords", "relative")
             updated_color_regs = dlg.get_color_regions()
             if updated_color_regs:
                 step["color_regions"] = updated_color_regs
@@ -2710,11 +2736,12 @@ class BuilderPage(QtWidgets.QWidget):
             step = deepcopy(ACTION_TEMPLATES.get(action, {}))
             step["action"] = action
 
-        if action in {"image_search", "screen_condition"} and not step.get("region_window_exe"):
-            step.setdefault("engine", "opencv")
-            step.setdefault("search_profile", "precise")
-            step.setdefault("confidence", 85)
-            step.setdefault("wait_condition", "appear")
+        if action in {"image_search", "screen_condition", "pixel_search", "ocr", "ocr_tracking"} and not step.get("region_window_exe"):
+            if action in {"image_search", "screen_condition"}:
+                step.setdefault("engine", "opencv")
+                step.setdefault("search_profile", "precise")
+                step.setdefault("confidence", 85)
+                step.setdefault("wait_condition", "appear")
             for candidate in reversed(steps):
                 c_exe = str(candidate.get("window_exe") or candidate.get("region_window_exe") or (candidate.get("click") or {}).get("window_exe") or "")
                 c_win = str(candidate.get("window") or candidate.get("region_window") or (candidate.get("click") or {}).get("window") or "")
@@ -2723,11 +2750,12 @@ class BuilderPage(QtWidgets.QWidget):
                     step["region_coords"] = "relative"
                     step["region_window_exe"] = c_exe
                     step["region_window"] = c_win
-                    click = step.setdefault("click", {})
-                    click["mode"] = "inactive"
-                    click["window_exe"] = c_exe
-                    click["window"] = c_win
-                    click["click_image"] = True
+                    if action in {"image_search", "screen_condition"}:
+                        click = step.setdefault("click", {})
+                        click["mode"] = "inactive"
+                        click["window_exe"] = c_exe
+                        click["window"] = c_win
+                        click["click_image"] = True
                     break
 
         source = self.node_canvas.selected_index()

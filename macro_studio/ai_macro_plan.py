@@ -327,3 +327,179 @@ def compile_plan(plan, private, asset_path):
     }
     validate_compiled_draft(draft)
     return draft
+
+
+def build_auto_plan(
+    private: dict[str, Any],
+    requests: list[dict[str, Any]] | None = None,
+    responses: dict[str, Any] | None = None,
+    purpose: str = "",
+    notes: str = "",
+) -> dict[str, Any]:
+    """Automatically build a valid, resilient macro plan from private recording records and supplement responses."""
+    if not isinstance(private, dict) or "records" not in private:
+        raise PlanError("유효한 비공개 녹화 기록(private)이 필요합니다.")
+    records = private["records"]
+    if not records:
+        raise PlanError("녹화 기록이 비어 있습니다.")
+
+    all_rids = sorted(records.keys())
+
+    # 1. Identify supplement check records from responses or metadata
+    supplement_rids = set()
+    if responses and isinstance(responses, dict):
+        for resp in responses.values():
+            if isinstance(resp, dict):
+                for rid in resp.get("records", []):
+                    if rid in records:
+                        supplement_rids.add(rid)
+
+    # Base records are original recording records
+    base_rids = [rid for rid in all_rids if rid not in supplement_rids]
+    if not base_rids:
+        base_rids = all_rids
+
+    # 2. Divide base records into candidate workflows (e.g. F7 divided jobs)
+    workflows: list[list[str]] = []
+    current_wf: list[str] = []
+    for rid in base_rids:
+        step = records[rid]["step"]
+        auto = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+        is_candidate = bool(auto.get("start_workflow_candidate")) and len(current_wf) > 0
+        wf_id = str(step.get("workflow_id") or "")
+        prev_wf_id = str(records[current_wf[-1]]["step"].get("workflow_id") or "") if current_wf else ""
+        if is_candidate or (wf_id and prev_wf_id and wf_id != prev_wf_id):
+            workflows.append(current_wf)
+            current_wf = [rid]
+        else:
+            current_wf.append(rid)
+    if current_wf:
+        workflows.append(current_wf)
+
+    first_rids = [wf[0] for wf in workflows if wf]
+
+    def to_nid(rid: str) -> str:
+        digits = "".join(c for c in rid if c.isdigit())
+        if digits:
+            return f"n{int(digits):03d}"
+        return f"n_{rid}"
+
+    nodes: list[dict[str, Any]] = []
+
+    # 3. Build nodes for each workflow
+    for wf_idx, wf_rids in enumerate(workflows):
+        for step_idx, rid in enumerate(wf_rids):
+            nid = to_nid(rid)
+            saved = records[rid]
+            step = saved.get("step", {})
+            act = step.get("action", "")
+            lbl = step.get("label") or f"동작 {nid}"
+            is_first = (step_idx == 0)
+            is_last = (step_idx == len(wf_rids) - 1)
+            next_rid = wf_rids[step_idx + 1] if not is_last else None
+            next_nid = to_nid(next_rid) if next_rid else "STOP"
+
+            mode = "check" if act in VISUAL and (step.get("click_enabled") is False or act == "screen_condition") else (
+                "wait" if act == "wait" else "replay"
+            )
+
+            node: dict[str, Any] = {
+                "id": nid,
+                "record": rid,
+                "mode": mode,
+                "label": f"[{rid}] {lbl}",
+            }
+
+            if mode == "wait":
+                node["duration_ms"] = int(step.get("duration") or 500)
+                node["success"] = next_nid
+                node["failure"] = next_nid
+            elif is_first and len(workflows) > 1:
+                # Multi-workflow candidate priority branch
+                node["success"] = next_nid
+                if wf_idx + 1 < len(workflows):
+                    node["failure"] = to_nid(first_rids[wf_idx + 1])
+                else:
+                    node["failure"] = "STOP"
+                if mode == "check" or act in VISUAL:
+                    node["timeout_ms"] = int(step.get("timeout") or 3000)
+                node["retries"] = 2
+                node["retry_delay_ms"] = 500
+            elif is_last:
+                # Workflow terminal
+                node["success"] = "STOP"
+                node["failure"] = "STOP"
+                node["retries"] = 2
+                node["retry_delay_ms"] = 500
+                if mode == "check":
+                    node["timeout_ms"] = int(step.get("timeout") or 3000)
+            else:
+                # Sequential step inside workflow
+                node["success"] = next_nid
+                node["failure"] = next_nid  # Resilient fallthrough
+                node["retries"] = 2
+                node["retry_delay_ms"] = 500
+                if mode == "check":
+                    node["timeout_ms"] = int(step.get("timeout") or 3000)
+
+            nodes.append(node)
+
+    # 4. Integrate Supplement Check Records (e.g. r105)
+    combined_notes = (str(notes) + " " + " ".join(
+        str(r.get("note", "")) for r in (responses.values() if responses else [])
+    ) + " " + " ".join(
+        str(req.get("reason", "")) for req in (requests or [])
+    )).lower()
+
+    stop_on_match = any(kw in combined_notes for kw in ["보존", "상승", "멈춤", "중단", "종료", "stop", "보호", "유지"])
+
+    for srid in sorted(supplement_rids):
+        snid = to_nid(srid)
+        saved = records[srid]
+        s_step = saved.get("step", {})
+        s_lbl = s_step.get("label") or f"보완 확인 [{srid}]"
+
+        base_rid = s_step.get("_base_record")
+        if not base_rid or base_rid not in records:
+            visual_bases = [r for r in base_rids if records[r]["step"].get("action") in VISUAL]
+            base_rid = visual_bases[-1] if visual_bases else base_rids[-1]
+
+        base_nid = to_nid(base_rid)
+        base_node = next((n for n in nodes if n["id"] == base_nid), None)
+        base_orig_success = base_node["success"] if base_node else "STOP"
+
+        s_node: dict[str, Any] = {
+            "id": snid,
+            "record": srid,
+            "mode": "check",
+            "label": f"[{srid}] {s_lbl}",
+            "timeout_ms": int(s_step.get("timeout") or 5000),
+            "retries": 2,
+            "retry_delay_ms": 500,
+        }
+
+        if stop_on_match:
+            s_node["success"] = "STOP"
+            s_node["failure"] = base_orig_success if base_orig_success != "STOP" else "STOP"
+        else:
+            s_node["success"] = base_orig_success
+            s_node["failure"] = "STOP"
+
+        if base_node:
+            base_node["success"] = snid
+
+        nodes.append(s_node)
+
+    name = purpose.strip()[:60] if purpose and purpose.strip() else "스마트 자동 매크로 플랜"
+    entry = to_nid(base_rids[0])
+
+    plan = {
+        "schema": VERSION,
+        "recording_id": private["recording_id"],
+        "name": name,
+        "entry": entry,
+        "nodes": nodes,
+        "missing_images": [],
+    }
+
+    return plan

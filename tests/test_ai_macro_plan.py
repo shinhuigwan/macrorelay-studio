@@ -7,6 +7,7 @@ from pathlib import Path
 from macro_studio.ai_macro_plan import (
     VERSION,
     PlanError,
+    build_auto_plan,
     compile_plan,
     export_recording,
     load_private_recording,
@@ -128,6 +129,61 @@ class PlanTests(unittest.TestCase):
         with self.assertRaises(PlanError) as ctx:
             validate_compiled_draft(bad_draft)
         self.assertIn("정수", str(ctx.exception))
+
+    def test_build_auto_plan_linear(self):
+        plan = build_auto_plan(self.private, purpose="단일 흐름 테스트")
+        self.assertEqual(plan["schema"], VERSION)
+        self.assertEqual(plan["recording_id"], self.private["recording_id"])
+        self.assertEqual(plan["name"], "단일 흐름 테스트")
+        self.assertEqual(plan["entry"], "n001")
+        self.assertEqual(len(plan["nodes"]), 1)
+        self.assertEqual(plan["nodes"][0]["success"], "STOP")
+
+        compiled = compile_plan(plan, self.private, self.resolver)
+        self.assertEqual(len(compiled["steps"]), 2)  # 1 step + flow_control
+
+    def test_build_auto_plan_branches_and_supplement(self):
+        # Create a multi-workflow private recording mock
+        mock_private = {
+            "schema": VERSION,
+            "recording_id": "test-rec-123",
+            "records": {
+                "r001": {
+                    "step": {"action": "image_search", "asset": "button", "label": "후보 1",
+                             "_automation": {"start_workflow_candidate": True}},
+                    "images": [{"alias": "button", "file": "images/r001-1.png", "sha256": "fake"}]
+                },
+                "r002": {
+                    "step": {"action": "image_search", "asset": "button", "label": "후보 1 동작",
+                             "workflow_id": "wf1"},
+                    "images": [{"alias": "button", "file": "images/r002-1.png", "sha256": "fake"}]
+                },
+                "r003": {
+                    "step": {"action": "image_search", "asset": "button", "label": "후보 2",
+                             "_automation": {"start_workflow_candidate": True}, "workflow_id": "wf2"},
+                    "images": [{"alias": "button", "file": "images/r003-1.png", "sha256": "fake"}]
+                },
+                "r004": {
+                    "step": {"action": "screen_condition", "asset": "button", "label": "보완 상승 확인",
+                             "_base_record": "r002"},
+                    "images": [{"alias": "button", "file": "images/r004-1.png", "sha256": "fake"}]
+                }
+            }
+        }
+        responses = {"req-1": {"records": ["r004"], "note": "상승 화살표 확인 시 보존"}}
+        plan = build_auto_plan(mock_private, responses=responses, purpose="분기 매크로")
+        node_map = {n["id"]: n for n in plan["nodes"]}
+
+        # Candidate 1 branches to Candidate 2 on failure
+        self.assertEqual(node_map["n001"]["failure"], "n003")
+
+        # Candidate 2 is last candidate, fails to STOP
+        self.assertEqual(node_map["n003"]["failure"], "STOP")
+
+        # Supplement check node n004 attached to n002
+        self.assertEqual(node_map["n002"]["success"], "n004")
+        # Note contains "상승" / "보존" -> success is STOP (Preserve item)
+        self.assertEqual(node_map["n004"]["success"], "STOP")
 
 
 if __name__ == "__main__":

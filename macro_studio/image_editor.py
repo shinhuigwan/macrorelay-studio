@@ -378,6 +378,81 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
             return QtCore.QRect()
         return self._selection.translated(self.geometry().topLeft())
 
+    @property
+    def selected_rect(self) -> QtCore.QRect:
+        """Property alias for selected_screen_rect."""
+        return self.selected_screen_rect()
+
+
+def select_region_on_snapshot(
+    snapshot_pixmap: QtGui.QPixmap,
+    parent=None,
+    hint_text: str | None = None,
+) -> list[int] | None:
+    """Open snapshot in a focused overlay allowing the user to drag an ROI directly on the snapshot frame.
+    Returns [left, top, right, bottom] relative to the snapshot (0, 0) or None if cancelled.
+    """
+    if snapshot_pixmap.isNull() or snapshot_pixmap.width() < 4 or snapshot_pixmap.height() < 4:
+        return None
+    geometry = virtual_desktop_geometry()
+    if not geometry.isValid():
+        geometry = QtCore.QRect(0, 0, 1920, 1080)
+
+    # Create dark dimmed overlay matching virtual desktop
+    overlay = QtGui.QPixmap(geometry.size())
+    overlay.fill(QtGui.QColor(12, 16, 24, 235))
+
+    sw = snapshot_pixmap.width()
+    sh = snapshot_pixmap.height()
+
+    # Center the snapshot on the screen (or primary monitor)
+    primary_screen = QtGui.QGuiApplication.primaryScreen()
+    if primary_screen:
+        p_geo = primary_screen.geometry()
+        cx = (p_geo.left() - geometry.left()) + max(0, (p_geo.width() - sw) // 2)
+        cy = (p_geo.top() - geometry.top()) + max(0, (p_geo.height() - sh) // 2)
+    else:
+        cx = max(0, (geometry.width() - sw) // 2)
+        cy = max(0, (geometry.height() - sh) // 2)
+
+    snap_target = QtCore.QRect(cx, cy, sw, sh)
+
+    painter = QtGui.QPainter(overlay)
+    painter.drawPixmap(cx, cy, snapshot_pixmap)
+
+    # Draw border and title banner
+    painter.setPen(QtGui.QPen(QtGui.QColor("#4D9FFF"), 2))
+    painter.drawRect(cx - 1, cy - 1, sw + 2, sh + 2)
+
+    painter.setPen(QtGui.QPen(QtGui.QColor("#E2E8F0")))
+    font = QtGui.QFont("Segoe UI", 10)
+    font.setBold(True)
+    painter.setFont(font)
+    banner_text = f"📸 녹화 당시 화면 (스냅샷: {sw}×{sh} px) · 틀 안쪽에서 검색할 영역을 마우스로 드래그하세요"
+    painter.drawText(cx, max(18, cy - 8), banner_text)
+    painter.end()
+
+    hint = hint_text or "📸 [녹화 당시 화면] 파란 틀 안쪽에서 검색할 영역을 드래그하세요 (Enter: 확정, Esc: 취소)"
+    picker = ScreenCaptureDialog(overlay, geometry, parent=parent, hint_text=hint)
+    try:
+        if picker.exec() != QtWidgets.QDialog.Accepted:
+            return None
+        selected = picker.selected_screen_rect()
+        local_sel = selected.translated(-geometry.topLeft())
+        intersected = local_sel.intersected(snap_target)
+        if not intersected.isValid() or intersected.width() < 4 or intersected.height() < 4:
+            return None
+        rel_left = intersected.left() - cx
+        rel_top = intersected.top() - cy
+        rel_right = intersected.right() - cx
+        rel_bottom = intersected.bottom() - cy
+        return [max(0, rel_left), max(0, rel_top), min(sw, rel_right), min(sh, rel_bottom)]
+    finally:
+        try:
+            picker.deleteLater()
+        except Exception:
+            pass
+
 
 class ImageEditorDialog(QtWidgets.QDialog):
     saved = QtCore.Signal(str)

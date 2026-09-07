@@ -19,9 +19,9 @@ import uuid
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .ai_macro_dialog import AiMacroDialog
-from .ai_macro_plan import load_plan, load_private_recording, PlanError, VISUAL, VERSION, SUPPORTED, _aliases
+from .ai_macro_plan import build_auto_plan, load_plan, load_private_recording, PlanError, VISUAL, VERSION, SUPPORTED, _aliases
 from .ai_macro_supplement import requests_from_plan, add_check_record, export_revision
-from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
+from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop, select_region_on_snapshot
 
 
 class CaptureMetadataDialog(QtWidgets.QDialog):
@@ -532,6 +532,21 @@ class AiMacroSupplementDialog(AiMacroDialog):
             private, rid = add_check_record(
                 self._private, base_rid, alias, label, self.repository.asset_path, search_region=rel_region
             )
+            snap_alias = None
+            try:
+                if client_rect is not None and client_rect.isValid():
+                    local_rect = client_rect.translated(-geometry.topLeft())
+                    client_pix = pixmap.copy(local_rect)
+                    if not client_pix.isNull() and client_pix.width() >= 10 and client_pix.height() >= 10:
+                        snap_alias = self.repository.add_asset_image(client_pix.toImage(), "ai-snap-" + uuid.uuid4().hex)
+                if not snap_alias and not pixmap.isNull():
+                    snap_alias = self.repository.add_asset_image(pixmap.toImage(), "ai-snap-" + uuid.uuid4().hex)
+            except Exception:
+                pass
+            if snap_alias:
+                private["records"][rid]["snapshot_alias"] = snap_alias
+                private["records"][rid]["step"]["_snapshot_alias"] = snap_alias
+            private["records"][rid]["step"]["_base_record"] = base_rid
             self._private = private
             self._responses.setdefault(req_id, {}).setdefault("records", []).append(rid)
             self._responses[req_id]["note"] = note
@@ -659,6 +674,76 @@ class AiMacroSupplementDialog(AiMacroDialog):
         rid = ids[-1]
         rec = self._private["records"].get(rid, {})
 
+        # 1. 스냅샷 검색 (현재 레코드 -> 베이스 레코드 -> 저장된 에셋 순)
+        snapshot_pixmap = None
+        base_rid = rec.get("step", {}).get("_base_record") or self.base.currentData() or "r001"
+        base_rec = self._private["records"].get(base_rid, {})
+
+        snap_alias = (
+            rec.get("snapshot_alias")
+            or rec.get("step", {}).get("_snapshot_alias")
+            or base_rec.get("snapshot_alias")
+            or base_rec.get("step", {}).get("_snapshot_alias")
+        )
+        if snap_alias:
+            path = self.repository.asset_path(snap_alias)
+            if path and Path(path).is_file():
+                pix = QtGui.QPixmap(str(path))
+                if not pix.isNull():
+                    snapshot_pixmap = pix
+
+        if snapshot_pixmap is None:
+            # 보완 항목 자체 이미지 또는 베이스 레코드의 이미지 확인
+            for candidate_rec in (rec, base_rec):
+                images = candidate_rec.get("images", [])
+                if images:
+                    path = self.repository.asset_path(images[0]["alias"])
+                    if path and Path(path).is_file():
+                        pix = QtGui.QPixmap(str(path))
+                        if not pix.isNull() and pix.width() >= 100 and pix.height() >= 100:
+                            snapshot_pixmap = pix
+                            break
+
+        # 2. 스냅샷 사용 여부 사용자 선택
+        use_snapshot = False
+        if snapshot_pixmap is not None and not snapshot_pixmap.isNull():
+            msg = QtWidgets.QMessageBox(self)
+            msg.setWindowTitle("🎯 검색 영역(ROI) 지정 방식 선택")
+            msg.setText(
+                "<b>어떤 화면을 기준으로 검색 영역을 지정하시겠습니까?</b><br><br>"
+                "• <b>📸 녹화 당시 화면 (스냅샷)</b>: 게임 화면이 이미 지나갔어도 당시 캡처 프레임 위에서 정확하게 영역을 드래그합니다 (추천).<br>"
+                "• <b>🖥️ 현재 실시간 화면</b>: 지금 모니터에 떠 있는 라이브 창을 직접 캡처하여 드래그합니다."
+            )
+            btn_snap = msg.addButton("📸 녹화 당시 화면 (스냅샷)", QtWidgets.QMessageBox.AcceptRole)
+            btn_snap.setStyleSheet("background: #2B6CB0; color: white; font-weight: bold; padding: 6px 14px;")
+            btn_live = msg.addButton("🖥️ 현재 실시간 화면", QtWidgets.QMessageBox.ActionRole)
+            btn_cancel = msg.addButton("취소", QtWidgets.QMessageBox.RejectRole)
+            msg.exec()
+            clicked = msg.clickedButton()
+            if clicked == btn_cancel:
+                return
+            use_snapshot = (clicked == btn_snap)
+
+        if use_snapshot and snapshot_pixmap is not None:
+            self.hide()
+            QtCore.QThread.msleep(150)
+            QtWidgets.QApplication.processEvents()
+            try:
+                rel_region = select_region_on_snapshot(snapshot_pixmap, parent=None)
+            finally:
+                self.show()
+                self.raise_()
+                self.activateWindow()
+
+            if rel_region is None:
+                return
+
+            rec["step"]["search_region"] = rel_region
+            self._update_resend_button_state()
+            self.status.setText(f"✔ {rid}의 검색 영역이 {rel_region}으로 재설정되었습니다. (녹화 스냅샷 기준)")
+            return
+
+        # 3. 실시간 화면 캡처 진행
         self.hide()
         QtCore.QThread.msleep(200)
         QtWidgets.QApplication.processEvents()
@@ -669,14 +754,13 @@ class AiMacroSupplementDialog(AiMacroDialog):
             return
 
         cap_dlg = ScreenCaptureDialog(desktop_pixmap, virtual_rect)
-        if cap_dlg.exec() != QtWidgets.QDialog.Accepted or not cap_dlg.selected_rect.isValid():
+        if cap_dlg.exec() != QtWidgets.QDialog.Accepted or not cap_dlg.selected_screen_rect().isValid():
             self.show()
             return
         self.show()
 
-        rect = cap_dlg.selected_rect
-        base_rid = self.base.currentData() or "r001"
-        base_step = self._private["records"].get(base_rid, {}).get("step", {})
+        rect = cap_dlg.selected_screen_rect()
+        base_step = base_rec.get("step", {})
         client_rect = None
         if "_automation" in base_step:
             rec_win = base_step["_automation"].get("recorded_window", {})
@@ -697,7 +781,7 @@ class AiMacroSupplementDialog(AiMacroDialog):
 
         rec["step"]["search_region"] = rel_region
         self._update_resend_button_state()
-        self.status.setText(f"✔ {rid}의 검색 영역이 {rel_region}으로 재설정되었습니다.")
+        self.status.setText(f"✔ {rid}의 검색 영역이 {rel_region}으로 재설정되었습니다. (실시간 화면 기준)")
 
     def _edit_search_params(self):
         req = self._current()

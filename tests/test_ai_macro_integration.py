@@ -338,6 +338,29 @@ class AiMacroStudioIntegrationTests(unittest.TestCase):
         self.assertEqual(2, len(dialog.draft["steps"]))
         self.assertTrue(dialog.accept_draft.isEnabled())
 
+    def test_generate_auto_plan_one_click(self):
+        steps = [{
+            "action": "image_search",
+            "asset": "test_btn",
+            "label": "버튼 클릭",
+            "click_enabled": True,
+            "click": {"offset": [0, 0]},
+        }]
+        from macro_studio.ai_macro_supplement_dialog import AiMacroSupplementDialog
+        dialog = AiMacroSupplementDialog(self.repo, steps)
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertTrue(hasattr(dialog, "btn_auto_generate"))
+        self.assertIn("원클릭", dialog.btn_auto_generate.text())
+
+        with mock.patch("pathlib.Path.home", return_value=self.root):
+            dialog.generate_auto_plan()
+
+        self.assertIsNotNone(dialog.draft)
+        self.assertEqual(2, len(dialog.draft["steps"]))
+        self.assertTrue(dialog.accept_draft.isEnabled())
+        self.assertIn("완료", dialog.status.text())
+
 
 if __name__ == "__main__":
     unittest.main()

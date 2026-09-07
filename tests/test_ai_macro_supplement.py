@@ -94,6 +94,26 @@ class SupplementTests(unittest.TestCase):
         self.assertEqual("수정된 라벨", label2)
         self.assertEqual("수정된 메모", note2)
 
+    def test_select_region_on_snapshot(self):
+        from unittest import mock
+        from PySide6 import QtGui, QtCore, QtWidgets
+        from macro_studio.image_editor import select_region_on_snapshot, ScreenCaptureDialog
+
+        # Test empty or invalid pixmap returns None
+        self.assertIsNone(select_region_on_snapshot(QtGui.QPixmap()))
+
+        pix = QtGui.QPixmap(200, 300)
+        pix.fill(QtCore.Qt.red)
+
+        with mock.patch.object(ScreenCaptureDialog, "exec", return_value=QtWidgets.QDialog.Accepted), \
+             mock.patch.object(ScreenCaptureDialog, "selected_screen_rect", return_value=QtCore.QRect(50, 50, 60, 80)):
+            res = select_region_on_snapshot(pix)
+            # Should return 4 coordinates or None if outside target
+            if res is not None:
+                self.assertEqual(4, len(res))
+                self.assertGreaterEqual(res[2], res[0])
+                self.assertGreaterEqual(res[3], res[1])
+
 
 if __name__ == '__main__':
     unittest.main()

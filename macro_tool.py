@@ -4436,19 +4436,26 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
     store_count_var = str(step.get("store_count_var") or "").strip()
 
     timeout = int(step.get("timeout") or 3000)
-    poll_delay = int(step.get("poll_delay") or 50)
+    poll_delay = max(10, int(step.get("poll_delay") or 50))
     click_offset_x = int(step.get("click_offset_x") or 0)
     click_offset_y = int(step.get("click_offset_y") or 0)
     sleep_after = int(step.get("sleep_after") or 0)
 
     found_var = f"__pixel_search_success_{step_index}" if step_index else "__pixel_search_success"
-    is_client_mode = str(step.get("region_mode") or "").casefold() == "client"
+
+    # Resolve target window and coordinate mode
+    win_exe = str(step.get("region_window_exe") or (step.get("click") or {}).get("window_exe") or "").strip()
+    win_title = str(step.get("region_window") or (step.get("click") or {}).get("window") or "").strip()
+    raw_mode = step.get("region_mode")
+    if not raw_mode and win_exe:
+        region_mode = "client"
+    else:
+        region_mode = str(raw_mode or "screen").strip().casefold()
 
     lines: List[str] = []
     lines.append(f"; ── 픽셀 색상 서치 ({'멀티 ' + str(total_colors) + '개' if total_colors > 1 else '단일'}) ──")
-    if is_client_mode:
-        lines.append("CoordMode, Pixel, Client")
-        lines.append("CoordMode, Mouse, Client")
+    lines.append("CoordMode, Pixel, Screen")
+    lines.append("CoordMode, Mouse, Screen")
     lines.append(f"{found_var} := 0")
     lines.append(f"PixelSearch_Timeout_{step_index} := {timeout}")
     lines.append(f"PixelSearch_PollDelay_{step_index} := {poll_delay}")
@@ -4456,6 +4463,64 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
     lines.append(f"PixelSearch_MatchCount_{step_index} := 0")
     lines.append(f"PixelSearch_FirstX_{step_index} := 0")
     lines.append(f"PixelSearch_FirstY_{step_index} := 0")
+
+    # Base coordinates for relative/client offset
+    lines.append(f"__ps_base_x_{step_index} := 0")
+    lines.append(f"__ps_base_y_{step_index} := 0")
+    lines.append(f"TargetHwnd_{step_index} := 0")
+
+    if region_mode in {"client", "window"}:
+        clean_exe = win_exe
+        if clean_exe.startswith("ahk_exe "):
+            clean_exe = clean_exe[8:].strip()
+        lines.append(f'TargetHwnd_{step_index} := EnsureTargetWindow(TargetHwnd_{step_index}, "{ahk_quote(win_title)}", "{ahk_quote(clean_exe)}")')
+        lines.append(f'if (!TargetHwnd_{step_index})')
+        lines.append(f'    TargetHwnd_{step_index} := WinExist("A")')
+        lines.append(f'if (TargetHwnd_{step_index}) {{')
+        if region_mode == "window":
+            lines.append(f'    WinGetPos, __ps_base_x_{step_index}, __ps_base_y_{step_index},,, ahk_id %TargetHwnd_{step_index}%')
+        else:
+            lines.append(f'    VarSetCapacity(__ps_pt_{step_index}, 8, 0)')
+            lines.append(f'    NumPut(0, __ps_pt_{step_index}, 0, "int")')
+            lines.append(f'    NumPut(0, __ps_pt_{step_index}, 4, "int")')
+            lines.append(f'    DllCall("ClientToScreen", "ptr", TargetHwnd_{step_index}, "ptr", &__ps_pt_{step_index})')
+            lines.append(f'    __ps_base_x_{step_index} := NumGet(__ps_pt_{step_index}, 0, "int")')
+            lines.append(f'    __ps_base_y_{step_index} := NumGet(__ps_pt_{step_index}, 4, "int")')
+        lines.append('}')
+
+    # Emit search variables for each color
+    for idx, c in enumerate(colors, 1):
+        reg = color_regions.get(c, base_region)
+        if isinstance(reg, (list, tuple)) and len(reg) >= 4:
+            left, top, right, bottom = int(reg[0]), int(reg[1]), int(reg[2]), int(reg[3])
+        else:
+            left, top, right, bottom = 0, 0, 0, 0
+
+        if left == 0 and top == 0 and right == 0 and bottom == 0:
+            if region_mode == "client":
+                lines.append(f'if (TargetHwnd_{step_index}) {{')
+                lines.append(f'    VarSetCapacity(__ps_rect_{step_index}, 16, 0)')
+                lines.append(f'    DllCall("GetClientRect", "ptr", TargetHwnd_{step_index}, "ptr", &__ps_rect_{step_index})')
+                lines.append(f'    __ps_sx1_{step_index}_{idx} := __ps_base_x_{step_index}')
+                lines.append(f'    __ps_sy1_{step_index}_{idx} := __ps_base_y_{step_index}')
+                lines.append(f'    __ps_sx2_{step_index}_{idx} := __ps_base_x_{step_index} + NumGet(__ps_rect_{step_index}, 8, "int")')
+                lines.append(f'    __ps_sy2_{step_index}_{idx} := __ps_base_y_{step_index} + NumGet(__ps_rect_{step_index}, 12, "int")')
+                lines.append('} else {')
+                lines.append(f'    __ps_sx1_{step_index}_{idx} := 0')
+                lines.append(f'    __ps_sy1_{step_index}_{idx} := 0')
+                lines.append(f'    __ps_sx2_{step_index}_{idx} := A_ScreenWidth')
+                lines.append(f'    __ps_sy2_{step_index}_{idx} := A_ScreenHeight')
+                lines.append('}')
+            else:
+                lines.append(f'__ps_sx1_{step_index}_{idx} := 0')
+                lines.append(f'__ps_sy1_{step_index}_{idx} := 0')
+                lines.append(f'__ps_sx2_{step_index}_{idx} := A_ScreenWidth')
+                lines.append(f'__ps_sy2_{step_index}_{idx} := A_ScreenHeight')
+        else:
+            lines.append(f'__ps_sx1_{step_index}_{idx} := __ps_base_x_{step_index} + ({left})')
+            lines.append(f'__ps_sy1_{step_index}_{idx} := __ps_base_y_{step_index} + ({top})')
+            lines.append(f'__ps_sx2_{step_index}_{idx} := __ps_base_x_{step_index} + ({right})')
+            lines.append(f'__ps_sy2_{step_index}_{idx} := __ps_base_y_{step_index} + ({bottom})')
 
     lines.append("Loop {")
     lines.append(f"    PixelSearch_MatchCount_{step_index} := 0")
@@ -4469,19 +4534,9 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
         else:
             c_hex = "0x" + c_str.upper()
         tol = int(color_tolerances.get(c, base_tol))
-        reg = color_regions.get(c, base_region)
-        if isinstance(reg, (list, tuple)) and len(reg) >= 4:
-            left, top, right, bottom = int(reg[0]), int(reg[1]), int(reg[2]), int(reg[3])
-        else:
-            left, top, right, bottom = 0, 0, 0, 0
-        if left == 0 and top == 0 and right == 0 and bottom == 0:
-            right_val, bottom_val = "A_ScreenWidth", "A_ScreenHeight"
-        else:
-            right_val, bottom_val = str(right), str(bottom)
-
         cur_x = f"__ps_x_{step_index}_{idx}"
         cur_y = f"__ps_y_{step_index}_{idx}"
-        lines.append(f"    PixelSearch, {cur_x}, {cur_y}, {left}, {top}, {right_val}, {bottom_val}, {c_hex}, {tol}, Fast RGB")
+        lines.append(f"    PixelSearch, {cur_x}, {cur_y}, %__ps_sx1_{step_index}_{idx}%, %__ps_sy1_{step_index}_{idx}%, %__ps_sx2_{step_index}_{idx}%, %__ps_sy2_{step_index}_{idx}%, {c_hex}, {tol}, Fast RGB")
         lines.append("    if (ErrorLevel = 0) {")
         lines.append(f"        PixelSearch_MatchCount_{step_index} += 1")
         lines.append(f"        if (PixelSearch_FirstX_{step_index} = 0 && PixelSearch_FirstY_{step_index} = 0) {{")
@@ -4523,6 +4578,10 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
 
     if action_on_found == "click":
         lines.append(f"if ({found_var}) {{")
+        lines.append(f"    if (TargetHwnd_{step_index}) {{")
+        lines.append(f"        WinActivate, ahk_id %TargetHwnd_{step_index}%")
+        lines.append(f"        WinWaitActive, ahk_id %TargetHwnd_{step_index}%, , 0.3")
+        lines.append("    }")
         if click_offset_x or click_offset_y:
             lines.append(f"    __click_x := {store_x} + {click_offset_x}")
             lines.append(f"    __click_y := {store_y} + {click_offset_y}")
@@ -4530,11 +4589,12 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
         else:
             lines.append(f"    Click, %{store_x}%, %{store_y}%")
         lines.append("}")
-    if is_client_mode:
-        lines.append("CoordMode, Pixel, Screen")
-        lines.append("CoordMode, Mouse, %MacroMouseCoordMode%")
+
     if sleep_after > 0:
         lines.append(f"Sleep, {sleep_after}")
+
+    lines.append("CoordMode, Pixel, Screen")
+    lines.append("CoordMode, Mouse, %MacroMouseCoordMode%")
     return lines
 
 

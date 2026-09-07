@@ -4742,7 +4742,22 @@ class ActionEditorDialog(QtWidgets.QDialog):
     def __init__(self, repository: MacroRepository, step: dict[str, Any], parent=None) -> None:
         super().__init__(parent)
         action = str(step.get("action") or "wait")
-        action_name = "멀티 이미지 서치" if action == "image_search" and len(step.get("assets") or []) > 1 else ACTION_LABELS.get(action, action)
+        raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
+        is_multi_pixel = (
+            action == "pixel_search"
+            and (
+                len(raw_colors) > 1
+                or bool((step.get("_automation") or {}).get("manual_multi_merge"))
+                or "멀티" in str(step.get("label") or "")
+            )
+        )
+        if action == "image_search" and len(step.get("assets") or []) > 1:
+            action_name = "멀티 이미지 서치"
+        elif is_multi_pixel:
+            count = len(raw_colors) or int((step.get("_automation") or {}).get("color_count") or 1)
+            action_name = f"멀티 색상 서치 ({count}개)" if count > 1 else "멀티 색상 서치"
+        else:
+            action_name = ACTION_LABELS.get(action, action)
         self.setWindowTitle(f"{action_name} · 상세 설정")
         self.setMinimumSize(860, 640)
 
@@ -4762,10 +4777,34 @@ class ActionEditorDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         title = QtWidgets.QLabel(action_name)
-        title.setStyleSheet("font-size:17pt; font-weight:800;")
-        hint = QtWidgets.QLabel("긴 설정을 넓은 창에서 편집합니다. '설정 저장'을 누르면 단계와 매크로 파일에 즉시 반영됩니다.")
+        title.setStyleSheet("font-size:17pt; font-weight:800; color:#38E7FF;" if is_multi_pixel else "font-size:17pt; font-weight:800;")
+        hint_text = (
+            "멀티 색상 서치 노드의 조건을 편집합니다. 여러 색상의 개별 오차 및 영역은 '색상 서치 / 영역 검증' 창에서 시각적으로 확인하고 미세조정할 수 있습니다."
+            if is_multi_pixel
+            else "긴 설정을 넓은 창에서 편집합니다. '설정 저장'을 누르면 단계와 매크로 파일에 즉시 반영됩니다."
+        )
+        hint = QtWidgets.QLabel(hint_text)
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+
+        self.multi_color_card: QtWidgets.QFrame | None = None
+        if is_multi_pixel:
+            self.multi_color_card = QtWidgets.QFrame()
+            self.multi_color_card.setObjectName("MultiColorSummaryCard")
+            self.multi_color_card.setStyleSheet("""
+                QFrame#MultiColorSummaryCard {
+                    background: #141A26;
+                    border: 1px solid #2B384E;
+                    border-left: 4px solid #FF6B9D;
+                    border-radius: 8px;
+                    padding: 4px;
+                }
+            """)
+            layout.addWidget(self.multi_color_card)
+            self._build_multi_color_card(step)
+
         self.editor = ActionEditor(repository)
         self.editor.refresh_sources()
         self.editor.load_step(step)
@@ -4773,10 +4812,108 @@ class ActionEditorDialog(QtWidgets.QDialog):
         buttons.button(QtWidgets.QDialogButtonBox.Save).setText("설정 저장")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(title)
-        layout.addWidget(hint)
         layout.addWidget(self.editor, 1)
         layout.addWidget(buttons)
+
+    def _build_multi_color_card(self, step: dict[str, Any]) -> None:
+        if not self.multi_color_card:
+            return
+        if self.multi_color_card.layout() is not None:
+            QtWidgets.QWidget().setLayout(self.multi_color_card.layout())
+        card_layout = QtWidgets.QVBoxLayout(self.multi_color_card)
+        card_layout.setContentsMargins(6, 6, 6, 6)
+        card_layout.setSpacing(6)
+
+        header_row = QtWidgets.QHBoxLayout()
+        raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
+        tols = step.get("color_tolerances") if isinstance(step.get("color_tolerances"), dict) else {}
+        regs = step.get("color_regions") if isinstance(step.get("color_regions"), dict) else {}
+        base_tol = int(step.get("tolerance") or 10)
+        base_reg = step.get("search_region") or step.get("region") or [0, 0, 0, 0]
+
+        cond = str(step.get("match_condition") or "all_matched")
+        cond_labels = {
+            "all_matched": "모든 색상 일치 시 참 (AND)",
+            "at_least_1": "1개 이상 일치 시 참 (OR)",
+            "at_least_n": f"{step.get('required_count', len(raw_colors))}개 이상 일치 시 참",
+            "exact_n": f"정확히 {step.get('required_count', len(raw_colors))}개 일치 시 참",
+        }
+        cond_text = cond_labels.get(cond, cond)
+
+        title_lbl = QtWidgets.QLabel(f"🎨 <b>멀티 색상 그룹</b> ({len(raw_colors)}개 색상) · 판정 조건: <span style='color:#38E7FF;'>{cond_text}</span>")
+        title_lbl.setStyleSheet("font-size: 9.3pt; color: #E2E8F0;")
+        header_row.addWidget(title_lbl, 1)
+
+        btn_verify = QtWidgets.QPushButton("🔍 색상 서치 / 영역 검증 (미리보기 설정창 열기)")
+        btn_verify.setStyleSheet("""
+            QPushButton {
+                background: #1A365D;
+                color: #63B3ED;
+                border: 1px solid #2B6CB0;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-weight: bold;
+                font-size: 8.8pt;
+            }
+            QPushButton:hover {
+                background: #2B6CB0;
+                color: #FFFFFF;
+            }
+        """)
+        btn_verify.clicked.connect(self._open_region_visual_test_and_refresh)
+        header_row.addWidget(btn_verify)
+        card_layout.addLayout(header_row)
+
+        chips_layout = QtWidgets.QHBoxLayout()
+        chips_layout.setSpacing(8)
+        for idx, col in enumerate(raw_colors, 1):
+            col_str = str(col).strip()
+            tol_val = tols.get(col_str, base_tol)
+            reg_val = regs.get(col_str, base_reg)
+            reg_str = f"[{reg_val[0]}, {reg_val[1]}, {reg_val[2]}, {reg_val[3]}]" if len(reg_val) >= 4 else "전체"
+
+            chip = QtWidgets.QFrame()
+            chip.setStyleSheet("""
+                QFrame {
+                    background: #1A2234;
+                    border: 1px solid #2E3E5B;
+                    border-radius: 6px;
+                    padding: 2px 6px;
+                }
+            """)
+            c_layout = QtWidgets.QHBoxLayout(chip)
+            c_layout.setContentsMargins(4, 2, 4, 2)
+            c_layout.setSpacing(6)
+
+            idx_lbl = QtWidgets.QLabel(f"<b>#{idx}</b>")
+            idx_lbl.setStyleSheet("color: #A0AEC0; font-size: 8.5pt;")
+            c_layout.addWidget(idx_lbl)
+
+            swatch = QtWidgets.QLabel()
+            swatch.setFixedSize(16, 16)
+            swatch.setStyleSheet(f"background-color: {col_str}; border-radius: 3px; border: 1px solid #FFFFFF;")
+            c_layout.addWidget(swatch)
+
+            hex_lbl = QtWidgets.QLabel(f"<code>{col_str}</code>")
+            hex_lbl.setStyleSheet("color: #38E7FF; font-weight: bold; font-size: 8.5pt;")
+            c_layout.addWidget(hex_lbl)
+
+            tol_lbl = QtWidgets.QLabel(f"오차 ±{tol_val}")
+            tol_lbl.setStyleSheet("color: #F6AD55; font-size: 8.2pt;")
+            c_layout.addWidget(tol_lbl)
+
+            reg_lbl = QtWidgets.QLabel(f"영역 {reg_str}")
+            reg_lbl.setStyleSheet("color: #CBD5E0; font-size: 8.2pt;")
+            c_layout.addWidget(reg_lbl)
+
+            chips_layout.addWidget(chip)
+        chips_layout.addStretch(1)
+        card_layout.addLayout(chips_layout)
+
+    def _open_region_visual_test_and_refresh(self) -> None:
+        self.editor._open_region_visual_test()
+        step = self.editor.build_step()
+        self._build_multi_color_card(step)
 
     def done(self, r: int) -> None:
         try:

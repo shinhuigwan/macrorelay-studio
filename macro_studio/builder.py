@@ -1800,9 +1800,37 @@ class BuilderPage(QtWidgets.QWidget):
             details = [f"대기: {int(step.get('duration') or 0)} ms"]
         elif action == "browser_action":
             details = [f"선택자: {step.get('selector') or '미입력'}", f"동작: {step.get('browser_action') or 'click'}"]
+        elif action == "pixel_search":
+            raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
+            color_cnt = len(raw_colors) or int((step.get("_automation") or {}).get("color_count") or 1)
+            is_multi = color_cnt > 1 or bool((step.get("_automation") or {}).get("manual_multi_merge")) or "멀티" in str(step.get("label") or "")
+            rm = str(step.get("region_mode") or "screen").lower()
+            rm_lbl = {"screen": "화면", "window": "창", "client": "클라이언트"}.get(rm, rm)
+            match_cond = str(step.get("match_condition") or "all_matched")
+            cond_lbl = {"all_matched": "모두 일치", "at_least_1": "1개 이상", "exact_n": "정확히 N개", "at_least_n": "N개 이상"}.get(match_cond, match_cond)
+            details = [
+                f"색상: 멀티 {color_cnt}개" if is_multi else f"색상: {step.get('color') or '#FF0000'}",
+                f"기준: {rm_lbl}",
+                f"조건: {cond_lbl}",
+            ]
         else:
             details = [self._step_summary(step)]
-        action_name = "멀티 이미지 서치" if action == "image_search" and len(step.get("assets") or []) > 1 else ACTION_LABELS.get(action, action)
+        raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
+        is_multi_pixel = (
+            action == "pixel_search"
+            and (
+                len(raw_colors) > 1
+                or bool((step.get("_automation") or {}).get("manual_multi_merge"))
+                or "멀티" in str(step.get("label") or "")
+            )
+        )
+        if action == "image_search" and len(step.get("assets") or []) > 1:
+            action_name = "멀티 이미지 서치"
+        elif is_multi_pixel:
+            cnt = len(raw_colors) or int((step.get("_automation") or {}).get("color_count") or 1)
+            action_name = f"멀티 색상 서치 ({cnt}개)" if cnt > 1 else "멀티 색상 서치"
+        else:
+            action_name = ACTION_LABELS.get(action, action)
         self.action_summary_label.setText(action_name + "\n" + "  ·  ".join(str(item) for item in details))
 
     def capture_current_action_coordinates(self) -> None:

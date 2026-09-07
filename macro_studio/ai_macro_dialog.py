@@ -1,5 +1,6 @@
-"""Optional PySide6 dialog. Emits unsaved macro data; never installs or runs it."""
 from datetime import datetime
+import hashlib
+import json
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -63,10 +64,50 @@ class AiMacroDialog(QtWidgets.QDialog):
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
         layout.addWidget(self.table)
+
+        # Table action row
+        table_btn_row = QtWidgets.QHBoxLayout()
+        self.btn_edit_step_img = QtWidgets.QPushButton("🎨 선택 단계 이미지 편집 (누끼 · 자르기 · 지우개)")
+        self.btn_edit_step_img.setStyleSheet("background: #2D3748; color: #F6AD55; font-weight: bold; padding: 6px; border-radius: 4px;")
+        self.btn_edit_step_img.setToolTip("테이블에서 선택한 단계의 이미지를 열어 자동 누끼(투명화), 자르기, 지우개 등을 직접 편집합니다.")
+        self.btn_edit_step_img.clicked.connect(self.edit_selected_step_image)
+        table_btn_row.addWidget(self.btn_edit_step_img)
+        layout.addLayout(table_btn_row)
+
         self.accept_draft = QtWidgets.QPushButton("자동 연결된 초안을 빌더로 보내기")
         self.accept_draft.setEnabled(False)
         self.accept_draft.clicked.connect(self.emit_draft)
         layout.addWidget(self.accept_draft)
+
+    def edit_selected_step_image(self):
+        row = self.table.currentRow()
+        if row < 0 or not self.draft or row >= len(self.draft.get("steps", [])):
+            self.status.setText("이미지를 편집할 단계를 테이블에서 먼저 선택하세요.")
+            return
+        step = self.draft["steps"][row]
+        alias = step.get("asset")
+        if not alias:
+            self.status.setText(f"{row+1}번 단계('{step.get('label')}')에는 이미지가 없습니다.")
+            return
+        resolved = self.repository.asset_path(alias)
+        if not resolved or not Path(resolved).is_file():
+            self.status.setText(f"이미지 파일 누락: {alias}")
+            return
+        from .image_editor import ImageEditorDialog
+        editor = ImageEditorDialog(Path(resolved), alias, self.repository.history_dir, self)
+        if editor.exec() == QtWidgets.QDialog.Accepted:
+            new_sha = hashlib.sha256(Path(resolved).read_bytes()).hexdigest()
+            if self.local_recording and Path(self.local_recording).is_file():
+                try:
+                    priv = load_private_recording(self.local_recording)
+                    for r in priv.get("records", {}).values():
+                        for img in r.get("images", []):
+                            if img.get("alias") == alias:
+                                img["sha256"] = new_sha
+                    Path(self.local_recording).write_text(json.dumps(priv, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+            self.status.setText(f"✔ {row+1}번 단계 '{alias}' 이미지 편집(누끼/자르기) 저장 완료!")
 
     def export(self):
         directory = QtWidgets.QFileDialog.getExistingDirectory(self, "패키지 저장 위치")

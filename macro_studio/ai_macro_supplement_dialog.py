@@ -21,7 +21,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .ai_macro_dialog import AiMacroDialog
 from .ai_macro_plan import load_plan, load_private_recording, PlanError, VISUAL, VERSION, SUPPORTED, _aliases
 from .ai_macro_supplement import requests_from_plan, add_check_record, export_revision
-from .image_editor import ScreenCaptureDialog, capture_virtual_desktop
+from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
 
 
 class CaptureMetadataDialog(QtWidgets.QDialog):
@@ -158,6 +158,26 @@ class AiMacroSupplementDialog(AiMacroDialog):
         self.preview.setTextFormat(QtCore.Qt.PlainText)
         self.preview.setMaximumHeight(95)
         box.addWidget(self.preview)
+
+        # 이미지 직접 개입 편집 버튼 행 (누끼, 영역 재지정, 조건 수정)
+        row_edit = QtWidgets.QHBoxLayout()
+        self.btn_edit_img = QtWidgets.QPushButton("🎨 이미지 직접 편집 (누끼·자르기·지우개)")
+        self.btn_edit_img.setStyleSheet("background: #2D3748; color: #F6AD55; font-weight: bold; padding: 6px; border-radius: 4px;")
+        self.btn_edit_img.setToolTip("선택한 항목의 이미지를 열어 자동 누끼(배경 투명화), 자르기, 지우개 등을 직접 편집합니다.")
+        self.btn_edit_img.clicked.connect(self._edit_selected_image)
+
+        self.btn_reselect_region = QtWidgets.QPushButton("🎯 검색 영역 다시 지정")
+        self.btn_reselect_region.setToolTip("화면에서 원하는 검색 영역(ROI)을 다시 드래그하여 좌표를 수정합니다.")
+        self.btn_reselect_region.clicked.connect(self._reselect_search_region)
+
+        self.btn_edit_params = QtWidgets.QPushButton("⚙️ 인식 조건 수정")
+        self.btn_edit_params.setToolTip("신뢰도 일치율(기본 84%) 및 검색 제한시간(timeout)을 직접 수정합니다.")
+        self.btn_edit_params.clicked.connect(self._edit_search_params)
+
+        row_edit.addWidget(self.btn_edit_img)
+        row_edit.addWidget(self.btn_reselect_region)
+        row_edit.addWidget(self.btn_edit_params)
+        box.addLayout(row_edit)
 
         self.answer = QtWidgets.QPlainTextEdit()
         self.answer.setPlaceholderText("선택한 항목의 설명: 예) 숫자는 매번 변하고 초록 화살표 3개가 성공 조건")
@@ -597,6 +617,131 @@ class AiMacroSupplementDialog(AiMacroDialog):
         else:
             self.resend_btn.setStyleSheet("")
             self.resend_btn.setText("보완 이미지·설명을 포함한 AI 패키지 저장 (Antigravity용)")
+
+    def _edit_selected_image(self):
+        req = self._current()
+        if not req:
+            self.status.setText("편집할 보완 항목을 먼저 선택하세요.")
+            return
+        ids = self._responses.get(req["id"], {}).get("records", [])
+        if not ids or not self._private:
+            self.status.setText("선택한 항목에 연결된 이미지가 없습니다. 캡처나 파일 추가를 먼저 하세요.")
+            return
+        rid = ids[-1]
+        rec = self._private["records"].get(rid, {})
+        images = rec.get("images", [])
+        if not images:
+            self.status.setText("이미지 정보가 없습니다.")
+            return
+        alias = images[0]["alias"]
+        resolved = self.repository.asset_path(alias)
+        if not resolved or not Path(resolved).is_file():
+            self.status.setText(f"이미지 파일 누락: {alias}")
+            return
+        editor = ImageEditorDialog(Path(resolved), alias, self.repository.history_dir, self)
+        if editor.exec() == QtWidgets.QDialog.Accepted:
+            new_data = Path(resolved).read_bytes()
+            new_sha = hashlib.sha256(new_data).hexdigest()
+            images[0]["sha256"] = new_sha
+            self._select_request(self.requests.currentRow())
+            self._update_resend_button_state()
+            self.status.setText(f"✔ '{alias}' 이미지 편집(누끼/자르기) 저장 완료!")
+
+    def _reselect_search_region(self):
+        req = self._current()
+        if not req or not self._private:
+            self.status.setText("영역을 수정할 항목을 먼저 선택하세요.")
+            return
+        ids = self._responses.get(req["id"], {}).get("records", [])
+        if not ids:
+            self.status.setText("선택한 항목에 연결된 기록이 없습니다.")
+            return
+        rid = ids[-1]
+        rec = self._private["records"].get(rid, {})
+
+        self.hide()
+        QtCore.QThread.msleep(200)
+        QtWidgets.QApplication.processEvents()
+        desktop_pixmap, virtual_rect = capture_virtual_desktop()
+        if desktop_pixmap.isNull():
+            self.show()
+            self.status.setText("화면 캡처 실패")
+            return
+
+        cap_dlg = ScreenCaptureDialog(desktop_pixmap, virtual_rect)
+        if cap_dlg.exec() != QtWidgets.QDialog.Accepted or not cap_dlg.selected_rect.isValid():
+            self.show()
+            return
+        self.show()
+
+        rect = cap_dlg.selected_rect
+        base_rid = self.base.currentData() or "r001"
+        base_step = self._private["records"].get(base_rid, {}).get("step", {})
+        client_rect = None
+        if "_automation" in base_step:
+            rec_win = base_step["_automation"].get("recorded_window", {})
+            origin = rec_win.get("client_origin")
+            size = rec_win.get("client_size")
+            if origin and size and len(origin) == 2 and len(size) == 2:
+                client_rect = QtCore.QRect(origin[0], origin[1], size[0], size[1])
+
+        if client_rect and client_rect.isValid():
+            rel_region = [
+                max(0, rect.left() - client_rect.left()),
+                max(0, rect.top() - client_rect.top()),
+                rect.right() - client_rect.left(),
+                rect.bottom() - client_rect.top(),
+            ]
+        else:
+            rel_region = [rect.left(), rect.top(), rect.right(), rect.bottom()]
+
+        rec["step"]["search_region"] = rel_region
+        self._update_resend_button_state()
+        self.status.setText(f"✔ {rid}의 검색 영역이 {rel_region}으로 재설정되었습니다.")
+
+    def _edit_search_params(self):
+        req = self._current()
+        if not req or not self._private:
+            self.status.setText("조건을 수정할 항목을 먼저 선택하세요.")
+            return
+        ids = self._responses.get(req["id"], {}).get("records", [])
+        if not ids:
+            self.status.setText("선택한 항목에 연결된 기록이 없습니다.")
+            return
+        rid = ids[-1]
+        step = self._private["records"].get(rid, {}).get("step", {})
+
+        current_conf = int(step.get("confidence") or 84)
+        current_timeout = int(step.get("timeout") or 3000)
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("인식 조건 직접 수정")
+        dlg.resize(320, 160)
+        l = QtWidgets.QVBoxLayout(dlg)
+
+        l.addWidget(QtWidgets.QLabel("<b>이미지 일치 신뢰도 (%):</b> (낮을수록 관대함)"))
+        conf_spin = QtWidgets.QSpinBox()
+        conf_spin.setRange(40, 99)
+        conf_spin.setValue(current_conf)
+        l.addWidget(conf_spin)
+
+        l.addWidget(QtWidgets.QLabel("<b>검색 제한 시간 (ms):</b> (대기 시간)"))
+        time_spin = QtWidgets.QSpinBox()
+        time_spin.setRange(100, 60000)
+        time_spin.setSingleStep(500)
+        time_spin.setValue(current_timeout)
+        l.addWidget(time_spin)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        l.addWidget(btns)
+
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            step["confidence"] = conf_spin.value()
+            step["timeout"] = time_spin.value()
+            self._update_resend_button_state()
+            self.status.setText(f"✔ {rid} 인식 조건 수정 완료: 신뢰도 {conf_spin.value()}%, 타임아웃 {time_spin.value()}ms")
 
     def _pick_png(self):
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(self, "캡처·편집한 원본 PNG", "", "PNG (*.png)")

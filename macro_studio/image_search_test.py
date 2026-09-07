@@ -106,6 +106,49 @@ def resolve_test_regions(step: dict[str, Any]) -> tuple[list[list[int]], str]:
     return translated, f"{'클라이언트' if mode == 'client' else '창'} · {base_x},{base_y} · {width}×{height}"
 
 
+def resolve_asset_test_regions(step: dict[str, Any], aliases: list[str]) -> list[list[list[int]]] | None:
+    raw_asset_regs = step.get("asset_regions") if isinstance(step.get("asset_regions"), dict) else {}
+    if not raw_asset_regs or not any(a in raw_asset_regs for a in aliases):
+        return None
+
+    mode = str(step.get("region_mode") or "screen").casefold()
+    coordinate_mode = str(step.get("region_coords") or "screen").casefold()
+    base_x, base_y = 0, 0
+    if mode != "screen":
+        hwnd = _find_window(
+            str(step.get("region_window_exe") or (step.get("click") or {}).get("window_exe") or ""),
+            str(step.get("region_window") or (step.get("click") or {}).get("window") or ""),
+        )
+        if hwnd:
+            user32 = ctypes.windll.user32
+            if mode == "client":
+                origin = wintypes.POINT(0, 0)
+                if user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+                    base_x, base_y = int(origin.x), int(origin.y)
+            else:
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    base_x, base_y = int(rect.left), int(rect.top)
+
+    res: list[list[list[int]]] = []
+    has_any = False
+    for alias in aliases:
+        cand = raw_asset_regs.get(alias)
+        if isinstance(cand, (list, tuple)) and len(cand) >= 4:
+            try:
+                l, t, r, b = int(cand[0]), int(cand[1]), int(cand[2]), int(cand[3])
+                if r > l and b > t:
+                    if coordinate_mode == "relative":
+                        l, t, r, b = base_x + l, base_y + t, base_x + r, base_y + b
+                    res.append([[l, t, r, b]])
+                    has_any = True
+                    continue
+            except (TypeError, ValueError):
+                pass
+        res.append([])
+    return res if has_any else None
+
+
 class BenchmarkWorker(QtCore.QObject):
     completed = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
@@ -177,16 +220,35 @@ class ImageSearchTestDialog(QtWidgets.QDialog):
         buttons = QtWidgets.QHBoxLayout()
         self.test_button = QtWidgets.QPushButton("▶ 현재 화면 테스트")
         self.test_button.clicked.connect(self.start_test)
+        self.visual_test_button = QtWidgets.QPushButton("🔍 영역 시각화 검사")
+        self.visual_test_button.setStyleSheet("background: #065F46; border: 1px solid #059669; color: #A7F3D0; font-weight: 700; padding: 6px 12px; border-radius: 6px;")
+        self.visual_test_button.setToolTip("실제 화면 캡처 위에 각 영역 사각형 박스를 표시하여 위치 왜곡을 실시간으로 확인하고 보정합니다.")
+        self.visual_test_button.clicked.connect(self._open_visual_test_dialog)
         self.apply_button = QtWidgets.QPushButton("추천값 적용")
         self.apply_button.setEnabled(False)
         self.apply_button.clicked.connect(self._apply_recommendation)
         close_button = QtWidgets.QPushButton("닫기")
         close_button.clicked.connect(self.reject)
         buttons.addWidget(self.test_button)
+        buttons.addWidget(self.visual_test_button)
         buttons.addStretch(1)
         buttons.addWidget(self.apply_button)
         buttons.addWidget(close_button)
         root.addLayout(buttons)
+
+    def _open_visual_test_dialog(self) -> None:
+        from .region_visual_test import RegionVisualTestDialog
+
+        dlg = RegionVisualTestDialog(self.step, self.repository, parent=self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            updated = dlg.get_asset_regions()
+            if updated:
+                self.step["asset_regions"] = updated
+                bounding = dlg.get_bounding_region()
+                if bounding:
+                    self.step["region"] = bounding
+                    self.step["regions"] = [bounding]
+            self.start_test()
 
     @staticmethod
     def _step_aliases(step: dict[str, Any]) -> list[str]:
@@ -212,6 +274,7 @@ class ImageSearchTestDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "검색 범위 오류", str(exc))
             return
         self.region_label.setText(f"검색 범위: {description} · {len(regions)}개 영역 · 화면은 테스트 시작 시 한 번만 캡처")
+        asset_regs = resolve_asset_test_regions(self.step, self._aliases)
         request = {
             "cmd": "benchmark",
             "images": [str(path) for path in self._paths if path is not None],
@@ -219,6 +282,8 @@ class ImageSearchTestDialog(QtWidgets.QDialog):
             "threshold": max(0.5, min(0.99, float(self.step.get("confidence") or 86) / 100)),
             "profile": str(self.step.get("search_profile") or "balanced"),
         }
+        if asset_regs:
+            request["image_regions"] = asset_regs
         self.test_button.setEnabled(False)
         self.test_button.setText("테스트 중…")
         self.apply_button.setEnabled(False)

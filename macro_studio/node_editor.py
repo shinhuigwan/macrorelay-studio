@@ -3097,6 +3097,8 @@ class NodeCanvas(QtWidgets.QWidget):
             "<span style='color:#9DA7BA'>· 선 선택→손잡이 드래그=경로 · 선 바깥 드롭=제거 · 바닥 더블클릭 유지=이동</span>"
         )
         legend.setObjectName("Muted")
+        legend.setMinimumWidth(0)
+        legend.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         toolbar_layout.addWidget(self.flow_label)
         toolbar_layout.addWidget(legend)
         toolbar_layout.addStretch(1)

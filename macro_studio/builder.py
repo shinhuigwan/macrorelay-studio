@@ -1290,6 +1290,7 @@ class BuilderPage(QtWidgets.QWidget):
 
     def _build_steps_panel(self) -> QtWidgets.QWidget:
         card = Card()
+        card.setMinimumWidth(280)
         layout = QtWidgets.QVBoxLayout(card)
         layout.setContentsMargins(10, 10, 10, 10)
         header = QtWidgets.QHBoxLayout()
@@ -1477,6 +1478,7 @@ class BuilderPage(QtWidgets.QWidget):
     def _build_inspector(self) -> QtWidgets.QWidget:
         card = Card()
         card.setMinimumWidth(0)
+        self._last_inspector_width = 360
         layout = QtWidgets.QVBoxLayout(card)
         layout.setContentsMargins(14, 14, 14, 14)
         title = QtWidgets.QLabel("단계 설정")
@@ -1572,6 +1574,7 @@ class BuilderPage(QtWidgets.QWidget):
         save_btn.clicked.connect(self._save_step)
         self.inspector_action.currentIndexChanged.connect(self._change_action_template)
         content = QtWidgets.QWidget()
+        content.setMinimumWidth(330)
         content_layout = QtWidgets.QVBoxLayout(content)
         content_layout.setContentsMargins(2, 2, 6, 2)
         content_layout.setSpacing(9)
@@ -1630,15 +1633,45 @@ class BuilderPage(QtWidgets.QWidget):
         cur_region = step.get("region") or step.get("search_region")
         if not cur_region and isinstance(step.get("regions"), list) and step["regions"]:
             cur_region = step["regions"][0]
-        dialog = ImageSearchConfidenceDialog(self.repository, aliases, cur_conf, cur_asset_conf, cur_region, self, step=step)
+        if isinstance(cur_region, list) and len(cur_region) >= 4:
+            try:
+                if int(cur_region[2]) <= int(cur_region[0]) or int(cur_region[3]) <= int(cur_region[1]):
+                    cur_region = None
+            except (TypeError, ValueError):
+                cur_region = None
+        cur_asset_regions = step.get("asset_regions") if isinstance(step.get("asset_regions"), dict) else {}
+        dialog = ImageSearchConfidenceDialog(
+            self.repository, aliases, cur_conf, cur_asset_conf, cur_region, self, step=step, asset_regions=cur_asset_regions
+        )
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             step["confidence"] = dialog.get_confidence()
             step["asset_confidences"] = dialog.get_asset_confidences()
+            new_asset_regs = dialog.get_asset_regions()
+            if new_asset_regs:
+                step["asset_regions"] = new_asset_regs
+                try:
+                    min_l = min(int(r[0]) for r in new_asset_regs.values())
+                    min_t = min(int(r[1]) for r in new_asset_regs.values())
+                    max_r = max(int(r[2]) for r in new_asset_regs.values())
+                    max_b = max(int(r[3]) for r in new_asset_regs.values())
+                    if max_r > min_l and max_b > min_t:
+                        step["region"] = [min_l, min_t, max_r, max_b]
+                        step["regions"] = [[min_l, min_t, max_r, max_b]]
+                        step["region_mode"] = "client"
+                        step["region_coords"] = "relative"
+                except Exception:
+                    pass
+            else:
+                step.pop("asset_regions", None)
             if dialog.search_region():
                 step["region"] = dialog.search_region()
                 step["regions"] = [dialog.search_region()]
                 step["region_mode"] = "client"
                 step["region_coords"] = "relative"
+            elif "region" in step and (step["region"] == [0, 0, 0, 0] or not isinstance(step["region"], list) or len(step["region"]) < 4 or step["region"][2] <= step["region"][0]):
+                step.pop("region", None)
+                if isinstance(step.get("regions"), list) and step["regions"] == [[0, 0, 0, 0]]:
+                    step.pop("regions", None)
             self._persist(f"{step_index}번 노드의 이미지 신뢰도 및 검색 영역 설정을 저장했습니다.")
             self._refresh_steps(row)
             self.status.emit(f"{step_index}번 노드 이미지 신뢰도 저장 완료 (신뢰도: {step['confidence']}%)")
@@ -2094,17 +2127,34 @@ class BuilderPage(QtWidgets.QWidget):
         button = self.macro_panel_toggle if is_macro else self.inspector_panel_toggle
         visible = panel.isVisibleTo(self) and panel.width() > 0
         if force_open or not visible:
+            if not is_macro:
+                panel.setMinimumWidth(360)
+                preferred = max(360, getattr(self, "_last_inspector_width", 360))
+            else:
+                panel.setMinimumWidth(190)
+                preferred = 230
             panel.show()
             sizes = self.builder_splitter.sizes()
-            preferred = 230 if is_macro else 360
             index = 0 if is_macro else 2
             if len(sizes) == 3:
                 sizes[index] = preferred
-                sizes[1] = max(480, sizes[1] - preferred)
+                sizes[1] = max(280, sizes[1] - preferred)
                 self.builder_splitter.setSizes(sizes)
             button.setText("◀ 목록" if is_macro else "설정 ▶")
             return
+        if not is_macro:
+            if panel.width() >= 360:
+                self._last_inspector_width = panel.width()
+            panel.setMinimumWidth(0)
+        else:
+            panel.setMinimumWidth(0)
         panel.hide()
+        sizes = self.builder_splitter.sizes()
+        index = 0 if is_macro else 2
+        if len(sizes) == 3:
+            sizes[1] += sizes[index]
+            sizes[index] = 0
+            self.builder_splitter.setSizes(sizes)
         button.setText("목록 ▶" if is_macro else "◀ 설정")
 
     def _leave_subflow(self) -> None:

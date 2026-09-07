@@ -2443,6 +2443,18 @@ def render_image_search(
     region_width = f"{region_prefix}_width"
     region_height = f"{region_prefix}_height"
     region_hwnd = f"{region_prefix}_hwnd"
+    all_action = str(step.get("all_action") or "").strip().lower()
+    match_condition = str(step.get("match_condition") or "at_least_1").strip().lower()
+    required_count = int(step.get("required_count") or 0)
+    store_count_var = normalize_variable_name(step.get("store_count_var") or "FoundCount") or "FoundCount"
+    if match_condition == "all_matched" and required_count == 0:
+        effective_min_count = len(aliases)
+    elif required_count > 0:
+        effective_min_count = required_count
+    elif match_condition == "all_matched":
+        effective_min_count = len(aliases)
+    else:
+        effective_min_count = 1
     def is_zero_area(entry: Any) -> bool:
         if not isinstance(entry, list) or len(entry) < 4:
             return False
@@ -2565,7 +2577,7 @@ def render_image_search(
     def _expr(value: Any) -> str:
         return value if isinstance(value, str) else str(value)
 
-    def emit_region_vars(idx, left, top, right, bottom, indent=""):
+    def emit_region_vars(idx, left, top, right, bottom, indent="", allow_auto_expand=True):
         left_expr = _expr(left)
         top_expr = _expr(top)
         right_expr = _expr(right)
@@ -2598,29 +2610,27 @@ def render_image_search(
         lines.append(f"{indent}        {bottom_var} := {region_base_y} + {region_height} - 1")
         lines.append(f"{indent}    }}")
         lines.append(f"{indent}}}")
-        # A stale recording can leave a 13x23-style client region after the
-        # window is moved/resized. It cannot contain even the template, so
-        # recover to the current target client instead of silently failing.
-        lines.append(
-            f"{indent}if (({right_var} - {left_var} + 1) < Max(48, FoundImageW) or ({bottom_var} - {top_var} + 1) < Max(48, FoundImageH))"
-        )
-        lines.append(f"{indent}{{")
-        lines.append(f'{indent}    Log("image search region auto-expanded: too small for template")')
-        lines.append(f"{indent}    if ({region_prefix}UseBase)")
-        lines.append(f"{indent}    {{")
-        lines.append(f"{indent}        {left_var} := {region_base_x}")
-        lines.append(f"{indent}        {top_var} := {region_base_y}")
-        lines.append(f"{indent}        {right_var} := {region_base_x} + {region_width} - 1")
-        lines.append(f"{indent}        {bottom_var} := {region_base_y} + {region_height} - 1")
-        lines.append(f"{indent}    }}")
-        lines.append(f"{indent}    else")
-        lines.append(f"{indent}    {{")
-        lines.append(f"{indent}        {left_var} := VirtualLeft")
-        lines.append(f"{indent}        {top_var} := VirtualTop")
-        lines.append(f"{indent}        {right_var} := VirtualRight")
-        lines.append(f"{indent}        {bottom_var} := VirtualBottom")
-        lines.append(f"{indent}    }}")
-        lines.append(f"{indent}}}")
+        if allow_auto_expand:
+            lines.append(
+                f"{indent}if (({right_var} - {left_var} + 1) < Max(16, FoundImageW) or ({bottom_var} - {top_var} + 1) < Max(16, FoundImageH))"
+            )
+            lines.append(f"{indent}{{")
+            lines.append(f'{indent}    Log("image search region auto-expanded: too small for template")')
+            lines.append(f"{indent}    if ({region_prefix}UseBase)")
+            lines.append(f"{indent}    {{")
+            lines.append(f"{indent}        {left_var} := {region_base_x}")
+            lines.append(f"{indent}        {top_var} := {region_base_y}")
+            lines.append(f"{indent}        {right_var} := {region_base_x} + {region_width} - 1")
+            lines.append(f"{indent}        {bottom_var} := {region_base_y} + {region_height} - 1")
+            lines.append(f"{indent}    }}")
+            lines.append(f"{indent}    else")
+            lines.append(f"{indent}    {{")
+            lines.append(f"{indent}        {left_var} := VirtualLeft")
+            lines.append(f"{indent}        {top_var} := VirtualTop")
+            lines.append(f"{indent}        {right_var} := VirtualRight")
+            lines.append(f"{indent}        {bottom_var} := VirtualBottom")
+            lines.append(f"{indent}    }}")
+            lines.append(f"{indent}}}")
         return left_var, top_var, right_var, bottom_var
 
     def emit_opencv_cli_result(indent=""):
@@ -2654,11 +2664,15 @@ def render_image_search(
         lines.append(f"{indent}    FoundImageH := OpenCvParts6")
         lines.append(f"{indent}    FoundScaleX := (SourceImageW > 0 ? FoundImageW / SourceImageW : 1.0)")
         lines.append(f"{indent}    FoundScaleY := (SourceImageH > 0 ? FoundImageH / SourceImageH : 1.0)")
+        lines.append(f"{indent}    MatchCount := 1")
+        lines.append(f"{indent}    {store_count_var} := 1")
         lines.append(f"{indent}    ErrorLevel := 0")
         lines.append(f"{indent}}}")
         lines.append(f'{indent}else if (OpenCvParts1 = "NOTFOUND")')
         lines.append(f"{indent}{{")
         lines.append(f"{indent}    OpenCvBestScore := OpenCvParts2")
+        lines.append(f"{indent}    MatchCount := 0")
+        lines.append(f"{indent}    {store_count_var} := 0")
         lines.append(f"{indent}    ErrorLevel := 1")
         lines.append(f"{indent}}}")
         lines.append(f"{indent}else")
@@ -2744,9 +2758,43 @@ def render_image_search(
                 else:
                     asset_thresholds.append(threshold)
         thresholds_json = f',""thresholds"":[{",".join(map(str, asset_thresholds))}]' if asset_thresholds else ""
-        lines.append(
-            f'{indent}VisionPayload .= "],""threshold"":" . OpenCvThreshold . "{thresholds_json},""profile"":""" . OpenCvProfile . """,""timeout"":" . OpenCvTimeout . ",""poll"":" . OpenCvPoll . ",""capture_cache_ms"":{capture_cache_ms},""capture_context"":""" . VisionContextJson . """}}"'
-        )
+        raw_asset_regions = step.get("asset_regions") if isinstance(step.get("asset_regions"), dict) else {}
+        asset_region_vars: list[tuple[str, str, str, str] | None] = []
+        has_any_asset_region = False
+        if len(multi_image_vars) > 1 and raw_asset_regions:
+            for cand_idx, cand_alias in enumerate(aliases, start=1):
+                reg_cand = raw_asset_regions.get(cand_alias)
+                if isinstance(reg_cand, (list, tuple)) and len(reg_cand) >= 4:
+                    try:
+                        l, t, r, b = int(reg_cand[0]), int(reg_cand[1]), int(reg_cand[2]), int(reg_cand[3])
+                        if r > l and b > t:
+                            rv = emit_region_vars(f"asset_{cand_idx}", l, t, r, b, indent=indent, allow_auto_expand=False)
+                            asset_region_vars.append(rv)
+                            has_any_asset_region = True
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                asset_region_vars.append(None)
+
+        multi_count_json = f',""min_count"":{effective_min_count},""match_condition"":""{match_condition}"",""all_action"":""{all_action}""'
+        if has_any_asset_region:
+            lines.append(f'{indent}VisionPayload .= "],""image_regions"":["')
+            for img_i, reg_tup in enumerate(asset_region_vars):
+                img_pfx = "," if img_i else ""
+                if reg_tup is not None:
+                    al, at, ar, ab = reg_tup
+                    lines.append(
+                        f'{indent}VisionPayload .= "{img_pfx}[[" . {al} . "," . {at} . "," . {ar} . "," . {ab} . "]]"'
+                    )
+                else:
+                    lines.append(f'{indent}VisionPayload .= "{img_pfx}[]"')
+            lines.append(
+                f'{indent}VisionPayload .= "],""threshold"":" . OpenCvThreshold . "{thresholds_json},""profile"":""" . OpenCvProfile . """,""timeout"":" . OpenCvTimeout . ",""poll"":" . OpenCvPoll . ",""capture_cache_ms"":{capture_cache_ms},""capture_context"":""" . VisionContextJson . """{multi_count_json}}}"'
+            )
+        else:
+            lines.append(
+                f'{indent}VisionPayload .= "],""threshold"":" . OpenCvThreshold . "{thresholds_json},""profile"":""" . OpenCvProfile . """,""timeout"":" . OpenCvTimeout . ",""poll"":" . OpenCvPoll . ",""capture_cache_ms"":{capture_cache_ms},""capture_context"":""" . VisionContextJson . """{multi_count_json}}}"'
+            )
         lines.append(f'{indent}if (VisionEngineStarted != 1 and FileExist(VisionEngineScript))')
         lines.append(f"{indent}{{")
         lines.append(
@@ -2798,43 +2846,50 @@ def render_image_search(
         )
         lines.append(f"{indent}    ErrorLevel := 2")
         lines.append(f"{indent}}}")
-        lines.append(f'{indent}else if (VisionEngine_IsTrue(VisionResp, "found"))')
+        lines.append(f"{indent}else")
         lines.append(f"{indent}{{")
-        lines.append(f'{indent}    FoundX := VisionEngine_ParseField(VisionResp, "x")')
-        lines.append(f'{indent}    FoundY := VisionEngine_ParseField(VisionResp, "y")')
-        lines.append(f'{indent}    OpenCvBestScore := VisionEngine_ParseField(VisionResp, "confidence")')
-        lines.append(f'{indent}    FoundImageW := VisionEngine_ParseField(VisionResp, "width")')
-        lines.append(f'{indent}    FoundImageH := VisionEngine_ParseField(VisionResp, "height")')
+        lines.append(f'{indent}    MatchCount := VisionEngine_ParseField(VisionResp, "match_count")')
+        lines.append(f'{indent}    if (MatchCount = "")')
+        lines.append(f'{indent}        MatchCount := (VisionEngine_IsTrue(VisionResp, "found") ? 1 : 0)')
+        lines.append(f'{indent}    {store_count_var} := MatchCount')
+        lines.append(f'{indent}    if (VisionEngine_IsTrue(VisionResp, "found"))')
+        lines.append(f"{indent}    {{")
+        lines.append(f'{indent}        FoundX := VisionEngine_ParseField(VisionResp, "x")')
+        lines.append(f'{indent}        FoundY := VisionEngine_ParseField(VisionResp, "y")')
+        lines.append(f'{indent}        OpenCvBestScore := VisionEngine_ParseField(VisionResp, "confidence")')
+        lines.append(f'{indent}        FoundImageW := VisionEngine_ParseField(VisionResp, "width")')
+        lines.append(f'{indent}        FoundImageH := VisionEngine_ParseField(VisionResp, "height")')
         if len(multi_image_vars) > 1:
-            lines.append(f'{indent}    SourceImageW := VisionEngine_ParseField(VisionResp, "source_width")')
-            lines.append(f'{indent}    SourceImageH := VisionEngine_ParseField(VisionResp, "source_height")')
-            lines.append(f'{indent}    MatchedImageIndex := VisionEngine_ParseField(VisionResp, "match_index")')
-        lines.append(f"{indent}    FoundScaleX := (SourceImageW > 0 ? FoundImageW / SourceImageW : 1.0)")
-        lines.append(f"{indent}    FoundScaleY := (SourceImageH > 0 ? FoundImageH / SourceImageH : 1.0)")
-        lines.append(f'{indent}    VisionElapsed := VisionEngine_ParseField(VisionResp, "elapsed_ms")')
-        lines.append(f'{indent}    VisionCacheHit := VisionEngine_ParseField(VisionResp, "cache_hit")')
-        lines.append(f'{indent}    VisionCaptures := VisionEngine_ParseField(VisionResp, "capture_count")')
-        lines.append(f'{indent}    VisionCaptureReuses := VisionEngine_ParseField(VisionResp, "capture_reuse_count")')
+            lines.append(f'{indent}        SourceImageW := VisionEngine_ParseField(VisionResp, "source_width")')
+            lines.append(f'{indent}        SourceImageH := VisionEngine_ParseField(VisionResp, "source_height")')
+            lines.append(f'{indent}        MatchedImageIndex := VisionEngine_ParseField(VisionResp, "match_index")')
+        lines.append(f"{indent}        FoundScaleX := (SourceImageW > 0 ? FoundImageW / SourceImageW : 1.0)")
+        lines.append(f"{indent}        FoundScaleY := (SourceImageH > 0 ? FoundImageH / SourceImageH : 1.0)")
+        lines.append(f'{indent}        VisionElapsed := VisionEngine_ParseField(VisionResp, "elapsed_ms")')
+        lines.append(f'{indent}        VisionCacheHit := VisionEngine_ParseField(VisionResp, "cache_hit")')
+        lines.append(f'{indent}        VisionCaptures := VisionEngine_ParseField(VisionResp, "capture_count")')
+        lines.append(f'{indent}        VisionCaptureReuses := VisionEngine_ParseField(VisionResp, "capture_reuse_count")')
         if len(multi_image_vars) > 1:
             lines.append(
-                f'{indent}    Log("vision engine multi hit: " . VisionElapsed . "ms cache=" . VisionCacheHit . " confidence=" . OpenCvBestScore . " match=" . MatchedImageIndex)'
+                f'{indent}        Log("vision engine multi hit: " . VisionElapsed . "ms cache=" . VisionCacheHit . " confidence=" . OpenCvBestScore . " match=" . MatchedImageIndex . " count=" . MatchCount . " -> {store_count_var}")'
             )
         else:
             lines.append(
-                f'{indent}    Log("vision engine hit: " . VisionElapsed . "ms cache=" . VisionCacheHit . " confidence=" . OpenCvBestScore)'
+                f'{indent}        Log("vision engine hit: " . VisionElapsed . "ms cache=" . VisionCacheHit . " confidence=" . OpenCvBestScore . " count=" . MatchCount . " -> {store_count_var}")'
             )
-        lines.append(f"{indent}    ErrorLevel := 0")
-        lines.append(f"{indent}}}")
-        lines.append(f"{indent}else")
-        lines.append(f"{indent}{{")
-        lines.append(f'{indent}    OpenCvBestScore := VisionEngine_ParseField(VisionResp, "best_score")')
-        lines.append(f'{indent}    VisionElapsed := VisionEngine_ParseField(VisionResp, "elapsed_ms")')
-        lines.append(f'{indent}    VisionCaptures := VisionEngine_ParseField(VisionResp, "capture_count")')
-        lines.append(f'{indent}    VisionCaptureReuses := VisionEngine_ParseField(VisionResp, "capture_reuse_count")')
+        lines.append(f"{indent}        ErrorLevel := 0")
+        lines.append(f"{indent}    }}")
+        lines.append(f"{indent}    else")
+        lines.append(f"{indent}    {{")
+        lines.append(f'{indent}        OpenCvBestScore := VisionEngine_ParseField(VisionResp, "best_score")')
+        lines.append(f'{indent}        VisionElapsed := VisionEngine_ParseField(VisionResp, "elapsed_ms")')
+        lines.append(f'{indent}        VisionCaptures := VisionEngine_ParseField(VisionResp, "capture_count")')
+        lines.append(f'{indent}        VisionCaptureReuses := VisionEngine_ParseField(VisionResp, "capture_reuse_count")')
         lines.append(
-            f'{indent}    Log("vision engine not found: " . VisionElapsed . "ms best=" . OpenCvBestScore)'
+            f'{indent}        Log("vision engine not found / condition unmet: " . VisionElapsed . "ms best=" . OpenCvBestScore . " count=" . MatchCount . " required={effective_min_count} -> {store_count_var}")'
         )
-        lines.append(f"{indent}    ErrorLevel := 1")
+        lines.append(f"{indent}        ErrorLevel := 1")
+        lines.append(f"{indent}    }}")
         lines.append(f"{indent}}}")
 
     if engine == "opencv":
@@ -2951,6 +3006,7 @@ def render_image_search(
         else:
             lines.append(f'Log("image search regions: {len(regions_list)}")')
             lines.append(f"{found_var} := 0")
+            lines.append("MatchCount := 0")
             for idx, region_vals in enumerate(regions_list, start=1):
                 left, top, right, bottom = region_vals
                 lines.append(f"; region {idx}")
@@ -2969,10 +3025,26 @@ def render_image_search(
                 lines.append("    Return")
                 lines.append("}")
                 lines.append("if (ErrorLevel = 0)")
-                lines.append(f"    {found_var} := 1")
-                lines.append(f"if ({found_var})")
-                lines.append(f"    goto __step_{step_index}_region_done")
+                lines.append("    MatchCount += 1")
+                if effective_min_count <= 1 and match_condition != "exact_n":
+                    lines.append("if (MatchCount >= 1)")
+                    lines.append(f"    goto __step_{step_index}_region_done")
             lines.append(f"__step_{step_index}_region_done:")
+            lines.append(f"{store_count_var} := MatchCount")
+            if match_condition == "exact_n":
+                cond_check = f"MatchCount = {effective_min_count}"
+            else:
+                cond_check = f"MatchCount >= {effective_min_count}"
+            lines.append(f"if ({cond_check})")
+            lines.append("{")
+            lines.append("    ErrorLevel := 0")
+            lines.append(f"    {found_var} := 1")
+            lines.append("}")
+            lines.append("else")
+            lines.append("{")
+            lines.append("    ErrorLevel := 1")
+            lines.append(f"    {found_var} := 0")
+            lines.append("}")
 
     wait_cond = str(step.get("wait_condition") or "appear").lower()
     if wait_cond == "vanish":
@@ -3085,8 +3157,8 @@ def render_image_search(
         prefix = "if" if match_index == 1 else "else if"
         lines.append(f"    {prefix} (MatchedImageIndex = {match_index})")
         lines.append(f'        MatchedImageName := "{ahk_quote(candidate_alias)}"')
-    lines.append(f'    Log("✅ [이미지 검색 성공] 대상: {alias} (화면 발견 위치: X=" . FoundX . ", Y=" . FoundY . ")")')
-    if click_info:
+    lines.append(f'    Log("✅ [이미지 검색 성공] 대상: {alias} (화면 발견 위치: X=" . FoundX . ", Y=" . FoundY . " 발견=" . {store_count_var} . "개)")')
+    if click_info and all_action != "count_only":
         mode = str(click_info.get("mode", "active")).lower()
         offset_values = click_info.get("offset") if isinstance(click_info.get("offset"), list) else [0, 0]
         click_offset = bool(click_info.get("click_offset"))
@@ -3201,6 +3273,8 @@ def render_image_search(
             lines.append(f"    if (!MacroDryRun)\n        Sleep, {sleep_after}")
         if use_mouse_coord_override:
             lines.append("    CoordMode, Mouse, %MacroMouseCoordMode%")
+    elif click_info and all_action == "count_only":
+        lines.append('    Log("image click skipped: all_action is count_only (발견 개수만 카운트)")')
     lines.append("}")
     return lines
 

@@ -2688,6 +2688,11 @@ class ActionEditor(QtWidgets.QWidget):
                 if isinstance(toggle, QtWidgets.QCheckBox):
                     toggle.toggled.connect(self._sync_datetime_controls)
             self._sync_datetime_controls()
+        elif action == "pixel_search":
+            color_edit = self.widgets[action].get("color")
+            tol_bar = self.widgets[action].get("tolerance")
+            if isinstance(color_edit, QtWidgets.QLineEdit) and isinstance(tol_bar, ColorToleranceBarWidget):
+                color_edit.textChanged.connect(lambda txt, tb=tol_bar: tb.setColor(txt))
         if action in {"image_search", "screen_condition"}:
             engine = self.widgets[action].get("engine")
             if isinstance(engine, QtWidgets.QComboBox):
@@ -4446,6 +4451,11 @@ class ActionEditor(QtWidgets.QWidget):
             self._update_offset_preview()
         elif action == "datetime_condition":
             self._sync_datetime_controls()
+        elif action == "pixel_search":
+            color_val = str(normalized.get("color") or "#FF0000").strip()
+            tol_w = self.widgets.get("pixel_search", {}).get("tolerance")
+            if isinstance(tol_w, ColorToleranceBarWidget):
+                tol_w.setColor(color_val)
         if action in {"image_search", "screen_condition"}:
             current_engine = str(normalized.get("engine") or "opencv").lower()
             setattr(self, f"_last_engine_{action}", current_engine)

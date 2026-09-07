@@ -19,7 +19,17 @@ class AiMacroDialog(QtWidgets.QDialog):
         self.setWindowTitle("녹화로 자동 매크로 만들기 · 초안")
         self.resize(780, 600)
         self.setModal(False)
-        layout = QtWidgets.QVBoxLayout(self)
+        self.root_layout = QtWidgets.QHBoxLayout(self)
+        self.root_layout.setContentsMargins(12, 12, 12, 12)
+        self.root_layout.setSpacing(12)
+
+        self.main_panel = QtWidgets.QWidget()
+        self.main_layout = QtWidgets.QVBoxLayout(self.main_panel)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(8)
+        self.root_layout.addWidget(self.main_panel, stretch=1)
+        layout = self.main_layout
+
         info = QtWidgets.QLabel("녹화 목적 입력 → 패키지를 GPT에 전달 → plan.json 가져오기 → 자동 연결된 초안 확인")
         info.setWordWrap(True)
         layout.addWidget(info)

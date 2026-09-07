@@ -79,11 +79,26 @@ class AiMacroSupplementDialog(AiMacroDialog):
         self._private = None
         self._requests = []
         self._responses = {}
-        self.setMinimumSize(760, 640)
-        self.resize(920, 860)
+        self.setMinimumSize(780, 620)
+        self.resize(780, 680)
         self.status.setTextFormat(QtCore.Qt.PlainText)
-        self.panel = QtWidgets.QGroupBox("추가 이미지 · 설명 보완")
+
+        # 우측 확장형 보완 패널
+        self.panel = QtWidgets.QGroupBox("추가 이미지 · 설명 보완 (우측 확장 패널)")
+        self.panel.setMinimumWidth(460)
+        self.panel.setMaximumWidth(580)
         box = QtWidgets.QVBoxLayout(self.panel)
+
+        header_row = QtWidgets.QHBoxLayout()
+        panel_title = QtWidgets.QLabel("<b>📋 보완 요청 및 항목 편집</b>")
+        btn_close_panel = QtWidgets.QPushButton("◀ 패널 접기")
+        btn_close_panel.setStyleSheet("background: #2D3748; color: #A0AEC0; padding: 4px 10px; border-radius: 4px; font-weight: bold;")
+        btn_close_panel.setToolTip("우측 보완 패널을 접고 창 너비를 기본 크기로 축소합니다.")
+        btn_close_panel.clicked.connect(self.close_supplement_panel)
+        header_row.addWidget(panel_title)
+        header_row.addStretch(1)
+        header_row.addWidget(btn_close_panel)
+        box.addLayout(header_row)
 
         list_header = QtWidgets.QLabel("<b>보완 요청 및 추가 항목 목록</b> (더블클릭 시 라벨 수정):")
         box.addWidget(list_header)
@@ -160,20 +175,24 @@ class AiMacroSupplementDialog(AiMacroDialog):
         self.resend_btn.clicked.connect(self._export_revision)
         box.addWidget(self.resend_btn)
 
-        self.btn_open_supplement = QtWidgets.QPushButton("▼ 3. 추가 이미지 · 설명 보완 패널 (열림)")
+        # 좌측 메인 레이아웃에 우측 확장 토글 버튼 배치
+        self.btn_open_supplement = QtWidgets.QPushButton("▶ 3. 추가 이미지 · 설명 보완 패널 열기 (우측 확장)")
         self.btn_open_supplement.setStyleSheet("background: #2D3748; color: #63B3ED; font-weight: 700; padding: 7px; border-radius: 4px;")
-        self.btn_open_supplement.setToolTip("클릭하면 추가 이미지 · 설명 보완 패널을 접거나 펼칠 수 있습니다.")
+        self.btn_open_supplement.setToolTip("클릭하면 우측으로 보완 패널이 확장되어 직접 캡처 및 설명을 추가할 수 있습니다.")
         self.btn_open_supplement.clicked.connect(self.toggle_supplement_panel)
-        self.layout().insertWidget(4, self.btn_open_supplement)
-        self.layout().insertWidget(5, self.panel)
-        self.panel.show()
+        if hasattr(self, "main_layout"):
+            self.main_layout.insertWidget(4, self.btn_open_supplement)
+        else:
+            self.layout().insertWidget(4, self.btn_open_supplement)
 
-        if hasattr(self, "purpose"):
-            self.purpose.setMaximumHeight(65)
-        if hasattr(self, "table"):
-            self.table.setMaximumHeight(130)
+        # root_layout(수평) 우측에 패널 배치
+        if hasattr(self, "root_layout"):
+            self.root_layout.addWidget(self.panel, stretch=0)
+        else:
+            self.layout().addWidget(self.panel)
+        self.panel.hide()
 
-        self._ensure_private_ready()
+        self._ensure_private_ready(interactive=False)
 
     def _init_private_from_recorded_steps(self):
         if not self.recorded_steps:
@@ -206,7 +225,7 @@ class AiMacroSupplementDialog(AiMacroDialog):
             "records": records,
         }
 
-    def _ensure_private_ready(self) -> bool:
+    def _ensure_private_ready(self, interactive: bool = False) -> bool:
         if self._private is not None:
             return True
         if self.recorded_steps:
@@ -214,6 +233,8 @@ class AiMacroSupplementDialog(AiMacroDialog):
             if self._private is not None:
                 self._populate_records_to_ui()
                 return True
+        if not interactive:
+            return False
         local = self.local_recording
         if local is None:
             selected, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -246,15 +267,26 @@ class AiMacroSupplementDialog(AiMacroDialog):
         if self.requests.count() > 0:
             self.requests.setCurrentRow(0)
 
+    def open_supplement_panel(self):
+        self._ensure_private_ready(interactive=False)
+        self.panel.show()
+        target_w = max(1300, self.width())
+        self.resize(target_w, max(self.height(), 660))
+        self.btn_open_supplement.setText("◀ 3. 추가 이미지 · 설명 보완 패널 닫기 (우측 접기)")
+        self.btn_open_supplement.setStyleSheet("background: #553C9A; color: #FAF5FF; font-weight: 700; padding: 7px; border-radius: 4px;")
+        self._update_resend_button_state()
+
+    def close_supplement_panel(self):
+        self.panel.hide()
+        self.resize(780, self.height())
+        self.btn_open_supplement.setText("▶ 3. 추가 이미지 · 설명 보완 패널 열기 (우측 확장)")
+        self.btn_open_supplement.setStyleSheet("background: #2D3748; color: #63B3ED; font-weight: 700; padding: 7px; border-radius: 4px;")
+
     def toggle_supplement_panel(self):
         if self.panel.isVisible():
-            self.panel.hide()
-            self.btn_open_supplement.setText("▶ 3. 추가 이미지 · 설명 보완 패널 열기 (수동/재전달)")
-            return
-        self._ensure_private_ready()
-        self.panel.show()
-        self.btn_open_supplement.setText("▼ 3. 추가 이미지 · 설명 보완 패널 (열림)")
-        self._update_resend_button_state()
+            self.close_supplement_panel()
+        else:
+            self.open_supplement_panel()
 
     def export(self):
         previous = self.local_recording
@@ -264,7 +296,7 @@ class AiMacroSupplementDialog(AiMacroDialog):
             self._requests = []
             self._responses = {}
             self.notes.clear()
-            self._ensure_private_ready()
+            self._ensure_private_ready(interactive=False)
             self._update_resend_button_state()
 
     def import_plan(self):
@@ -298,14 +330,13 @@ class AiMacroSupplementDialog(AiMacroDialog):
             self.requests.clear()
             for request in self._requests:
                 self.requests.addItem(request["label"])
-            self.panel.show()
-            if hasattr(self, "btn_open_supplement"):
-                self.btn_open_supplement.setText("3. 추가 이미지 · 설명 보완 패널 닫기")
             self.requests.setCurrentRow(0)
             self._update_resend_button_state()
             if requests:
-                self.status.setText("추가 자료가 필요합니다. 항목을 선택하고 이미지·설명을 보완해 ZIP을 다시 전달하세요.")
+                self.open_supplement_panel()
+                self.status.setText("추가 자료가 필요합니다. 우측 보완 패널에서 항목을 확인하고 이미지·설명을 보완해 ZIP을 다시 전달하세요.")
                 return
+            self.close_supplement_panel()
             from .ai_macro_plan import compile_plan
             self.draft = compile_plan(plan, private, self.repository.asset_path)
             self.table.setRowCount(len(self.draft["steps"]))

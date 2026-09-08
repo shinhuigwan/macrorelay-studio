@@ -3,63 +3,138 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
+import re
 from typing import Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .repository import MacroRepository
+from .screen_coordinates import display_coordinate_maps
 from .theme import COLORS
 
 
 def _virtual_screen_region() -> list[int]:
     geometry = QtCore.QRect()
-    for screen in QtGui.QGuiApplication.screens():
-        geometry = geometry.united(screen.geometry())
+    for item in display_coordinate_maps():
+        geometry = geometry.united(item.native)
+    if not geometry.isValid():
+        for screen in QtGui.QGuiApplication.screens():
+            geometry = geometry.united(screen.geometry())
     return [geometry.left(), geometry.top(), geometry.right() + 1, geometry.bottom() + 1]
 
 
-def _find_window(exe_name: str, window_token: str) -> int:
+def _find_window(
+    exe_name: str,
+    window_token: str,
+    reference_rect: QtCore.QRect | None = None,
+) -> int:
+    """Resolve the intended top-level window, not merely the first matching EXE."""
     token = str(window_token or "").strip()
-    if token.casefold().startswith("ahk_id"):
-        raw = token.split(None, 1)[1].strip() if " " in token else ""
+    id_match = re.search(r"ahk_id\s+([^\s,]+)", token, re.IGNORECASE)
+    requested_hwnd = 0
+    if id_match:
         try:
-            hwnd = int(raw, 0)
-            if hwnd and ctypes.windll.user32.IsWindow(hwnd):
-                return hwnd
-        except (ValueError, OSError):
-            pass
-    wanted = Path(str(exe_name or "")).name.casefold()
-    if not wanted:
+            requested_hwnd = int(id_match.group(1), 0)
+        except ValueError:
+            requested_hwnd = 0
+
+    wanted_exe = Path(str(exe_name or "")).name.casefold()
+    exe_match = re.search(r"ahk_exe\s+([^\s,]+)", token, re.IGNORECASE)
+    if exe_match:
+        wanted_exe = Path(exe_match.group(1)).name.casefold()
+    class_match = re.search(r"ahk_class\s+([^\s,]+)", token, re.IGNORECASE)
+    wanted_class = class_match.group(1).strip().casefold() if class_match else ""
+    pid_match = re.search(r"ahk_pid\s+([^\s,]+)", token, re.IGNORECASE)
+    try:
+        wanted_pid = int(pid_match.group(1), 0) if pid_match else 0
+    except ValueError:
+        wanted_pid = 0
+    wanted_title = re.sub(
+        r"ahk_(?:id|pid|class|exe)\s+[^\s,]+", "", token, flags=re.IGNORECASE
+    ).strip().casefold()
+    if not any((requested_hwnd, wanted_exe, wanted_class, wanted_pid, wanted_title)):
         return 0
-    matches: list[int] = []
+    matches: list[tuple[int, int]] = []
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def callback(hwnd: int, _lparam: int) -> bool:
-        if not user32.IsWindowVisible(hwnd):
-            return True
+    def candidate_score(hwnd: int) -> int | None:
+        if not hwnd or not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+            return None
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        handle = kernel32.OpenProcess(0x1000, False, pid.value)
-        if not handle:
-            return True
-        try:
-            size = wintypes.DWORD(32768)
-            buffer = ctypes.create_unicode_buffer(size.value)
-            if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-                if Path(buffer.value).name.casefold() == wanted:
-                    matches.append(int(hwnd))
-                    return False
-        finally:
-            kernel32.CloseHandle(handle)
+        if wanted_pid and int(pid.value) != wanted_pid:
+            return None
+        class_buffer = ctypes.create_unicode_buffer(512)
+        user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+        current_class = class_buffer.value.strip().casefold()
+        if wanted_class and current_class != wanted_class:
+            return None
+        title_buffer = ctypes.create_unicode_buffer(1024)
+        user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
+        current_title = title_buffer.value.strip().casefold()
+        if wanted_title and wanted_title not in current_title:
+            return None
+        if wanted_exe:
+            current_exe = ""
+            handle = kernel32.OpenProcess(0x1000, False, pid.value)
+            if handle:
+                try:
+                    size = wintypes.DWORD(32768)
+                    buffer = ctypes.create_unicode_buffer(size.value)
+                    if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                        current_exe = Path(buffer.value).name.casefold()
+                finally:
+                    kernel32.CloseHandle(handle)
+            if current_exe != wanted_exe:
+                return None
+        client = wintypes.RECT()
+        if not user32.GetClientRect(hwnd, ctypes.byref(client)):
+            return None
+        width = int(client.right - client.left)
+        height = int(client.bottom - client.top)
+        if width < 30 or height < 30:
+            return None
+        score = min(100, max(0, width * height // 100_000))
+        if current_title:
+            score += 20
+        if int(user32.GetForegroundWindow() or 0) == int(hwnd):
+            score += 150
+        if reference_rect is not None and reference_rect.isValid():
+            window_rect = wintypes.RECT()
+            if user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
+                candidate_rect = QtCore.QRect(
+                    int(window_rect.left), int(window_rect.top),
+                    int(window_rect.right - window_rect.left), int(window_rect.bottom - window_rect.top),
+                )
+                if candidate_rect.contains(reference_rect.center()):
+                    score += 2000
+                elif candidate_rect.intersects(reference_rect):
+                    score += 1000
+                else:
+                    score -= 1000
+        return score
+
+    if requested_hwnd:
+        direct_score = candidate_score(requested_hwnd)
+        if direct_score is not None and (reference_rect is None or direct_score >= 1000):
+            return requested_hwnd
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd: int, _lparam: int) -> bool:
+        score = candidate_score(int(hwnd))
+        if score is not None:
+            matches.append((int(hwnd), score))
         return True
 
     try:
         user32.EnumWindows(callback, 0)
     except Exception:
         return 0
-    return matches[0] if matches else 0
+    if not matches:
+        return 0
+    matches.sort(key=lambda item: item[1], reverse=True)
+    return matches[0][0]
 
 
 def resolve_test_regions(step: dict[str, Any]) -> tuple[list[list[int]], str]:
@@ -395,4 +470,3 @@ class ImageSearchTestDialog(QtWidgets.QDialog):
         self._thread = None
         self.test_button.setEnabled(True)
         self.test_button.setText("▶ 현재 화면 테스트")
-

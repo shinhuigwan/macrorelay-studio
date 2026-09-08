@@ -23,7 +23,7 @@ def configure_windows_app_identity() -> None:
         pass
 
 
-def create_app(root=None) -> tuple[QtWidgets.QApplication, MainWindow]:
+def create_app(root=None, *, start_remote_runtime: bool = True) -> tuple[QtWidgets.QApplication, MainWindow]:
     configure_windows_app_identity()
     QtCore.QCoreApplication.setApplicationName("MacroRelay Studio")
     QtCore.QCoreApplication.setOrganizationName("MacroRelay")
@@ -46,12 +46,12 @@ def create_app(root=None) -> tuple[QtWidgets.QApplication, MainWindow]:
             old_remote.stop_local_relay()
     repository = MacroRepository(root)
     remote = RemoteController(repository.root)
-    if remote.load().get("enabled"):
+    if start_remote_runtime and remote.load().get("enabled"):
         remote.ensure_running()
     remote_watchdog = QtCore.QTimer(app)
     remote_watchdog.setInterval(5000)
     remote_watchdog.timeout.connect(remote.ensure_running)
-    if remote.load().get("enabled"):
+    if start_remote_runtime and remote.load().get("enabled"):
         remote_watchdog.start()
     # QApplication owns this timer, but retaining explicit Python references
     # also prevents wrapper collection in long-running Studio sessions.

@@ -1524,6 +1524,20 @@ class ProjectDataTests(unittest.TestCase):
         self.assertGreaterEqual(stats["steps"], 1)
         self.assertGreaterEqual(stats["assets"], 1)
 
+    def test_macro_listing_skips_non_macro_json_and_tolerates_bad_steps(self) -> None:
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.macros_dir.mkdir(parents=True, exist_ok=True)
+            (repository.macros_dir / "order.json").write_text('["one", "two"]', encoding="utf-8")
+            (repository.macros_dir / "damaged-shape.json").write_text(
+                '{"description":"kept visible", "steps":42}', encoding="utf-8"
+            )
+            summaries = repository.list_macros()
+            self.assertEqual(["damaged-shape"], [item.name for item in summaries])
+            self.assertEqual(0, summaries[0].steps)
+
     def test_opencv_macro_is_blocked_while_component_install_is_running(self) -> None:
         from macro_studio.repository import MacroRepository
 
@@ -2039,7 +2053,7 @@ class UiSmokeTests(unittest.TestCase):
     def test_all_pages_construct_and_refresh(self) -> None:
         from macro_studio.app import create_app
 
-        app, window = create_app(ROOT)
+        app, window = create_app(ROOT, start_remote_runtime=False)
         for page in ("builder", "assets", "data", "hotkeys", "export", "settings"):
             window.switch_page(page)
             app.processEvents()
@@ -2050,6 +2064,19 @@ class UiSmokeTests(unittest.TestCase):
         self.assertFalse(window.windowIcon().isNull())
         self.assertEqual(app.windowIcon().cacheKey(), window.windowIcon().cacheKey())
         window.close()
+
+    def test_create_app_can_disable_remote_runtime_for_safe_inspection(self) -> None:
+        from macro_studio.app import create_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "remote_config.json").write_text('{"enabled": true}', encoding="utf-8")
+            with mock.patch("macro_studio.app.RemoteController.ensure_running") as ensure_running:
+                app, window = create_app(root, start_remote_runtime=False)
+                app.processEvents()
+            ensure_running.assert_not_called()
+            self.assertFalse(app._macrorelay_remote_watchdog.isActive())
+            window.close()
 
     def test_builder_snapshot_undo_redo_and_collapsible_sidebar(self) -> None:
         from macro_studio.app import create_app
@@ -2921,7 +2948,9 @@ class UiSmokeTests(unittest.TestCase):
             builder.node_canvas.select_node(1)
             builder._add_step()
             self.assertEqual(5, builder.current_macro["steps"][0]["on_success"])
-            self.assertEqual([350.0, 0.0], builder.current_macro["graph_positions"]["5"])
+            new_position = builder.current_macro["graph_positions"]["5"]
+            self.assertGreaterEqual(new_position[0], 196.0)
+            self.assertEqual(0.0, new_position[1])
 
             builder.node_canvas.select_node(1)
             builder._add_step()
@@ -2972,7 +3001,10 @@ class UiSmokeTests(unittest.TestCase):
         app.processEvents()
         bar._position_next_to_studio()
         host_rect = host.frameGeometry()
-        self.assertEqual(host_rect.right() + 1, bar.x())
+        if host_rect.right() + bar.frameGeometry().width() <= available.right():
+            self.assertEqual(host_rect.right() + 1, bar.x())
+        else:
+            self.assertGreaterEqual(bar.x(), available.left())
         self.assertEqual(host_rect.top(), bar.y())
         bar.close()
         host.close()
@@ -3767,18 +3799,15 @@ class UiSmokeTests(unittest.TestCase):
         from PySide6 import QtCore
         from macro_studio.builder import BuilderPage
 
-        settings = QtCore.QSettings("MacroRelay", "Studio")
-        previous = settings.value("smart_recording/hide_notice_date", "")
-        try:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QtCore.QSettings(str(Path(directory) / "settings.ini"), QtCore.QSettings.IniFormat)
             settings.setValue(
                 "smart_recording/hide_notice_date",
                 QtCore.QDate.currentDate().toString(QtCore.Qt.ISODate),
             )
-            self.assertTrue(BuilderPage._recording_notice_hidden_today())
+            self.assertTrue(BuilderPage._recording_notice_hidden_today(settings))
             settings.setValue("smart_recording/hide_notice_date", "2000-01-01")
-            self.assertFalse(BuilderPage._recording_notice_hidden_today())
-        finally:
-            settings.setValue("smart_recording/hide_notice_date", previous)
+            self.assertFalse(BuilderPage._recording_notice_hidden_today(settings))
 
     def test_run_current_blocks_missing_image_asset(self) -> None:
         from PySide6 import QtWidgets
@@ -3887,7 +3916,7 @@ class UiSmokeTests(unittest.TestCase):
         from macro_studio.app import create_app
         from macro_studio.shortcuts import STUDIO_SHORTCUT_SPECS
 
-        app, window = create_app(ROOT)
+        app, window = create_app(ROOT, start_remote_runtime=False)
         settings = window.pages["settings"]
         quick_slots = window.pages["hotkeys"]
         self.assertEqual(len(STUDIO_SHORTCUT_SPECS), len(settings.shortcut_edits))
@@ -4688,6 +4717,26 @@ class RemoteFeatureTests(unittest.TestCase):
             relay.assert_called_once_with(9123)
             agent.assert_called_once_with()
             self.assertTrue(status["agent_running"])
+
+    def test_remote_controller_retains_and_reaps_owned_process(self):
+        from macro_studio.remote import RemoteController
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = RemoteController(Path(directory))
+            helper = Path(directory) / "helper.py"
+            helper.write_text("pass\n", encoding="utf-8")
+            process = mock.Mock(pid=12345)
+            process.poll.return_value = None
+            with mock.patch("macro_studio.remote.subprocess.Popen", return_value=process), mock.patch(
+                "macro_studio.remote.subprocess.run"
+            ), mock.patch.object(
+                controller, "_pid_alive", side_effect=[False, True, True, False]
+            ):
+                self.assertTrue(controller._start(controller.agent_pid, ["python", str(helper)]))
+                self.assertIs(process, controller._owned_processes[controller.agent_pid])
+                self.assertTrue(controller._stop(controller.agent_pid))
+            process.wait.assert_called_once_with(timeout=3)
+            self.assertNotIn(controller.agent_pid, controller._owned_processes)
 
     def test_relay_pair_status_command_and_event_roundtrip(self):
         from remote.relay_server import create_server

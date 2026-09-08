@@ -12,6 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .color_widgets import ColorToleranceBarWidget
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop, virtual_desktop_geometry
 from .repository import MacroRepository
+from .screen_coordinates import display_coordinate_maps, logical_point_to_native, rect_to_exclusive_list
 from .widgets import WheelSafeSpinBox
 
 
@@ -44,7 +45,10 @@ class KoreanContainsProxyModel(QtCore.QSortFilterProxyModel):
 
     def set_query(self, query: str) -> None:
         self.query = query
-        self.invalidateFilter()
+        # Qt 6.13 deprecates invalidateFilter(); limit the refresh to rows and
+        # use the replacement API so large asset lists are not rebuilt twice.
+        self.beginFilterChange()
+        self.endFilterChange(QtCore.QSortFilterProxyModel.Direction.Rows)
 
     def filterAcceptsRow(self, source_row: int, source_parent: QtCore.QModelIndex) -> bool:
         index = self.sourceModel().index(source_row, 0, source_parent)
@@ -151,7 +155,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
         self.preview_scroll.setWidgetResizable(True)
         self.preview_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.preview_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.preview_scroll.setFixedHeight(112)
+        self.preview_scroll.setFixedHeight(148)
         self.preview_body = QtWidgets.QWidget()
         self.preview_layout = QtWidgets.QHBoxLayout(self.preview_body)
         self.preview_layout.setContentsMargins(4, 4, 4, 4)
@@ -248,8 +252,14 @@ class MultiAssetPicker(QtWidgets.QWidget):
         return {alias: list(self._asset_regions[alias]) for alias in self.value() if alias in self._asset_regions}
 
     def _open_confidence_dialog(self, target_alias: str = "") -> None:
-        repo = getattr(self.window(), "repository", None) or getattr(self.parent(), "repository", None)
-        step_dict = getattr(self.window(), "original", None) or getattr(self.parent(), "original", None) or {}
+        owner = self.parentWidget()
+        while owner is not None and not hasattr(owner, "build_step"):
+            owner = owner.parentWidget()
+        repo = getattr(owner, "repository", None) or getattr(self.window(), "repository", None)
+        step_dict = owner.build_step() if owner is not None and hasattr(owner, "build_step") else {}
+        action = str(getattr(owner, "current_action", "image_search") or "image_search")
+        if action not in {"image_search", "multi_image_search"}:
+            action = "image_search"
         dialog = ImageSearchConfidenceDialog(
             repo,
             self.value(),
@@ -265,11 +275,14 @@ class MultiAssetPicker(QtWidgets.QWidget):
             self._asset_confidences = dialog.get_asset_confidences()
             self._asset_regions = dialog.get_asset_regions()
             bounding = dialog.get_bounding_region()
-            if bounding:
-                editor = self.window()
-                if hasattr(editor, "_set_field_value"):
+            if owner is not None and hasattr(owner, "_set_field_value"):
+                context = dialog.region_context()
+                for field in ("region_mode", "region_coords", "region_window", "region_window_exe"):
+                    if field in context and owner.widgets.get(action, {}).get(field) is not None:
+                        owner._set_field_value(action, field, context[field])
+                if bounding:
                     for offset, val in enumerate(bounding):
-                        editor._set_field_value("image_search", f"region.{offset}", val)
+                        owner._set_field_value(action, f"region.{offset}", val)
             self._refresh_previews()
             self.offset_edited.emit()
 
@@ -311,16 +324,16 @@ class MultiAssetPicker(QtWidgets.QWidget):
             if pixmap.isNull():
                 continue
             card = QtWidgets.QFrame()
-            card.setFixedWidth(150)
+            card.setFixedWidth(158)
             card.setStyleSheet("QFrame { background: #171A22; border: 1px solid #2B354A; border-radius: 6px; padding: 2px; } QFrame:hover { border-color: #4D9FFF; }")
             card_layout = QtWidgets.QVBoxLayout(card)
             card_layout.setContentsMargins(4, 4, 4, 4)
             card_layout.setSpacing(3)
             image = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
-            image.setFixedSize(142, 64)
+            image.setFixedSize(150, 56)
             image.setPixmap(pixmap.scaled(image.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
             image.setCursor(QtCore.Qt.PointingHandCursor)
-            shown_name = QtGui.QFontMetrics(card.font()).elidedText(alias, QtCore.Qt.ElideMiddle, 140)
+            shown_name = QtGui.QFontMetrics(card.font()).elidedText(alias, QtCore.Qt.ElideMiddle, 148)
             name = QtWidgets.QLabel(shown_name, alignment=QtCore.Qt.AlignCenter)
             name.setToolTip(alias)
             cur_conf = self._asset_confidences.get(alias, self._confidence)
@@ -330,9 +343,36 @@ class MultiAssetPicker(QtWidgets.QWidget):
             reg_desc = f"지정 영역: {self._asset_regions[alias]}" if alias in self._asset_regions else "영역: 기본/전체"
             conf_btn.setToolTip(f"신뢰도: {cur_conf}%\n{reg_desc}\n클릭하여 신뢰도 및 검색 영역 설정")
             conf_btn.clicked.connect(lambda _, a=alias: self._open_confidence_dialog(a))
+
+            cur_offset = self._offsets.get(alias, [0, 0])
+            off_row = QtWidgets.QHBoxLayout()
+            off_row.setContentsMargins(0, 0, 0, 0)
+            off_row.setSpacing(2)
+            off_x = QtWidgets.QSpinBox()
+            off_x.setRange(-2000, 2000)
+            off_x.setValue(int(cur_offset[0]))
+            off_x.setPrefix("X:")
+            off_x.setSuffix("px")
+            off_x.setToolTip(f"'{alias}' 발견 시 좌클릭할 X 오프셋 (중심 기준)")
+            off_x.setStyleSheet("font-size: 7.8pt; padding: 1px; background: #0E121B; color: #38BDF8; border: 1px solid #283548; border-radius: 3px;")
+            off_x.valueChanged.connect(lambda val, a=alias: self._set_offset_axis(a, 0, val))
+
+            off_y = QtWidgets.QSpinBox()
+            off_y.setRange(-2000, 2000)
+            off_y.setValue(int(cur_offset[1]))
+            off_y.setPrefix("Y:")
+            off_y.setSuffix("px")
+            off_y.setToolTip(f"'{alias}' 발견 시 좌클릭할 Y 오프셋 (중심 기준)")
+            off_y.setStyleSheet("font-size: 7.8pt; padding: 1px; background: #0E121B; color: #38BDF8; border: 1px solid #283548; border-radius: 3px;")
+            off_y.valueChanged.connect(lambda val, a=alias: self._set_offset_axis(a, 1, val))
+
+            off_row.addWidget(off_x)
+            off_row.addWidget(off_y)
+
             card_layout.addWidget(image)
             card_layout.addWidget(name)
             card_layout.addWidget(conf_btn)
+            card_layout.addLayout(off_row)
             self.preview_layout.addWidget(card)
             self.preview_aliases.append(alias)
         self.preview_layout.addStretch(1)
@@ -387,6 +427,7 @@ ACTION_LABELS = {
     "multi_pixel_check": "다중 픽셀 체크",
     "wait_color": "색상 변화 대기",
     "color_ratio": "색상 비율 게이지",
+    "multi_image_search": "멀티 이미지 서치",
 }
 
 
@@ -519,6 +560,137 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         ),
         FieldSpec("repeat_on_success_delay", "재검색 간격", "duration", 50, 0, 60_000, section="완료 처리", tooltip="성공 재검색 시 다음 검색 전 대기 시간(ms)"),
         FieldSpec("sleep_after", "완료 후 대기", "duration", 0, 0, 600_000, section="완료 처리", tooltip="노드 실행 완료 후 다음 노드로 진행하기 전 대기 시간(ms)"),
+    ],
+    "multi_image_search": [
+        FieldSpec(
+            "assets",
+            "멀티 검색 이미지",
+            "assets",
+            [],
+            tooltip="화면에서 동시에 탐색할 이미지 목록입니다. 미리보기 창에서 직접 화면을 캡처하여 추가하거나 여기서 체크하여 선택할 수 있습니다.",
+        ),
+        FieldSpec(
+            "match_condition",
+            "성공 판정 조건",
+            "choice",
+            "all_matched",
+            options=choice(
+                ("모든 멀티 이미지 발견 시 참 (전체 일치 · AND)", "all_matched"),
+                ("1개 이상 발견 시 참 (하나라도 일치 · OR)", "at_least_1"),
+                ("지정 개수 이상 발견 시 참 (최소 N개)", "at_least_n"),
+                ("지정 개수와 일치 시 참 (정확히 N개)", "exact_n"),
+            ),
+            tooltip="등록된 이미지들 중 몇 개가 발견되어야 성공(참, 녹색선)으로 분기할지 결정합니다.",
+        ),
+        FieldSpec(
+            "required_count",
+            "성공 기준 개수 (N개)",
+            "int",
+            0,
+            0,
+            100,
+            tooltip="'지정 개수 이상' 또는 '지정 개수 일치' 선택 시 기준이 되는 개수입니다. (0이면 전체 개수 자동 적용)",
+        ),
+        FieldSpec(
+            "store_count_var",
+            "발견 개수 저장 변수",
+            "text",
+            "FoundCount",
+            tooltip="실제 발견된 이미지 개수가 저장되는 변수명입니다.",
+        ),
+        FieldSpec(
+            "engine",
+            "검색 엔진",
+            "choice",
+            "opencv",
+            options=choice(("OpenCV · 정밀(권장)", "opencv"), ("AutoHotkey · 가볍고 빠름", "ahk")),
+            tooltip="• OpenCV: 여러 이미지 동시 비교 및 정밀 매칭 (권장)\n• AutoHotkey: 가볍고 빠른 즉시 반응속도",
+        ),
+        FieldSpec(
+            "search_profile",
+            "검색 품질",
+            "choice",
+            "fast",
+            options=choice(("빠름 · 권장", "fast"), ("균형 · 색상 보강", "balanced"), ("정밀 · 70~150% 자동 배율", "precise")),
+            tooltip="• 빠름: 35ms 주기 고속 탐색\n• 균형: 표준 매칭\n• 정밀: 크기 변화 및 고해상도 지원",
+        ),
+        FieldSpec(
+            "confidence",
+            "기본 일치 신뢰도",
+            "int",
+            85,
+            50,
+            99,
+            tooltip="이미지 일치율 기준(0~100%). 미리보기 창에서 이미지별로 개별 신뢰도를 설정할 수도 있습니다.",
+        ),
+        FieldSpec(
+            "variation",
+            "색상 허용 오차",
+            "int",
+            16,
+            0,
+            255,
+            tooltip="낮을수록 더 정확하고 엄격하게 일치합니다. (0~255, 기본 16)",
+        ),
+        FieldSpec(
+            "timeout",
+            "검색 제한 시간",
+            "duration",
+            1000,
+            0,
+            600_000,
+            tooltip="이미지들이 나타날 때까지 대기할 최대 시간(ms)입니다. 0이면 1회만 검사합니다.",
+        ),
+        FieldSpec(
+            "poll_delay",
+            "검색 반복 간격",
+            "duration",
+            35,
+            10,
+            60_000,
+            tooltip="대기 중 화면을 다시 캡처하여 비교하는 반복 간격(ms)입니다.",
+        ),
+        FieldSpec(
+            "click_target",
+            "조건 만족 시 클릭 동작",
+            "choice",
+            "each_image",
+            options=choice(
+                ("발견된 각 이미지 클릭 (오프셋 적용)", "each_image"),
+                ("첫 번째 발견 이미지 클릭", "first_image"),
+                ("지정 좌표 클릭 (고정 위치)", "custom_coord"),
+                ("클릭 안 함 (조건 분기만)", "none"),
+            ),
+            section="클릭 & 후속 동작",
+            tooltip="조건을 만족했을 때 마우스 클릭을 수행할 대상을 지정합니다.\n• 발견된 각 이미지 클릭: 탐색된 각 이미지 위치에 개별 오프셋을 더해 순차 클릭\n• 지정 좌표 클릭: 조건 달성 시 설정된 고정 X, Y 좌표 클릭",
+        ),
+        FieldSpec("custom_click_x", "지정 클릭 X좌표", "int", 0, -100_000, 100_000, section="클릭 & 후속 동작", tooltip="지정 좌표 클릭 선택 시 클릭할 X 좌표 (창/클라이언트 기준)"),
+        FieldSpec("custom_click_y", "지정 클릭 Y좌표", "int", 0, -100_000, 100_000, section="클릭 & 후속 동작", tooltip="지정 좌표 클릭 선택 시 클릭할 Y 좌표 (창/클라이언트 기준)"),
+        FieldSpec("click_delay", "각 위치 클릭 간격", "duration", 100, 0, 10_000, section="클릭 & 후속 동작", tooltip="여러 위치를 순차 클릭할 때의 간격(ms)"),
+        FieldSpec("click.button", "마우스 버튼", "choice", "left", options=choice(("좌클릭 (기본)", "left"), ("우클릭", "right"), ("휠클릭", "middle")), section="클릭 & 후속 동작"),
+        FieldSpec("click.mode", "클릭 모드", "choice", "inactive", options=choice(("비활성 클릭 (권장)", "inactive"), ("활성 클릭", "active")), section="클릭 & 후속 동작"),
+        FieldSpec("click.method", "비활성 방식", "choice", "auto", options=choice(("자동 · 앱에 맞춤", "auto"), ("최상위 창 직접 메시지", "direct_postmessage"), ("ControlClick", "controlclick"), ("PostMessage", "postmessage")), section="클릭 & 후속 동작"),
+        FieldSpec("click.count", "클릭 횟수", "int", 1, 1, 20, section="클릭 & 후속 동작"),
+        FieldSpec("click.offset", "공통 기본 오프셋", "offset", [0, 0], section="클릭 & 후속 동작"),
+        FieldSpec("region_mode", "범위 기준", "choice", "client", options=choice(("대상 프로그램", "client"), ("전체 화면", "screen"), ("창 전체", "window")), section="검색 대상 창 & 범위"),
+        FieldSpec("region_coords", "좌표 해석", "choice", "relative", options=choice(("대상 기준", "relative"), ("화면 절대 좌표", "screen")), section="검색 대상 창 & 범위"),
+        FieldSpec("region_window", "검색 대상 창", "text", "", section="검색 대상 창 & 범위"),
+        FieldSpec("region_window_exe", "검색 대상 프로그램", "text", "", section="검색 대상 창 & 범위"),
+        FieldSpec("region.0", "공통 범위 왼쪽", "int", 0, -100_000, 100_000, section="검색 대상 창 & 범위"),
+        FieldSpec("region.1", "공통 범위 위", "int", 0, -100_000, 100_000, section="검색 대상 창 & 범위"),
+        FieldSpec("region.2", "공통 범위 오른쪽", "int", 0, -100_000, 100_000, section="검색 대상 창 & 범위"),
+        FieldSpec("region.3", "공통 범위 아래", "int", 0, -100_000, 100_000, section="검색 대상 창 & 범위"),
+        FieldSpec(
+            "fallback_full_region",
+            "지정 범위 실패 시 프로그램 전체 확장",
+            "bool",
+            False,
+            section="검색 대상 창 & 범위",
+        ),
+        FieldSpec("abort_on_fail", "검색 실패 시 중단", "bool", False, section="완료 처리"),
+        FieldSpec("repeat_on_success", "성공하면 같은 노드 재검색", "bool", False, section="완료 처리"),
+        FieldSpec("repeat_on_success_delay", "재검색 간격", "duration", 50, 0, 60_000, section="완료 처리"),
+        FieldSpec("sleep_after", "완료 후 대기", "duration", 0, 0, 600_000, section="완료 처리"),
     ],
     "screen_condition": [
         FieldSpec("asset", "조건 이미지", "asset", ""),
@@ -1998,6 +2170,7 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.repository = repository
         self.step = dict(step or {})
+        self._last_detected_target: dict[str, Any] = {}
         self.aliases = [str(a) for a in aliases if str(a).strip()]
         self._confidence = max(1, min(100, int(confidence or 86)))
         self._asset_confidences = dict(asset_confidences or {})
@@ -2254,6 +2427,9 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
 
         dlg = RegionVisualTestDialog(cur_step, self.repository, asset_regions=self._asset_regions, parent=self)
         if dlg.exec() == QtWidgets.QDialog.Accepted:
+            for field in ("region_mode", "region_coords", "region_window", "region_window_exe"):
+                if field in dlg.step:
+                    self.step[field] = dlg.step[field]
             updated_regs = dlg.get_asset_regions()
             self._asset_regions.update(updated_regs)
             for alias, reg in self._asset_regions.items():
@@ -2354,18 +2530,37 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
             if not pixmap.isNull() and geometry.isValid():
                 picker = ScreenCaptureDialog(pixmap, geometry, parent=None, hint_text=hint_text)
                 if picker.exec() == QtWidgets.QDialog.Accepted:
-                    rect = picker.selected_screen_rect()
+                    rect = picker.selected_native_screen_rect()
                     if rect.isValid() and rect.width() >= 4 and rect.height() >= 4:
-                        client_rect = self._detect_target_client_rect(rect)
-                        if client_rect is not None and client_rect.isValid():
-                            rel_region = [
-                                max(0, rect.left() - client_rect.left()),
-                                max(0, rect.top() - client_rect.top()),
-                                rect.right() - client_rect.left(),
-                                rect.bottom() - client_rect.top(),
-                            ]
+                        mode = str(self.step.get("region_mode") or "client").casefold()
+                        if mode == "screen":
+                            self.step["region_coords"] = "screen"
+                            rel_region = rect_to_exclusive_list(rect)
                         else:
-                            rel_region = [rect.left(), rect.top(), rect.right(), rect.bottom()]
+                            target_rect = self._detect_target_client_rect(rect, mode=mode)
+                            if target_rect is not None and target_rect.isValid():
+                                clipped = rect.intersected(target_rect)
+                                if clipped.width() >= 4 and clipped.height() >= 4:
+                                    end_x = clipped.x() + clipped.width()
+                                    end_y = clipped.y() + clipped.height()
+                                    rel_region = [
+                                        clipped.x() - target_rect.x(),
+                                        clipped.y() - target_rect.y(),
+                                        end_x - target_rect.x(),
+                                        end_y - target_rect.y(),
+                                    ]
+                                    self.step["region_mode"] = mode if mode in {"client", "window"} else "client"
+                                    self.step["region_coords"] = "relative"
+                                    if self._last_detected_target:
+                                        self.step["region_window"] = str(self._last_detected_target.get("window") or "")
+                                        self.step["region_window_exe"] = str(self._last_detected_target.get("exe") or "")
+                            else:
+                                # Never save physical screen coordinates as
+                                # client-relative values. That double offset
+                                # was the main cause of regions moving down.
+                                self.step["region_mode"] = "screen"
+                                self.step["region_coords"] = "screen"
+                                rel_region = rect_to_exclusive_list(rect)
         except Exception as exc:
             import logging
             logging.warning("영역 드래그 캡처 중 예외: %s", exc)
@@ -2395,7 +2590,8 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
                 self.btn_pick_region.setText(f"📐 검색 영역 지정됨: {w_text} (재지정 가능)")
                 self.btn_pick_region.setStyleSheet("background: #143528; border: 1px solid #287A50; color: #4ADE80; padding: 6px; border-radius: 6px; font-weight: 700;")
             if hasattr(self, "notice_lbl"):
-                self.notice_lbl.setText(f"✔ 클라이언트 상대 영역 {w_text} 지정 완료!\n창 아래쪽 [✔ 신뢰도 설정 저장] 또는 [⚡ 즉시 저장]을 누르면 완료됩니다.")
+                basis = "화면 절대" if self.step.get("region_mode") == "screen" else "대상 창 상대"
+                self.notice_lbl.setText(f"✔ {basis} 영역 {w_text} 지정 완료!\n창 아래쪽 [✔ 신뢰도 설정 저장] 또는 [⚡ 즉시 저장]을 누르면 완료됩니다.")
                 self.notice_lbl.setVisible(True)
 
     def _pick_asset_search_region(self, alias: str, btn: QtWidgets.QPushButton) -> None:
@@ -2430,35 +2626,65 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
                     pass
         return res
 
-    def _detect_target_client_rect(self, screen_rect: QtCore.QRect) -> QtCore.QRect | None:
+    def region_context(self) -> dict[str, Any]:
+        return {
+            "region_mode": str(self.step.get("region_mode") or "screen"),
+            "region_coords": str(self.step.get("region_coords") or "screen"),
+            "region_window": str(self.step.get("region_window") or ""),
+            "region_window_exe": str(self.step.get("region_window_exe") or ""),
+        }
+
+    def _detect_target_client_rect(self, screen_rect: QtCore.QRect, *, mode: str = "client") -> QtCore.QRect | None:
+        self._last_detected_target = {}
         # 1순위: 현재 노드(step)에 지정된 대상 창(dnplayer.exe 등)을 최우선 검색
         win_text = str(self.step.get("region_window") or self.step.get("window") or "").strip()
         exe_text = str(self.step.get("region_window_exe") or self.step.get("window_exe") or "").strip()
         if win_text or exe_text:
             try:
                 from .image_search_test import _find_window
-                hwnd = _find_window(exe_text, win_text)
+                hwnd = _find_window(exe_text, win_text, reference_rect=screen_rect)
                 if hwnd:
                     import ctypes, ctypes.wintypes as wt
                     user32 = ctypes.windll.user32
                     crect = wt.RECT()
                     origin_pt = wt.POINT(0, 0)
-                    if user32.GetClientRect(hwnd, ctypes.byref(crect)) and user32.ClientToScreen(hwnd, ctypes.byref(origin_pt)):
-                        cw = int(crect.right - crect.left)
-                        ch = int(crect.bottom - crect.top)
-                        c_rect = QtCore.QRect(int(origin_pt.x), int(origin_pt.y), cw, ch)
-                        if c_rect.intersects(screen_rect):
-                            return c_rect
+                    if mode == "window":
+                        wrect = wt.RECT()
+                        if user32.GetWindowRect(hwnd, ctypes.byref(wrect)):
+                            target_rect = QtCore.QRect(
+                                int(wrect.left), int(wrect.top),
+                                int(wrect.right - wrect.left), int(wrect.bottom - wrect.top),
+                            )
+                        else:
+                            target_rect = QtCore.QRect()
+                    elif user32.GetClientRect(hwnd, ctypes.byref(crect)) and user32.ClientToScreen(hwnd, ctypes.byref(origin_pt)):
+                        target_rect = QtCore.QRect(
+                            int(origin_pt.x), int(origin_pt.y),
+                            int(crect.right - crect.left), int(crect.bottom - crect.top),
+                        )
+                    else:
+                        target_rect = QtCore.QRect()
+                    if target_rect.isValid() and target_rect.intersects(screen_rect):
+                        self._last_detected_target = {"window": win_text, "exe": exe_text}
+                        return target_rect
             except Exception:
                 pass
 
         # 2순위: 중심 좌표 기준 Z-order 최상위 창 감지
         try:
-            target = ActionEditor._window_target_at(screen_rect.center())
-            if target and target.get("client_origin") and target.get("client_size"):
-                co = target["client_origin"]
-                cs = target["client_size"]
-                return QtCore.QRect(co[0], co[1], cs[0], cs[1])
+            target = ActionEditor._window_target_at(screen_rect.center(), position_is_native=True)
+            if target:
+                self._last_detected_target = {
+                    "window": str(target.get("window") or ""),
+                    "exe": str(target.get("exe") or ""),
+                }
+                if mode == "window" and isinstance(target.get("window_rect"), list):
+                    left, top, right, bottom = target["window_rect"][:4]
+                    return QtCore.QRect(int(left), int(top), int(right) - int(left), int(bottom) - int(top))
+                if target.get("client_origin") and target.get("client_size"):
+                    co = target["client_origin"]
+                    cs = target["client_size"]
+                    return QtCore.QRect(co[0], co[1], cs[0], cs[1])
         except Exception:
             pass
 
@@ -2602,7 +2828,7 @@ class ActionEditor(QtWidgets.QWidget):
             else:
                 sections[spec.section].addRow(spec.label, widget)
             self.widgets[action][spec.key] = widget
-            if action in {"image_search", "screen_condition"} and spec.key == "engine":
+            if action in {"image_search", "screen_condition", "multi_image_search"} and spec.key == "engine":
                 preset_bar = QtWidgets.QWidget()
                 preset_layout = QtWidgets.QHBoxLayout(preset_bar)
                 preset_layout.setContentsMargins(0, 3, 0, 5)
@@ -2644,6 +2870,12 @@ class ActionEditor(QtWidgets.QWidget):
                 btn_pick_fail.setToolTip("화면에서 원하는 위치를 마우스 좌클릭으로 1번 찍어 실패 클릭 좌표를 자동 입력합니다.")
                 btn_pick_fail.clicked.connect(self._capture_fail_click_cursor)
                 sections[spec.section].addRow("", btn_pick_fail)
+            if action == "multi_image_search" and spec.key == "custom_click_y":
+                btn_pick_custom = QtWidgets.QPushButton("🎯 화면 클릭으로 지정 좌표 찍기")
+                btn_pick_custom.setStyleSheet("background: #1E1B4B; border: 1px solid #4338CA; color: #A5B4FC; font-weight: 700; padding: 5px;")
+                btn_pick_custom.setToolTip("화면에서 원하는 위치를 마우스 좌클릭으로 찍어 지정 클릭 좌표(X, Y)를 자동 입력합니다.")
+                btn_pick_custom.clicked.connect(self._capture_multi_image_custom_coord)
+                sections[spec.section].addRow("", btn_pick_custom)
             if action in {"pixel_search", "ocr"} and spec.key == "click_offset_y":
                 btn_row = QtWidgets.QWidget()
                 btn_layout = QtWidgets.QHBoxLayout(btn_row)
@@ -2663,10 +2895,12 @@ class ActionEditor(QtWidgets.QWidget):
                 btn_layout.addWidget(btn_reset_offset, 1)
 
                 sections[spec.section].addRow("오프셋 지정", btn_row)
-        if action == "image_search":
+        if action in {"image_search", "multi_image_search"}:
             region_mode = self.widgets[action].get("region_mode")
             if isinstance(region_mode, QtWidgets.QComboBox):
-                region_mode.currentIndexChanged.connect(self._sync_image_region_coordinates)
+                region_mode.currentIndexChanged.connect(
+                    lambda _index, target_action=action: self._sync_image_region_coordinates(target_action)
+                )
             profile = self.widgets[action].get("search_profile")
             if isinstance(profile, QtWidgets.QComboBox):
                 profile.currentIndexChanged.connect(lambda _index: self._apply_search_profile())
@@ -2700,11 +2934,16 @@ class ActionEditor(QtWidgets.QWidget):
                     toggle.toggled.connect(self._sync_datetime_controls)
             self._sync_datetime_controls()
         elif action == "pixel_search":
+            region_mode = self.widgets[action].get("region_mode")
+            if isinstance(region_mode, QtWidgets.QComboBox):
+                region_mode.currentIndexChanged.connect(
+                    lambda _index, target_action=action: self._sync_image_region_coordinates(target_action)
+                )
             color_edit = self.widgets[action].get("color")
             tol_bar = self.widgets[action].get("tolerance")
             if isinstance(color_edit, QtWidgets.QLineEdit) and isinstance(tol_bar, ColorToleranceBarWidget):
                 color_edit.textChanged.connect(lambda txt, tb=tol_bar: tb.setColor(txt))
-        if action in {"image_search", "screen_condition"}:
+        if action in {"image_search", "screen_condition", "multi_image_search"}:
             engine = self.widgets[action].get("engine")
             if isinstance(engine, QtWidgets.QComboBox):
                 engine.currentIndexChanged.connect(lambda _idx, act=action: self._on_engine_changed(act))
@@ -2713,7 +2952,7 @@ class ActionEditor(QtWidgets.QWidget):
         return scroll
 
     def _update_engine_controls_state(self, action: str) -> None:
-        if action not in {"image_search", "screen_condition"}:
+        if action not in {"image_search", "screen_condition", "multi_image_search"}:
             return
         widgets = self.widgets.get(action, {})
         engine_widget = widgets.get("engine")
@@ -2976,8 +3215,9 @@ class ActionEditor(QtWidgets.QWidget):
             if isinstance(widget, QtWidgets.QSpinBox):
                 widget.setValue(value)
 
-    def _sync_image_region_coordinates(self) -> None:
-        widgets = self.widgets.get("image_search", {})
+    def _sync_image_region_coordinates(self, action: str | None = None) -> None:
+        target_action = action or self.current_action
+        widgets = self.widgets.get(target_action, {})
         mode_widget = widgets.get("region_mode")
         coords_widget = widgets.get("region_coords")
         if not isinstance(mode_widget, QtWidgets.QComboBox) or not isinstance(coords_widget, QtWidgets.QComboBox):
@@ -3009,6 +3249,18 @@ class ActionEditor(QtWidgets.QWidget):
                     ("설정 검사", self._diagnose_image_search),
                     ("▤ 이미지 서치 테스트 센터", self._open_image_search_test_center),
                     ("🎯 실패 클릭 좌표 지정", self._capture_fail_click_cursor),
+                ]
+            )
+        elif action == "multi_image_search":
+            buttons.extend(
+                [
+                    ("🔍 멀티 이미지 시각화 및 실시간 검사기 (미리보기)", self._open_region_visual_test),
+                    ("🎯 멀티 전체 발견 시 참(성공) 설정", self._preset_multi_count_all),
+                    ("⌖ 화면 캡처로 새 이미지 추가", self._capture_register_asset),
+                    ("▣ 검색 범위 잡기 (드래그)", lambda: self._pick_region(action, "region")),
+                    ("◎ 대상 창", lambda: self._pick_window(action, "window")),
+                    ("▣ 대상 프로그램", lambda: self._pick_window(action, "program")),
+                    ("⚡ 속도 프리셋 ▾", lambda: self._show_speed_preset_menu(action)),
                 ]
             )
         elif action == "screen_condition":
@@ -3249,6 +3501,27 @@ class ActionEditor(QtWidgets.QWidget):
                 f"실패 시 대체 클릭 좌표 X {offset[0]}, Y {offset[1]} 설정 완료",
                 self,
             )
+
+    def _capture_multi_image_custom_coord(self) -> None:
+        hosts = self._hide_host_windows()
+        picker = WindowPickerDialog(ignored_hwnds=self._host_hwnds(hosts))
+        accepted = picker.exec() == QtWidgets.QDialog.Accepted
+        client_point = picker.selected_client_point() if accepted else None
+        self._restore_host_windows(hosts)
+        if not accepted or client_point is None:
+            return
+        self._set_field_value("multi_image_search", "custom_click_x", client_point.x())
+        self._set_field_value("multi_image_search", "custom_click_y", client_point.y())
+        self._set_field_value("multi_image_search", "click_target", "custom_coord")
+        if picker.exe_name:
+            self._set_field_value("multi_image_search", "region_window_exe", picker.exe_name)
+        if picker.window_token:
+            self._set_field_value("multi_image_search", "region_window", picker.window_token)
+        QtWidgets.QToolTip.showText(
+            QtGui.QCursor.pos(),
+            f"지정 클릭 좌표 X {client_point.x()}, Y {client_point.y()} 설정 완료",
+            self,
+        )
 
     def _capture_pixel_search_offset(self, action: str = "pixel_search") -> None:
         hosts = self._hide_host_windows()
@@ -3794,18 +4067,20 @@ class ActionEditor(QtWidgets.QWidget):
         picker = ScreenCaptureDialog(pixmap, geometry)
         try:
             accepted = picker.exec() == QtWidgets.QDialog.Accepted
-            rect = picker.selected_screen_rect() if accepted else QtCore.QRect()
+            rect = picker.selected_native_screen_rect() if accepted else QtCore.QRect()
         finally:
             picker.deleteLater()
         self._restore_host_windows(hosts)
         if rect.isValid() and rect.width() >= 4 and rect.height() >= 4:
             # Check if this action uses client/relative coordinates
             is_client = False
+            basis_mode = "screen"
             mode_widget = self.widgets.get(action, {}).get("region_mode")
             if mode_widget is not None:
                 spec = next((item for item in ACTION_FIELDS.get(action, []) if item.key == "region_mode"), None)
                 if spec:
                     mode_val = str(self._widget_value(mode_widget, spec) or "").lower()
+                    basis_mode = mode_val
                     if mode_val in {"client", "window"}:
                         is_client = True
 
@@ -3853,38 +4128,51 @@ class ActionEditor(QtWidgets.QWidget):
             if win_text or exe_text:
                 try:
                     from .image_search_test import _find_window
-                    hwnd = _find_window(exe_text, win_text)
+                    hwnd = _find_window(exe_text, win_text, reference_rect=rect)
                     if hwnd and hwnd not in ignored_hwnds:
                         import ctypes, ctypes.wintypes as wt
                         user32 = ctypes.windll.user32
-                        crect = wt.RECT()
+                        target_rect = QtCore.QRect()
                         origin_pt = wt.POINT(0, 0)
-                        if user32.GetClientRect(hwnd, ctypes.byref(crect)) and user32.ClientToScreen(hwnd, ctypes.byref(origin_pt)):
-                            client_w = crect.right - crect.left
-                            client_h = crect.bottom - crect.top
-                            c_rect = QtCore.QRect(origin_pt.x, origin_pt.y, client_w, client_h)
-                            if c_rect.intersects(rect):
-                                client_origin = [int(origin_pt.x), int(origin_pt.y)]
-                                title_buf = ctypes.create_unicode_buffer(512)
-                                user32.GetWindowTextW(hwnd, title_buf, len(title_buf))
-                                target = {"title": title_buf.value, "exe": exe_text or win_text, "window": win_text}
+                        if basis_mode == "window":
+                            wrect = wt.RECT()
+                            if user32.GetWindowRect(hwnd, ctypes.byref(wrect)):
+                                target_rect = QtCore.QRect(
+                                    int(wrect.left), int(wrect.top),
+                                    int(wrect.right - wrect.left), int(wrect.bottom - wrect.top),
+                                )
+                                origin_pt = wt.POINT(int(wrect.left), int(wrect.top))
+                        else:
+                            crect = wt.RECT()
+                            if user32.GetClientRect(hwnd, ctypes.byref(crect)) and user32.ClientToScreen(hwnd, ctypes.byref(origin_pt)):
+                                target_rect = QtCore.QRect(
+                                    int(origin_pt.x), int(origin_pt.y),
+                                    int(crect.right - crect.left), int(crect.bottom - crect.top),
+                                )
+                        if target_rect.isValid() and target_rect.intersects(rect):
+                            client_origin = [int(origin_pt.x), int(origin_pt.y)]
+                            title_buf = ctypes.create_unicode_buffer(512)
+                            user32.GetWindowTextW(hwnd, title_buf, len(title_buf))
+                            target = {"title": title_buf.value, "exe": exe_text or win_text, "window": win_text, "rect": target_rect}
                 except Exception:
                     pass
 
             # 2순위: 지정된 창이 없거나 드래그 영역과 겹치지 않으면, Z-Order 최상위(맨 앞) 창을 자동 감지
             if client_origin is None:
-                target = self._window_target_at(rect.center(), ignored_hwnds)
-                if target and target.get("client_origin"):
-                    client_origin = target["client_origin"]
+                target = self._window_target_at(rect.center(), ignored_hwnds, position_is_native=True)
+                if target:
+                    if basis_mode == "window" and isinstance(target.get("rect"), QtCore.QRect):
+                        target_rect = target["rect"]
+                        client_origin = [target_rect.left(), target_rect.top()]
+                    elif target.get("client_origin"):
+                        client_origin = target["client_origin"]
 
-            # 프로그램 클라이언트 영역이 감지되었을 경우: 무조건 클라이언트 상대 모드로 자동 동기화
-            if client_origin is not None:
-                is_client = True
-                if self.widgets.get(action, {}).get("region_mode") is not None:
-                    self._set_field_value(action, "region_mode", "client")
+            # Relative modes keep the chosen basis (client vs whole window).
+            # Screen mode must remain absolute even when the drag overlaps a window.
+            if client_origin is not None and is_client:
                 if self.widgets.get(action, {}).get("region_coords") is not None:
                     self._set_field_value(action, "region_coords", "relative")
-                if self.widgets.get(action, {}).get("coordinate_scope") is not None:
+                if basis_mode == "client" and self.widgets.get(action, {}).get("coordinate_scope") is not None:
                     self._set_field_value(action, "coordinate_scope", "client")
 
                 # 대상 창 정보가 비어있으면 자동 바인딩
@@ -3907,14 +4195,15 @@ class ActionEditor(QtWidgets.QWidget):
                                 self._set_field_value(action, ek, target_exe)
 
             if is_client and client_origin:
+                exclusive = rect_to_exclusive_list(rect)
                 values = (
                     max(0, rect.left() - client_origin[0]),
                     max(0, rect.top() - client_origin[1]),
-                    max(0, rect.right() - client_origin[0]),
-                    max(0, rect.bottom() - client_origin[1]),
+                    max(0, exclusive[2] - client_origin[0]),
+                    max(0, exclusive[3] - client_origin[1]),
                 )
             else:
-                values = (rect.left(), rect.top(), rect.right(), rect.bottom())
+                values = tuple(rect_to_exclusive_list(rect))
 
             for offset, value in enumerate(values):
                 self._set_field_value(action, f"{key}.{offset}", value)
@@ -3969,21 +4258,29 @@ class ActionEditor(QtWidgets.QWidget):
             accepted = picker.exec() == QtWidgets.QDialog.Accepted
             image = picker.captured_image() if accepted else QtGui.QImage()
             if accepted:
-                self._last_capture_rect = picker.selected_screen_rect()
+                self._last_capture_rect = picker.selected_native_screen_rect()
                 if self._last_capture_rect.isValid():
-                    self._last_capture_target = self._window_target_at(self._last_capture_rect.center(), ignored_hwnds)
+                    self._last_capture_target = self._window_target_at(
+                        self._last_capture_rect.center(), ignored_hwnds, position_is_native=True
+                    )
         finally:
             picker.deleteLater()
         self._restore_host_windows(hosts)
         return image
 
     @staticmethod
-    def _window_target_at(position: QtCore.QPoint, ignored_hwnds: set[int] | None = None) -> dict[str, Any] | None:
+    def _window_target_at(
+        position: QtCore.QPoint,
+        ignored_hwnds: set[int] | None = None,
+        *,
+        position_is_native: bool = False,
+    ) -> dict[str, Any] | None:
         """캡처 중심점이 일반 앱의 클라이언트 영역이면 자동 검색 대상을 반환합니다."""
         ignored = set(ignored_hwnds or ())
         try:
             user32 = ctypes.windll.user32
-            point = wintypes.POINT(position.x(), position.y())
+            native_position = QtCore.QPoint(position) if position_is_native else logical_point_to_native(position)
+            point = wintypes.POINT(native_position.x(), native_position.y())
             hwnd = int(user32.WindowFromPoint(point) or 0)
             root = int(user32.GetAncestor(hwnd, 2) or hwnd)  # GA_ROOT
             if not root or root in ignored or not user32.IsWindowVisible(root):
@@ -4010,9 +4307,9 @@ class ActionEditor(QtWidgets.QWidget):
                 int(window_rect.right - window_rect.left),
                 int(window_rect.bottom - window_rect.top),
             )
-            if width < 32 or height < 32 or not window_screen_rect.contains(position):
+            if width < 32 or height < 32 or not window_screen_rect.contains(native_position):
                 return None
-            capture_scope = "client" if screen_rect.contains(position) else "window"
+            capture_scope = "client" if screen_rect.contains(native_position) else "window"
             capture_rect = screen_rect if capture_scope == "client" else window_screen_rect
 
             pid = wintypes.DWORD()
@@ -4094,7 +4391,9 @@ class ActionEditor(QtWidgets.QWidget):
         key = self._capture_register_asset(automatic=True)
         if not key:
             return
-        geometry = virtual_desktop_geometry()
+        geometry = QtCore.QRect()
+        for mapping in display_coordinate_maps():
+            geometry = geometry.united(mapping.native)
         target = self._last_capture_target
         engine_widget = self.widgets.get("image_search", {}).get("engine")
         selected_engine = (
@@ -4121,9 +4420,17 @@ class ActionEditor(QtWidgets.QWidget):
         for field, value in values.items():
             self._set_field_value("image_search", field, value)
         if target:
-            region_values = (0, 0, max(0, int(target["width"]) - 1), max(0, int(target["height"]) - 1))
+            # Region fields store inclusive right/bottom coordinates.  Window
+            # width/height are extents, so subtract one to avoid searching a
+            # phantom row/column and to keep the picker/runtime consistent.
+            region_values = (
+                0,
+                0,
+                max(0, int(target["width"]) - 1),
+                max(0, int(target["height"]) - 1),
+            )
         elif geometry.isValid():
-            region_values = (geometry.left(), geometry.top(), geometry.right(), geometry.bottom())
+            region_values = tuple(rect_to_exclusive_list(geometry))
         else:
             region_values = (0, 0, 0, 0)
         for offset, value in enumerate(region_values):
@@ -4181,58 +4488,127 @@ class ActionEditor(QtWidgets.QWidget):
                 step.setdefault("region_coords", "relative")
 
         dlg = RegionVisualTestDialog(step, self.repository, parent=self.window())
-        if dlg.exec() != QtWidgets.QDialog.Accepted:
-            return
-        if self.current_action == "pixel_search":
-            updated_color_regs = dlg.get_color_regions()
-            updated_tols = dlg.get_color_tolerances()
-            if updated_tols:
-                tol_val = next(iter(updated_tols.values()))
-                self._set_field_value("pixel_search", "tolerance", tol_val)
-                self.original["color_tolerances"] = updated_tols
-            if updated_color_regs:
-                self.original["color_regions"] = updated_color_regs
-            if dlg.step.get("region_window_exe"):
-                we = str(dlg.step["region_window_exe"])
-                w = str(dlg.step.get("region_window", ""))
-                rm = str(dlg.step.get("region_mode", "client"))
-                rc = str(dlg.step.get("region_coords", "relative"))
-                self._set_field_value("pixel_search", "region_window_exe", we)
-                self._set_field_value("pixel_search", "region_window", w)
-                self._set_field_value("pixel_search", "region_mode", rm)
-                self._set_field_value("pixel_search", "region_coords", rc)
-                self.original["region_window_exe"] = we
-                self.original["region_window"] = w
-                self.original["region_mode"] = rm
-                self.original["region_coords"] = rc
-            bounding = dlg.get_bounding_region()
-            if bounding:
-                for offset, val in enumerate(bounding):
-                    self._set_field_value("pixel_search", f"search_region.{offset}", val)
-            QtWidgets.QMessageBox.information(
-                self,
-                "색상 및 영역 보정 완료",
-                "검색 영역 검사기에서 조절한 대상 창, 허용 오차 및 검색 영역이 노드에 성공적으로 적용되었습니다!",
-            )
-            return
+        try:
+            if dlg.exec() != QtWidgets.QDialog.Accepted:
+                return
+            if self.current_action == "pixel_search":
+                updated_color_regs = dlg.get_color_regions()
+                updated_tols = dlg.get_color_tolerances()
+                if updated_tols:
+                    tol_val = next(iter(updated_tols.values()))
+                    self._set_field_value("pixel_search", "tolerance", tol_val)
+                    self.original["color_tolerances"] = updated_tols
+                if updated_color_regs:
+                    self.original["color_regions"] = updated_color_regs
+                if dlg.step.get("region_window_exe"):
+                    we = str(dlg.step["region_window_exe"])
+                    w = str(dlg.step.get("region_window", ""))
+                    rm = str(dlg.step.get("region_mode", "client"))
+                    rc = str(dlg.step.get("region_coords", "relative"))
+                    self._set_field_value("pixel_search", "region_window_exe", we)
+                    self._set_field_value("pixel_search", "region_window", w)
+                    self._set_field_value("pixel_search", "region_mode", rm)
+                    self._set_field_value("pixel_search", "region_coords", rc)
+                    self.original["region_window_exe"] = we
+                    self.original["region_window"] = w
+                    self.original["region_mode"] = rm
+                    self.original["region_coords"] = rc
+                bounding = dlg.get_bounding_region()
+                if bounding:
+                    for offset, val in enumerate(bounding):
+                        self._set_field_value("pixel_search", f"search_region.{offset}", val)
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "색상 및 영역 보정 완료",
+                    "검색 영역 검사기에서 조절한 대상 창, 허용 오차 및 검색 영역이 노드에 성공적으로 적용되었습니다!",
+                )
+                return
 
-        updated_regs = dlg.get_asset_regions()
-        if updated_regs:
-            picker = self.widgets.get("image_search", {}).get("assets")
-            if isinstance(picker, MultiAssetPicker):
-                picker.set_asset_regions(updated_regs)
-            bounding = dlg.get_bounding_region()
-            if bounding:
-                for offset, val in enumerate(bounding):
-                    self._set_field_value("image_search", f"region.{offset}", val)
-            QtWidgets.QMessageBox.information(
-                self,
-                "영역 보정 완료",
-                "검색 영역 검사기에서 수정한 영역이 노드에 성공적으로 적용되었습니다!",
-            )
+            action = self.current_action
+            if action in {"image_search", "multi_image_search"}:
+                updated_aliases = dlg.get_aliases()
+                updated_regs = dlg.get_asset_regions()
+                updated_offsets = dlg.get_asset_offsets()
+                updated_cond = dlg.get_match_condition()
+                updated_req = dlg.get_required_count()
+                click_target = dlg.get_click_target()
+                cx, cy = dlg.get_custom_click_coords()
+
+                picker = self.widgets.get(action, {}).get("assets")
+                if isinstance(picker, MultiAssetPicker):
+                    if updated_aliases:
+                        picker.set_value(updated_aliases)
+                    if updated_regs:
+                        picker.set_asset_regions(updated_regs)
+                    if updated_offsets:
+                        picker.set_offsets(updated_offsets)
+
+                if updated_aliases:
+                    self.original["assets"] = list(updated_aliases)
+                    self.original["asset"] = updated_aliases[0]
+                    self._set_field_value(action, "asset", updated_aliases[0])
+                if updated_regs:
+                    self.original["asset_regions"] = updated_regs
+                if updated_offsets:
+                    self.original["asset_offsets"] = updated_offsets
+                if click_target:
+                    self._set_field_value(action, "click_target", click_target)
+                    self.original["click_target"] = click_target
+                    if click_target == "custom_coord":
+                        self._set_field_value(action, "custom_click_x", cx)
+                        self._set_field_value(action, "custom_click_y", cy)
+                        self.original["custom_click_x"] = cx
+                        self.original["custom_click_y"] = cy
+                        self._set_field_value(action, "click_enabled", True)
+                        self.original["click_enabled"] = True
+                    elif click_target in {"each_image", "first_image"}:
+                        self._set_field_value(action, "click_enabled", True)
+                        self.original["click_enabled"] = True
+                    elif click_target == "none":
+                        self._set_field_value(action, "click_enabled", False)
+                        self.original["click_enabled"] = False
+                if updated_cond:
+                    self._set_field_value(action, "match_condition", updated_cond)
+                    self.original["match_condition"] = updated_cond
+                if updated_req >= 0:
+                    self._set_field_value(action, "required_count", updated_req)
+                    self.original["required_count"] = updated_req
+
+                if dlg.step.get("region_window_exe"):
+                    we = str(dlg.step["region_window_exe"])
+                    w = str(dlg.step.get("region_window", ""))
+                    rm = str(dlg.step.get("region_mode", "client"))
+                    rc = str(dlg.step.get("region_coords", "relative"))
+                    self._set_field_value(action, "region_window_exe", we)
+                    self._set_field_value(action, "region_window", w)
+                    self._set_field_value(action, "region_mode", rm)
+                    self._set_field_value(action, "region_coords", rc)
+                    self.original["region_window_exe"] = we
+                    self.original["region_window"] = w
+                    self.original["region_mode"] = rm
+                    self.original["region_coords"] = rc
+
+                bounding = dlg.get_bounding_region()
+                if bounding:
+                    for offset, val in enumerate(bounding):
+                        self._set_field_value(action, f"region.{offset}", val)
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "멀티 이미지 및 영역 보정 완료",
+                    "검색 영역 검사기에서 수정한 이미지, 일치 조건 및 영역이 노드에 성공적으로 적용되었습니다!",
+                )
+                return
+        finally:
+            dlg.deleteLater()
+            win = self.window()
+            if win is not None and hasattr(win, "setEnabled"):
+                win.setEnabled(True)
+                if hasattr(win, "activateWindow"):
+                    win.activateWindow()
 
     def _update_offset_preview(self) -> None:
-        widgets = self.widgets.get("image_search", {})
+        action = self.current_action if self.current_action in {"image_search", "multi_image_search"} else "image_search"
+        widgets = self.widgets.get(action, {})
         combo = widgets.get("asset")
         picker = widgets.get("assets")
         editor = widgets.get("click.offset")
@@ -4475,7 +4851,7 @@ class ActionEditor(QtWidgets.QWidget):
                 continue
             value = get_path(normalized, spec.key, spec.default)
             self._set_widget_value(self.widgets[action][spec.key], spec, value)
-        if action == "image_search":
+        if action in {"image_search", "multi_image_search"}:
             picker = self.widgets[action].get("assets")
             offset_editor = self.widgets[action].get("click.offset")
             if isinstance(offset_editor, OffsetEditor):
@@ -4492,7 +4868,7 @@ class ActionEditor(QtWidgets.QWidget):
             tol_w = self.widgets.get("pixel_search", {}).get("tolerance")
             if isinstance(tol_w, ColorToleranceBarWidget):
                 tol_w.setColor(color_val)
-        if action in {"image_search", "screen_condition"}:
+        if action in {"image_search", "screen_condition", "multi_image_search"}:
             current_engine = str(normalized.get("engine") or "opencv").lower()
             setattr(self, f"_last_engine_{action}", current_engine)
             if not hasattr(self, "_engine_configs"):
@@ -4515,7 +4891,7 @@ class ActionEditor(QtWidgets.QWidget):
         if getattr(self, "_current_search_preset", None):
             payload["search_preset"] = self._current_search_preset
         original_handle_method = str(self.original.get("method") or "") if action == "inactive_click" else ""
-        original_click = self.original.get("click") if action == "image_search" and isinstance(self.original.get("click"), dict) else {}
+        original_click = self.original.get("click") if action in {"image_search", "multi_image_search"} and isinstance(self.original.get("click"), dict) else {}
         payload["action"] = action
         for spec in ACTION_FIELDS.get(action, []):
             if spec.key in COMMON_FIELD_KEYS:
@@ -4525,7 +4901,7 @@ class ActionEditor(QtWidgets.QWidget):
                 remove_path(payload, spec.key)
             else:
                 set_path(payload, spec.key, value)
-        if action == "image_search":
+        if action in {"image_search", "multi_image_search"}:
             # Always respect the user's chosen engine from the combobox
             engine_widget = self.widgets[action].get("engine")
             chosen_engine = str(self._widget_value(engine_widget, FieldSpec("engine", "", "choice", "opencv")) or "opencv").lower() if engine_widget else "opencv"
@@ -4533,12 +4909,20 @@ class ActionEditor(QtWidgets.QWidget):
 
             multi_assets = [str(value) for value in payload.get("assets") or [] if str(value).strip()]
             primary_asset = str(payload.get("asset") or "").strip()
-            if len(multi_assets) > 1:
+            if action == "multi_image_search" or len(multi_assets) > 1:
                 if primary_asset and primary_asset not in multi_assets:
                     multi_assets.insert(0, primary_asset)
                 payload["assets"] = list(dict.fromkeys(multi_assets))
-                payload["asset"] = payload["assets"][0]
+                if payload["assets"]:
+                    payload["asset"] = payload["assets"][0]
+                # The runtime compares multiple templates in one warm OpenCV
+                # request. AHK only receives the first ImageSpec, so persisting
+                # AHK here would make the editor disagree with execution.
                 payload["engine"] = "opencv"
+                if engine_widget is not None:
+                    opencv_index = engine_widget.findData("opencv")
+                    if opencv_index >= 0:
+                        engine_widget.setCurrentIndex(opencv_index)
                 picker = self.widgets[action].get("assets")
                 if isinstance(picker, MultiAssetPicker):
                     offset_editor = self.widgets[action].get("click.offset")
@@ -4560,8 +4944,9 @@ class ActionEditor(QtWidgets.QWidget):
                             max_b = max(int(r[3]) for r in asset_regs.values())
                             if max_r > min_l and max_b > min_t:
                                 payload["region"] = [min_l, min_t, max_r, max_b]
-                                payload["region_mode"] = "client"
-                                payload["region_coords"] = "relative"
+                                mode = str(payload.get("region_mode") or "client").casefold()
+                                payload["region_mode"] = mode if mode in {"screen", "window", "client"} else "client"
+                                payload["region_coords"] = "screen" if payload["region_mode"] == "screen" else "relative"
                         except Exception:
                             pass
                     else:
@@ -4577,7 +4962,28 @@ class ActionEditor(QtWidgets.QWidget):
                 payload.pop("asset_offsets", None)
                 payload.pop("asset_confidences", None)
                 payload.pop("asset_regions", None)
-            click_enabled = bool(payload.pop("click_enabled", False))
+            click_target = str(payload.get("click_target") or "").lower().strip()
+            if click_target in {"each_image", "first_image", "custom_coord"}:
+                click_enabled = True
+                payload["click_enabled"] = True
+                if click_target == "each_image":
+                    payload["search_mode"] = "all"
+                    payload["all_action"] = "click_all"
+                elif click_target == "first_image":
+                    payload["search_mode"] = "first"
+            elif click_target == "none":
+                click_enabled = False
+                payload["click_enabled"] = False
+            else:
+                click_enabled = bool(payload.get("click_enabled", False))
+                payload["click_enabled"] = click_enabled
+
+            if click_target == "custom_coord":
+                if "click" not in payload or not isinstance(payload["click"], dict):
+                    payload["click"] = dict(original_click or {})
+                payload["click"].setdefault("mode", "inactive")
+                payload["click"].setdefault("button", "Left")
+
             region2 = payload.pop("region2", None)
             region = payload.get("region")
             def valid_region(value: Any) -> bool:
@@ -4600,7 +5006,7 @@ class ActionEditor(QtWidgets.QWidget):
             else:
                 payload.pop("regions", None)
                 payload.pop("region", None)
-            if not click_enabled:
+            if not click_enabled and click_target != "custom_coord":
                 payload.pop("click", None)
             elif str(original_click.get("method") or "") == "handle_probe" and isinstance(payload.get("click"), dict):
                 payload["click"]["method"] = "handle_probe"
@@ -4743,6 +5149,11 @@ class ActionEditorDialog(QtWidgets.QDialog):
         super().__init__(parent)
         action = str(step.get("action") or "wait")
         raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
+        raw_assets = step.get("assets") if isinstance(step.get("assets"), list) else []
+        is_multi_image = (
+            action == "multi_image_search"
+            or (action == "image_search" and len(raw_assets) > 1)
+        )
         is_multi_pixel = (
             action == "pixel_search"
             and (
@@ -4751,8 +5162,9 @@ class ActionEditorDialog(QtWidgets.QDialog):
                 or "멀티" in str(step.get("label") or "")
             )
         )
-        if action == "image_search" and len(step.get("assets") or []) > 1:
-            action_name = "멀티 이미지 서치"
+        if is_multi_image:
+            count = len(raw_assets)
+            action_name = f"멀티 이미지 서치 ({count}개)" if count > 0 else "멀티 이미지 서치"
         elif is_multi_pixel:
             count = len(raw_colors) or int((step.get("_automation") or {}).get("color_count") or 1)
             action_name = f"멀티 색상 서치 ({count}개)" if count > 1 else "멀티 색상 서치"
@@ -4777,17 +5189,24 @@ class ActionEditorDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         title = QtWidgets.QLabel(action_name)
-        title.setStyleSheet("font-size:17pt; font-weight:800; color:#38E7FF;" if is_multi_pixel else "font-size:17pt; font-weight:800;")
-        hint_text = (
-            "멀티 색상 서치 노드의 조건을 편집합니다. 여러 색상의 개별 오차 및 영역은 '색상 서치 / 영역 검증' 창에서 시각적으로 확인하고 미세조정할 수 있습니다."
-            if is_multi_pixel
-            else "긴 설정을 넓은 창에서 편집합니다. '설정 저장'을 누르면 단계와 매크로 파일에 즉시 반영됩니다."
-        )
+        title_color = "#38BDF8" if is_multi_image else ("#38E7FF" if is_multi_pixel else "#FFFFFF")
+        title.setStyleSheet(f"font-size:17pt; font-weight:800; color:{title_color};")
+        if is_multi_image:
+            hint_text = "여러 이미지를 동시에 검색하고 일치 조건을 판별합니다. 이미지 추가 및 영역/신뢰도 설정은 상단의 '미리보기 설정창'에서 직접 화면을 보며 편리하게 조절할 수 있습니다."
+        elif is_multi_pixel:
+            hint_text = "멀티 색상 서치 노드의 조건을 편집합니다. 여러 색상의 개별 오차 및 영역은 '색상 서치 / 영역 검증' 창에서 시각적으로 확인하고 미세조정할 수 있습니다."
+        else:
+            hint_text = "긴 설정을 넓은 창에서 편집합니다. '설정 저장'을 누르면 단계와 매크로 파일에 즉시 반영됩니다."
         hint = QtWidgets.QLabel(hint_text)
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(hint)
+
+        self.repository = repository
+        self.editor = ActionEditor(repository)
+        self.editor.refresh_sources()
+        self.editor.load_step(step)
 
         self.multi_color_card: QtWidgets.QFrame | None = None
         if is_multi_pixel:
@@ -4805,9 +5224,22 @@ class ActionEditorDialog(QtWidgets.QDialog):
             layout.addWidget(self.multi_color_card)
             self._build_multi_color_card(step)
 
-        self.editor = ActionEditor(repository)
-        self.editor.refresh_sources()
-        self.editor.load_step(step)
+        self.multi_image_card: QtWidgets.QFrame | None = None
+        if is_multi_image:
+            self.multi_image_card = QtWidgets.QFrame()
+            self.multi_image_card.setObjectName("MultiImageSummaryCard")
+            self.multi_image_card.setStyleSheet("""
+                QFrame#MultiImageSummaryCard {
+                    background: #141A26;
+                    border: 1px solid #2B384E;
+                    border-left: 4px solid #38BDF8;
+                    border-radius: 8px;
+                    padding: 4px;
+                }
+            """)
+            layout.addWidget(self.multi_image_card)
+            self._build_multi_image_card(step)
+
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
         buttons.button(QtWidgets.QDialogButtonBox.Save).setText("설정 저장")
         buttons.accepted.connect(self.accept)
@@ -4910,10 +5342,130 @@ class ActionEditorDialog(QtWidgets.QDialog):
         chips_layout.addStretch(1)
         card_layout.addLayout(chips_layout)
 
+    def _build_multi_image_card(self, step: dict[str, Any]) -> None:
+        if not self.multi_image_card:
+            return
+        if self.multi_image_card.layout() is not None:
+            QtWidgets.QWidget().setLayout(self.multi_image_card.layout())
+        card_layout = QtWidgets.QVBoxLayout(self.multi_image_card)
+        card_layout.setContentsMargins(6, 6, 6, 6)
+        card_layout.setSpacing(6)
+
+        header_row = QtWidgets.QHBoxLayout()
+        raw_assets = step.get("assets") if isinstance(step.get("assets"), list) else []
+        regs = step.get("asset_regions") if isinstance(step.get("asset_regions"), dict) else {}
+        offsets = step.get("asset_offsets") if isinstance(step.get("asset_offsets"), dict) else {}
+        base_reg = step.get("search_region") or step.get("region") or [0, 0, 0, 0]
+
+        cond = str(step.get("match_condition") or "all_matched")
+        cond_labels = {
+            "all_matched": "모든 이미지 일치 시 참 (AND)",
+            "at_least_1": "1개 이상 일치 시 참 (OR)",
+            "at_least_n": f"{step.get('required_count', len(raw_assets))}개 이상 일치 시 참",
+            "exact_n": f"정확히 {step.get('required_count', len(raw_assets))}개 일치 시 참",
+        }
+        cond_text = cond_labels.get(cond, cond)
+        click_target = str(step.get("click_target") or "each_image")
+        target_labels = {
+            "each_image": "각 이미지 클릭(개별 오프셋)",
+            "first_image": "첫 이미지 클릭",
+            "custom_coord": f"지정 좌표 클릭({step.get('custom_click_x', 0)}, {step.get('custom_click_y', 0)})",
+            "none": "클릭 안 함",
+        }
+        target_text = target_labels.get(click_target, click_target)
+
+        title_lbl = QtWidgets.QLabel(f"🖼️ <b>멀티 이미지 그룹</b> ({len(raw_assets)}개 이미지) · 판정: <span style='color:#38BDF8;'>{cond_text}</span> · 동작: <span style='color:#A5B4FC;'>{target_text}</span>")
+        title_lbl.setStyleSheet("font-size: 9.3pt; color: #E2E8F0;")
+        header_row.addWidget(title_lbl, 1)
+
+        btn_verify = QtWidgets.QPushButton("🔍 멀티 이미지 시각화 및 실시간 검사 (미리보기 열기)")
+        btn_verify.setStyleSheet("""
+            QPushButton {
+                background: #0C4A6E;
+                color: #38BDF8;
+                border: 1px solid #0284C7;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-weight: bold;
+                font-size: 8.8pt;
+            }
+            QPushButton:hover {
+                background: #0284C7;
+                color: #FFFFFF;
+            }
+        """)
+        btn_verify.clicked.connect(self._open_region_visual_test_and_refresh)
+        header_row.addWidget(btn_verify)
+        card_layout.addLayout(header_row)
+
+        if not raw_assets:
+            no_asset_lbl = QtWidgets.QLabel("등록된 이미지가 없습니다. 위의 [🔍 멀티 이미지 시각화 및 실시간 검사 (미리보기 열기)] 버튼을 눌러 화면을 보며 이미지를 캡처/추가하세요.")
+            no_asset_lbl.setStyleSheet("color: #94A3B8; font-size: 8.5pt; padding: 4px;")
+            card_layout.addWidget(no_asset_lbl)
+        else:
+            chips_layout = QtWidgets.QHBoxLayout()
+            chips_layout.setSpacing(8)
+            for idx, ast in enumerate(raw_assets, 1):
+                ast_str = str(ast).strip()
+                reg_val = regs.get(ast_str, base_reg)
+                reg_str = f"[{reg_val[0]}, {reg_val[1]}, {reg_val[2]}, {reg_val[3]}]" if len(reg_val) >= 4 and reg_val != [0, 0, 0, 0] else "전체"
+                off_val = offsets.get(ast_str, [0, 0])
+                ox = int(off_val[0]) if isinstance(off_val, (list, tuple)) and len(off_val) >= 1 else 0
+                oy = int(off_val[1]) if isinstance(off_val, (list, tuple)) and len(off_val) >= 2 else 0
+                off_str = f"오프셋 ({ox:+d}, {oy:+d})" if (ox or oy) else "오프셋 (0, 0)"
+
+                chip = QtWidgets.QFrame()
+                chip.setStyleSheet("""
+                    QFrame {
+                        background: #1A2234;
+                        border: 1px solid #2E3E5B;
+                        border-radius: 6px;
+                        padding: 2px 6px;
+                    }
+                """)
+                c_layout = QtWidgets.QHBoxLayout(chip)
+                c_layout.setContentsMargins(4, 2, 4, 2)
+                c_layout.setSpacing(6)
+
+                idx_lbl = QtWidgets.QLabel(f"<b>#{idx}</b>")
+                idx_lbl.setStyleSheet("color: #A0AEC0; font-size: 8.5pt;")
+                c_layout.addWidget(idx_lbl)
+
+                if getattr(self, "repository", None):
+                    path = self.repository.asset_path(ast_str)
+                    if path and path.is_file():
+                        thumb_pix = QtGui.QPixmap(str(path))
+                        if not thumb_pix.isNull():
+                            thumb_lbl = QtWidgets.QLabel()
+                            thumb_lbl.setFixedSize(20, 20)
+                            thumb_lbl.setPixmap(thumb_pix.scaled(20, 20, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+                            c_layout.addWidget(thumb_lbl)
+
+                ast_lbl = QtWidgets.QLabel(f"<code>{ast_str}</code>")
+                ast_lbl.setStyleSheet("color: #38BDF8; font-weight: bold; font-size: 8.5pt;")
+                c_layout.addWidget(ast_lbl)
+
+                reg_lbl = QtWidgets.QLabel(f"영역 {reg_str}")
+                reg_lbl.setStyleSheet("color: #CBD5E0; font-size: 8.2pt;")
+                c_layout.addWidget(reg_lbl)
+
+                off_lbl = QtWidgets.QLabel(off_str)
+                off_lbl.setStyleSheet("color: #7DD3FC; font-size: 8.2pt; font-weight: 600;")
+                c_layout.addWidget(off_lbl)
+
+                chips_layout.addWidget(chip)
+            chips_layout.addStretch(1)
+            card_layout.addLayout(chips_layout)
+
     def _open_region_visual_test_and_refresh(self) -> None:
-        self.editor._open_region_visual_test()
-        step = self.editor.build_step()
-        self._build_multi_color_card(step)
+        try:
+            self.editor._open_region_visual_test()
+            step = self.editor.build_step()
+            self._build_multi_color_card(step)
+            self._build_multi_image_card(step)
+        finally:
+            self.setEnabled(True)
+            self.activateWindow()
 
     def done(self, r: int) -> None:
         try:

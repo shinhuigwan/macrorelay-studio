@@ -77,6 +77,7 @@ CATEGORIZED_ACTIONS: list[tuple[str, str, list[tuple[str, str, str]]]] = [
     ]),
     ("🖼️ 화면 & 이미지", "#35C89A", [
         ("image_search", "이미지 서치", "화면에서 이미지를 찾아 중심 또는 오프셋을 클릭합니다."),
+        ("multi_image_search", "멀티 이미지 서치", "여러 이미지를 동시에 탐색하고 일치 조건(전체/일부)을 판별합니다."),
         ("screen_condition", "화면 조건", "이미지가 화면에 있는지 확인하여 성공/실패로 분기합니다."),
     ]),
     ("🎯 색상 & 픽셀", "#FF6B9D", [
@@ -1415,6 +1416,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.comments_changed.connect(self._graph_comments_changed)
         self.node_canvas.link_requested.connect(self._connect_graph_nodes)
         self.node_canvas.edge_delete_requested.connect(self._delete_graph_edge)
+        self.node_canvas.edges_delete_requested.connect(self._delete_graph_edges_batch)
         self.node_canvas.edge_delay_requested.connect(self._set_graph_edge_delay)
         self.node_canvas.edge_condition_delete_requested.connect(self._delete_graph_condition)
         self.node_canvas.edge_condition_retarget_requested.connect(self._retarget_graph_condition)
@@ -1426,6 +1428,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.log_requested.connect(self._open_logs)
         self.node_canvas.image_edit_requested.connect(self._edit_node_search_image)
         self.node_canvas.color_visual_test_requested.connect(self._open_node_color_visual_test)
+        self.node_canvas.image_visual_test_requested.connect(self._open_node_image_visual_test)
         self.node_canvas.multi_image_merge_requested.connect(
             lambda indexes: QtCore.QTimer.singleShot(
                 0, lambda values=list(indexes): self._merge_graph_image_nodes(values)
@@ -1623,6 +1626,9 @@ class BuilderPage(QtWidgets.QWidget):
         if not 0 <= row < len(steps):
             return
         step = steps[row]
+        if str(step.get("action") or "") == "multi_image_search":
+            self._open_node_image_visual_test(step_index)
+            return
         if str(step.get("action") or "") not in {"image_search", "screen_condition"}:
             return
         aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
@@ -2460,28 +2466,107 @@ class BuilderPage(QtWidgets.QWidget):
                     break
         from .region_visual_test import RegionVisualTestDialog
         dlg = RegionVisualTestDialog(step, self.repository, parent=self.window())
-        if dlg.exec() == QtWidgets.QDialog.Accepted:
-            if dlg.step.get("region_window_exe"):
-                step["region_window_exe"] = dlg.step["region_window_exe"]
-                step["region_window"] = dlg.step.get("region_window", "")
-                step["region_mode"] = dlg.step.get("region_mode", "client")
-                step["region_coords"] = dlg.step.get("region_coords", "relative")
-            updated_color_regs = dlg.get_color_regions()
-            if updated_color_regs:
-                step["color_regions"] = updated_color_regs
-            updated_tols = dlg.get_color_tolerances()
-            if updated_tols:
-                step["color_tolerances"] = updated_tols
-                if step.get("color") in updated_tols:
-                    step["tolerance"] = updated_tols[step["color"]]
-                elif updated_tols:
-                    step["tolerance"] = next(iter(updated_tols.values()))
-            bounding = dlg.get_bounding_region()
-            if bounding:
-                step["search_region"] = bounding
-                step["region"] = bounding
-            self._persist(f"{step_index}번 노드의 색상 및 검색 영역을 보정했습니다.")
-            self._refresh_steps(row)
+        try:
+            if dlg.exec() == QtWidgets.QDialog.Accepted:
+                if dlg.step.get("region_window_exe"):
+                    step["region_window_exe"] = dlg.step["region_window_exe"]
+                    step["region_window"] = dlg.step.get("region_window", "")
+                    step["region_mode"] = dlg.step.get("region_mode", "client")
+                    step["region_coords"] = dlg.step.get("region_coords", "relative")
+                updated_color_regs = dlg.get_color_regions()
+                if updated_color_regs:
+                    step["color_regions"] = updated_color_regs
+                updated_tols = dlg.get_color_tolerances()
+                if updated_tols:
+                    step["color_tolerances"] = updated_tols
+                    if step.get("color") in updated_tols:
+                        step["tolerance"] = updated_tols[step["color"]]
+                    elif updated_tols:
+                        step["tolerance"] = next(iter(updated_tols.values()))
+                bounding = dlg.get_bounding_region()
+                if bounding:
+                    step["search_region"] = bounding
+                    step["region"] = bounding
+                self._persist(f"{step_index}번 노드의 색상 및 검색 영역을 보정했습니다.")
+                self._refresh_steps(row)
+        finally:
+            dlg.deleteLater()
+            win = self.window()
+            if win is not None and hasattr(win, "setEnabled"):
+                win.setEnabled(True)
+                if hasattr(win, "activateWindow"):
+                    win.activateWindow()
+
+    def _open_node_image_visual_test(self, step_index: int) -> None:
+        steps = list((self.current_macro or {}).get("steps") or [])
+        row = int(step_index) - 1
+        if not 0 <= row < len(steps):
+            return
+        step = steps[row]
+        if str(step.get("action") or "") not in {"image_search", "screen_condition", "multi_image_search"}:
+            return
+        # Auto-inherit target window from macro if not set
+        if not step.get("region_window_exe"):
+            for candidate in reversed(steps):
+                c_exe = str(candidate.get("window_exe") or candidate.get("region_window_exe") or (candidate.get("click") or {}).get("window_exe") or "")
+                c_win = str(candidate.get("window") or candidate.get("region_window") or (candidate.get("click") or {}).get("window") or "")
+                if c_exe:
+                    step["region_mode"] = "client"
+                    step["region_coords"] = "relative"
+                    step["region_window_exe"] = c_exe
+                    step["region_window"] = c_win
+                    break
+        from .region_visual_test import RegionVisualTestDialog
+        dlg = RegionVisualTestDialog(step, self.repository, parent=self.window())
+        try:
+            if dlg.exec() == QtWidgets.QDialog.Accepted:
+                if dlg.step.get("region_window_exe"):
+                    step["region_window_exe"] = dlg.step["region_window_exe"]
+                    step["region_window"] = dlg.step.get("region_window", "")
+                    step["region_mode"] = dlg.step.get("region_mode", "client")
+                    step["region_coords"] = dlg.step.get("region_coords", "relative")
+                aliases = dlg.get_aliases()
+                if aliases:
+                    step["assets"] = aliases
+                    step["asset"] = aliases[0]
+                updated_regs = dlg.get_asset_regions()
+                if updated_regs:
+                    step["asset_regions"] = updated_regs
+                offsets = dlg.get_asset_offsets()
+                if offsets:
+                    step["asset_offsets"] = offsets
+                click_target = dlg.get_click_target()
+                if click_target:
+                    step["click_target"] = click_target
+                    if click_target == "custom_coord":
+                        cx, cy = dlg.get_custom_click_coords()
+                        step["custom_click_x"] = cx
+                        step["custom_click_y"] = cy
+                        step["click_enabled"] = True
+                    elif click_target in {"each_image", "first_image"}:
+                        step["click_enabled"] = True
+                    elif click_target == "none":
+                        step["click_enabled"] = False
+                cond = dlg.get_match_condition()
+                if cond:
+                    step["match_condition"] = cond
+                req_cnt = dlg.get_required_count()
+                if req_cnt >= 0:
+                    step["required_count"] = req_cnt
+                bounding = dlg.get_bounding_region()
+                if bounding:
+                    step["search_region"] = bounding
+                    step["region"] = bounding
+                    step["regions"] = [bounding]
+                self._persist(f"{step_index}번 노드의 멀티 이미지 및 검색 영역을 보정했습니다.")
+                self._refresh_steps(row)
+        finally:
+            dlg.deleteLater()
+            win = self.window()
+            if win is not None and hasattr(win, "setEnabled"):
+                win.setEnabled(True)
+                if hasattr(win, "activateWindow"):
+                    win.activateWindow()
 
     @QtCore.Slot(int, int, str)
     def _delete_graph_edge(self, source: int, target: int, kind: str) -> None:
@@ -2501,6 +2586,83 @@ class BuilderPage(QtWidgets.QWidget):
             steps[source - 1].pop(delay_field, None)
         self._persist(f"{source}번 노드의 연결을 끊었습니다.")
         QtCore.QTimer.singleShot(0, lambda: self._refresh_steps(source - 1))
+
+    @QtCore.Slot(list)
+    def _delete_graph_edges_batch(self, edge_specs: list[dict[str, Any]]) -> None:
+        if not edge_specs:
+            return
+        steps = (self.current_macro or {}).get("steps") or []
+        if not steps:
+            return
+
+        # 1. Condition edges: group by source and pop in descending index order
+        cond_specs = [spec for spec in edge_specs if spec.get("is_condition")]
+        cond_by_source: dict[int, list[int]] = {}
+        for spec in cond_specs:
+            src = int(spec.get("source") or 0)
+            idx = int(spec.get("condition_index", -1))
+            if 0 < src <= len(steps) and idx >= 0:
+                cond_by_source.setdefault(src, []).append(idx)
+
+        for src, idxs in cond_by_source.items():
+            rules = steps[src - 1].get("edge_conditions") or []
+            if isinstance(rules, list):
+                for idx in sorted(set(idxs), reverse=True):
+                    if 0 <= idx < len(rules):
+                        rules.pop(idx)
+                if not rules:
+                    steps[src - 1].pop("edge_conditions", None)
+
+        # 2. Non-condition edges
+        non_cond_specs = [spec for spec in edge_specs if not spec.get("is_condition")]
+        affected_sources = set(cond_by_source.keys())
+
+        for spec in non_cond_specs:
+            src = int(spec.get("source") or 0)
+            target = int(spec.get("target") or 0)
+            kind = str(spec.get("kind") or "success")
+            if not (0 < src <= len(steps)):
+                continue
+
+            step = steps[src - 1]
+            field = "on_fail" if kind == "fail" else "on_success"
+            delay_field = "on_fail_delay" if kind == "fail" else "on_success_delay"
+
+            # Check success_candidates
+            candidates = step.get("success_candidates") or []
+            if kind == "success" and isinstance(candidates, list) and target in [int(value) for value in candidates]:
+                new_cands = [int(value) for value in candidates if int(value) != target]
+                configure_success_candidates(steps, src, new_cands)
+                if not step.get("success_candidates"):
+                    step.pop(delay_field, None)
+                affected_sources.add(src)
+                continue
+
+            # Check fail_candidates
+            fail_cands = step.get("fail_candidates") or []
+            if kind == "fail" and isinstance(fail_cands, list) and target in [int(value) for value in fail_cands]:
+                new_fail_cands = [int(value) for value in fail_cands if int(value) != target]
+                if new_fail_cands:
+                    step["fail_candidates"] = new_fail_cands
+                else:
+                    step.pop("fail_candidates", None)
+                    step.pop(delay_field, None)
+                affected_sources.add(src)
+                continue
+
+            # Normal on_success or on_fail
+            if int(step.get(field) or 0) == target:
+                step.pop(field, None)
+                if kind != "success" or not step.get("success_candidates"):
+                    step.pop(delay_field, None)
+                affected_sources.add(src)
+
+        if affected_sources:
+            total_count = len(edge_specs)
+            self._persist(f"{total_count}개의 노드 연결선을 삭제했습니다.")
+            self.node_canvas.rebuild_edges()
+            refresh_row = min(affected_sources) - 1
+            QtCore.QTimer.singleShot(0, lambda: self._refresh_steps(refresh_row))
 
     @QtCore.Slot(int, int, str)
     def _set_graph_edge_delay(self, source: int, target: int, kind: str) -> None:
@@ -2764,12 +2926,15 @@ class BuilderPage(QtWidgets.QWidget):
             step = deepcopy(ACTION_TEMPLATES.get(action, {}))
             step["action"] = action
 
-        if action in {"image_search", "screen_condition", "pixel_search", "ocr", "ocr_tracking"} and not step.get("region_window_exe"):
-            if action in {"image_search", "screen_condition"}:
+        if action in {"image_search", "screen_condition", "pixel_search", "ocr", "ocr_tracking", "multi_image_search"} and not step.get("region_window_exe"):
+            if action in {"image_search", "screen_condition", "multi_image_search"}:
                 step.setdefault("engine", "opencv")
-                step.setdefault("search_profile", "precise")
+                step.setdefault("search_profile", "fast")
                 step.setdefault("confidence", 85)
                 step.setdefault("wait_condition", "appear")
+                if action == "multi_image_search":
+                    step.setdefault("match_condition", "all_matched")
+                    step.setdefault("assets", [])
             for candidate in reversed(steps):
                 c_exe = str(candidate.get("window_exe") or candidate.get("region_window_exe") or (candidate.get("click") or {}).get("window_exe") or "")
                 c_win = str(candidate.get("window") or candidate.get("region_window") or (candidate.get("click") or {}).get("window") or "")
@@ -2778,7 +2943,7 @@ class BuilderPage(QtWidgets.QWidget):
                     step["region_coords"] = "relative"
                     step["region_window_exe"] = c_exe
                     step["region_window"] = c_win
-                    if action in {"image_search", "screen_condition"}:
+                    if action in {"image_search", "screen_condition", "multi_image_search"}:
                         click = step.setdefault("click", {})
                         click["mode"] = "inactive"
                         click["window_exe"] = c_exe
@@ -3185,11 +3350,19 @@ class BuilderPage(QtWidgets.QWidget):
         self.status.emit("스마트 녹화 준비 · 실시간 노드맵 · F5 확인 · F7 새 작업 · F8 캡처 · F10 종료")
 
     @staticmethod
-    def _recording_notice_hidden_today() -> bool:
+    def _studio_settings() -> QtCore.QSettings:
+        settings = QtCore.QSettings("MacroRelay", "Studio")
+        if settings.isWritable():
+            return settings
+        config_dir = Path(QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.AppConfigLocation))
+        config_dir.mkdir(parents=True, exist_ok=True)
+        return QtCore.QSettings(str(config_dir / "macrorelay-studio.ini"), QtCore.QSettings.IniFormat)
+
+    @staticmethod
+    def _recording_notice_hidden_today(settings: QtCore.QSettings | None = None) -> bool:
         today = QtCore.QDate.currentDate().toString(QtCore.Qt.ISODate)
-        hidden_date = str(
-            QtCore.QSettings("MacroRelay", "Studio").value("smart_recording/hide_notice_date", "") or ""
-        )
+        settings = settings or BuilderPage._studio_settings()
+        hidden_date = str(settings.value("smart_recording/hide_notice_date", "") or "")
         return hidden_date == today
 
     def _confirm_smart_recording(self) -> bool:
@@ -3215,10 +3388,12 @@ class BuilderPage(QtWidgets.QWidget):
         message.setCheckBox(hide_today)
         accepted = message.exec() == QtWidgets.QMessageBox.Yes
         if accepted and hide_today.isChecked():
-            QtCore.QSettings("MacroRelay", "Studio").setValue(
+            settings = self._studio_settings()
+            settings.setValue(
                 "smart_recording/hide_notice_date",
                 QtCore.QDate.currentDate().toString(QtCore.Qt.ISODate),
             )
+            settings.sync()
         return accepted
 
     @QtCore.Slot(list)

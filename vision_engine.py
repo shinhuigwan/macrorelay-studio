@@ -381,6 +381,21 @@ class VisionState:
                     image_key = str(prepared["path"]).casefold()
                     self.last_hits[image_key] = (center_x, center_y, width, height)
                     canvas_width, canvas_height = prepared.get("canvas_size") or (width, height)
+                    matches_list = []
+                    csv_parts = []
+                    for t_idx in sorted(cycle_matched_templates.keys()):
+                        m_conf, m_idx, m_cx, m_cy, m_w, m_h, m_prep = cycle_matched_templates[t_idx]
+                        matches_list.append({
+                            "index": m_idx + 1,
+                            "x": m_cx,
+                            "y": m_cy,
+                            "width": m_w,
+                            "height": m_h,
+                            "confidence": round(m_conf, 4),
+                            "path": str(m_prep.get("path") or ""),
+                        })
+                        csv_parts.append(f"{m_idx + 1},{m_cx},{m_cy},{m_w},{m_h}")
+                    matches_csv = "|".join(csv_parts)
                     return {
                         "ok": True,
                         "found": True,
@@ -394,6 +409,8 @@ class VisionState:
                         "source_height": int(canvas_height),
                         "match_index": index + 1,
                         "matched_image": str(prepared["path"]),
+                        "matches": matches_list,
+                        "matches_csv": matches_csv,
                         "match_count": cycle_count,
                         "required_count": target_count,
                         "image_count": len(prepared_items),

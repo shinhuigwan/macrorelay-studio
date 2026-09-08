@@ -51,6 +51,7 @@ ACTIONS = [
     "multi_pixel_check",
     "wait_color",
     "color_ratio",
+    "multi_image_search",
 ]
 
 
@@ -2480,6 +2481,7 @@ def render_image_search(
     region_width = f"{region_prefix}_width"
     region_height = f"{region_prefix}_height"
     region_hwnd = f"{region_prefix}_hwnd"
+    region_valid = f"{region_prefix}_target_valid"
     all_action = str(step.get("all_action") or "").strip().lower()
     match_condition = str(step.get("match_condition") or "at_least_1").strip().lower()
     required_count = int(step.get("required_count") or 0)
@@ -2562,19 +2564,16 @@ def render_image_search(
             f"{region_prefix}UseBase := ({region_prefix}Coords = \"relative\")",
             f"{region_base_x} := 0",
             f"{region_base_y} := 0",
-            f"{region_width} := A_ScreenWidth",
-            f"{region_height} := A_ScreenHeight",
+            f"{region_width} := ({region_prefix}Mode = \"screen\" ? VirtualRight - VirtualLeft + 1 : 0)",
+            f"{region_height} := ({region_prefix}Mode = \"screen\" ? VirtualBottom - VirtualTop + 1 : 0)",
             f'{region_hwnd} := ""',
+            f'{region_valid} := ({region_prefix}Mode = "screen")',
             f'if ({region_prefix}Mode = "window" or {region_prefix}Mode = "client")',
             "{",
-            f'    if ("{region_window_text}" != "")',
-            f'        {region_hwnd} := WinExist("{region_window_text}")',
-            f'    if (!{region_hwnd} and "{region_window_exe_text}" != "")',
-            f'        {region_hwnd} := WinExist("ahk_exe {region_window_exe_text}")',
-            f"    if (!{region_hwnd})",
-            f'        {region_hwnd} := WinExist("A")',
+            f'    {region_hwnd} := EnsureTargetWindow({region_hwnd}, "{region_window_text}", "{region_window_exe_text}")',
             f"    if ({region_hwnd})",
             "    {",
+            f"        {region_valid} := 1",
             f'        if ({region_prefix}Mode = "window")',
             "        {",
             f"            WinGetPos, {region_base_x}, {region_base_y}, {region_width}, {region_height}, ahk_id %{region_hwnd}%",
@@ -2593,6 +2592,8 @@ def render_image_search(
             f"            {region_base_y} := NumGet({region_prefix}_pt, 4, \"int\")",
             "        }",
             "    }",
+            "    else",
+            f'        Log("image search target window not found: {ahk_quote(region_window or region_window_exe)}")',
             "}",
         ]
     )
@@ -2952,6 +2953,13 @@ def render_image_search(
     lines.append(f'MatchedImageName := "{ahk_quote(alias)}"')
     if len(asset_files) > 1:
         lines.append("MatchedImageIndex := 0")
+    target_missing_label = f"__step_{step_index}_image_target_missing"
+    lines.append(f"if (!{region_valid})")
+    lines.append("{")
+    lines.append("    ErrorLevel := 1")
+    lines.append(f"    {found_var} := 0")
+    lines.append(f"    goto {target_missing_label}")
+    lines.append("}")
     if engine == "opencv":
         threshold = 0.86
         if confidence is not None:
@@ -3103,6 +3111,7 @@ def render_image_search(
                 "}",
             ]
         )
+    lines.append(f"{target_missing_label}:")
     lines.append("if (ErrorLevel = 2)")
     lines.append("{")
     if engine == "opencv":
@@ -3195,7 +3204,208 @@ def render_image_search(
         lines.append(f"    {prefix} (MatchedImageIndex = {match_index})")
         lines.append(f'        MatchedImageName := "{ahk_quote(candidate_alias)}"')
     lines.append(f'    Log("✅ [이미지 검색 성공] 대상: {alias} (화면 발견 위치: X=" . FoundX . ", Y=" . FoundY . " 발견=" . {store_count_var} . "개)")')
-    if click_info and all_action != "count_only":
+    click_target = str(step.get("click_target") or "").strip().lower()
+    if not click_target:
+        if bool(step.get("click_enabled")):
+            if str(step.get("search_mode") or "").lower() == "all" and str(step.get("all_action") or "").lower() == "click_all":
+                click_target = "each_image"
+            elif step.get("custom_click_x") is not None and (int(step.get("custom_click_x") or 0) or int(step.get("custom_click_y") or 0)):
+                click_target = "custom_coord"
+            else:
+                click_target = "first_image"
+        elif step.get("custom_click_x") is not None and (int(step.get("custom_click_x") or 0) or int(step.get("custom_click_y") or 0)):
+            click_target = "custom_coord"
+        elif click_info and all_action != "count_only":
+            click_target = "first_image"
+        else:
+            click_target = "none"
+
+    if click_target == "none" or all_action == "count_only":
+        lines.append('    Log("image click skipped: click_target is none or count_only (조건 분기만 실행)")')
+    elif click_target == "custom_coord":
+        custom_x = int(step.get("custom_click_x") or 0)
+        custom_y = int(step.get("custom_click_y") or 0)
+        click_payload = dict(click_info or {})
+        click_mode = str(click_payload.get("mode") or step.get("click_mode") or "inactive").lower()
+        click_count = max(1, int(click_payload.get("count") or step.get("click_count") or 1))
+        click_btn = str(click_payload.get("button") or "Left")
+
+        lines.append(f'    ; ── 조건 일치 시 지정 좌표 클릭 ──')
+        lines.append(f'    Log("🎯 [조건 만족 클릭] 멀티 이미지 조건 만족으로 지정 좌표(X={custom_x}, Y={custom_y}) {click_count}회 클릭을 실행합니다. (방식: {click_mode})")')
+        lines.append(f"    if (MacroDryRun)")
+        lines.append(f"    {{")
+        lines.append(f'        Log("dry-run custom click predicted: {custom_x},{custom_y}")')
+        lines.append(f'        SetLastClick({custom_x}, {custom_y}, "dry-run-custom")')
+        lines.append(f"    }}")
+        lines.append(f"    else")
+        lines.append(f"    {{")
+        if click_mode == "active":
+            lines.append(f"        CoordMode, Mouse, Screen")
+            lines.append(f"        __target_hwnd := {region_hwnd}")
+            lines.append(f"        if (!__target_hwnd and \"{region_window_text}\" != \"\")")
+            lines.append(f'            __target_hwnd := WinExist("{region_window_text}")')
+            lines.append(f"        if (!__target_hwnd and \"{region_window_exe_text}\" != \"\")")
+            lines.append(f'            __target_hwnd := WinExist("ahk_exe {region_window_exe_text}")')
+            lines.append(f"        if (__target_hwnd)")
+            lines.append(f"        {{")
+            lines.append(f"            VarSetCapacity(__pt, 8, 0)")
+            lines.append(f"            NumPut({custom_x}, __pt, 0, \"Int\")")
+            lines.append(f"            NumPut({custom_y}, __pt, 4, \"Int\")")
+            lines.append(f'            DllCall("ClientToScreen", "Ptr", __target_hwnd, "Ptr", &__pt)')
+            lines.append(f'            __sx := NumGet(__pt, 0, "Int")')
+            lines.append(f'            __sy := NumGet(__pt, 4, "Int")')
+            lines.append(f"            WinActivate, ahk_id %__target_hwnd%")
+            lines.append(f"            WinWaitActive, ahk_id %__target_hwnd%, , 0.5")
+            lines.append(f"            Click, %__sx%, %__sy%, {click_btn}, {click_count}")
+            lines.append(f'            SetLastClick(__sx, __sy, "foreground")')
+            lines.append(f"        }}")
+            lines.append(f"        else")
+            lines.append(f"        {{")
+            lines.append(f"            Click, {custom_x}, {custom_y}, {click_btn}, {click_count}")
+            lines.append(f'            SetLastClick({custom_x}, {custom_y}, "foreground")')
+            lines.append(f"        }}")
+            lines.append(f"        CoordMode, Mouse, %MacroMouseCoordMode%")
+        else:
+            lines.append(f"        __target_hwnd := {region_hwnd}")
+            lines.append(f"        if (!__target_hwnd and \"{region_window_text}\" != \"\")")
+            lines.append(f'            __target_hwnd := WinExist("{region_window_text}")')
+            lines.append(f"        if (!__target_hwnd and \"{region_window_exe_text}\" != \"\")")
+            lines.append(f'            __target_hwnd := WinExist("ahk_exe {region_window_exe_text}")')
+            lines.append(f"        if (!__target_hwnd)")
+            lines.append(f'            __target_hwnd := WinExist("A")')
+            lines.append(f"        if (__target_hwnd)")
+            lines.append(f"        {{")
+            lines.append(f"            __lparam := ({custom_y} << 16) | ({custom_x} & 0xFFFF)")
+            lines.append(f"            Loop, {click_count}")
+            lines.append(f"            {{")
+            if click_btn == "Right":
+                lines.append(f"                PostMessage, 0x204, 2, %__lparam%,, ahk_id %__target_hwnd%")
+                lines.append(f"                Sleep, 35")
+                lines.append(f"                PostMessage, 0x205, 0, %__lparam%,, ahk_id %__target_hwnd%")
+                lines.append(f"                ControlClick, x{custom_x} y{custom_y}, ahk_id %__target_hwnd%,, Right, 1, NA")
+            else:
+                lines.append(f"                PostMessage, 0x201, 1, %__lparam%,, ahk_id %__target_hwnd%")
+                lines.append(f"                Sleep, 35")
+                lines.append(f"                PostMessage, 0x202, 0, %__lparam%,, ahk_id %__target_hwnd%")
+                lines.append(f"                ControlClick, x{custom_x} y{custom_y}, ahk_id %__target_hwnd%,, Left, 1, NA")
+            lines.append(f"                if (A_Index < {click_count})")
+            lines.append(f"                    Sleep, 50")
+            lines.append(f"            }}")
+            lines.append(f'            SetLastClick({custom_x}, {custom_y}, "inactive")')
+            lines.append(f"        }}")
+            lines.append(f"        else")
+            lines.append(f"        {{")
+            lines.append(f"            CoordMode, Mouse, Screen")
+            lines.append(f"            Click, {custom_x}, {custom_y}, {click_btn}, {click_count}")
+            lines.append(f"            CoordMode, Mouse, %MacroMouseCoordMode%")
+            lines.append(f'            SetLastClick({custom_x}, {custom_y}, "foreground")')
+            lines.append(f"        }}")
+        lines.append(f"    }}")
+        lines.append(f'    Log("🎯 [조건 만족 클릭 완료] (X={custom_x}, Y={custom_y}) 클릭 완료")')
+        sleep_after = step.get("sleep_after")
+        if sleep_after:
+            lines.append(f"    if (!MacroDryRun)\n        Sleep, {sleep_after}")
+    elif click_target == "each_image":
+        click_payload = dict(click_info or {})
+        mode = str(click_payload.get("mode", "inactive")).lower()
+        click_delay = max(0, int(step.get("click_delay", 100) or 100))
+        click_count = max(1, int(click_payload.get("count") or 1))
+        click_btn = str(click_payload.get("button") or "Left")
+        lines.append(f'    ; ── 발견된 각 이미지 순차 클릭 (개별 오프셋 적용) ──')
+        lines.append(f'    MatchesCsv := VisionEngine_ParseField(VisionResp, "matches_csv")')
+        lines.append(f'    if (MatchesCsv = "")')
+        lines.append(f'        MatchesCsv := MatchedImageIndex . "," . FoundX . "," . FoundY . "," . FoundImageW . "," . FoundImageH')
+        lines.append(f'    Log("🎯 [멀티 이미지 순차 클릭 시작] 발견 목록: " . MatchesCsv . " (간격: {click_delay}ms, 방식: {mode})")')
+        lines.append(f'    __target_hwnd := {region_hwnd}')
+        lines.append(f'    if (!__target_hwnd and "{region_window_text}" != "")')
+        lines.append(f'        __target_hwnd := WinExist("{region_window_text}")')
+        lines.append(f'    if (!__target_hwnd and "{region_window_exe_text}" != "")')
+        lines.append(f'        __target_hwnd := WinExist("ahk_exe {region_window_exe_text}")')
+        lines.append(f'    if (!__target_hwnd)')
+        lines.append(f'        __target_hwnd := WinExist("A")')
+        if mode == "active":
+            lines.append(f'    if (!MacroDryRun and __target_hwnd)')
+            lines.append(f'    {{')
+            lines.append(f'        WinActivate, ahk_id %__target_hwnd%')
+            lines.append(f'        WinWaitActive, ahk_id %__target_hwnd%, , 0.5')
+            lines.append(f'    }}')
+            lines.append(f'    CoordMode, Mouse, Screen')
+        lines.append(f'    Loop, Parse, MatchesCsv, |')
+        lines.append(f'    {{')
+        lines.append(f'        if (A_LoopField = "")')
+        lines.append(f'            continue')
+        lines.append(f'        StringSplit, __m_val, A_LoopField, `,')
+        lines.append(f'        __cur_idx := __m_val1')
+        lines.append(f'        __cur_x := __m_val2')
+        lines.append(f'        __cur_y := __m_val3')
+        lines.append(f'        __cur_off_x := 0')
+        lines.append(f'        __cur_off_y := 0')
+        if asset_offsets:
+            for m_idx, (ox, oy) in enumerate(asset_offsets, start=1):
+                pfx = "if" if m_idx == 1 else "else if"
+                lines.append(f'        {pfx} (__cur_idx = {m_idx})')
+                lines.append(f'        {{')
+                lines.append(f'            __cur_off_x := {ox}')
+                lines.append(f'            __cur_off_y := {oy}')
+                lines.append(f'        }}')
+        lines.append(f'        __target_x := __cur_x + (__cur_off_x * FoundScaleX)')
+        lines.append(f'        __target_y := __cur_y + (__cur_off_y * FoundScaleY)')
+        lines.append(f'        Log("🎯 [멀티 이미지 클릭] #" . __cur_idx . " 위치(X=" . __cur_x . ", Y=" . __cur_y . ") + 오프셋(" . __cur_off_x . ", " . __cur_off_y . ") ➔ (X=" . __target_x . ", Y=" . __target_y . ")")')
+        lines.append(f'        if (MacroDryRun)')
+        lines.append(f'        {{')
+        lines.append(f'            Log("dry-run multi click predicted: " . __target_x . "," . __target_y)')
+        lines.append(f'            SetLastClick(__target_x, __target_y, "dry-run-multi")')
+        lines.append(f'        }}')
+        lines.append(f'        else')
+        lines.append(f'        {{')
+        if mode == "active":
+            lines.append(f'            Click, %__target_x%, %__target_y%, {click_btn}, {click_count}')
+            lines.append(f'            SetLastClick(__target_x, __target_y, "foreground")')
+        else:
+            lines.append(f'            if (__target_hwnd)')
+            lines.append(f'            {{')
+            lines.append(f'                VarSetCapacity(__pt, 8, 0)')
+            lines.append(f'                NumPut(__target_x, __pt, 0, "Int")')
+            lines.append(f'                NumPut(__target_y, __pt, 4, "Int")')
+            lines.append(f'                DllCall("ScreenToClient", "Ptr", __target_hwnd, "Ptr", &__pt)')
+            lines.append(f'                __cx := NumGet(__pt, 0, "Int")')
+            lines.append(f'                __cy := NumGet(__pt, 4, "Int")')
+            lines.append(f'                __lparam := (__cy << 16) | (__cx & 0xFFFF)')
+            lines.append(f'                Loop, {click_count}')
+            lines.append(f'                {{')
+            if click_btn == "Right":
+                lines.append(f'                    PostMessage, 0x204, 2, %__lparam%,, ahk_id %__target_hwnd%')
+                lines.append(f'                    Sleep, 35')
+                lines.append(f'                    PostMessage, 0x205, 0, %__lparam%,, ahk_id %__target_hwnd%')
+                lines.append(f'                    ControlClick, x%__cx% y%__cy%, ahk_id %__target_hwnd%,, Right, 1, NA')
+            else:
+                lines.append(f'                    PostMessage, 0x201, 1, %__lparam%,, ahk_id %__target_hwnd%')
+                lines.append(f'                    Sleep, 35')
+                lines.append(f'                    PostMessage, 0x202, 0, %__lparam%,, ahk_id %__target_hwnd%')
+                lines.append(f'                    ControlClick, x%__cx% y%__cy%, ahk_id %__target_hwnd%,, Left, 1, NA')
+            lines.append(f'                    if (A_Index < {click_count})')
+            lines.append(f'                        Sleep, 50')
+            lines.append(f'                }}')
+            lines.append(f'                SetLastClick(__target_x, __target_y, "inactive")')
+            lines.append(f'            }}')
+            lines.append(f'            else')
+            lines.append(f'            {{')
+            lines.append(f'                CoordMode, Mouse, Screen')
+            lines.append(f'                Click, %__target_x%, %__target_y%, {click_btn}, {click_count}')
+            lines.append(f'                SetLastClick(__target_x, __target_y, "foreground")')
+            lines.append(f'            }}')
+        lines.append(f'        }}')
+        if click_delay > 0:
+            lines.append(f'        if (!MacroDryRun)')
+            lines.append(f'            Sleep, {click_delay}')
+        lines.append(f'    }}')
+        if mode == "active":
+            lines.append(f'    CoordMode, Mouse, %MacroMouseCoordMode%')
+        lines.append(f'    Log("🎯 [멀티 이미지 순차 클릭 완료]")')
+        sleep_after = step.get("sleep_after")
+        if sleep_after:
+            lines.append(f"    if (!MacroDryRun)\n        Sleep, {sleep_after}")
+    elif click_info:
         mode = str(click_info.get("mode", "active")).lower()
         offset_values = click_info.get("offset") if isinstance(click_info.get("offset"), list) else [0, 0]
         click_offset = bool(click_info.get("click_offset"))
@@ -3310,8 +3520,6 @@ def render_image_search(
             lines.append(f"    if (!MacroDryRun)\n        Sleep, {sleep_after}")
         if use_mouse_coord_override:
             lines.append("    CoordMode, Mouse, %MacroMouseCoordMode%")
-    elif click_info and all_action == "count_only":
-        lines.append('    Log("image click skipped: all_action is count_only (발견 개수만 카운트)")')
     lines.append("}")
     return lines
 
@@ -4492,6 +4700,15 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
         region_mode = "client"
     else:
         region_mode = str(raw_mode or "screen").strip().casefold()
+    if region_mode not in {"screen", "window", "client"}:
+        region_mode = "screen"
+    raw_coords = str(step.get("region_coords") or "").strip().casefold()
+    if region_mode == "screen":
+        region_coords = "screen"
+    elif raw_coords in {"relative", "screen"}:
+        region_coords = raw_coords
+    else:
+        region_coords = "relative"
 
     lines: List[str] = []
     lines.append(f"; ── 픽셀 색상 서치 ({'멀티 ' + str(total_colors) + '개' if total_colors > 1 else '단일'}) ──")
@@ -4508,19 +4725,27 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
     # Base coordinates for relative/client offset
     lines.append(f"__ps_base_x_{step_index} := 0")
     lines.append(f"__ps_base_y_{step_index} := 0")
+    lines.append(f"__ps_width_{step_index} := 0")
+    lines.append(f"__ps_height_{step_index} := 0")
     lines.append(f"TargetHwnd_{step_index} := 0")
+    lines.append(f'__ps_coords_{step_index} := "{region_coords}"')
+    lines.append(f'__ps_use_base_{step_index} := (__ps_coords_{step_index} = "relative")')
+    lines.append(f"__ps_target_valid_{step_index} := {1 if region_mode == 'screen' else 0}")
 
     if region_mode in {"client", "window"}:
         clean_exe = win_exe
         if clean_exe.startswith("ahk_exe "):
             clean_exe = clean_exe[8:].strip()
         lines.append(f'TargetHwnd_{step_index} := EnsureTargetWindow(TargetHwnd_{step_index}, "{ahk_quote(win_title)}", "{ahk_quote(clean_exe)}")')
-        lines.append(f'if (!TargetHwnd_{step_index})')
-        lines.append(f'    TargetHwnd_{step_index} := WinExist("A")')
         lines.append(f'if (TargetHwnd_{step_index}) {{')
+        lines.append(f'    __ps_target_valid_{step_index} := 1')
         if region_mode == "window":
-            lines.append(f'    WinGetPos, __ps_base_x_{step_index}, __ps_base_y_{step_index},,, ahk_id %TargetHwnd_{step_index}%')
+            lines.append(f'    WinGetPos, __ps_base_x_{step_index}, __ps_base_y_{step_index}, __ps_width_{step_index}, __ps_height_{step_index}, ahk_id %TargetHwnd_{step_index}%')
         else:
+            lines.append(f'    VarSetCapacity(__ps_rect_{step_index}, 16, 0)')
+            lines.append(f'    DllCall("GetClientRect", "ptr", TargetHwnd_{step_index}, "ptr", &__ps_rect_{step_index})')
+            lines.append(f'    __ps_width_{step_index} := NumGet(__ps_rect_{step_index}, 8, "int")')
+            lines.append(f'    __ps_height_{step_index} := NumGet(__ps_rect_{step_index}, 12, "int")')
             lines.append(f'    VarSetCapacity(__ps_pt_{step_index}, 8, 0)')
             lines.append(f'    NumPut(0, __ps_pt_{step_index}, 0, "int")')
             lines.append(f'    NumPut(0, __ps_pt_{step_index}, 4, "int")')
@@ -4528,6 +4753,8 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
             lines.append(f'    __ps_base_x_{step_index} := NumGet(__ps_pt_{step_index}, 0, "int")')
             lines.append(f'    __ps_base_y_{step_index} := NumGet(__ps_pt_{step_index}, 4, "int")')
         lines.append('}')
+        lines.append(f'else')
+        lines.append(f'    Log("pixel search target window not found: {ahk_quote(win_title or clean_exe)}")')
 
     # Emit search variables for each color
     for idx, c in enumerate(colors, 1):
@@ -4546,32 +4773,32 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
             left, top, right, bottom = 0, 0, 0, 0
 
         if left == 0 and top == 0 and right == 0 and bottom == 0:
-            if region_mode == "client":
+            if region_mode in {"client", "window"}:
                 lines.append(f'if (TargetHwnd_{step_index}) {{')
-                lines.append(f'    VarSetCapacity(__ps_rect_{step_index}, 16, 0)')
-                lines.append(f'    DllCall("GetClientRect", "ptr", TargetHwnd_{step_index}, "ptr", &__ps_rect_{step_index})')
                 lines.append(f'    __ps_sx1_{step_index}_{idx} := __ps_base_x_{step_index}')
                 lines.append(f'    __ps_sy1_{step_index}_{idx} := __ps_base_y_{step_index}')
-                lines.append(f'    __ps_sx2_{step_index}_{idx} := __ps_base_x_{step_index} + NumGet(__ps_rect_{step_index}, 8, "int")')
-                lines.append(f'    __ps_sy2_{step_index}_{idx} := __ps_base_y_{step_index} + NumGet(__ps_rect_{step_index}, 12, "int")')
+                lines.append(f'    __ps_sx2_{step_index}_{idx} := __ps_base_x_{step_index} + __ps_width_{step_index} - 1')
+                lines.append(f'    __ps_sy2_{step_index}_{idx} := __ps_base_y_{step_index} + __ps_height_{step_index} - 1')
                 lines.append('} else {')
                 lines.append(f'    __ps_sx1_{step_index}_{idx} := 0')
                 lines.append(f'    __ps_sy1_{step_index}_{idx} := 0')
-                lines.append(f'    __ps_sx2_{step_index}_{idx} := A_ScreenWidth')
-                lines.append(f'    __ps_sy2_{step_index}_{idx} := A_ScreenHeight')
+                lines.append(f'    __ps_sx2_{step_index}_{idx} := -1')
+                lines.append(f'    __ps_sy2_{step_index}_{idx} := -1')
                 lines.append('}')
             else:
-                lines.append(f'__ps_sx1_{step_index}_{idx} := 0')
-                lines.append(f'__ps_sy1_{step_index}_{idx} := 0')
-                lines.append(f'__ps_sx2_{step_index}_{idx} := A_ScreenWidth')
-                lines.append(f'__ps_sy2_{step_index}_{idx} := A_ScreenHeight')
+                lines.append(f'__ps_sx1_{step_index}_{idx} := VirtualLeft')
+                lines.append(f'__ps_sy1_{step_index}_{idx} := VirtualTop')
+                lines.append(f'__ps_sx2_{step_index}_{idx} := VirtualRight')
+                lines.append(f'__ps_sy2_{step_index}_{idx} := VirtualBottom')
         else:
-            lines.append(f'__ps_sx1_{step_index}_{idx} := __ps_base_x_{step_index} + ({left})')
-            lines.append(f'__ps_sy1_{step_index}_{idx} := __ps_base_y_{step_index} + ({top})')
-            lines.append(f'__ps_sx2_{step_index}_{idx} := __ps_base_x_{step_index} + ({right})')
-            lines.append(f'__ps_sy2_{step_index}_{idx} := __ps_base_y_{step_index} + ({bottom})')
+            lines.append(f'__ps_sx1_{step_index}_{idx} := (__ps_use_base_{step_index} ? __ps_base_x_{step_index} : 0) + ({left})')
+            lines.append(f'__ps_sy1_{step_index}_{idx} := (__ps_use_base_{step_index} ? __ps_base_y_{step_index} : 0) + ({top})')
+            lines.append(f'__ps_sx2_{step_index}_{idx} := (__ps_use_base_{step_index} ? __ps_base_x_{step_index} : 0) + ({right}) - 1')
+            lines.append(f'__ps_sy2_{step_index}_{idx} := (__ps_use_base_{step_index} ? __ps_base_y_{step_index} : 0) + ({bottom}) - 1')
 
     lines.append("Loop {")
+    lines.append(f"    if (!__ps_target_valid_{step_index})")
+    lines.append("        break")
     lines.append(f"    PixelSearch_MatchCount_{step_index} := 0")
 
     for idx, c in enumerate(colors, 1):
@@ -5018,7 +5245,7 @@ def render_step(
         return ["; call_submacro expanded"]
     if action == "text_condition":
         return render_text_condition(step, step_index)
-    if action in {"image_search", "screen_condition"}:
+    if action in {"image_search", "screen_condition", "multi_image_search"}:
         prepared = dict(step)
         prepared["click_enabled"] = False if action == "screen_condition" else bool(step.get("click_enabled"))
         return render_image_search(prepared, assets, step_index)
@@ -5172,12 +5399,12 @@ def _expand_macro_steps(
                 has_internal_fail = int(prepared.get(child_fail_field) or 0) > 0
             except (TypeError, ValueError):
                 has_internal_fail = False
-            if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "text_condition"} and not has_internal_fail:
+            if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "text_condition", "multi_image_search"} and not has_internal_fail:
                 if fail_target:
                     prepared[child_fail_field] = fail_target
                 else:
                     prepared["_subflow_abort_on_fail"] = True
-                if action in {"image_search", "screen_condition"}:
+                if action in {"image_search", "screen_condition", "multi_image_search"}:
                     # Route through the shared failure block so the parent
                     # result variable and failure output are both applied.
                     prepared["abort_on_fail"] = False
@@ -5226,11 +5453,14 @@ def render_macro_script(
         lines.extend(browser_action_helpers())
         lines.append("")
     has_vision = any(
-        step.get("action") in {"image_search", "screen_condition"}
-        and (
-            str(step.get("engine") or "ahk").lower() == "opencv"
-            or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
+        (
+            step.get("action") in {"image_search", "screen_condition"}
+            and (
+                str(step.get("engine") or "ahk").lower() == "opencv"
+                or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
+            )
         )
+        or step.get("action") == "multi_image_search"
         for step in steps
     )
     if has_vision:
@@ -5410,7 +5640,7 @@ def render_macro_script(
         else:
             lines.extend(render_step(step, assets, count, browser_fast))
         if end_step and count == end_step:
-            if action not in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search"}:
+            if action not in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search"}:
                 lines.append("Return")
                 lines.append("")
                 continue
@@ -5419,10 +5649,10 @@ def render_macro_script(
             lines.append("")
             continue
 
-        if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search"}:
+        if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search"}:
             found_var = (
                 f"__step_found_{count}"
-                if action in {"image_search", "screen_condition"}
+                if action in {"image_search", "screen_condition", "multi_image_search"}
                 else f"__pixel_search_success_{count}"
                 if action == "pixel_search"
                 else f"__time_condition_success_{count}"
@@ -5435,7 +5665,7 @@ def render_macro_script(
             lines.extend("    " + line for line in render_subflow_success(step))
             lines.append(f"    MarkStepSuccess({count}, {on_success or (count + 1 if count < total_steps else 0)})")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
-            if action in {"image_search", "screen_condition"}:
+            if action in {"image_search", "screen_condition", "multi_image_search"}:
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; confidence=" . OpenCvBestScore . "; x=" . FoundX . "; y=" . FoundY . "; scale=" . Round(FoundScaleX, 3) . "x" . Round(FoundScaleY, 3) . "; elapsed_ms=" . VisionElapsed . "; cache=" . VisionCacheHit . "; captures=" . VisionCaptures . "; capture_reuse=" . VisionCaptureReuses)'
                 )
@@ -5457,7 +5687,7 @@ def render_macro_script(
                 lines.append(f"    __rep{count} := 0")
                 if repeat_var:
                     lines.append(f"    __rep_limit{count} := \"\"")
-            if action in {"image_search", "screen_condition"} and bool(step.get("repeat_on_success")):
+            if action in {"image_search", "screen_condition", "multi_image_search"} and bool(step.get("repeat_on_success")):
                 repeat_on_success_delay = max(0, int(step.get("repeat_on_success_delay", 50) or 0))
                 lines.append(f'    Log("image search success loop: step {count}")')
                 if repeat_on_success_delay:
@@ -5479,7 +5709,7 @@ def render_macro_script(
             lines.append("else")
             lines.append("{")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "FAIL")')
-            if action in {"image_search", "screen_condition"}:
+            if action in {"image_search", "screen_condition", "multi_image_search"}:
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; best_confidence=" . OpenCvBestScore . "; result=not_found")'
                 )
@@ -5601,7 +5831,7 @@ def prepare_macro_for_runtime(macro: Dict[str, Any], runtime_mode: str = "auto")
                 "AutoHotkey 전용으로 내보낼 수 없는 Python 필수 단계가 있습니다: " + detail
             )
     for step in steps:
-        if not isinstance(step, dict) or step.get("action") not in {"image_search", "screen_condition"}:
+        if not isinstance(step, dict) or step.get("action") not in {"image_search", "screen_condition", "multi_image_search"}:
             continue
         if mode == "ahk":
             if isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1:
@@ -5679,11 +5909,14 @@ def export_macro_payload(
         if tessdata.is_dir():
             shutil.copytree(tessdata, target.parent / "tessdata", dirs_exist_ok=True)
     if any(
-        step.get("action") in {"image_search", "screen_condition"}
-        and (
-            str(step.get("engine") or "ahk").lower() == "opencv"
-            or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
+        (
+            step.get("action") in {"image_search", "screen_condition"}
+            and (
+                str(step.get("engine") or "ahk").lower() == "opencv"
+                or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
+            )
         )
+        or step.get("action") == "multi_image_search"
         for step in expanded_steps
     ):
         for helper_name in ("opencv_search.py", "vision_engine.py"):
@@ -5718,7 +5951,7 @@ def copy_assets_for_macro(macro: Dict[str, Any], destination: Path) -> None:
     assets = read_assets()
     aliases = set()
     for step in macro.get("steps", []):
-        if step.get("action") in {"image_search", "screen_condition"}:
+        if step.get("action") in {"image_search", "screen_condition", "multi_image_search"}:
             alias = step.get("asset")
             if alias:
                 aliases.add(alias)

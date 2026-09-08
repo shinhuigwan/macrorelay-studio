@@ -12,9 +12,13 @@ import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -197,14 +201,21 @@ class MacroRepository:
         for path in self.macros_dir.glob("*.json"):
             try:
                 payload = self._read_json(path, {})
-            except (OSError, ValueError):
+                if not isinstance(payload, dict):
+                    # Auxiliary/order JSON files and partially written user
+                    # files must not make the whole Studio fail to start.
+                    continue
+                modified = datetime.fromtimestamp(path.stat().st_mtime)
+                raw_steps = payload.get("steps")
+                step_count = len(raw_steps) if isinstance(raw_steps, list) else 0
+            except (OSError, ValueError, TypeError):
                 continue
             summaries.append(
                 MacroSummary(
                     name=path.stem,
                     description=str(payload.get("description") or ""),
-                    steps=len(payload.get("steps") or []),
-                    modified=datetime.fromtimestamp(path.stat().st_mtime),
+                    steps=step_count,
+                    modified=modified,
                     path=path,
                 )
             )
@@ -440,7 +451,7 @@ class MacroRepository:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
             metadata["size"] = target.stat().st_size
-            metadata["updated_at"] = datetime.utcnow().isoformat() + "Z"
+            metadata["updated_at"] = _utc_now_iso()
             changed = True
         if changed:
             self._write_json(self.assets_index_path, index)
@@ -459,7 +470,7 @@ class MacroRepository:
         self._backup_macro(path)
         payload = dict(payload)
         payload["name"] = payload.get("name") or name
-        payload.setdefault("meta", {})["last_modified"] = datetime.utcnow().isoformat() + "Z"
+        payload.setdefault("meta", {})["last_modified"] = _utc_now_iso()
         payload.setdefault("steps", [])
         self._write_json(path, payload)
         return path
@@ -473,7 +484,7 @@ class MacroRepository:
             "description": description.strip(),
             "meta": {"coord_mode": "Screen"},
             "steps": [],
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": _utc_now_iso(),
         }
         self._write_json(path, payload)
         self._append_macro_order(path.stem)
@@ -491,7 +502,7 @@ class MacroRepository:
         counter = 1
 
         payload_copy = deepcopy(payload)
-        payload_copy.setdefault("meta", {})["created_at"] = datetime.utcnow().isoformat() + "Z"
+        payload_copy.setdefault("meta", {})["created_at"] = _utc_now_iso()
         payload_copy.setdefault("steps", [])
 
         while True:
@@ -512,7 +523,7 @@ class MacroRepository:
     def duplicate_macro(self, source: str, target: str) -> Path:
         payload = self.load_macro(source)
         payload["name"] = target
-        payload["created_at"] = datetime.utcnow().isoformat() + "Z"
+        payload["created_at"] = _utc_now_iso()
         path = self.macro_path(target)
         if path.exists():
             raise FileExistsError(f"'{path.stem}' 매크로가 이미 있습니다.")
@@ -580,7 +591,7 @@ class MacroRepository:
             "file": str(target.relative_to(self.root)),
             "source": str(source),
             "size": target.stat().st_size,
-            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "updated_at": _utc_now_iso(),
         }
         self._write_json(self.assets_index_path, index)
         return key
@@ -597,7 +608,7 @@ class MacroRepository:
             "file": str(target.relative_to(self.root)),
             "source": "screen-capture",
             "size": target.stat().st_size,
-            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "updated_at": _utc_now_iso(),
         }
         self._write_json(self.assets_index_path, index)
         return key
@@ -610,7 +621,7 @@ class MacroRepository:
         path = (self.root / str(metadata.get("file") or "")).resolve()
         if path.exists():
             metadata["size"] = path.stat().st_size
-            metadata["updated_at"] = datetime.utcnow().isoformat() + "Z"
+            metadata["updated_at"] = _utc_now_iso()
             self._write_json(self.assets_index_path, index)
 
     def update_asset_organization(
@@ -803,7 +814,7 @@ class MacroRepository:
                 "file": str(path.relative_to(self.root)),
                 "source": "asset-folder-sync",
                 "size": path.stat().st_size,
-                "updated_at": datetime.utcnow().isoformat() + "Z",
+                "updated_at": _utc_now_iso(),
             }
             changed += 1
         if changed:
@@ -859,7 +870,7 @@ class MacroRepository:
             raise FileNotFoundError("복원할 이미지 파일이 없습니다.")
         restored_metadata["file"] = str(target.relative_to(self.root))
         restored_metadata["size"] = target.stat().st_size
-        restored_metadata["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        restored_metadata["updated_at"] = _utc_now_iso()
         index[restored_alias] = restored_metadata
         self._write_json(self.assets_index_path, index)
         return restored_alias

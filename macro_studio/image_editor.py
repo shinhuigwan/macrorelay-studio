@@ -8,6 +8,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .theme import COLORS
 from .widgets import Card, WheelSafeSpinBox, primary_button
+from .screen_coordinates import logical_rect_to_native
 
 
 def virtual_desktop_geometry() -> QtCore.QRect:
@@ -362,6 +363,33 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
     def captured_image(self) -> QtGui.QImage:
         if self._selection.width() < 4 or self._selection.height() < 4:
             return QtGui.QImage()
+        # Qt composes the desktop in logical pixels.  Searching is performed
+        # against Win32/OpenCV physical pixels, so save the template from the
+        # native rectangle instead of a DPI-scaled preview whenever possible.
+        native_rect = self.selected_native_screen_rect()
+        if native_rect.isValid():
+            try:
+                from opencv_search import capture_region
+
+                frame = capture_region(
+                    native_rect.x(), native_rect.y(),
+                    native_rect.x() + native_rect.width(),
+                    native_rect.y() + native_rect.height(),
+                )
+                if frame is not None and frame.size:
+                    if len(frame.shape) == 2:
+                        qimage = QtGui.QImage(
+                            frame.data, frame.shape[1], frame.shape[0], frame.strides[0],
+                            QtGui.QImage.Format_Grayscale8,
+                        )
+                    else:
+                        qimage = QtGui.QImage(
+                            frame.data, frame.shape[1], frame.shape[0], frame.strides[0],
+                            QtGui.QImage.Format_BGR888,
+                        )
+                    return qimage.copy()
+            except Exception:
+                pass
         sx = self._source.width() / max(1, self.canvas.width())
         sy = self._source.height() / max(1, self.canvas.height())
         rect = QtCore.QRect(
@@ -373,10 +401,14 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         return self._source.toImage().copy(rect)
 
     def selected_screen_rect(self) -> QtCore.QRect:
-        """선택한 범위를 현재 화면의 전역 좌표로 반환합니다."""
+        """선택한 범위를 Qt 전역 논리 좌표로 반환합니다."""
         if self._selection.width() < 4 or self._selection.height() < 4:
             return QtCore.QRect()
         return self._selection.translated(self.geometry().topLeft())
+
+    def selected_native_screen_rect(self) -> QtCore.QRect:
+        """Return the selection in Win32/OpenCV physical screen pixels."""
+        return logical_rect_to_native(self.selected_screen_rect())
 
     @property
     def selected_rect(self) -> QtCore.QRect:

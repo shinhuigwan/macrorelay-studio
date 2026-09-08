@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from copy import deepcopy
 import logging
 import os
 from pathlib import Path
 import re
+from datetime import datetime
 from typing import Any
 
 import cv2
@@ -14,6 +16,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .color_widgets import ColorToleranceBarWidget, ToleranceSpectrumBar
 from .repository import MacroRepository
+from .screen_coordinates import display_coordinate_maps, logical_point_to_native
 from .theme import COLORS
 
 
@@ -28,6 +31,158 @@ def hex_to_bgr(hex_str: str) -> tuple[int, int, int]:
         except ValueError:
             pass
     return (0, 0, 255)
+
+
+_NON_TARGET_WINDOW_CLASSES = {
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+}
+
+
+def _configure_window_api(user32) -> None:
+    """Preserve 64-bit HWND values when ctypes has no declared prototypes."""
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetClientRect.restype = wintypes.BOOL
+    user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+    user32.ClientToScreen.restype = wintypes.BOOL
+
+
+def _configure_process_api(kernel32) -> None:
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+def _window_target_details(hwnd: int) -> dict[str, Any] | None:
+    """Return a portable target descriptor for a top-level Win32 window.
+
+    A live HWND is deliberately not used in the persisted selector because it
+    changes after an application restart and on another computer.
+    """
+    if not hwnd:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        _configure_window_api(user32)
+        root = int(user32.GetAncestor(int(hwnd), 2) or hwnd)  # GA_ROOT
+        if not root or not user32.IsWindow(root) or not user32.IsWindowVisible(root):
+            return None
+
+        class_buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(root, class_buffer, len(class_buffer))
+        class_name = class_buffer.value
+        if class_name in _NON_TARGET_WINDOW_CLASSES:
+            return None
+
+        window_rect = wintypes.RECT()
+        client_rect = wintypes.RECT()
+        client_origin = wintypes.POINT(0, 0)
+        if not user32.GetWindowRect(root, ctypes.byref(window_rect)):
+            return None
+        if not user32.GetClientRect(root, ctypes.byref(client_rect)):
+            return None
+        if not user32.ClientToScreen(root, ctypes.byref(client_origin)):
+            return None
+
+        window_width = int(window_rect.right - window_rect.left)
+        window_height = int(window_rect.bottom - window_rect.top)
+        client_width = int(client_rect.right - client_rect.left)
+        client_height = int(client_rect.bottom - client_rect.top)
+        if window_width < 32 or window_height < 32 or client_width < 4 or client_height < 4:
+            return None
+
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(root, ctypes.byref(pid))
+        exe_name = ""
+        kernel32 = ctypes.windll.kernel32
+        _configure_process_api(kernel32)
+        process = kernel32.OpenProcess(0x1000, False, pid.value)
+        if process:
+            try:
+                length = wintypes.DWORD(32768)
+                path_buffer = ctypes.create_unicode_buffer(length.value)
+                if kernel32.QueryFullProcessImageNameW(
+                    process, 0, path_buffer, ctypes.byref(length)
+                ):
+                    exe_name = Path(path_buffer.value).name
+            finally:
+                kernel32.CloseHandle(process)
+        if not exe_name:
+            return None
+
+        title_buffer = ctypes.create_unicode_buffer(1024)
+        user32.GetWindowTextW(root, title_buffer, len(title_buffer))
+        # Class + executable remains stable across restarts and other PCs.
+        if class_name:
+            window_token = f"ahk_class {class_name} ahk_exe {exe_name}"
+        else:
+            window_token = f"ahk_exe {exe_name}"
+        return {
+            "window": window_token,
+            "exe": exe_name,
+            "class": class_name,
+            "title": title_buffer.value,
+            "hwnd": root,
+            "client_origin": [int(client_origin.x), int(client_origin.y)],
+            "client_size": [client_width, client_height],
+            "window_origin": [int(window_rect.left), int(window_rect.top)],
+            "window_size": [window_width, window_height],
+        }
+    except Exception:
+        return None
+
+
+def _window_target_at_native_point(
+    point: QtCore.QPoint,
+    ignored_hwnds: set[int] | None = None,
+) -> dict[str, Any] | None:
+    """Find the first visible non-Studio window under a physical screen point."""
+    ignored = {int(value) for value in (ignored_hwnds or set()) if value}
+    try:
+        user32 = ctypes.windll.user32
+        _configure_window_api(user32)
+        found: list[int] = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @callback_type
+        def callback(hwnd, _lparam):
+            root = int(user32.GetAncestor(hwnd, 2) or hwnd)
+            if not root or root in ignored or not user32.IsWindowVisible(root):
+                return True
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(root, ctypes.byref(rect)):
+                return True
+            if rect.left <= point.x() < rect.right and rect.top <= point.y() < rect.bottom:
+                details = _window_target_details(root)
+                if details is not None:
+                    found.append(root)
+                    return False
+            return True
+
+        user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.EnumWindows(callback, 0)
+        return _window_target_details(found[0]) if found else None
+    except Exception:
+        return None
 
 
 def _ensure_interactive_desktop() -> None:
@@ -102,6 +257,13 @@ def _get_window_info(hwnd: int) -> dict[str, Any]:
 
 
 def _find_target_window(exe_name: str, window_token: str) -> int:
+    # Use the same title/class/EXE-aware resolver as the editor and test
+    # center.  The older fallback below remains for unusual desktop stations.
+    from .image_search_test import _find_window
+
+    resolved = _find_window(exe_name, window_token)
+    if resolved:
+        return resolved
     token = str(window_token or "").strip()
     m_id = re.search(r"ahk_id\s+([^\s,]+)", token, re.IGNORECASE)
     if m_id:
@@ -278,10 +440,18 @@ def capture_target_area(step: dict[str, Any]) -> tuple[np.ndarray | None, int, i
                     desc = f"창 전체 [{pname} · HWND: {hhex}{class_tag}] · {ww}×{wh} (기준점 {bx},{by})"
                     return frame, bx, by, desc
 
-    # Fallback to screen capture
+    # Do not silently reinterpret client-relative regions as screen-absolute
+    # regions when the intended window is gone. That produced convincing but
+    # vertically shifted overlays and could target another active program.
+    target_str = win_exe or win_token
+    if mode != "screen" and target_str:
+        desc = f"⚠️ 대상 창({target_str})을 찾지 못했습니다. 대상 프로그램을 다시 지정하세요."
+        return None, 0, 0, desc
+
+    # Screen mode capture
     geom = QtCore.QRect()
-    for s in QtGui.QGuiApplication.screens():
-        geom = geom.united(s.geometry())
+    for mapping in display_coordinate_maps():
+        geom = geom.united(mapping.native)
     if geom.isEmpty() or geom.width() <= 0 or geom.height() <= 0:
         l = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
         t = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
@@ -293,15 +463,11 @@ def capture_target_area(step: dict[str, Any]) -> tuple[np.ndarray | None, int, i
             l, t = 0, 0
         r, b = l + max(1, w), t + max(1, h)
     else:
-        l, t, r, b = geom.left(), geom.top(), geom.right() + 1, geom.bottom() + 1
+        l, t, r, b = geom.left(), geom.top(), geom.x() + geom.width(), geom.y() + geom.height()
 
     from opencv_search import capture_region
     frame = capture_region(l, t, r, b)
-    target_str = win_exe or win_token
-    if mode != "screen" and target_str:
-        desc = f"⚠️ 대상 창({target_str}) 미발견 ➔ 전체 화면 대체 · {r - l}×{b - t}"
-    else:
-        desc = f"전체 화면 · {r - l}×{b - t}"
+    desc = f"전체 화면 · {r - l}×{b - t}"
     return frame, l, t, desc
 
 
@@ -464,10 +630,16 @@ class InteractiveCanvas(QtWidgets.QWidget):
             self._drag_current = None
             if r.width() >= 6 and r.height() >= 6 and self._active_alias:
                 s = self._scale
-                l = int(r.left() / s)
-                t = int(r.top() / s)
-                right = int(r.right() / s)
-                bottom = int(r.bottom() / s)
+                l = int(r.x() / s)
+                t = int(r.y() / s)
+                # Stored regions use an exclusive right/bottom edge everywhere.
+                right = int((r.x() + r.width()) / s)
+                bottom = int((r.y() + r.height()) / s)
+                if self._pixmap is not None:
+                    l = max(0, min(l, self._pixmap.width() - 1))
+                    t = max(0, min(t, self._pixmap.height() - 1))
+                    right = max(l + 1, min(right, self._pixmap.width()))
+                    bottom = max(t + 1, min(bottom, self._pixmap.height()))
                 self.region_dragged.emit(self._active_alias, [l, t, right, bottom])
             self.update()
 
@@ -486,7 +658,9 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.step = dict(step)
+        # The visual editor is cancellable. Keep nested click/asset structures
+        # isolated until the caller accepts and copies the result.
+        self.step = deepcopy(step)
         self.repository = repository
         self._is_color_mode: bool = (
             str(step.get("action") or "") == "pixel_search"
@@ -523,6 +697,17 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             self._color_regions = {}
             self._asset_regions = dict(asset_regions or step.get("asset_regions") or {})
             self._aliases = self._extract_aliases(step)
+            raw_offsets = step.get("asset_offsets") if isinstance(step.get("asset_offsets"), dict) else {}
+            default_off = (step.get("click") or {}).get("offset") or [0, 0]
+            self._asset_offsets: dict[str, list[int]] = {}
+            for a in self._aliases:
+                off_val = raw_offsets.get(a)
+                if isinstance(off_val, (list, tuple)) and len(off_val) >= 2:
+                    self._asset_offsets[a] = [int(off_val[0] or 0), int(off_val[1] or 0)]
+                elif isinstance(default_off, (list, tuple)) and len(default_off) >= 2:
+                    self._asset_offsets[a] = [int(default_off[0] or 0), int(default_off[1] or 0)]
+                else:
+                    self._asset_offsets[a] = [0, 0]
 
         self._color_card_labels: dict[str, dict[str, QtWidgets.QLabel]] = {}
         self._bgr_frame: np.ndarray | None = None
@@ -533,35 +718,30 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._required_count: int = int(step.get("required_count") or len(self._aliases))
         self._match_condition: str = str(step.get("match_condition") or "all_matched").strip()
 
-        # Auto-inherit target window from repository / candidate steps / running emulator if missing
+        # Click settings for condition match
+        raw_target = str(step.get("click_target") or "").strip().lower()
+        if not raw_target:
+            if bool(step.get("click_enabled")):
+                if str(step.get("search_mode") or "").lower() == "all" and str(step.get("all_action") or "").lower() == "click_all":
+                    raw_target = "each_image"
+                elif step.get("custom_click_x") is not None and (int(step.get("custom_click_x") or 0) or int(step.get("custom_click_y") or 0)):
+                    raw_target = "custom_coord"
+                else:
+                    raw_target = "first_image"
+            elif step.get("custom_click_x") is not None and (int(step.get("custom_click_x") or 0) or int(step.get("custom_click_y") or 0)):
+                raw_target = "custom_coord"
+            else:
+                raw_target = "each_image"
+        self._click_target: str = raw_target
+        self._custom_click_x: int = int(step.get("custom_click_x") or 0)
+        self._custom_click_y: int = int(step.get("custom_click_y") or 0)
+
+        # A missing target must remain screen-based until the user selects or
+        # drags over the intended program. Borrowing the first macro target or
+        # a running emulator made unrelated applications receive the search.
         if not self.step.get("region_window_exe"):
-            cand_exe = ""
-            cand_win = ""
-            if self.repository:
-                try:
-                    for m in self.repository.load_macros():
-                        for s in m.get("steps", []):
-                            we = str(s.get("region_window_exe") or (s.get("click") or {}).get("window_exe") or s.get("window_exe") or "")
-                            w = str(s.get("region_window") or (s.get("click") or {}).get("window") or s.get("window") or "")
-                            if we:
-                                cand_exe = we
-                                cand_win = w
-                                break
-                        if cand_exe:
-                            break
-                except Exception:
-                    pass
-            if not cand_exe:
-                for cname in ("dnplayer.exe", "HD-Player.exe", "Nox.exe", "MuMuPlayer.exe"):
-                    if _find_target_window(cname, ""):
-                        cand_exe = cname
-                        cand_win = f"ahk_exe {cname}"
-                        break
-            if cand_exe:
-                self.step["region_window_exe"] = cand_exe
-                self.step["region_window"] = cand_win
-                self.step.setdefault("region_mode", "client")
-                self.step.setdefault("region_coords", "relative")
+            self.step["region_mode"] = "screen"
+            self.step["region_coords"] = "screen"
 
         win_title = "🎨 색상 검색 영역 시각화 및 실시간 화면 검사기" if self._is_color_mode else "🔍 검색 영역 시각화 및 실시간 화면 검사기"
         self.setWindowTitle(win_title)
@@ -598,6 +778,174 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self.lbl_target_info = QtWidgets.QLabel("대상: 확인 중…")
         self.lbl_target_info.setStyleSheet("color: #8A98B0; font-size: 9pt;")
         left_layout.addWidget(self.lbl_target_info)
+
+        # Multi-image Management Box
+        if not self._is_color_mode:
+            img_tools_box = QtWidgets.QFrame()
+            img_tools_box.setStyleSheet("background: #141C2E; border: 1px solid #2B3D5B; border-radius: 8px; padding: 6px;")
+            img_tools_layout = QtWidgets.QVBoxLayout(img_tools_box)
+            img_tools_layout.setContentsMargins(8, 8, 8, 8)
+            img_tools_layout.setSpacing(6)
+
+            # Row 1: Add buttons
+            add_btn_row = QtWidgets.QHBoxLayout()
+            btn_add_capture = QtWidgets.QPushButton("➕ 화면 캡처로 새 이미지 추가")
+            btn_add_capture.setStyleSheet("""
+                QPushButton {
+                    background: #0284C7;
+                    color: #FFFFFF;
+                    font-weight: 800;
+                    font-size: 9pt;
+                    padding: 6px 10px;
+                    border-radius: 5px;
+                    border: 1px solid #38BDF8;
+                }
+                QPushButton:hover {
+                    background: #0369A1;
+                }
+            """)
+            btn_add_capture.setToolTip("화면에서 원하는 이미지 영역을 마우스로 드래그 캡처하여 즉시 멀티 이미지 서치 목록에 추가합니다.")
+            btn_add_capture.clicked.connect(self._add_image_via_capture)
+
+            btn_add_asset = QtWidgets.QPushButton("📂 보관함에서 추가")
+            btn_add_asset.setStyleSheet("""
+                QPushButton {
+                    background: #1E293B;
+                    color: #70C5FF;
+                    font-weight: 700;
+                    font-size: 8.8pt;
+                    padding: 6px 8px;
+                    border-radius: 5px;
+                    border: 1px solid #3B4A6B;
+                }
+                QPushButton:hover {
+                    background: #334155;
+                    color: #FFFFFF;
+                }
+            """)
+            btn_add_asset.setToolTip("기존 에셋 보관함에 저장된 이미지 중 하나를 선택하여 추가합니다.")
+            btn_add_asset.clicked.connect(self._add_image_from_assets)
+
+            add_btn_row.addWidget(btn_add_capture, 3)
+            add_btn_row.addWidget(btn_add_asset, 2)
+            img_tools_layout.addLayout(add_btn_row)
+
+            # Row 2: Condition & Required Count
+            cond_row = QtWidgets.QHBoxLayout()
+            cond_lbl = QtWidgets.QLabel("일치 조건:")
+            cond_lbl.setStyleSheet("color: #CBD5E1; font-weight: 700; font-size: 8.8pt;")
+            cond_row.addWidget(cond_lbl)
+
+            self.combo_condition = QtWidgets.QComboBox()
+            self.combo_condition.setStyleSheet("""
+                QComboBox {
+                    background: #0F172A;
+                    color: #E2E8F0;
+                    border: 1px solid #334155;
+                    border-radius: 4px;
+                    padding: 3px 8px;
+                    font-size: 8.8pt;
+                }
+            """)
+            self.combo_condition.addItem("모든 이미지 일치 (AND)", "all_matched")
+            self.combo_condition.addItem("1개 이상 일치 (OR)", "at_least_1")
+            self.combo_condition.addItem("N개 이상 일치", "at_least_n")
+            self.combo_condition.addItem("정확히 N개 일치", "exact_n")
+
+            cur_cond = self._match_condition or "all_matched"
+            c_idx = self.combo_condition.findData(cur_cond)
+            if c_idx >= 0:
+                self.combo_condition.setCurrentIndex(c_idx)
+            self.combo_condition.currentIndexChanged.connect(self._on_condition_changed)
+            cond_row.addWidget(self.combo_condition, 1)
+
+            self.spin_req_count = QtWidgets.QSpinBox()
+            self.spin_req_count.setRange(1, 99)
+            self.spin_req_count.setValue(max(1, self._required_count))
+            self.spin_req_count.setSuffix("개")
+            self.spin_req_count.setFixedWidth(65)
+            self.spin_req_count.setStyleSheet("""
+                QSpinBox {
+                    background: #0F172A;
+                    color: #38BDF8;
+                    font-weight: bold;
+                    border: 1px solid #334155;
+                    border-radius: 4px;
+                    padding: 3px;
+                }
+            """)
+            self.spin_req_count.setEnabled(cur_cond in {"at_least_n", "exact_n"})
+            self.spin_req_count.valueChanged.connect(self._on_req_count_changed)
+            cond_row.addWidget(self.spin_req_count)
+
+            img_tools_layout.addLayout(cond_row)
+
+            # Row 3: Click Target & Custom Coords
+            click_row = QtWidgets.QHBoxLayout()
+            click_lbl = QtWidgets.QLabel("클릭 동작:")
+            click_lbl.setStyleSheet("color: #CBD5E1; font-weight: 700; font-size: 8.8pt;")
+            click_row.addWidget(click_lbl)
+
+            self.combo_click_target = QtWidgets.QComboBox()
+            self.combo_click_target.setStyleSheet("""
+                QComboBox {
+                    background: #0F172A;
+                    color: #E2E8F0;
+                    border: 1px solid #334155;
+                    border-radius: 4px;
+                    padding: 3px 8px;
+                    font-size: 8.8pt;
+                }
+            """)
+            self.combo_click_target.addItem("발견된 각 이미지 클릭 (오프셋 적용)", "each_image")
+            self.combo_click_target.addItem("첫 번째 발견 이미지 클릭", "first_image")
+            self.combo_click_target.addItem("지정 좌표 클릭 (고정 위치)", "custom_coord")
+            self.combo_click_target.addItem("클릭 안 함 (조건 분기만)", "none")
+
+            t_idx = self.combo_click_target.findData(self._click_target)
+            if t_idx >= 0:
+                self.combo_click_target.setCurrentIndex(t_idx)
+            self.combo_click_target.currentIndexChanged.connect(self._on_click_target_changed)
+            click_row.addWidget(self.combo_click_target, 1)
+            img_tools_layout.addLayout(click_row)
+
+            # Row 4: Custom coord spinboxes (visible only when custom_coord is selected)
+            self.custom_coord_row = QtWidgets.QHBoxLayout()
+            self.lbl_coord_desc = QtWidgets.QLabel("지정 좌표:")
+            self.lbl_coord_desc.setStyleSheet("color: #A5B4FC; font-weight: 600; font-size: 8.5pt;")
+            self.custom_coord_row.addWidget(self.lbl_coord_desc)
+
+            self.spin_click_x = QtWidgets.QSpinBox()
+            self.spin_click_x.setRange(-100_000, 100_000)
+            self.spin_click_x.setValue(self._custom_click_x)
+            self.spin_click_x.setPrefix("X: ")
+            self.spin_click_x.setSuffix(" px")
+            self.spin_click_x.setStyleSheet("background: #0F172A; color: #A5B4FC; border: 1px solid #334155; border-radius: 4px; padding: 2px;")
+            self.spin_click_x.valueChanged.connect(lambda v: setattr(self, "_custom_click_x", int(v)))
+
+            self.spin_click_y = QtWidgets.QSpinBox()
+            self.spin_click_y.setRange(-100_000, 100_000)
+            self.spin_click_y.setValue(self._custom_click_y)
+            self.spin_click_y.setPrefix("Y: ")
+            self.spin_click_y.setSuffix(" px")
+            self.spin_click_y.setStyleSheet("background: #0F172A; color: #A5B4FC; border: 1px solid #334155; border-radius: 4px; padding: 2px;")
+            self.spin_click_y.valueChanged.connect(lambda v: setattr(self, "_custom_click_y", int(v)))
+
+            self.custom_coord_row.addWidget(self.spin_click_x)
+            self.custom_coord_row.addWidget(self.spin_click_y)
+
+            btn_pick_coord = QtWidgets.QPushButton("⌖ 찍기")
+            btn_pick_coord.setStyleSheet("background: #312E81; border: 1px solid #4F46E5; color: #C7D2FE; font-weight: bold; border-radius: 4px; padding: 2px 6px; font-size: 8.5pt;")
+            btn_pick_coord.setToolTip("화면에서 원하는 위치를 마우스 좌클릭하여 지정 클릭 좌표를 즉시 설정합니다.")
+            btn_pick_coord.clicked.connect(self._pick_custom_click_point)
+            self.custom_coord_row.addWidget(btn_pick_coord)
+
+            self.custom_coord_widget = QtWidgets.QWidget()
+            self.custom_coord_widget.setLayout(self.custom_coord_row)
+            self.custom_coord_widget.setVisible(self._click_target == "custom_coord")
+            img_tools_layout.addWidget(self.custom_coord_widget)
+
+            left_layout.addWidget(img_tools_box)
 
         # Overall Status Banner
         self.banner_box = QtWidgets.QFrame()
@@ -744,10 +1092,13 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             mode = str(self.step.get("region_mode") or "screen").casefold()
             if mode == "client":
                 self.btn_toggle_mode.setText("🖥️ 전체 화면 전환")
-                self.btn_toggle_mode.setToolTip("현재 앱플레이어 내부를 캡처 중입니다. 클릭하면 모니터 전체 화면 모드로 전환합니다.")
+                self.btn_toggle_mode.setToolTip("현재 선택한 프로그램의 클라이언트 영역을 캡처 중입니다. 클릭하면 모니터 전체 화면 모드로 전환합니다.")
+            elif mode == "window":
+                self.btn_toggle_mode.setText("🖥️ 전체 화면 전환")
+                self.btn_toggle_mode.setToolTip("현재 선택한 프로그램 창 전체를 캡처 중입니다. 클릭하면 모니터 전체 화면 모드로 전환합니다.")
             else:
-                self.btn_toggle_mode.setText("🎯 앱플레이어 전환")
-                self.btn_toggle_mode.setToolTip("현재 전체 화면을 캡처 중입니다. 클릭하면 실행 중인 앱플레이어(LDPlayer 등) 핸들 캡처로 전환합니다.")
+                self.btn_toggle_mode.setText("🎯 프로그램 선택")
+                self.btn_toggle_mode.setToolTip("대상 프로그램을 클릭해 선택합니다. 이미지나 검색 영역을 드래그해도 그 아래 프로그램이 자동 지정됩니다.")
 
         if frame is None or frame.size == 0:
             self.lbl_banner_main.setText("❌ 화면 캡처 실패")
@@ -759,12 +1110,148 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._evaluate_all_regions()
         self._refresh_ui()
 
+    def _uses_screen_coordinates(self) -> bool:
+        mode = str(self.step.get("region_mode") or "screen").casefold()
+        coords = str(self.step.get("region_coords") or "").casefold()
+        return mode == "screen" or coords == "screen"
+
+    def _region_to_frame(self, region: list[int] | tuple[int, ...]) -> list[int]:
+        """Convert persisted native-screen coordinates to capture-frame coordinates."""
+        values = [int(value) for value in region[:4]]
+        if self._uses_screen_coordinates():
+            return [
+                values[0] - self._base_x,
+                values[1] - self._base_y,
+                values[2] - self._base_x,
+                values[3] - self._base_y,
+            ]
+        return values
+
+    def _region_from_frame(self, region: list[int] | tuple[int, ...]) -> list[int]:
+        """Convert capture-frame coordinates to the persisted coordinate system."""
+        values = [int(value) for value in region[:4]]
+        if self._uses_screen_coordinates():
+            return [
+                values[0] + self._base_x,
+                values[1] + self._base_y,
+                values[2] + self._base_x,
+                values[3] + self._base_y,
+            ]
+        return values
+
+    def _canvas_regions(self) -> dict[str, list[int]]:
+        return {
+            alias: self._region_to_frame(region)
+            for alias, region in self._asset_regions.items()
+            if isinstance(region, (list, tuple)) and len(region) >= 4
+        }
+
+    def _ignored_window_roots(self) -> set[int]:
+        roots: set[int] = set()
+        try:
+            user32 = ctypes.windll.user32
+            _configure_window_api(user32)
+            for widget in QtWidgets.QApplication.topLevelWidgets():
+                try:
+                    hwnd = int(widget.winId())
+                    root = int(user32.GetAncestor(hwnd, 2) or hwnd)
+                    if root:
+                        roots.add(root)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return roots
+
+    def _target_at_native_rect(self, rect: QtCore.QRect) -> dict[str, Any] | None:
+        if not rect.isValid():
+            return None
+        return _window_target_at_native_point(rect.center(), self._ignored_window_roots())
+
+    def _apply_window_target(self, target: dict[str, Any], *, refresh: bool = True) -> bool:
+        """Rebase stored regions and bind this node to the detected client."""
+        exe_name = str(target.get("exe") or "").strip()
+        window_token = str(target.get("window") or "").strip()
+        origin = target.get("client_origin")
+        size = target.get("client_size")
+        if not exe_name or not window_token or not isinstance(origin, (list, tuple)) or len(origin) < 2:
+            return False
+        if not isinstance(size, (list, tuple)) or len(size) < 2:
+            return False
+
+        new_x, new_y = int(origin[0]), int(origin[1])
+        new_w, new_h = max(1, int(size[0])), max(1, int(size[1]))
+        old_is_screen = self._uses_screen_coordinates()
+        old_x, old_y = int(self._base_x), int(self._base_y)
+        converted: dict[str, list[int]] = {}
+        for alias, value in self._asset_regions.items():
+            if not isinstance(value, (list, tuple)) or len(value) < 4:
+                continue
+            screen = [int(part) for part in value[:4]]
+            if not old_is_screen:
+                screen = [screen[0] + old_x, screen[1] + old_y, screen[2] + old_x, screen[3] + old_y]
+            relative = [
+                max(0, min(new_w, screen[0] - new_x)),
+                max(0, min(new_h, screen[1] - new_y)),
+                max(0, min(new_w, screen[2] - new_x)),
+                max(0, min(new_h, screen[3] - new_y)),
+            ]
+            if relative[2] > relative[0] and relative[3] > relative[1]:
+                converted[str(alias)] = relative
+            else:
+                # A region belonging to another window cannot be reused safely.
+                converted[str(alias)] = [0, 0, new_w, new_h]
+
+        self._asset_regions.update(converted)
+        if self._is_color_mode:
+            self._color_regions = self._asset_regions
+        self.step["region_window"] = window_token
+        self.step["region_window_exe"] = exe_name
+        self.step["region_mode"] = "client"
+        self.step["region_coords"] = "relative"
+        click = self.step.get("click")
+        if isinstance(click, dict):
+            click["window"] = window_token
+            click["window_exe"] = exe_name
+        self._base_x, self._base_y = new_x, new_y
+        if refresh:
+            self._do_capture_and_test()
+        return True
+
+    def _pick_program_target(self) -> None:
+        """Let the user click any program and bind the search to that client."""
+        from .action_editor import CoordinatePickerDialog
+
+        original_opacity = self.windowOpacity()
+        self.setWindowOpacity(0.0)
+        QtWidgets.QApplication.processEvents()
+        picker: CoordinatePickerDialog | None = None
+        try:
+            picker = CoordinatePickerDialog(parent=None)
+            if picker.exec() != QtWidgets.QDialog.Accepted:
+                return
+            native_point = logical_point_to_native(picker.point)
+            target = _window_target_at_native_point(native_point, self._ignored_window_roots())
+            if target is None or not self._apply_window_target(target):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "프로그램 감지 실패",
+                    "선택한 위치에서 일반 프로그램 창을 찾지 못했습니다. 대상 창 내부를 다시 클릭해주세요.",
+                )
+        finally:
+            if picker is not None:
+                picker.deleteLater()
+            self.setWindowOpacity(original_opacity if original_opacity > 0 else 1.0)
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
     def _toggle_target_mode(self) -> None:
-        """Toggle between client window mode and full screen mode with coordinate conversion."""
+        """Toggle full screen or choose the actual program under a click."""
         cur_mode = str(self.step.get("region_mode") or "screen").casefold()
         old_bx, old_by = self._base_x, self._base_y
 
-        if cur_mode == "client":
+        if cur_mode in {"client", "window"}:
             self.step["region_mode"] = "screen"
             self.step["region_coords"] = "screen"
             for alias, reg in list(self._asset_regions.items()):
@@ -772,36 +1259,187 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
                     self._asset_regions[alias] = [reg[0] + old_bx, reg[1] + old_by, reg[2] + old_bx, reg[3] + old_by]
             self._do_capture_and_test()
         else:
-            win_exe = str(self.step.get("region_window_exe") or "")
-            win_token = str(self.step.get("region_window") or "")
-            if not win_exe:
-                for cname in ("dnplayer.exe", "HD-Player.exe", "Nox.exe", "MuMuPlayer.exe"):
-                    if _find_target_window(cname, ""):
-                        win_exe = cname
-                        win_token = f"ahk_exe {cname}"
-                        break
-            if win_exe:
-                self.step["region_window_exe"] = win_exe
-                self.step["region_window"] = win_token
-                self.step["region_mode"] = "client"
-                self.step["region_coords"] = "relative"
-                frame, new_bx, new_by, desc = capture_target_area(self.step)
-                if frame is not None and (new_bx or new_by):
-                    fh, fw = frame.shape[:2]
-                    for alias, reg in list(self._asset_regions.items()):
-                        if isinstance(reg, (list, tuple)) and len(reg) >= 4 and (reg[0] or reg[1] or reg[2] or reg[3]):
-                            x1 = max(0, min(fw, reg[0] - new_bx))
-                            y1 = max(0, min(fh, reg[1] - new_by))
-                            x2 = max(0, min(fw, reg[2] - new_bx))
-                            y2 = max(0, min(fh, reg[3] - new_by))
-                            self._asset_regions[alias] = [x1, y1, x2, y2]
+            self._pick_program_target()
+
+    def _on_condition_changed(self) -> None:
+        if hasattr(self, "combo_condition"):
+            self._match_condition = str(self.combo_condition.currentData() or "all_matched")
+        if hasattr(self, "spin_req_count"):
+            self.spin_req_count.setEnabled(self._match_condition in {"at_least_n", "exact_n"})
+        self._refresh_banner_only()
+
+    def _on_req_count_changed(self, val: int) -> None:
+        self._required_count = int(val)
+        self._refresh_banner_only()
+
+    def _on_click_target_changed(self) -> None:
+        if hasattr(self, "combo_click_target"):
+            self._click_target = str(self.combo_click_target.currentData() or "each_image")
+        if hasattr(self, "custom_coord_widget"):
+            self.custom_coord_widget.setVisible(self._click_target == "custom_coord")
+
+    def _pick_custom_click_point(self) -> None:
+        from .action_editor import OffsetPointPickerDialog
+        orig_opacity = self.windowOpacity()
+        self.setWindowOpacity(0.0)
+        QtCore.QThread.msleep(150)
+        QtWidgets.QApplication.processEvents()
+        picker: OffsetPointPickerDialog | None = None
+        try:
+            picker = OffsetPointPickerDialog(single_click=True)
+            if picker.exec() == QtWidgets.QDialog.Accepted:
+                pt = picker.offset()
+                if pt and len(pt) >= 2:
+                    if self._base_x or self._base_y:
+                        pt_x = pt[0] - self._base_x
+                        pt_y = pt[1] - self._base_y
+                    else:
+                        pt_x = pt[0]
+                        pt_y = pt[1]
+                    self._custom_click_x = pt_x
+                    self._custom_click_y = pt_y
+                    if hasattr(self, "spin_click_x"):
+                        self.spin_click_x.setValue(pt_x)
+                    if hasattr(self, "spin_click_y"):
+                        self.spin_click_y.setValue(pt_y)
+        finally:
+            if picker is not None:
+                picker.deleteLater()
+            self.setWindowOpacity(orig_opacity)
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def _add_image_via_capture(self) -> None:
+        from .image_editor import ScreenCaptureDialog, capture_virtual_desktop
+        orig_opacity = self.windowOpacity()
+        self.setWindowOpacity(0.0)
+        QtCore.QThread.msleep(150)
+        QtWidgets.QApplication.processEvents()
+
+        picker: ScreenCaptureDialog | None = None
+        try:
+            pixmap, geometry = capture_virtual_desktop()
+            if pixmap.isNull() or not geometry.isValid():
+                QtWidgets.QMessageBox.warning(self, "캡처 실패", "가상 데스크톱 화면을 캡처하지 못했습니다.")
+                return
+
+            hint_text = "추가할 이미지 대상을 마우스로 드래그 선택 후 Enter (Esc 취소)"
+            picker = ScreenCaptureDialog(pixmap, geometry, parent=None, hint_text=hint_text)
+            if picker.exec() == QtWidgets.QDialog.Accepted:
+                image = picker.captured_image()
+                screen_rect = picker.selected_native_screen_rect()
+                if image.isNull() or not screen_rect.isValid() or screen_rect.width() < 4 or screen_rect.height() < 4:
+                    return
+
+                idx = len(self._aliases) + 1
+                alias = f"multi-img-{idx}-{datetime.now():%H%M%S}"
+
+                try:
+                    self.repository.add_asset_image(image, alias)
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "저장 오류", f"이미지 에셋 저장 중 오류 발생: {e}")
+                    return
+
+                # Bind the node to the actual program underneath the dragged
+                # capture. This works for browsers, desktop apps and emulators;
+                # no hard-coded player name or transient HWND is persisted.
+                target = self._target_at_native_rect(screen_rect)
+                if target is not None:
+                    self._apply_window_target(target, refresh=False)
+
+                # Persist either native-screen or target-relative coordinates,
+                # matching region_mode/region_coords used by the runtime.
+                if not self._uses_screen_coordinates():
+                    rel_left = screen_rect.left() - self._base_x
+                    rel_top = screen_rect.top() - self._base_y
+                else:
+                    rel_left = screen_rect.left()
+                    rel_top = screen_rect.top()
+                rel_right = rel_left + screen_rect.width()
+                rel_bottom = rel_top + screen_rect.height()
+
+                # Add a margin around captured object for flexible search (+20px)
+                if self._uses_screen_coordinates():
+                    # Negative coordinates are valid on monitors positioned to
+                    # the left or above the primary monitor.
+                    reg = [rel_left - 20, rel_top - 20, rel_right + 20, rel_bottom + 20]
+                else:
+                    target_size = target.get("client_size") if target else None
+                    max_w = int(target_size[0]) if isinstance(target_size, (list, tuple)) and len(target_size) >= 2 else None
+                    max_h = int(target_size[1]) if isinstance(target_size, (list, tuple)) and len(target_size) >= 2 else None
+                    reg = [
+                        max(0, rel_left - 20),
+                        max(0, rel_top - 20),
+                        min(max_w, rel_right + 20) if max_w is not None else rel_right + 20,
+                        min(max_h, rel_bottom + 20) if max_h is not None else rel_bottom + 20,
+                    ]
+
+                if alias not in self._aliases:
+                    self._aliases.append(alias)
+                self._asset_regions[alias] = reg
+                self._asset_offsets[alias] = [0, 0]
+                self.canvas.set_active_alias(alias)
+
+                if hasattr(self, "spin_req_count"):
+                    self.spin_req_count.setMaximum(max(1, len(self._aliases)))
+
                 self._do_capture_and_test()
+        finally:
+            if picker is not None:
+                picker.deleteLater()
+            self.setWindowOpacity(orig_opacity)
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def _add_image_from_assets(self) -> None:
+        assets = self.repository.load_assets()
+        existing = set(self._aliases)
+        candidates = [k for k in sorted(assets.keys()) if k not in existing]
+        if not candidates:
+            QtWidgets.QMessageBox.information(
+                self,
+                "에셋 없음",
+                "추가할 수 있는 새 에셋이 없습니다.\n[➕ 화면 캡처로 새 이미지 추가] 버튼으로 직접 캡처하세요."
+            )
+            return
+
+        selected, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "에셋 보관함에서 이미지 추가",
+            "추가할 에셋을 선택하세요:",
+            candidates,
+            0,
+            False,
+        )
+        if ok and selected:
+            if selected not in self._aliases:
+                self._aliases.append(selected)
+            if self._bgr_frame is not None:
+                fh, fw = self._bgr_frame.shape[:2]
+                self._asset_regions[selected] = [0, 0, fw, fh]
             else:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "대상 창 없음",
-                    "실행 중인 앱플레이어(LDPlayer 등) 또는 대상 창을 찾지 못했습니다.\n창을 먼저 띄운 후 다시 시도해주세요."
-                )
+                self._asset_regions[selected] = [0, 0, 0, 0]
+            self._asset_offsets[selected] = [0, 0]
+            self.canvas.set_active_alias(selected)
+            if hasattr(self, "spin_req_count"):
+                self.spin_req_count.setMaximum(max(1, len(self._aliases)))
+            self._evaluate_all_regions()
+            self._refresh_ui()
+
+    def _remove_image_alias(self, alias: str) -> None:
+        if alias in self._aliases:
+            self._aliases.remove(alias)
+        self._asset_regions.pop(alias, None)
+        self._asset_offsets.pop(alias, None)
+        self._test_results.pop(alias, None)
+        if self.canvas._active_alias == alias:
+            self.canvas.set_active_alias(self._aliases[0] if self._aliases else "")
+        if hasattr(self, "spin_req_count"):
+            self.spin_req_count.setMaximum(max(1, len(self._aliases)))
+        self._evaluate_all_regions()
+        self._refresh_ui()
 
     def _evaluate_all_regions(self) -> None:
         if self._is_color_mode:
@@ -836,7 +1474,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
                 nreg = self.step.get("region") or [0, 0, fw, fh]
                 reg = nreg
 
-            l, t, r, b = [int(x) for x in reg[:4]]
+            l, t, r, b = self._region_to_frame(reg)
             # Clamp to frame dimensions
             cl = max(0, min(l, fw - 1))
             ct = max(0, min(t, fh - 1))
@@ -910,7 +1548,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             if not reg or len(reg) < 4 or (reg[0] == 0 and reg[1] == 0 and reg[2] == 0 and reg[3] == 0):
                 reg = [0, 0, fw, fh]
 
-            l, t, r, b = [int(x) for x in reg[:4]]
+            l, t, r, b = self._region_to_frame(reg)
             cl = max(0, min(l, fw - 1))
             ct = max(0, min(t, fh - 1))
             cr = max(cl + 1, min(r, fw))
@@ -959,12 +1597,10 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         self._test_results = results
 
-    def _refresh_ui(self) -> None:
-        active = self.canvas._active_alias or (self._aliases[0] if self._aliases else "")
-        self.canvas.set_data(self._asset_regions, self._test_results, active_alias=active)
-
-        # Update Top Banner
+    def _refresh_banner_only(self) -> None:
         total = len(self._aliases)
+        if total == 0:
+            return
         matched_count = sum(1 for r in self._test_results.values() if r.get("found"))
         req = self._required_count if self._required_count > 0 else total
 
@@ -994,6 +1630,42 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #F87171;")
             self.lbl_banner_sub.setText(f"조건: {cond_desc} (현재 {matched_count}개 일치) ➔ [실패(거짓) 분기]로 이동합니다.")
             self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #FECACA;")
+
+    def _refresh_ui(self) -> None:
+        active = self.canvas._active_alias or (self._aliases[0] if self._aliases else "")
+        self.canvas.set_data(self._canvas_regions(), self._test_results, active_alias=active)
+
+        total = len(self._aliases)
+        if total == 0:
+            self.banner_box.setStyleSheet("background: #1E293B; border: 1px solid #3B4A6B; border-radius: 8px; padding: 8px;")
+            if not self._is_color_mode:
+                self.lbl_banner_main.setText("ℹ️ 등록된 검색 이미지가 없습니다")
+                self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #38BDF8;")
+                self.lbl_banner_sub.setText("상단의 [➕ 화면 캡처로 새 이미지 추가] 버튼을 눌러 탐색할 이미지들을 등록하세요.")
+                self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #94A3B8;")
+            else:
+                self.lbl_banner_main.setText("ℹ️ 등록된 색상이 없습니다")
+                self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #38BDF8;")
+                self.lbl_banner_sub.setText("검색할 색상을 추가하세요.")
+                self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #94A3B8;")
+
+            while self.cards_layout.count():
+                item = self.cards_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+
+            empty_card = QtWidgets.QFrame()
+            empty_card.setStyleSheet("background: #141C2E; border: 1px dashed #2B3D5B; border-radius: 8px; padding: 16px;")
+            ec_layout = QtWidgets.QVBoxLayout(empty_card)
+            ec_lbl = QtWidgets.QLabel("🖼️ <b>등록된 이미지가 없습니다.</b><br><br>상단의 <b>[➕ 화면 캡처로 새 이미지 추가]</b> 버튼을 누르고 게임/창 화면에서 찾고자 하는 이미지 영역을 드래그하여 등록하세요.<br><br>여러 이미지를 등록하여 일치 조건을 자유롭게 설정할 수 있습니다.")
+            ec_lbl.setStyleSheet("color: #94A3B8; font-size: 9pt; line-height: 1.4;")
+            ec_lbl.setWordWrap(True)
+            ec_layout.addWidget(ec_lbl)
+            self.cards_layout.addWidget(empty_card)
+            self.cards_layout.addStretch(1)
+            return
+
+        self._refresh_banner_only()
 
         # Rebuild Cards
         while self.cards_layout.count():
@@ -1094,7 +1766,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._color_tolerances[color_hex] = val
         self._evaluate_all_regions()
         active = self.canvas._active_alias or (self._aliases[0] if self._aliases else "")
-        self.canvas.set_data(self._asset_regions, self._test_results, active_alias=active)
+        self.canvas.set_data(self._canvas_regions(), self._test_results, active_alias=active)
 
         # Update Banner
         total = len(self._aliases)
@@ -1151,10 +1823,22 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         vbox.setContentsMargins(6, 6, 6, 6)
         vbox.setSpacing(4)
 
-        # Row 1: Index, Alias, Status
+        # Row 1: Index, Thumbnail, Alias, Status
         top_row = QtWidgets.QHBoxLayout()
+
+        # Asset thumbnail
+        path = self.repository.asset_path(alias)
+        if path and Path(path).is_file():
+            pix = QtGui.QPixmap(str(path))
+            if not pix.isNull():
+                thumb = QtWidgets.QLabel()
+                thumb.setFixedSize(30, 30)
+                thumb.setPixmap(pix.scaled(30, 30, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+                thumb.setStyleSheet("background: #0B0E14; border: 1px solid #334155; border-radius: 4px; padding: 1px;")
+                top_row.addWidget(thumb)
+
         name_lbl = QtWidgets.QLabel(f"<b>[{idx}] {alias}</b>")
-        name_lbl.setStyleSheet("color: #FFFFFF; font-size: 10pt;")
+        name_lbl.setStyleSheet("color: #FFFFFF; font-size: 9.5pt;")
         top_row.addWidget(name_lbl)
         top_row.addStretch(1)
 
@@ -1170,6 +1854,34 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         reg_lbl = QtWidgets.QLabel(f"영역: [{reg[0]}, {reg[1]}, {reg[2]}, {reg[3]}] (크기: {reg[2]-reg[0]}×{reg[3]-reg[1]})")
         reg_lbl.setStyleSheet("color: #94A3B8; font-size: 8.5pt;")
         vbox.addWidget(reg_lbl)
+
+        # Row 2.5: Individual Click Offset (X, Y)
+        cur_off = self._asset_offsets.get(alias) or [0, 0]
+        off_row = QtWidgets.QHBoxLayout()
+        off_lbl = QtWidgets.QLabel("클릭 오프셋:")
+        off_lbl.setStyleSheet("color: #CBD5E1; font-size: 8.5pt; font-weight: 600;")
+        off_row.addWidget(off_lbl)
+
+        off_x_spin = QtWidgets.QSpinBox()
+        off_x_spin.setRange(-2000, 2000)
+        off_x_spin.setValue(int(cur_off[0]))
+        off_x_spin.setPrefix("X: ")
+        off_x_spin.setSuffix(" px")
+        off_x_spin.setToolTip(f"'{alias}' 발견 시 클릭할 가로(X) 상대 위치 오프셋 (중심 기준)")
+        off_x_spin.setStyleSheet("background: #0B0E14; color: #38BDF8; border: 1px solid #334155; border-radius: 4px; padding: 1px 4px; font-size: 8.5pt;")
+        off_x_spin.valueChanged.connect(lambda val, a=alias: self._set_asset_offset(a, 0, val))
+        off_row.addWidget(off_x_spin)
+
+        off_y_spin = QtWidgets.QSpinBox()
+        off_y_spin.setRange(-2000, 2000)
+        off_y_spin.setValue(int(cur_off[1]))
+        off_y_spin.setPrefix("Y: ")
+        off_y_spin.setSuffix(" px")
+        off_y_spin.setToolTip(f"'{alias}' 발견 시 클릭할 세로(Y) 상대 위치 오프셋 (중심 기준)")
+        off_y_spin.setStyleSheet("background: #0B0E14; color: #38BDF8; border: 1px solid #334155; border-radius: 4px; padding: 1px 4px; font-size: 8.5pt;")
+        off_y_spin.valueChanged.connect(lambda val, a=alias: self._set_asset_offset(a, 1, val))
+        off_row.addWidget(off_y_spin)
+        vbox.addLayout(off_row)
 
         # Row 3: Diagnostic / Hint
         if not found:
@@ -1203,17 +1915,66 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             btn_snap.clicked.connect(lambda _, a=alias: self._snap_single_to_actual(a))
             btn_box.addWidget(btn_snap)
 
+        btn_del = QtWidgets.QPushButton("🗑️ 삭제")
+        btn_del.setStyleSheet("""
+            QPushButton {
+                background: #450A0A;
+                border: 1px solid #991B1B;
+                color: #FCA5A5;
+                padding: 3px 8px;
+                border-radius: 4px;
+                font-size: 8.5pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #991B1B;
+                color: #FFFFFF;
+            }
+        """)
+        btn_del.clicked.connect(lambda _, a=alias: self._remove_image_alias(a))
+        btn_box.addWidget(btn_del)
+
         vbox.addLayout(btn_box)
         return card
+
+    def _set_asset_offset(self, alias: str, axis: int, value: int) -> None:
+        if alias not in self._asset_offsets:
+            self._asset_offsets[alias] = [0, 0]
+        self._asset_offsets[alias][axis] = int(value)
 
     def _select_active_alias(self, alias: str) -> None:
         self.canvas.set_active_alias(alias)
         self._refresh_ui()
 
     def _on_canvas_region_dragged(self, alias: str, reg: list[int]) -> None:
-        self._asset_regions[alias] = reg
+        # A drag on the full-desktop canvas also identifies the real program
+        # underneath that area and rebases all regions to its client origin.
+        if self._uses_screen_coordinates() and len(reg) >= 4:
+            native_rect = QtCore.QRect(
+                int(reg[0]) + self._base_x,
+                int(reg[1]) + self._base_y,
+                max(1, int(reg[2]) - int(reg[0])),
+                max(1, int(reg[3]) - int(reg[1])),
+            )
+            target = self._target_at_native_rect(native_rect)
+            if target is not None and self._apply_window_target(target, refresh=False):
+                origin = target.get("client_origin") or [0, 0]
+                size = target.get("client_size") or [1, 1]
+                stored_reg = [
+                    max(0, min(int(size[0]), native_rect.x() - int(origin[0]))),
+                    max(0, min(int(size[1]), native_rect.y() - int(origin[1]))),
+                    max(0, min(int(size[0]), native_rect.x() + native_rect.width() - int(origin[0]))),
+                    max(0, min(int(size[1]), native_rect.y() + native_rect.height() - int(origin[1]))),
+                ]
+                self._asset_regions[alias] = stored_reg
+                if self._is_color_mode:
+                    self._color_regions[alias] = stored_reg
+                self._do_capture_and_test()
+                return
+        stored_reg = self._region_from_frame(reg)
+        self._asset_regions[alias] = stored_reg
         if self._is_color_mode:
-            self._color_regions[alias] = reg
+            self._color_regions[alias] = stored_reg
         self._evaluate_all_regions()
         self._refresh_ui()
 
@@ -1250,13 +2011,17 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
                 th = int(res.get("tmpl_h", 24))
                 pad_x = max(16, tw)
                 pad_y = max(14, th)
-            self._asset_regions[alias] = [max(0, fx - pad_x), max(0, fy - pad_y), fx + pad_x, fy + pad_y]
+            local_reg = [max(0, fx - pad_x), max(0, fy - pad_y), fx + pad_x, fy + pad_y]
+            self._asset_regions[alias] = self._region_from_frame(local_reg)
             if self._is_color_mode:
                 self._color_regions[alias] = self._asset_regions[alias]
             self._evaluate_all_regions()
             self._refresh_ui()
 
     def _snap_all_to_actual_matches(self) -> None:
+        if not self._aliases:
+            QtWidgets.QMessageBox.information(self, "알림", "등록된 대상(이미지/색상)이 없습니다.")
+            return
         snapped_count = 0
         for alias in self._aliases:
             res = self._test_results.get(alias, {})
@@ -1271,7 +2036,8 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
                     th = int(res.get("tmpl_h", 24))
                     pad_x = max(16, tw)
                     pad_y = max(14, th)
-                self._asset_regions[alias] = [max(0, fx - pad_x), max(0, fy - pad_y), fx + pad_x, fy + pad_y]
+                local_reg = [max(0, fx - pad_x), max(0, fy - pad_y), fx + pad_x, fy + pad_y]
+                self._asset_regions[alias] = self._region_from_frame(local_reg)
                 if self._is_color_mode:
                     self._color_regions[alias] = self._asset_regions[alias]
                 snapped_count += 1
@@ -1324,3 +2090,48 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         max_r = max(int(r[2]) for r in valid_regs)
         max_b = max(int(r[3]) for r in valid_regs)
         return [min_l, min_t, max_r, max_b]
+
+    def get_aliases(self) -> list[str]:
+        return list(self._aliases)
+
+    def get_match_condition(self) -> str:
+        return self._match_condition
+
+    def get_required_count(self) -> int:
+        return self._required_count
+
+    def get_asset_offsets(self) -> dict[str, list[int]]:
+        return {k: list(v) for k, v in self._asset_offsets.items()}
+
+    def get_click_target(self) -> str:
+        return self._click_target
+
+    def get_custom_click_coords(self) -> tuple[int, int]:
+        return (self._custom_click_x, self._custom_click_y)
+
+    def accept(self) -> None:
+        self.setWindowOpacity(1.0)
+        p = self.parent()
+        if p is not None and hasattr(p, "setEnabled"):
+            p.setEnabled(True)
+            if hasattr(p, "activateWindow"):
+                p.activateWindow()
+        super().accept()
+
+    def reject(self) -> None:
+        self.setWindowOpacity(1.0)
+        p = self.parent()
+        if p is not None and hasattr(p, "setEnabled"):
+            p.setEnabled(True)
+            if hasattr(p, "activateWindow"):
+                p.activateWindow()
+        super().reject()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.setWindowOpacity(1.0)
+        p = self.parent()
+        if p is not None and hasattr(p, "setEnabled"):
+            p.setEnabled(True)
+            if hasattr(p, "activateWindow"):
+                p.activateWindow()
+        super().closeEvent(event)

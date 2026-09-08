@@ -349,6 +349,9 @@ class SettingsPage(QtWidgets.QWidget):
         test_notify = QtWidgets.QPushButton("🔔 휴대폰 테스트 알림")
         test_notify.setToolTip("휴대폰으로 테스트 알림을 즉시 전송하여 연동 상태 및 소리/진동을 확인합니다.")
         test_notify.clicked.connect(self._send_test_remote_notify)
+        reset_pairing = QtWidgets.QPushButton("새 연결 코드 발급")
+        reset_pairing.setToolTip("보안키가 바뀌었거나 device_secret_mismatch가 발생한 경우 모바일 연결을 새로 만듭니다.")
+        reset_pairing.clicked.connect(self._reset_remote_pairing)
         save = primary_button("설정 저장 및 적용")
         save.clicked.connect(self._save_remote_settings)
         actions.addWidget(self.remote_local_button)
@@ -356,6 +359,7 @@ class SettingsPage(QtWidgets.QWidget):
         actions.addWidget(open_mobile)
         actions.addWidget(copy_code)
         actions.addWidget(test_notify)
+        actions.addWidget(reset_pairing)
         actions.addStretch(1)
         actions.addWidget(save)
         outer.addLayout(actions)
@@ -427,6 +431,30 @@ class SettingsPage(QtWidgets.QWidget):
         self.status.emit("원격 에이전트를 중지했습니다." if running and ok else "원격 에이전트를 시작했습니다." if ok else "원격 에이전트를 시작하지 못했습니다.")
         self._refresh_remote_status()
 
+    def _reset_remote_pairing(self) -> None:
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "모바일 연결 새로 만들기",
+            "기존 모바일 연결 토큰을 폐기하고 새 연결 코드를 발급할까요?\n"
+            "완료 후 휴대폰에서 기존 연결을 해제하고 새 6자리 코드를 입력해야 합니다.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            self.remote.reset_identity()
+            self.remote.ensure_running()
+            self._refresh_remote_status()
+            self.status.emit("새 모바일 연결 코드를 발급했습니다. 휴대폰에서 다시 페어링하세요.")
+            QtWidgets.QMessageBox.information(
+                self,
+                "새 연결 코드 발급 완료",
+                "새 코드가 발급되었습니다. 휴대폰의 기존 연결을 해제한 뒤 새 코드를 입력하세요.",
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "연결 초기화 실패", str(exc))
+
     def _copy_remote_code(self) -> None:
         code = self.remote_pair_code.text().strip()
         if code and code != "—":
@@ -470,14 +498,20 @@ class SettingsPage(QtWidgets.QWidget):
         status = self.remote.status()
         running = bool(status.get("agent_running"))
         connected = bool(status.get("connected")) and time.time() - float(status.get("updated") or 0) < 15
+        last_error = str(status.get("last_error") or "").strip()
         if connected:
             text, color = "중계 서버 연결됨", COLORS["success"]
+        elif last_error == "device_secret_mismatch":
+            text, color = "재페어링 필요", COLORS["danger"]
+        elif last_error:
+            text, color = "연결 오류", COLORS["danger"]
         elif running:
             text, color = "연결 시도 중", COLORS["warning"]
         else:
             text, color = "중지됨", COLORS["warning"]
         self.remote_state.setText(text)
         self.remote_state.setStyleSheet(f"font-weight: 700; color: {color};")
+        self.remote_state.setToolTip(last_error or ("정상 연결됨" if connected else "에이전트가 아직 중계 서버에 등록되지 않았습니다."))
         self.remote_pair_code.setText(str(status.get("pairing_code") or "—"))
         relay_running = bool(status.get("relay_running"))
         self.remote_local_button.setText("고급: 로컬 서버 중지" if relay_running else "고급: 로컬 서버 시작")

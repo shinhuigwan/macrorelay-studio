@@ -1069,17 +1069,24 @@ class MainWindow(QtWidgets.QMainWindow):
         pixmap = screen.grabWindow(0, left, top, width, height)
         if pixmap.isNull():
             return None
-        marker_x = local_x - left
-        marker_y = local_y - top
+        # QScreen returns a pixmap whose backing image may be larger than the
+        # logical capture rectangle on a scaled display.  Draw the marker in
+        # backing-pixel coordinates so the preview crosshair stays on the
+        # actual click instead of drifting at 125/150% DPI.
+        scale = max(1.0, float(pixmap.devicePixelRatio()))
+        marker_x = round((local_x - left) * scale)
+        marker_y = round((local_y - top) * scale)
         painter = QtGui.QPainter(pixmap)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        shadow = QtGui.QPen(QtGui.QColor(8, 12, 20, 220), 6)
-        accent = QtGui.QPen(QtGui.QColor("#32e6d0"), 3)
+        shadow = QtGui.QPen(QtGui.QColor(8, 12, 20, 220), max(2, round(6 * scale)))
+        accent = QtGui.QPen(QtGui.QColor("#32e6d0"), max(1, round(3 * scale)))
         for pen in (shadow, accent):
             painter.setPen(pen)
-            painter.drawLine(marker_x - 24, marker_y, marker_x + 24, marker_y)
-            painter.drawLine(marker_x, marker_y - 24, marker_x, marker_y + 24)
-            painter.drawEllipse(QtCore.QPoint(marker_x, marker_y), 13, 13)
+            arm = round(24 * scale)
+            radius = round(13 * scale)
+            painter.drawLine(marker_x - arm, marker_y, marker_x + arm, marker_y)
+            painter.drawLine(marker_x, marker_y - arm, marker_x, marker_y + arm)
+            painter.drawEllipse(QtCore.QPoint(marker_x, marker_y), radius, radius)
         painter.end()
         return pixmap
 
@@ -1132,6 +1139,8 @@ class MainWindow(QtWidgets.QMainWindow):
         app = QtWidgets.QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
+        if hasattr(self, "_mini_hud") and self._mini_hud:
+            self._mini_hud.close()
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("sidebar_collapsed", self._sidebar_collapsed)
         super().closeEvent(event)

@@ -18,6 +18,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .action_editor import ActionEditor, CoordinatePickerDialog, WindowPickerDialog, action_template
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
 from .node_editor import ACTION_TITLES
+from .screen_coordinates import logical_point_to_native, logical_rect_to_native, native_point_to_logical, native_rect_to_logical, rect_to_exclusive_list
 from .theme import COLORS
 from .widgets import WheelSafeSpinBox
 
@@ -483,6 +484,46 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
     return drafts
 
 
+def _native_pixel_color(point: QtCore.QPoint, fallback: QtGui.QColor) -> QtGui.QColor:
+    """Read the exact physical desktop pixel selected by a Qt logical cursor."""
+    try:
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        dc = user32.GetDC(0)
+        if dc:
+            try:
+                color_ref = int(gdi32.GetPixel(dc, int(point.x()), int(point.y())))
+                if color_ref != -1:
+                    return QtGui.QColor(
+                        color_ref & 0xFF,
+                        (color_ref >> 8) & 0xFF,
+                        (color_ref >> 16) & 0xFF,
+                    )
+            finally:
+                user32.ReleaseDC(0, dc)
+    except Exception:
+        pass
+    return QtGui.QColor(fallback)
+
+
+def _native_region_image(rect: QtCore.QRect, fallback: QtGui.QImage) -> QtGui.QImage:
+    """Capture an exact physical-pixel image for a native desktop rectangle."""
+    if not rect.isValid():
+        return fallback
+    try:
+        from opencv_search import capture_region
+
+        frame = capture_region(rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height())
+        if frame is not None and frame.size:
+            qimage = QtGui.QImage(
+                frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QtGui.QImage.Format_BGR888
+            )
+            return qimage.copy()
+    except Exception:
+        pass
+    return fallback
+
+
 class PixelColorPickerDialog(QtWidgets.QDialog):
     """Fullscreen overlay with magnifier lens for precise pixel color extraction."""
 
@@ -520,8 +561,9 @@ class PixelColorPickerDialog(QtWidgets.QDialog):
             local_x = screen_pos.x() - self._geometry.left()
             local_y = screen_pos.y() - self._geometry.top()
             if 0 <= local_x < img.width() and 0 <= local_y < img.height():
-                self._selected_color = img.pixelColor(local_x, local_y)
-                self._selected_point = screen_pos
+                native_pos = logical_point_to_native(screen_pos)
+                self._selected_color = _native_pixel_color(native_pos, img.pixelColor(local_x, local_y))
+                self._selected_point = native_pos
             self.accept()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
@@ -681,10 +723,11 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
             local_x = screen_pos.x() - self._geometry.left()
             local_y = screen_pos.y() - self._geometry.top()
             if 0 <= local_x < img.width() and 0 <= local_y < img.height():
-                color = img.pixelColor(local_x, local_y)
+                native_pos = logical_point_to_native(screen_pos)
+                color = _native_pixel_color(native_pos, img.pixelColor(local_x, local_y))
                 self._points.append({
-                    "x": screen_pos.x(),
-                    "y": screen_pos.y(),
+                    "x": native_pos.x(),
+                    "y": native_pos.y(),
                     "color": color.name().upper(),
                     "tolerance": 10,
                 })
@@ -1133,6 +1176,7 @@ class RecordingBar(QtWidgets.QDialog):
         self.live_canvas.setMinimumHeight(280)
         self.live_canvas.link_requested.connect(self._connect_live_nodes)
         self.live_canvas.edge_delete_requested.connect(self._delete_live_edge)
+        self.live_canvas.edges_delete_requested.connect(self._delete_live_edges_batch)
         self.live_canvas.node_delete_requested.connect(self._delete_live_node)
         self.live_canvas.inspector_requested.connect(self._open_live_node_editor)
         self.live_canvas.multi_image_merge_requested.connect(self._merge_live_image_nodes)
@@ -1197,8 +1241,13 @@ class RecordingBar(QtWidgets.QDialog):
         elif left_x >= available.left():
             x = left_x
         else:
-            x = min(max(available.left(), right_x), available.right() - width + 1)
-        y = min(max(available.top(), host_rect.top()), available.bottom() - height + 1)
+            # If the recorder is wider than the available desktop, the old
+            # upper clamp became smaller than the lower clamp and produced a
+            # negative/off-screen coordinate.
+            max_x = max(available.left(), available.right() - width + 1)
+            x = min(max(available.left(), right_x), max_x)
+        max_y = max(available.top(), available.bottom() - height + 1)
+        y = min(max(available.top(), host_rect.top()), max_y)
         self.move(x, y)
 
     def _position_at_cursor(self) -> None:
@@ -1226,7 +1275,10 @@ class RecordingBar(QtWidgets.QDialog):
             self.events_deleted.emit(member_ids)
 
     def _delete_selected_live_nodes(self) -> None:
-        """선택된 노드들을 일괄 삭제합니다."""
+        """선택된 노드 또는 노드선들을 일괄 삭제합니다."""
+        selected_edges = [item for item in self.live_canvas.scene.selectedItems() if type(item).__name__ == "EdgeItem"]
+        if selected_edges and hasattr(self.live_canvas, "delete_selected_edges"):
+            self.live_canvas.delete_selected_edges(selected_edges)
         selected = self.live_canvas.selected_indexes()
         if selected:
             for idx in sorted(selected, reverse=True):
@@ -1566,6 +1618,34 @@ class RecordingBar(QtWidgets.QDialog):
                 self._live_link_overrides[key] = remaining if len(remaining) > 1 else (remaining[0] if remaining else None)
             else:
                 self._live_link_overrides[key] = None
+            self._schedule_live_rebuild()
+
+    def _delete_live_edges_batch(self, edge_specs: list[dict[str, Any]]) -> None:
+        if not edge_specs:
+            return
+        modified = False
+        for spec in edge_specs:
+            source = int(spec.get("source") or 0)
+            target = int(spec.get("target") or 0)
+            kind = str(spec.get("kind") or "success")
+            if not 0 < source <= len(self.live_canvas.steps):
+                continue
+            source_id = str(self.live_canvas.steps[source - 1].get("_event_id") or "")
+            if not source_id:
+                continue
+            normalized_kind = "fail" if kind == "fail" else "success"
+            key = (source_id, normalized_kind)
+            current = self._live_link_overrides.get(key)
+            if isinstance(current, list):
+                target_id = ""
+                if 0 < target <= len(self.live_canvas.steps):
+                    target_id = str(self.live_canvas.steps[target - 1].get("_event_id") or "")
+                remaining = [value for value in current if value != target_id]
+                self._live_link_overrides[key] = remaining if len(remaining) > 1 else (remaining[0] if remaining else None)
+            else:
+                self._live_link_overrides[key] = None
+            modified = True
+        if modified:
             self._schedule_live_rebuild()
 
     def _merge_live_image_nodes(self, indexes: list[int]) -> None:
@@ -2482,7 +2562,7 @@ class SmartRecordingController(QtCore.QObject):
                         picker = ScreenCaptureDialog(pixmap, geometry, hint_text=hint_text)
                         try:
                             if picker.exec() == QtWidgets.QDialog.Accepted:
-                                screen_rect = picker.selected_screen_rect()
+                                screen_rect = picker.selected_native_screen_rect()
                                 image = picker.captured_image()
                                 if not image.isNull() and screen_rect.isValid():
                                     payload = QtCore.QByteArray()
@@ -2494,8 +2574,8 @@ class SmartRecordingController(QtCore.QObject):
                                     search_region = [
                                         screen_rect.left() - client_rect.left() if client_rect.isValid() else screen_rect.left(),
                                         screen_rect.top() - client_rect.top() if client_rect.isValid() else screen_rect.top(),
-                                        screen_rect.right() - client_rect.left() if client_rect.isValid() else screen_rect.right(),
-                                        screen_rect.bottom() - client_rect.top() if client_rect.isValid() else screen_rect.bottom(),
+                                        screen_rect.x() + screen_rect.width() - client_rect.left() if client_rect.isValid() else screen_rect.x() + screen_rect.width(),
+                                        screen_rect.y() + screen_rect.height() - client_rect.top() if client_rect.isValid() else screen_rect.y() + screen_rect.height(),
                                     ]
                                     alias = f"ocr-sample-{datetime.now():%Y%m%d-%H%M%S}"
                                     self.repository.add_asset_image(image, alias)
@@ -2563,18 +2643,18 @@ class SmartRecordingController(QtCore.QObject):
                             search_region = [0, 0, 0, 0]
                             try:
                                 if region_picker.exec() == QtWidgets.QDialog.Accepted:
-                                    s_rect = region_picker.selected_screen_rect()
+                                    s_rect = region_picker.selected_native_screen_rect()
                                     if s_rect.isValid() and s_rect.width() > 5 and s_rect.height() > 5:
                                         client_rect = _resolve_live_client_rect(window)
                                         if client_rect.isValid():
                                             search_region = [
                                                 max(0, s_rect.left() - client_rect.left()),
                                                 max(0, s_rect.top() - client_rect.top()),
-                                                s_rect.right() - client_rect.left(),
-                                                s_rect.bottom() - client_rect.top(),
+                                                s_rect.x() + s_rect.width() - client_rect.left(),
+                                                s_rect.y() + s_rect.height() - client_rect.top(),
                                             ]
                                         else:
-                                            search_region = [s_rect.left(), s_rect.top(), s_rect.right(), s_rect.bottom()]
+                                            search_region = rect_to_exclusive_list(s_rect)
                             finally:
                                 region_picker.deleteLater()
                             event.update({
@@ -2601,7 +2681,7 @@ class SmartRecordingController(QtCore.QObject):
                         )
                         try:
                             if picker1.exec() == QtWidgets.QDialog.Accepted:
-                                track_rect = picker1.selected_screen_rect()
+                                track_rect = picker1.selected_native_screen_rect()
                                 track_img = picker1.captured_image()
                                 if not track_img.isNull() and track_rect.isValid():
                                     alias = f"track-target-{datetime.now():%Y%m%d-%H%M%S}"
@@ -2614,7 +2694,7 @@ class SmartRecordingController(QtCore.QObject):
                                     try:
                                         ocr_rect = track_rect
                                         if picker2.exec() == QtWidgets.QDialog.Accepted:
-                                            sel_ocr = picker2.selected_screen_rect()
+                                            sel_ocr = picker2.selected_native_screen_rect()
                                             if sel_ocr.isValid() and sel_ocr.width() > 2:
                                                 ocr_rect = sel_ocr
                                         offset_x = ocr_rect.left() - track_rect.left()
@@ -2693,18 +2773,18 @@ class SmartRecordingController(QtCore.QObject):
                             )
                             search_region = [0, 0, 0, 0]
                             if region_picker.exec() == QtWidgets.QDialog.Accepted:
-                                s_rect = region_picker.selected_screen_rect()
+                                s_rect = region_picker.selected_native_screen_rect()
                                 if s_rect.isValid() and s_rect.width() > 4 and s_rect.height() > 4:
                                     client_rect = _resolve_live_client_rect(window)
                                     if client_rect.isValid():
                                         search_region = [
                                             max(0, s_rect.left() - client_rect.left()),
                                             max(0, s_rect.top() - client_rect.top()),
-                                            s_rect.right() - client_rect.left(),
-                                            s_rect.bottom() - client_rect.top(),
+                                            s_rect.x() + s_rect.width() - client_rect.left(),
+                                            s_rect.y() + s_rect.height() - client_rect.top(),
                                         ]
                                     else:
-                                        search_region = [s_rect.left(), s_rect.top(), s_rect.right(), s_rect.bottom()]
+                                        search_region = rect_to_exclusive_list(s_rect)
                             event.update({
                                 "target_color": color_hex,
                                 "search_region": search_region,
@@ -2945,12 +3025,16 @@ class SmartRecordingController(QtCore.QObject):
             if prompt_search_region:
                 # F4 Instant Capture: Zero drag overlay dialogs, 100% instant 1-click snapshot at cursor position
                 point = wintypes.POINT()
-                if not user32.GetCursorPos(ctypes.byref(point)):
-                    point.x, point.y = geometry.center().x(), geometry.center().y()
-                screen_rect = QtCore.QRect(point.x - 48, point.y - 32, 96, 64).intersected(geometry)
+                if user32.GetCursorPos(ctypes.byref(point)):
+                    logical_cursor = native_point_to_logical(QtCore.QPoint(int(point.x), int(point.y)))
+                else:
+                    logical_cursor = geometry.center()
+                screen_rect = QtCore.QRect(
+                    logical_cursor.x() - 48, logical_cursor.y() - 32, 96, 64
+                ).intersected(geometry)
                 local_rect = screen_rect.translated(-geometry.left(), -geometry.top())
                 image = pixmap.copy(local_rect).toImage()
-                selected_center = QtCore.QPoint(point.x, point.y)
+                selected_center = QtCore.QPoint(logical_cursor)
             else:
                 hint1 = "[ 수동 이미지 영역 지정 ] 드래그 선택 후 Enter (Esc 취소)"
                 picker = ScreenCaptureDialog(pixmap, geometry, hint_text=hint1)
@@ -2969,6 +3053,11 @@ class SmartRecordingController(QtCore.QObject):
                     image = pixmap.copy(local_rect).toImage()
                     screen_rect = expanded
 
+            native_screen_rect = logical_rect_to_native(screen_rect)
+            native_center = native_screen_rect.center()
+            if prompt_search_region:
+                image = _native_region_image(native_screen_rect, image)
+
             ignored_hwnds: set[int] = set()
             try:
                 for widget in QtWidgets.QApplication.topLevelWidgets():
@@ -2977,7 +3066,7 @@ class SmartRecordingController(QtCore.QObject):
                         ignored_hwnds.add(root)
             except Exception:
                 ignored_hwnds.clear()
-            detected = ActionEditor._window_target_at(selected_center, ignored_hwnds)
+            detected = ActionEditor._window_target_at(native_center, ignored_hwnds, position_is_native=True)
             if detected:
                 window = {key: value for key, value in detected.items() if key != "rect"}
             elif str(window.get("exe") or "").casefold() in {"python.exe", "pythonw.exe"}:
@@ -2988,17 +3077,17 @@ class SmartRecordingController(QtCore.QObject):
                 client_rect = _resolve_live_client_rect(window)
                 if client_rect.isValid():
                     search_region = [
-                        max(0, selected_center.x() - client_rect.left() - 220),
-                        max(0, selected_center.y() - client_rect.top() - 160),
-                        min(client_rect.width(), selected_center.x() - client_rect.left() + 220),
-                        min(client_rect.height(), selected_center.y() - client_rect.top() + 160),
+                        max(0, native_center.x() - client_rect.left() - 220),
+                        max(0, native_center.y() - client_rect.top() - 160),
+                        min(client_rect.width(), native_center.x() - client_rect.left() + 220),
+                        min(client_rect.height(), native_center.y() - client_rect.top() + 160),
                     ]
                 else:
                     search_region = [
-                        max(0, selected_center.x() - 220),
-                        max(0, selected_center.y() - 160),
-                        selected_center.x() + 220,
-                        selected_center.y() + 160,
+                        max(0, native_center.x() - 220),
+                        max(0, native_center.y() - 160),
+                        native_center.x() + 220,
+                        native_center.y() + 160,
                     ]
 
             payload = QtCore.QByteArray()
@@ -3006,7 +3095,7 @@ class SmartRecordingController(QtCore.QObject):
             buffer.open(QtCore.QIODevice.WriteOnly)
             image.save(buffer, "PNG")
             buffer.close()
-            center = selected_center
+            center = native_center
             origin = window.get("capture_origin") if isinstance(window.get("capture_origin"), list) else window.get("client_origin")
             if not isinstance(origin, list):
                 origin = [0, 0]
@@ -3021,10 +3110,16 @@ class SmartRecordingController(QtCore.QObject):
                 "button": "Left",
                 "record_mode": "branch" if record_mode == "branch" else "action",
                 "window": window,
-                "selected_screen_rect": [screen_rect.x(), screen_rect.y(), screen_rect.width(), screen_rect.height()],
+                "selected_screen_rect": [
+                    native_screen_rect.x(), native_screen_rect.y(),
+                    native_screen_rect.width(), native_screen_rect.height(),
+                ],
                 "image_sample_bmp": base64.b64encode(bytes(payload)).decode("ascii"),
                 "image_sample_size": [image.width(), image.height()],
-                "image_anchor": [int(center.x() - screen_rect.left()), int(center.y() - screen_rect.top())],
+                "image_anchor": [
+                    int(native_center.x() - native_screen_rect.left()),
+                    int(native_center.y() - native_screen_rect.top()),
+                ],
             }
             if search_region:
                 capture_event["search_region"] = search_region
@@ -3781,7 +3876,8 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             self.setWindowOpacity(orig_opacity if orig_opacity > 0 else 1.0)
             self.show()
             return
-        clipped = client_rect.intersected(desktop_geometry)
+        logical_client_rect = native_rect_to_logical(client_rect)
+        clipped = logical_client_rect.intersected(desktop_geometry)
         if not clipped.isValid():
             self.setWindowOpacity(orig_opacity if orig_opacity > 0 else 1.0)
             self.show()
@@ -3793,7 +3889,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         try:
             if picker.exec() != QtWidgets.QDialog.Accepted:
                 return
-            selected = picker.selected_screen_rect().intersected(client_rect)
+            selected = picker.selected_native_screen_rect().intersected(client_rect)
             if selected.width() < 4 or selected.height() < 4:
                 return
             region = [
@@ -4830,7 +4926,7 @@ class QuickActionWizard:
                 if dialog.exec() != QtWidgets.QDialog.Accepted:
                     return None
                 image = dialog.captured_image()
-                rect = dialog.selected_screen_rect()
+                rect = dialog.selected_native_screen_rect()
             finally:
                 dialog.deleteLater()
             if image.isNull() or not rect.isValid():
@@ -4839,10 +4935,10 @@ class QuickActionWizard:
             alias = f"{prefix}_{datetime.now():%m%d_%H%M%S}"
             alias = repository.add_asset_image(image, alias)
             search_region = [
-                max(0, rect.left() - 100),
-                max(0, rect.top() - 100),
-                rect.right() + 100,
-                rect.bottom() + 100,
+                rect.left() - 100,
+                rect.top() - 100,
+                rect.x() + rect.width() + 100,
+                rect.y() + rect.height() + 100,
             ]
             step.update(
                 {
@@ -4886,14 +4982,14 @@ class QuickActionWizard:
                 if dialog.exec() != QtWidgets.QDialog.Accepted:
                     return None
                 image = dialog.captured_image()
-                rect = dialog.selected_screen_rect()
+                rect = dialog.selected_native_screen_rect()
             finally:
                 dialog.deleteLater()
             if image.isNull() or not rect.isValid():
                 return None
             alias = f"ocr_sample_{datetime.now():%m%d_%H%M%S}"
             repository.add_asset_image(image, alias)
-            search_region = [rect.left(), rect.top(), rect.right(), rect.bottom()]
+            search_region = rect_to_exclusive_list(rect)
             step.update(
                 {
                     "asset": alias,
@@ -4954,12 +5050,12 @@ class QuickActionWizard:
                     return None
                 alias = f"track-{datetime.now():%Y%m%d-%H%M%S}"
                 repository.add_asset_image(img, alias)
-                ref_rect = p1.selected_screen_rect()
+                ref_rect = p1.selected_native_screen_rect()
                 p2 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="[ 2단계 ] 인식할 OCR 텍스트 영역을 드래그 선택 후 Enter")
                 try:
                     if p2.exec() != QtWidgets.QDialog.Accepted:
                         return None
-                    ocr_rect = p2.selected_screen_rect()
+                    ocr_rect = p2.selected_native_screen_rect()
                 finally:
                     p2.deleteLater()
             finally:
@@ -5007,15 +5103,15 @@ class QuickActionWizard:
                 return None
             p2 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="게이지(체력바) 영역을 드래그 선택 후 Enter")
             try:
-                if p2.exec() != QtWidgets.QDialog.Accepted or not p2.selected_screen_rect().isValid():
+                if p2.exec() != QtWidgets.QDialog.Accepted or not p2.selected_native_screen_rect().isValid():
                     return None
-                r = p2.selected_screen_rect()
+                r = p2.selected_native_screen_rect()
             finally:
                 p2.deleteLater()
             step.update(
                 {
                     "target_color": color.name().upper(),
-                    "search_region": [r.left(), r.top(), r.right(), r.bottom()],
+                    "search_region": rect_to_exclusive_list(r),
                     "label": "자동 설정 색상 비율 게이지",
                 }
             )

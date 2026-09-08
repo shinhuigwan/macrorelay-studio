@@ -84,6 +84,7 @@ class FloatingMiniHUD(QtWidgets.QWidget):
         self._is_running: bool = False
         self._is_paused: bool = False
         self._last_pixmap: QtGui.QPixmap | None = None
+        self._preview_popup: ClickPreviewPopup | None = None
 
         self._build_ui()
         self._load_saved_position()
@@ -304,18 +305,39 @@ class FloatingMiniHUD(QtWidgets.QWidget):
             return
         self._last_pixmap = pixmap
         icon_pixmap = pixmap.scaled(
-            30, 30, QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation
+            30, 30, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
         )
         self.btn_thumb.setIcon(QtGui.QIcon(icon_pixmap))
         self.btn_thumb.setIconSize(QtCore.QSize(28, 28))
         self.btn_thumb.setText("")
 
     def _show_thumb_preview(self) -> None:
-        if self._last_pixmap is not None and not self._last_pixmap.isNull():
-            popup = ClickPreviewPopup(self._last_pixmap, self)
-            global_pos = self.btn_thumb.mapToGlobal(QtCore.QPoint(0, self.btn_thumb.height() + 4))
+        if self._last_pixmap is None or self._last_pixmap.isNull():
+            return
+        # A modal exec() here starts a nested Qt event loop.  That made the
+        # Studio look frozen while the preview was open and could swallow the
+        # stop/restore buttons.  Keep one non-modal popup instead.
+        if self._preview_popup is not None and self._preview_popup.isVisible():
+            self._preview_popup.raise_()
+            self._preview_popup.activateWindow()
+            return
+        popup = ClickPreviewPopup(self._last_pixmap, self)
+        popup.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        popup.destroyed.connect(lambda *_args: setattr(self, "_preview_popup", None))
+        self._preview_popup = popup
+        global_pos = self.btn_thumb.mapToGlobal(QtCore.QPoint(0, self.btn_thumb.height() + 4))
+        popup.adjustSize()
+        screen = QtGui.QGuiApplication.screenAt(global_pos) or QtGui.QGuiApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = max(area.left(), min(global_pos.x(), area.right() - popup.width() + 1))
+            y = max(area.top(), min(global_pos.y(), area.bottom() - popup.height() + 1))
+            popup.move(x, y)
+        else:
             popup.move(global_pos)
-            popup.exec()
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
 
     def _on_pause_resume_clicked(self) -> None:
         if not self._is_running:
@@ -345,7 +367,7 @@ class FloatingMiniHUD(QtWidgets.QWidget):
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         if self._drag_pos is not None and (event.buttons() & QtCore.Qt.LeftButton):
             new_pos = event.globalPosition().toPoint() - self._drag_pos
-            self.move(new_pos)
+            self.move(self._clamp_position(new_pos))
             event.accept()
         else:
             super().mouseMoveEvent(event)
@@ -370,24 +392,48 @@ class FloatingMiniHUD(QtWidgets.QWidget):
         settings.setValue("pos_x", self.x())
         settings.setValue("pos_y", self.y())
 
+    @staticmethod
+    def _virtual_available_geometry() -> QtCore.QRect:
+        screens = QtGui.QGuiApplication.screens()
+        if not screens:
+            return QtCore.QRect(0, 0, 1920, 1080)
+        geometry = QtCore.QRect()
+        for screen in screens:
+            geometry = geometry.united(screen.availableGeometry())
+        return geometry
+
+    def _clamp_position(self, position: QtCore.QPoint) -> QtCore.QPoint:
+        """Keep the HUD reachable on any monitor, including negative origins."""
+        virtual = self._virtual_available_geometry()
+        width = max(1, self.width())
+        height = max(1, self.height())
+        max_x = virtual.right() - width + 1
+        max_y = virtual.bottom() - height + 1
+        return QtCore.QPoint(
+            max(virtual.left(), min(position.x(), max_x)),
+            max(virtual.top(), min(position.y(), max_y)),
+        )
+
     def _load_saved_position(self) -> None:
         settings = QtCore.QSettings("MacroRelay", "MiniHUD")
         pos_x = settings.value("pos_x", None)
         pos_y = settings.value("pos_y", None)
-        primary_screen = QtGui.QGuiApplication.primaryScreen()
-        screen_geo = primary_screen.availableGeometry() if primary_screen else QtCore.QRect(0, 0, 1920, 1080)
+        screen_geo = self._virtual_available_geometry()
 
         if pos_x is not None and pos_y is not None:
             try:
                 x = int(pos_x)
                 y = int(pos_y)
-                x = max(screen_geo.left(), min(x, screen_geo.right() - 350))
-                y = max(screen_geo.top(), min(y, screen_geo.bottom() - 60))
-                self.move(x, y)
+                self.move(self._clamp_position(QtCore.QPoint(x, y)))
                 return
             except (TypeError, ValueError):
                 pass
 
-        default_x = screen_geo.right() - 420
+        default_x = screen_geo.right() - self.width() - 20
         default_y = screen_geo.top() + 40
-        self.move(default_x, default_y)
+        self.move(self._clamp_position(QtCore.QPoint(default_x, default_y)))
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        if self._preview_popup is not None:
+            self._preview_popup.close()
+        super().hideEvent(event)

@@ -38,6 +38,22 @@ class RegionClickOffsetTests(unittest.TestCase):
         self.assertEqual("", canvas._offset_pick_alias)
         canvas.close()
 
+    def test_region_visual_default_size_uses_most_of_the_screen(self) -> None:
+        from PySide6 import QtCore
+        from macro_studio.region_visual_test import region_visual_default_size
+
+        self.assertEqual(QtCore.QSize(1840, 1015), region_visual_default_size(QtCore.QSize(1920, 1080)))
+        self.assertEqual(QtCore.QSize(1311, 728), region_visual_default_size(QtCore.QSize(1366, 768)))
+        self.assertEqual(QtCore.QSize(1000, 728), region_visual_default_size(QtCore.QSize(1024, 768)))
+        self.assertEqual(QtCore.QSize(616, 440), region_visual_default_size(QtCore.QSize(640, 480)))
+
+    def test_region_visual_left_panel_is_wider_but_bounded(self) -> None:
+        from macro_studio.region_visual_test import region_visual_left_panel_width
+
+        self.assertEqual(500, region_visual_left_panel_width(1311))
+        self.assertEqual(534, region_visual_left_panel_width(1840))
+        self.assertEqual(560, region_visual_left_panel_width(2400))
+
 
 if __name__ == "__main__":
     unittest.main()

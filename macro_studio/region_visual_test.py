@@ -49,6 +49,22 @@ def image_click_offset(result: dict[str, Any], point: list[int] | tuple[int, int
         return None
 
 
+def region_visual_default_size(available_size: QtCore.QSize) -> QtCore.QSize:
+    """Return a large default dialog size that stays inside the usable screen."""
+    available_width = max(1, int(available_size.width()))
+    available_height = max(1, int(available_size.height()))
+    max_width = max(1, available_width - 24)
+    max_height = max(1, available_height - 40)
+    width = min(max_width, min(1840, max(1180, round(available_width * 0.96))))
+    height = min(max_height, min(1080, max(740, round(available_height * 0.94))))
+    return QtCore.QSize(width, height)
+
+
+def region_visual_left_panel_width(dialog_width: int) -> int:
+    """Keep controls readable without taking too much room from the preview."""
+    return min(560, max(500, round(max(1, int(dialog_width)) * 0.29)))
+
+
 _NON_TARGET_WINDOW_CLASSES = {
     "Progman",
     "WorkerW",
@@ -822,7 +838,14 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         win_title = "🎨 색상 검색 영역 시각화 및 실시간 화면 검사기" if self._is_color_mode else "🔍 검색 영역 시각화 및 실시간 화면 검사기"
         self.setWindowTitle(win_title)
-        self.resize(1180, 740)
+        screen = QtGui.QGuiApplication.screenAt(QtGui.QCursor.pos()) or QtGui.QGuiApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QtCore.QRect(0, 0, 1920, 1080)
+        default_size = region_visual_default_size(available.size())
+        self.resize(default_size)
+        self.move(
+            available.x() + (available.width() - default_size.width()) // 2,
+            available.y() + (available.height() - default_size.height()) // 2,
+        )
         self.setStyleSheet("QDialog { background: #11151F; color: #E2E8F0; }")
 
         main_layout = QtWidgets.QHBoxLayout(self)
@@ -831,7 +854,8 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         # ── LEFT PANEL: Controls & Analysis (width ~400px) ──
         left_panel = QtWidgets.QWidget()
-        left_panel.setFixedWidth(410)
+        left_panel_width = region_visual_left_panel_width(default_size.width())
+        left_panel.setFixedWidth(left_panel_width)
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
@@ -1997,6 +2021,8 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         name_lbl = QtWidgets.QLabel(f"<b>[{idx}] {alias}</b>")
         name_lbl.setStyleSheet("color: #FFFFFF; font-size: 9.5pt;")
+        name_lbl.setToolTip(alias)
+        name_lbl.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         top_row.addWidget(name_lbl)
         top_row.addStretch(1)
 

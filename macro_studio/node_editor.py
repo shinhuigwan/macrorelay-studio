@@ -2461,6 +2461,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
     def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:
         menu = QtWidgets.QMenu()
         delay = menu.addAction("연결 설정 · 딜레이와 조건 분기")
+        add_condition = menu.addAction("＋ 조건 분기 바로 추가")
+        menu.addSeparator()
         add_point = menu.addAction("＋ 이 위치에 경유점 추가")
         reset_route = menu.addAction("수동 경로 초기화")
         reset_route.setEnabled(bool(self.manual_points))
@@ -2470,7 +2472,17 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             event.accept()
             return
         if chosen == delay:
-            self.canvas.edge_delay_requested.emit(self.source, self.target, self.kind)
+            source, target, kind = self.source, self.target, self.kind
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: self.canvas.edge_delay_requested.emit(source, target, kind),
+            )
+        elif chosen == add_condition:
+            source, target, kind = self.source, self.target, self.kind
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: self.canvas.edge_condition_add_requested.emit(source, target, kind),
+            )
         elif chosen == add_point:
             self.add_manual_point(event.scenePos())
         elif chosen == reset_route:
@@ -3288,6 +3300,7 @@ class NodeCanvas(QtWidgets.QWidget):
     edge_delay_requested = QtCore.Signal(int, int, str)
     edge_condition_delete_requested = QtCore.Signal(int, int)
     edge_condition_retarget_requested = QtCore.Signal(int, int, int)
+    edge_condition_add_requested = QtCore.Signal(int, int, str)
     node_delete_requested = QtCore.Signal(int)
     node_duplicate_requested = QtCore.Signal(int)
     wait_duration_requested = QtCore.Signal(list)

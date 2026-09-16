@@ -1260,6 +1260,7 @@ class RecordingBar(QtWidgets.QDialog):
         self.live_canvas.edge_delete_requested.connect(self._delete_live_edge)
         self.live_canvas.edges_delete_requested.connect(self._delete_live_edges_batch)
         self.live_canvas.edge_delay_requested.connect(self._set_live_edge_delay)
+        self.live_canvas.edge_condition_add_requested.connect(self._add_live_condition)
         self.live_canvas.edge_condition_delete_requested.connect(self._delete_live_condition)
         self.live_canvas.edge_condition_retarget_requested.connect(self._retarget_live_condition)
         self.live_canvas.node_delete_requested.connect(self._delete_live_node)
@@ -1917,6 +1918,32 @@ class RecordingBar(QtWidgets.QDialog):
         rules.pop(condition_index)
         if not rules:
             step.pop("edge_conditions", None)
+        if self._save_live_step_payload(source):
+            self.update_live_events(self._live_events, force=True)
+
+    def _add_live_condition(self, source: int, target: int, kind: str) -> None:
+        if not 0 < source <= len(self.live_canvas.steps):
+            return
+        from .builder import EdgeConditionDialog, _raise_modal_dialog
+
+        normalized_kind = "fail" if kind == "fail" else "success"
+        dialog = EdgeConditionDialog(
+            len(self.live_canvas.steps),
+            normalized_kind,
+            {"kind": normalized_kind, "target": target},
+            self,
+        )
+        QtCore.QTimer.singleShot(0, lambda: _raise_modal_dialog(dialog))
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        step = self.live_canvas.steps[source - 1]
+        rules = [
+            deepcopy(rule)
+            for rule in (step.get("edge_conditions") or [])
+            if isinstance(rule, dict)
+        ]
+        rules.append(dialog.payload(normalized_kind))
+        step["edge_conditions"] = rules
         if self._save_live_step_payload(source):
             self.update_live_events(self._live_events, force=True)
 

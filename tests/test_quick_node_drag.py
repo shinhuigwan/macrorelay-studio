@@ -155,7 +155,51 @@ class QuickNodeDragTests(unittest.TestCase):
         self.assertEqual(275, payload["on_success_delay"])
         self.assertEqual("두 번 후 분기", payload["edge_conditions"][0]["label"])
         self.assertEqual(275, bar.live_canvas.steps[0]["on_success_delay"])
+
+        class FakeConditionDialog:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            @staticmethod
+            def exec() -> int:
+                return QtWidgets.QDialog.Accepted
+
+            @staticmethod
+            def payload(kind: str) -> dict:
+                return {
+                    "kind": kind,
+                    "label": "우클릭 직접 분기",
+                    "source": "edge_count",
+                    "operator": ">=",
+                    "value": 1,
+                    "target": 2,
+                }
+
+        with mock.patch("macro_studio.builder.EdgeConditionDialog", FakeConditionDialog):
+            bar.live_canvas.edge_condition_add_requested.emit(1, 2, "success")
+        app.processEvents()
+        payload = bar.step_payloads()["source"]
+        self.assertEqual(2, len(payload["edge_conditions"]))
+        self.assertEqual("우클릭 직접 분기", payload["edge_conditions"][1]["label"])
         bar.close()
+
+    def test_nested_edge_condition_dialog_stays_above_recording_window(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.builder import EdgeConditionDialog, EdgeSettingsDialog
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        host = QtWidgets.QDialog()
+        host.setWindowFlags(QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint)
+        settings = EdgeSettingsDialog(3, "success", 0, [], host)
+        condition = EdgeConditionDialog(3, "success", parent=settings)
+
+        self.assertTrue(bool(settings.windowFlags() & QtCore.Qt.WindowStaysOnTopHint))
+        self.assertTrue(bool(condition.windowFlags() & QtCore.Qt.WindowStaysOnTopHint))
+        self.assertEqual(QtCore.Qt.WindowModal, condition.windowModality())
+        condition.close()
+        settings.close()
+        host.close()
+        app.processEvents()
 
 
 if __name__ == "__main__":

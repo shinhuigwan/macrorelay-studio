@@ -42,6 +42,15 @@ from .widgets import Card, PageHeader, WheelSafeSpinBox, danger_button, primary_
 ACTION_TEMPLATES: dict[str, dict[str, Any]] = {action: action_template(action) for action in ACTION_LABELS}
 
 
+def _raise_modal_dialog(dialog: QtWidgets.QDialog) -> None:
+    """Keep nested dialogs visible without crashing if they close immediately."""
+    try:
+        dialog.raise_()
+        dialog.activateWindow()
+    except (AttributeError, RuntimeError):
+        return
+
+
 class MacroListWidget(QtWidgets.QListWidget):
     delete_requested = QtCore.Signal()
     undo_requested = QtCore.Signal()
@@ -402,6 +411,9 @@ class MacroDialog(QtWidgets.QDialog):
 class EdgeConditionDialog(QtWidgets.QDialog):
     def __init__(self, step_count: int, kind: str, rule: dict[str, Any] | None = None, parent=None) -> None:
         super().__init__(parent)
+        if parent is not None and bool(parent.window().windowFlags() & QtCore.Qt.WindowStaysOnTopHint):
+            self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self.setWindowModality(QtCore.Qt.WindowModal)
         self.setWindowTitle("조건 분기 편집")
         self.setMinimumWidth(460)
         rule = rule or {}
@@ -447,7 +459,7 @@ class EdgeConditionDialog(QtWidgets.QDialog):
         self.sentence_label = QtWidgets.QLabel()
         self.sentence_label.setWordWrap(True)
         self.sentence_label.setStyleSheet(
-            f"background:{COLORS['surface_alt']}; border:1px solid {COLORS['border']}; border-radius:8px; padding:10px; font-weight:700;"
+            f"background:{COLORS['panel_alt']}; border:1px solid {COLORS['border']}; border-radius:8px; padding:10px; font-weight:700;"
         )
         layout.addWidget(self.sentence_label)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
@@ -502,6 +514,9 @@ class EdgeConditionDialog(QtWidgets.QDialog):
 class EdgeSettingsDialog(QtWidgets.QDialog):
     def __init__(self, step_count: int, kind: str, delay: int, rules: list[dict[str, Any]], parent=None) -> None:
         super().__init__(parent)
+        if parent is not None and bool(parent.window().windowFlags() & QtCore.Qt.WindowStaysOnTopHint):
+            self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self.setWindowModality(QtCore.Qt.WindowModal)
         self.step_count = step_count
         self.kind = kind
         self.rules = [deepcopy(rule) for rule in rules]
@@ -568,6 +583,7 @@ class EdgeSettingsDialog(QtWidgets.QDialog):
 
     def _add_rule(self) -> None:
         dialog = EdgeConditionDialog(self.step_count, self.kind, parent=self)
+        QtCore.QTimer.singleShot(0, lambda: _raise_modal_dialog(dialog))
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.rules.append(dialog.payload(self.kind))
             self._refresh_rules()
@@ -577,6 +593,7 @@ class EdgeSettingsDialog(QtWidgets.QDialog):
         if not 0 <= row < len(self.rules):
             return
         dialog = EdgeConditionDialog(self.step_count, self.kind, self.rules[row], self)
+        QtCore.QTimer.singleShot(0, lambda: _raise_modal_dialog(dialog))
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.rules[row] = dialog.payload(self.kind)
             self._refresh_rules()
@@ -1424,6 +1441,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.edge_delete_requested.connect(self._delete_graph_edge)
         self.node_canvas.edges_delete_requested.connect(self._delete_graph_edges_batch)
         self.node_canvas.edge_delay_requested.connect(self._set_graph_edge_delay)
+        self.node_canvas.edge_condition_add_requested.connect(self._add_graph_condition)
         self.node_canvas.edge_condition_delete_requested.connect(self._delete_graph_condition)
         self.node_canvas.edge_condition_retarget_requested.connect(self._retarget_graph_condition)
         self.node_canvas.node_delete_requested.connect(self._delete_node_from_graph)
@@ -2801,6 +2819,28 @@ class BuilderPage(QtWidgets.QWidget):
             steps[source - 1].pop("edge_conditions", None)
         self._persist("조건 분기 노드라인을 제거했습니다.")
         self.node_canvas.rebuild_edges()
+
+    @QtCore.Slot(int, int, str)
+    def _add_graph_condition(self, source: int, target: int, kind: str) -> None:
+        steps = (self.current_macro or {}).get("steps") or []
+        if not 0 < source <= len(steps):
+            return
+        normalized_kind = "fail" if kind == "fail" else "success"
+        dialog = EdgeConditionDialog(
+            len(steps),
+            normalized_kind,
+            {"kind": normalized_kind, "target": target},
+            self,
+        )
+        QtCore.QTimer.singleShot(0, lambda: _raise_modal_dialog(dialog))
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        step = steps[source - 1]
+        rules = [rule for rule in (step.get("edge_conditions") or []) if isinstance(rule, dict)]
+        rules.append(dialog.payload(normalized_kind))
+        step["edge_conditions"] = rules
+        self._persist("조건 분기 노드라인을 추가했습니다.")
+        QtCore.QTimer.singleShot(0, lambda: self._refresh_steps(source - 1))
 
     @QtCore.Slot(int, int, int)
     def _retarget_graph_condition(self, source: int, condition_index: int, target: int) -> None:

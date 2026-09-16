@@ -1234,6 +1234,9 @@ class RecordingBar(QtWidgets.QDialog):
         self.branch_button.setToolTip("현재 작업을 끝내고 독립된 새 작업 분기 녹화를 시작합니다.")
         self.branch_button.setVisible(False)
         self.branch_button.clicked.connect(self.branch_requested.emit)
+        self.delete_button = QtWidgets.QPushButton("🗑 선택 삭제  Del")
+        self.delete_button.setToolTip("스마트 녹화 캔버스에서 선택한 노드 또는 연결선을 삭제합니다.")
+        self.delete_button.clicked.connect(self._delete_selected_live_nodes)
         stop = QtWidgets.QPushButton("■ 종료  F10")
         stop.clicked.connect(self.stop_requested.emit)
         controls.addWidget(self.dot)
@@ -1242,6 +1245,7 @@ class RecordingBar(QtWidgets.QDialog):
         controls.addWidget(self.branch_button)
         controls.addWidget(self.region_capture_button)
         controls.addWidget(self.capture_button)
+        controls.addWidget(self.delete_button)
         controls.addWidget(stop)
         layout.addLayout(controls)
         shortcuts = QtWidgets.QLabel(
@@ -1254,6 +1258,7 @@ class RecordingBar(QtWidgets.QDialog):
         from .node_editor import NodeCanvas
 
         self.live_canvas = NodeCanvas(self)
+        self.live_canvas.live_edit_mode = True
         self.live_canvas.flow_label.setText("SMART RECORDING · LIVE NODE MAP")
         self.live_canvas.setMinimumHeight(280)
         self.live_canvas.link_requested.connect(self._connect_live_nodes)
@@ -1265,6 +1270,8 @@ class RecordingBar(QtWidgets.QDialog):
         self.live_canvas.edge_condition_retarget_requested.connect(self._retarget_live_condition)
         self.live_canvas.node_delete_requested.connect(self._delete_live_node)
         self.live_canvas.inspector_requested.connect(self._open_live_node_editor)
+        self.live_canvas.image_edit_requested.connect(self._edit_live_node_image)
+        self.live_canvas.node_title_changed.connect(self._rename_live_node)
         self.live_canvas.multi_image_merge_requested.connect(self._merge_live_image_nodes)
         self.live_canvas.quick_node_drop_requested.connect(self._on_quick_node_drop)
         self.live_canvas.set_macro({"steps": []})
@@ -1491,7 +1498,29 @@ class RecordingBar(QtWidgets.QDialog):
         if event_id and event_id not in member_ids:
             member_ids.append(event_id)
         if member_ids:
+            deleted = set(member_ids)
+            self._live_events = [
+                item for item in self._live_events
+                if str((item if isinstance(item, dict) else {}).get("event_id") or "") not in deleted
+            ]
+            for identifier in deleted:
+                self._event_positions.pop(identifier, None)
+                self._live_step_payloads.pop(identifier, None)
+                self._live_multi_groups.pop(identifier, None)
+            cleaned_links: dict[tuple[str, str], str | list[str] | None] = {}
+            for key, value in self._live_link_overrides.items():
+                if key[0] in deleted:
+                    continue
+                if isinstance(value, list):
+                    remaining = [target for target in value if target not in deleted]
+                    cleaned_links[key] = remaining if len(remaining) > 1 else (remaining[0] if remaining else None)
+                elif isinstance(value, str) and value in deleted:
+                    cleaned_links[key] = None
+                else:
+                    cleaned_links[key] = value
+            self._live_link_overrides = cleaned_links
             self.events_deleted.emit(member_ids)
+            self.update_live_events(self._live_events, force=True)
 
     def _delete_selected_live_nodes(self) -> None:
         """선택된 노드 또는 노드선들을 일괄 삭제합니다."""
@@ -1781,7 +1810,9 @@ class RecordingBar(QtWidgets.QDialog):
         previews: dict[int, Any] = {}
         for index, draft in enumerate(drafts, start=1):
             event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
-            image = _recorded_sample_image(event)
+            image = _recorded_detail_image(event)
+            if image.isNull():
+                image = _recorded_sample_image(event)
             if not image.isNull():
                 pixmap = QtGui.QPixmap.fromImage(image)
                 search_region = event.get("search_region") or event.get("_review_search_region")
@@ -1907,6 +1938,61 @@ class RecordingBar(QtWidgets.QDialog):
             step.pop("edge_conditions", None)
         if self._save_live_step_payload(source):
             self.update_live_events(self._live_events, force=True)
+
+    def _rename_live_node(self, index: int, new_title: str) -> None:
+        """Persist a live title so rebuilding edges cannot restore the generated name."""
+        if not 0 < index <= len(self.live_canvas.steps):
+            return
+        step = self.live_canvas.steps[index - 1]
+        if new_title.strip():
+            step["label"] = new_title.strip()
+        else:
+            step.pop("label", None)
+        self._save_live_step_payload(index)
+
+    def _edit_live_node_image(self, index: int) -> None:
+        """Open the recorded image detail editor from the node preview badge."""
+        if not 0 < index <= len(self.live_canvas.steps):
+            return
+        event_id = str(self.live_canvas.steps[index - 1].get("_event_id") or "")
+        event = next(
+            (
+                item for item in self._live_events
+                if isinstance(item, dict) and str(item.get("event_id") or "") == event_id
+            ),
+            None,
+        )
+        if not isinstance(event, dict):
+            return
+        image = _recorded_detail_image(event)
+        if image.isNull():
+            image = _recorded_sample_image(event)
+        if image.isNull():
+            QtWidgets.QMessageBox.information(self, "이미지 상세 편집", "이 노드에는 편집할 녹화 이미지가 없습니다.")
+            return
+        offset_values = event.get("_review_detail_click_offset")
+        initial_offset = None
+        if isinstance(offset_values, list) and len(offset_values) >= 2:
+            initial_offset = QtCore.QPoint(int(offset_values[0] or 0), int(offset_values[1] or 0))
+        dialog = RecordedImageDetailDialog(
+            image,
+            self,
+            precise=bool(event.get("_review_detail_precise", True)),
+            initial_click_offset=initial_offset,
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        edited = dialog.edited_image()
+        if edited.isNull():
+            return
+        event["_review_edited_image_bmp"] = _encoded_png(edited)
+        event["_review_detail_precise"] = dialog.precise_search_enabled()
+        click_offset = dialog.click_offset()
+        if click_offset is None:
+            event.pop("_review_detail_click_offset", None)
+        else:
+            event["_review_detail_click_offset"] = [click_offset.x(), click_offset.y()]
+        self.update_live_events(self._live_events, force=True)
 
     def _delete_live_condition(self, source: int, condition_index: int) -> None:
         if not 0 < source <= len(self.live_canvas.steps):
@@ -3312,15 +3398,24 @@ class SmartRecordingController(QtCore.QObject):
 
             self._manual_captures.append(event)
             if self.bar is not None:
-                live_events = sorted(
-                    [*load_recording(self.output), *self._manual_captures],
-                    key=lambda item: int(item.get("t") or 0),
-                )
+                live_events = self._current_live_events()
                 if drop_payload:
                     self.bar.apply_quick_node_drop(event_id, drop_payload, rebuild=False)
                 self.bar.update_live_events(live_events, force=bool(drop_payload))
         finally:
             self._capture_in_progress = False
+
+    def _current_live_events(self) -> list[dict[str, Any]]:
+        """Return the live timeline without nodes explicitly deleted in the editor."""
+        return sorted(
+            [
+                event
+                for event in [*load_recording(self.output), *self._manual_captures]
+                if isinstance(event, dict)
+                and str(event.get("event_id") or "") not in self._deleted_event_ids
+            ],
+            key=lambda item: int(item.get("t") or 0),
+        )
 
     def _delete_recorded_events(self, event_ids: list[str]) -> None:
         for identifier in event_ids:
@@ -3329,6 +3424,8 @@ class SmartRecordingController(QtCore.QObject):
             e for e in self._manual_captures
             if str((e if isinstance(e, dict) else {}).get("event_id") or "") not in self._deleted_event_ids
         ]
+        if self.bar is not None:
+            self.bar.update_live_events(self._current_live_events(), force=True)
 
     def stop(self) -> None:
         self._manual_stop = True
@@ -3387,11 +3484,7 @@ class SmartRecordingController(QtCore.QObject):
         if latest_workflow_index is not None and self.bar is not None:
             self.bar.set_workflow_index(latest_workflow_index)
         if self.bar is not None:
-            live_events = sorted(
-                [*load_recording(self.output), *self._manual_captures],
-                key=lambda item: int(item.get("t") or 0),
-            )
-            self.bar.update_live_events(live_events)
+            self.bar.update_live_events(self._current_live_events())
         return requests
 
     def _poll_capture_requests(self) -> None:
@@ -3542,11 +3635,7 @@ class SmartRecordingController(QtCore.QObject):
 
             if self.bar is not None:
                 self.bar.show_capture_result(image.width(), image.height(), search_region_set=bool(search_region))
-                live_events = sorted(
-                    [*load_recording(self.output), *self._manual_captures],
-                    key=lambda item: int(item.get("t") or 0),
-                )
-                self.bar.update_live_events(live_events)
+                self.bar.update_live_events(self._current_live_events())
         finally:
             self._capture_in_progress = False
             if self.bar is not None:
@@ -3924,7 +4013,9 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 if draft.get("kind") in {"screen_condition", "screen_verification"}:
                     combo.addItem("이미지가 보이는지 확인 · 클릭 안 함", "image")
                     event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
-                    image = _recorded_sample_image(event)
+                    image = _recorded_detail_image(event)
+                    if image.isNull():
+                        image = _recorded_sample_image(event)
                     if not image.isNull() and row not in self.crop_rects:
                         self.crop_sizes[row] = QtCore.QSize(min(128, image.width()), min(88, image.height()))
                 elif draft.get("kind") == "image_capture":

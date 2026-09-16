@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 
@@ -199,6 +201,127 @@ class QuickNodeDragTests(unittest.TestCase):
         condition.close()
         settings.close()
         host.close()
+        app.processEvents()
+
+    def test_live_name_survives_rebuild_and_deleted_node_stays_removed(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingBar
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        bar = RecordingBar(repository=None)
+        events = [
+            {"type": "wait", "event_id": "source", "t": 1, "duration": 1},
+            {"type": "wait", "event_id": "target", "t": 2, "duration": 1},
+        ]
+        bar.update_live_events(events, force=True)
+        bar.live_canvas.node_title_changed.emit(1, "사용자 지정 이름")
+        bar.live_canvas.link_requested.emit(1, 2, "success")
+        app.processEvents()
+        app.processEvents()
+
+        self.assertEqual("사용자 지정 이름", bar.live_canvas.steps[0]["label"])
+        self.assertEqual("사용자 지정 이름", bar.step_payloads()["source"]["label"])
+
+        deleted: list[str] = []
+        bar.events_deleted.connect(lambda values: deleted.extend(values))
+        bar.live_canvas.node_delete_requested.emit(2)
+        app.processEvents()
+        self.assertEqual(["target"], deleted)
+        self.assertEqual(1, len(bar.live_canvas.steps))
+        self.assertEqual("🗑 선택 삭제  Del", bar.delete_button.text())
+        bar.close()
+
+    def test_live_preview_click_applies_detailed_image_edit(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.automation import RecordingBar, _encoded_png
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        original = QtGui.QImage(8, 8, QtGui.QImage.Format_ARGB32)
+        original.fill(QtGui.QColor("#FF0000"))
+        edited = QtGui.QImage(8, 8, QtGui.QImage.Format_ARGB32)
+        edited.fill(QtGui.QColor("#00FF00"))
+        event = {
+            "type": "capture",
+            "event_id": "image",
+            "t": 1,
+            "image_sample_bmp": _encoded_png(original),
+        }
+        bar = RecordingBar(repository=None)
+        bar.update_live_events([event], force=True)
+
+        class FakeImageDialog:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            @staticmethod
+            def exec() -> int:
+                return QtWidgets.QDialog.Accepted
+
+            @staticmethod
+            def edited_image() -> QtGui.QImage:
+                return edited
+
+            @staticmethod
+            def precise_search_enabled() -> bool:
+                return True
+
+            @staticmethod
+            def click_offset() -> QtCore.QPoint:
+                return QtCore.QPoint(2, 3)
+
+        with mock.patch("macro_studio.automation.RecordedImageDetailDialog", FakeImageDialog):
+            bar.live_canvas.image_edit_requested.emit(1)
+        app.processEvents()
+        self.assertTrue(bool(event.get("_review_edited_image_bmp")))
+        self.assertEqual([2, 3], event.get("_review_detail_click_offset"))
+        self.assertEqual("#00ff00", bar.live_canvas._asset_pixmaps["1"].toImage().pixelColor(0, 0).name())
+        bar.close()
+
+    def test_pixel_search_exposes_multi_color_and_inactive_click(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.action_editor import ACTION_FIELDS, ActionEditor
+        from macro_studio.repository import MacroRepository
+        from macro_tool import render_pixel_search
+
+        keys = {spec.key for spec in ACTION_FIELDS["pixel_search"]}
+        self.assertIn("colors_text", keys)
+        self.assertIn("click.mode", keys)
+        script = "\n".join(
+            render_pixel_search(
+                {
+                    "action": "pixel_search",
+                    "color": "#FF0000",
+                    "colors": ["#FF0000", "#00FF00"],
+                    "match_condition": "all_matched",
+                    "region_mode": "client",
+                    "region_window_exe": "dnplayer.exe",
+                    "action_on_found": "click",
+                    "click": {"mode": "inactive", "method": "postmessage", "button": "Left"},
+                },
+                4,
+            )
+        )
+        self.assertEqual(2, script.count("    PixelSearch,"))
+        self.assertIn("inactive click target", script)
+        self.assertIn("PostMessage", script)
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            editor = ActionEditor(MacroRepository(Path(directory)))
+            editor.load_step(
+                {
+                    "action": "pixel_search",
+                    "color": "#FF0000",
+                    "colors": ["#FF0000", "#00FF00"],
+                    "region_window_exe": "dnplayer.exe",
+                    "click": {"mode": "inactive", "method": "postmessage"},
+                }
+            )
+            built = editor.build_step()
+            self.assertEqual(["#FF0000", "#00FF00"], built["colors"])
+            self.assertEqual("inactive", built["click"]["mode"])
+            self.assertEqual("dnplayer.exe", built["click"]["window_exe"])
+            editor.close()
         app.processEvents()
 
 

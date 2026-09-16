@@ -908,7 +908,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 )
             elif live_pixmap is not None:
                 region_hint = f"<br>서치 영역: {live_region[2]-live_region[0]}×{live_region[3]-live_region[1]}" if live_region and len(live_region) >= 4 else ""
-                badge.setToolTip(f"<b>캡처 이미지</b><br>{live_pixmap.width()}×{live_pixmap.height()}{region_hint}<br>커서를 올리면 미리보기")
+                badge.setToolTip(f"<b>캡처 이미지</b><br>{live_pixmap.width()}×{live_pixmap.height()}{region_hint}<br>커서를 올리면 미리보기 · 클릭하면 상세 편집")
             else:
                 badge.setToolTip("이미지 미선택")
             self.preview_badge = badge
@@ -1681,7 +1681,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
         act_unbranch = menu.addAction(f"⛓️ 선택 노드 {len(selected_indexes)}개 분기 해제 (실패선 제거)") if has_branch else None
         menu.addSeparator()
         duplicate = menu.addAction("노드 복제")
-        archive = menu.addAction("노드 보관")
+        archive = menu.addAction("🗑 선택 노드 삭제" if getattr(self.canvas, "live_edit_mode", False) else "노드 보관")
         open_archive = menu.addAction("📦 노드 보관함 열기...")
         chosen = menu.exec(event.screenPos())
         if not chosen:

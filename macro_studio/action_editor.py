@@ -753,6 +753,15 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
     ],
     "pixel_search": [
         FieldSpec("color", "검색 색상 (HEX)", "text", "#FF0000", placeholder="예: #FF3A2B 또는 0xFF3A2B"),
+        FieldSpec(
+            "colors_text",
+            "멀티 검색 색상",
+            "multiline",
+            "",
+            placeholder="#FF0000\n#00FF00\n#0088FF",
+            tooltip="한 줄에 하나씩 입력합니다. 첫 번째 색상이 기본 검색 색상으로 사용됩니다.",
+            section="멀티 색상",
+        ),
         FieldSpec("tolerance", "색상 허용 오차", "color_tolerance", 10, 0, 255, tooltip="기준 색상 위치와 허용 오차(±Tolerance)를 시각적 색상 바에서 휠이나 드래그, 숫자로 조절합니다."),
         FieldSpec("region_mode", "범위 기준", "choice", "screen", options=choice(
             ("전체 화면 · 모든 모니터", "screen"),
@@ -788,6 +797,12 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("poll_delay", "반복 간격", "duration", 50, 10, 60_000, section="타이밍"),
         FieldSpec("click_offset_x", "클릭 오프셋 X", "int", 0, -10000, 10000, section="클릭 옵션", tooltip="발견된 픽셀 X좌표 기준 상대 클릭 오프셋 (px). 0이면 픽셀 위치 그대로 클릭"),
         FieldSpec("click_offset_y", "클릭 오프셋 Y", "int", 0, -10000, 10000, section="클릭 옵션", tooltip="발견된 픽셀 Y좌표 기준 상대 클릭 오프셋 (px). 0이면 픽셀 위치 그대로 클릭"),
+        FieldSpec("click.mode", "클릭 방식", "choice", "active", options=choice(("활성 클릭", "active"), ("비활성 클릭", "inactive")), section="클릭 옵션"),
+        FieldSpec("click.method", "비활성 클릭 엔진", "choice", "auto", options=choice(("자동 · 앱에 맞춤", "auto"), ("최상위 창 직접 메시지", "direct_postmessage"), ("ControlClick", "controlclick"), ("PostMessage", "postmessage")), section="클릭 옵션"),
+        FieldSpec("click.button", "마우스 버튼", "choice", "Left", options=choice(("좌클릭", "Left"), ("우클릭", "Right")), section="클릭 옵션"),
+        FieldSpec("click.count", "클릭 횟수", "int", 1, 1, 20, section="클릭 옵션"),
+        FieldSpec("click.window", "클릭 대상 창", "text", "", section="클릭 옵션", tooltip="비워 두면 검색 대상 창을 그대로 사용합니다."),
+        FieldSpec("click.window_exe", "클릭 대상 프로그램", "text", "", section="클릭 옵션", tooltip="비워 두면 검색 대상 프로그램을 그대로 사용합니다."),
         FieldSpec("sleep_after", "완료 후 대기", "duration", 0, 0, 600_000, section="클릭 옵션"),
     ],
     "ocr_tracking": [
@@ -3279,6 +3294,7 @@ class ActionEditor(QtWidgets.QWidget):
         elif action == "pixel_search":
             buttons.append(("🔍 색상 검색 영역 검증 및 실시간 검사", self._open_region_visual_test))
             buttons.append(("🎯 색상 스포이트 (돋보기 좌클릭)", lambda: self._pick_pixel_color(action)))
+            buttons.append(("➕ 멀티 검색 색상 추가", lambda: self._pick_pixel_color(action, append=True)))
             buttons.append(("▣ 검색 영역 잡기 (드래그)", lambda: self._pick_region(action, "search_region")))
             buttons.append(("🎯 멀티 전체 발견 시 참(성공) 설정", self._preset_color_multi_count_all))
         elif action == "ocr_tracking":
@@ -3819,7 +3835,7 @@ class ActionEditor(QtWidgets.QWidget):
                 if idx >= 0:
                     w_profile.setCurrentIndex(idx)
 
-    def _pick_pixel_color(self, action: str) -> None:
+    def _pick_pixel_color(self, action: str, append: bool = False) -> None:
         from .automation import capture_virtual_desktop, PixelColorPickerDialog
         hosts = self._hide_host_windows()
         pixmap, geometry = capture_virtual_desktop()
@@ -3832,7 +3848,22 @@ class ActionEditor(QtWidgets.QWidget):
         self._restore_host_windows(hosts)
         if accepted and color:
             hex_val = color.name().upper()
-            self._set_field_value(action, "color", hex_val)
+            if append:
+                colors_widget = self.widgets.get(action, {}).get("colors_text")
+                existing = colors_widget.toPlainText() if isinstance(colors_widget, QtWidgets.QPlainTextEdit) else ""
+                colors = [value.strip().upper() for value in existing.replace(",", "\n").splitlines() if value.strip()]
+                if not colors:
+                    primary = self.widgets.get(action, {}).get("color")
+                    if isinstance(primary, QtWidgets.QLineEdit) and primary.text().strip():
+                        colors.append(primary.text().strip().upper())
+                if hex_val not in colors:
+                    colors.append(hex_val)
+                self._set_field_value(action, "colors_text", "\n".join(colors))
+                if colors:
+                    self._set_field_value(action, "color", colors[0])
+                QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"멀티 검색 색상 {len(colors)}개가 등록되었습니다.")
+            else:
+                self._set_field_value(action, "color", hex_val)
             tol_w = self.widgets.get(action, {}).get("tolerance")
             if isinstance(tol_w, ColorToleranceBarWidget):
                 tol_w.set_color(hex_val)
@@ -4864,6 +4895,12 @@ class ActionEditor(QtWidgets.QWidget):
         elif action == "datetime_condition":
             self._sync_datetime_controls()
         elif action == "pixel_search":
+            raw_colors = normalized.get("colors") if isinstance(normalized.get("colors"), list) else []
+            if not raw_colors:
+                primary_color = str(normalized.get("color") or "").strip()
+                raw_colors = [primary_color] if primary_color else []
+            normalized["colors_text"] = "\n".join(str(value) for value in raw_colors if str(value).strip())
+            self._set_field_value("pixel_search", "colors_text", normalized["colors_text"])
             color_val = str(normalized.get("color") or "#FF0000").strip()
             tol_w = self.widgets.get("pixel_search", {}).get("tolerance")
             if isinstance(tol_w, ColorToleranceBarWidget):
@@ -5042,6 +5079,33 @@ class ActionEditor(QtWidgets.QWidget):
             else:
                 payload["day_mode"] = "everyday"
                 payload["custom_days"] = ""
+        elif action == "pixel_search":
+            raw_text = str(payload.pop("colors_text", "") or "")
+            colors = [
+                token.strip().upper()
+                for line in raw_text.replace(",", "\n").replace(";", "\n").splitlines()
+                for token in [line]
+                if token.strip()
+            ]
+            primary_color = str(payload.get("color") or "").strip().upper()
+            if not colors and primary_color:
+                colors = [primary_color]
+            colors = list(dict.fromkeys(colors))
+            if colors:
+                payload["color"] = colors[0]
+            if len(colors) > 1:
+                payload["colors"] = colors
+                if str(payload.get("match_condition") or "all_matched") == "all_matched":
+                    payload["required_count"] = len(colors)
+            else:
+                payload.pop("colors", None)
+                payload["required_count"] = 1
+            click = payload.get("click") if isinstance(payload.get("click"), dict) else {}
+            if not str(click.get("window") or "").strip():
+                click["window"] = str(payload.get("region_window") or "")
+            if not str(click.get("window_exe") or "").strip():
+                click["window_exe"] = str(payload.get("region_window_exe") or "")
+            payload["click"] = click
         if action == "inactive_click" and original_handle_method == "handle_probe":
             payload["method"] = "handle_probe"
             for key in ("target_control", "target_hwnd", "target_child_class"):

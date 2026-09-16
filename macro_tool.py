@@ -4688,6 +4688,8 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
     poll_delay = max(10, int(step.get("poll_delay") or 50))
     click_offset_x = int(step.get("click_offset_x") or 0)
     click_offset_y = int(step.get("click_offset_y") or 0)
+    click_payload = step.get("click") if isinstance(step.get("click"), dict) else {}
+    click_mode = str(click_payload.get("mode") or "active").strip().lower()
     sleep_after = int(step.get("sleep_after") or 0)
 
     found_var = f"__pixel_search_success_{step_index}" if step_index else "__pixel_search_success"
@@ -4862,16 +4864,29 @@ def render_pixel_search(step: Dict[str, Any], step_index: int = 0) -> List[str]:
 
     if action_on_found == "click":
         lines.append(f"if ({found_var}) {{")
-        lines.append(f"    if (TargetHwnd_{step_index}) {{")
-        lines.append(f"        WinActivate, ahk_id %TargetHwnd_{step_index}%")
-        lines.append(f"        WinWaitActive, ahk_id %TargetHwnd_{step_index}%, , 0.3")
-        lines.append("    }")
-        if click_offset_x or click_offset_y:
-            lines.append(f"    __click_x := {store_x} + {click_offset_x}")
-            lines.append(f"    __click_y := {store_y} + {click_offset_y}")
-            lines.append("    Click, %__click_x%, %__click_y%")
+        if click_mode == "inactive":
+            lines.append(f"    FoundX := {store_x}")
+            lines.append(f"    FoundY := {store_y}")
+            inactive_payload = {
+                **click_payload,
+                "window": str(click_payload.get("window") or win_title),
+                "window_exe": str(click_payload.get("window_exe") or win_exe),
+                "button": str(click_payload.get("button") or "Left"),
+                "count": int(click_payload.get("count") or 1),
+                "offset": [click_offset_x, click_offset_y],
+            }
+            lines.extend(f"    {line}" if line else line for line in render_inactive_click_from_hit(inactive_payload))
         else:
-            lines.append(f"    Click, %{store_x}%, %{store_y}%")
+            lines.append(f"    if (TargetHwnd_{step_index}) {{")
+            lines.append(f"        WinActivate, ahk_id %TargetHwnd_{step_index}%")
+            lines.append(f"        WinWaitActive, ahk_id %TargetHwnd_{step_index}%, , 0.3")
+            lines.append("    }")
+            if click_offset_x or click_offset_y:
+                lines.append(f"    __click_x := {store_x} + {click_offset_x}")
+                lines.append(f"    __click_y := {store_y} + {click_offset_y}")
+                lines.append("    Click, %__click_x%, %__click_y%")
+            else:
+                lines.append(f"    Click, %{store_x}%, %{store_y}%")
         lines.append("}")
 
     if sleep_after > 0:

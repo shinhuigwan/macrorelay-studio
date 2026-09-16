@@ -39,6 +39,16 @@ def hex_to_bgr(hex_str: str) -> tuple[int, int, int]:
     return (0, 0, 255)
 
 
+def image_click_offset(result: dict[str, Any], point: list[int] | tuple[int, int]) -> list[int] | None:
+    """Return a click offset from the detected template centre to a frame point."""
+    if not bool(result.get("found")) or len(point) < 2:
+        return None
+    try:
+        return [int(point[0]) - int(result["hit_x"]), int(point[1]) - int(result["hit_y"])]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 _NON_TARGET_WINDOW_CLASSES = {
     "Progman",
     "WorkerW",
@@ -479,6 +489,7 @@ def capture_target_area(step: dict[str, Any]) -> tuple[np.ndarray | None, int, i
 
 class InteractiveCanvas(QtWidgets.QWidget):
     region_dragged = QtCore.Signal(str, list)  # (alias, [l, t, r, b])
+    click_point_picked = QtCore.Signal(str, list)  # (alias, [frame_x, frame_y])
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -492,7 +503,22 @@ class InteractiveCanvas(QtWidgets.QWidget):
         self._drag_start: QtCore.QPoint | None = None
         self._drag_current: QtCore.QPoint | None = None
         self._hover_pos: QtCore.QPoint | None = None
+        self._offset_pick_alias: str = ""
         self.setStyleSheet("background: #0B0E14;")
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+    def begin_click_offset_pick(self, alias: str) -> None:
+        self._offset_pick_alias = str(alias or "")
+        self._drag_start = None
+        self._drag_current = None
+        self.setCursor(QtCore.Qt.CrossCursor)
+        self.setFocus(QtCore.Qt.MouseFocusReason)
+        self.update()
+
+    def cancel_click_offset_pick(self) -> None:
+        self._offset_pick_alias = ""
+        self.unsetCursor()
+        self.update()
 
     def set_frame(self, bgr_frame: np.ndarray | None) -> None:
         if bgr_frame is None or bgr_frame.size == 0:
@@ -542,6 +568,15 @@ class InteractiveCanvas(QtWidgets.QWidget):
             return
 
         painter.drawPixmap(self.rect(), self._pixmap)
+
+        if self._offset_pick_alias:
+            banner = QtCore.QRectF(12, 12, min(520, max(260, self.width() - 24)), 34)
+            painter.fillRect(banner, QtGui.QColor(30, 41, 59, 235))
+            painter.setPen(QtGui.QPen(QtGui.QColor("#38E7FF"), 1.5))
+            painter.drawRoundedRect(banner, 6, 6)
+            painter.setPen(QtGui.QColor("#E6FAFF"))
+            painter.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold))
+            painter.drawText(banner.adjusted(10, 0, -8, 0), QtCore.Qt.AlignVCenter, "실제로 클릭할 위치를 한 번 클릭하세요 · Esc 취소")
 
         s = self._scale
         # 1. Draw each designated region
@@ -633,10 +668,30 @@ class InteractiveCanvas(QtWidgets.QWidget):
             painter.drawRect(r)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._offset_pick_alias:
+            if event.button() == QtCore.Qt.RightButton:
+                self.cancel_click_offset_pick()
+                event.accept()
+                return
+            if event.button() == QtCore.Qt.LeftButton and self._pixmap is not None:
+                alias = self._offset_pick_alias
+                x = max(0, min(self._pixmap.width() - 1, round(event.position().x() / self._scale)))
+                y = max(0, min(self._pixmap.height() - 1, round(event.position().y() / self._scale)))
+                self.cancel_click_offset_pick()
+                self.click_point_picked.emit(alias, [x, y])
+                event.accept()
+                return
         if event.button() == QtCore.Qt.LeftButton:
             self._drag_start = event.position().toPoint()
             self._drag_current = self._drag_start
             self.update()
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key_Escape and self._offset_pick_alias:
+            self.cancel_click_offset_pick()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         self._hover_pos = event.position().toPoint()
@@ -1090,6 +1145,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self.canvas_scroll.setStyleSheet("QScrollArea { border: 1px solid #2B3850; border-radius: 8px; background: #0B0E14; }")
         self.canvas = InteractiveCanvas(self.canvas_scroll)
         self.canvas.region_dragged.connect(self._on_canvas_region_dragged)
+        self.canvas.click_point_picked.connect(self._on_canvas_click_offset_picked)
         self.canvas_scroll.setWidget(self.canvas)
         right_layout.addWidget(self.canvas_scroll, 1)
 
@@ -1985,6 +2041,23 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         off_row.addWidget(off_y_spin)
         vbox.addLayout(off_row)
 
+        btn_pick_offset = QtWidgets.QPushButton("🎯 버튼 클릭 후 오른쪽 화면에서 클릭 위치 지정")
+        btn_pick_offset.setEnabled(found)
+        btn_pick_offset.setToolTip(
+            "이 버튼을 누른 다음 오른쪽 실시간 화면에서 실제로 클릭할 위치를 한 번 클릭하세요.\n"
+            "현재 발견된 이미지 중심을 기준으로 X/Y 오프셋이 자동 계산됩니다."
+            if found
+            else "이미지가 현재 검색 영역에서 발견된 뒤 사용할 수 있습니다."
+        )
+        btn_pick_offset.setStyleSheet(
+            "QPushButton { background:#123047; border:1px solid #38BDF8; color:#BAE6FD; "
+            "font-weight:700; padding:4px 7px; border-radius:4px; font-size:8.5pt; }"
+            "QPushButton:hover { background:#164E63; color:#FFFFFF; }"
+            "QPushButton:disabled { background:#171C26; border-color:#334155; color:#64748B; }"
+        )
+        btn_pick_offset.clicked.connect(lambda _, a=alias: self._start_asset_offset_pick(a))
+        vbox.addWidget(btn_pick_offset)
+
         # Row 3: Diagnostic / Hint
         if not found:
             diagnosis = str(res.get("diagnosis") or "탐지 실패")
@@ -2034,6 +2107,53 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             self._asset_offsets[alias] = [0, 0]
         self._asset_offsets[alias][axis] = int(value)
         self._refresh_canvas_data()
+
+    def _start_asset_offset_pick(self, alias: str) -> None:
+        result = self._test_results.get(alias, {})
+        if not bool(result.get("found")):
+            QtWidgets.QMessageBox.information(
+                self,
+                "클릭 위치 지정",
+                "이 이미지를 현재 검색 영역에서 먼저 발견해야 오프셋을 계산할 수 있습니다.",
+            )
+            return
+        self.canvas.set_active_alias(alias)
+        self.canvas.begin_click_offset_pick(alias)
+        hit_x = int(result.get("hit_x") or 0)
+        hit_y = int(result.get("hit_y") or 0)
+        scale = float(self.canvas._scale)
+        self.canvas_scroll.horizontalScrollBar().setValue(
+            max(0, round(hit_x * scale - self.canvas_scroll.viewport().width() / 2))
+        )
+        self.canvas_scroll.verticalScrollBar().setValue(
+            max(0, round(hit_y * scale - self.canvas_scroll.viewport().height() / 2))
+        )
+        self.lbl_click_preflight.setText(
+            f"🎯 '{alias}'의 실제 클릭 위치를 오른쪽 화면에서 한 번 클릭하세요. Esc 또는 우클릭으로 취소합니다."
+        )
+        self.lbl_click_preflight.setStyleSheet(
+            "background:#123047; border:1px solid #38BDF8; border-radius:5px; "
+            "padding:6px; color:#BAE6FD; font-size:8.8pt; font-weight:700;"
+        )
+
+    def _on_canvas_click_offset_picked(self, alias: str, point: list[int]) -> None:
+        offset = image_click_offset(self._test_results.get(alias, {}), point)
+        if offset is None:
+            return
+        self._asset_offsets[alias] = offset
+        self._click_target = "each_image" if self._click_target == "none" else self._click_target
+        if hasattr(self, "combo_click_target") and self._click_target == "each_image":
+            index = self.combo_click_target.findData("each_image")
+            if index >= 0:
+                blocker = QtCore.QSignalBlocker(self.combo_click_target)
+                self.combo_click_target.setCurrentIndex(index)
+                del blocker
+        self._refresh_ui()
+        QtWidgets.QToolTip.showText(
+            QtGui.QCursor.pos(),
+            f"'{alias}' 오프셋 설정 완료 · X {offset[0]:+d}px, Y {offset[1]:+d}px",
+            self,
+        )
 
     def _select_active_alias(self, alias: str) -> None:
         self.canvas.set_active_alias(alias)

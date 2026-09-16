@@ -3181,13 +3181,13 @@ def render_image_search(
     confidence_val = step.get("confidence") or 86
     if die_on_missing:
         lines.append(f'    Log("❌ [이미지 검색 실패] 대상: {alias}")')
-        lines.append(f'    Log("💡 [실패 원인] 1) 화면에 대상 이미지가 가려져 있거나 표시되지 않음 2) 일치율이 기준 신뢰도({confidence_val}%)에 미달 3) 대상 창 크기/해상도 변경")')
+        lines.append(f'    Log("💡 [실패 원인] 1) 화면에 대상 이미지가 가려져 있거나 표시되지 않음 2) 일치율이 기준 신뢰도 {confidence_val} 퍼센트에 미달 3) 대상 창 크기/해상도 변경")')
         lines.append(f'    Log("🔧 [해결 방법] 1) 대상 창이 가려지지 않고 화면에 떠 있는지 확인 2) 상세설정에서 일치 신뢰도를 낮추기 3) 검색 범위를 \'전체 화면\'으로 변경")')
         if on_fail:
             lines.append(f'    Log("🔀 [분기 이동] {on_fail}번 노드(다음 분기)로 자동 전환하여 계속 실행합니다.")')
         else:
             lines.append(f'    SetRunResult("FAILED", "IMAGE_NOT_FOUND", "화면에서 이미지를 찾지 못했습니다: {ahk_quote(str(alias))} (해결: 신뢰도를 낮추거나 화면 표시 확인)")')
-            lines.append(f'    MsgBox, 16, 매크로 알림, 화면에서 "{alias}" 이미지를 찾지 못했습니다.`n`n[실패 원인]`n• 화면에 대상 이미지가 가려져 있거나 없음`n• 일치율이 기준 신뢰도({confidence_val}%)에 미달`n`n[해결 방법]`n• 화면에 대상 창이 켜져 있는지 확인`n• 상세설정에서 일치 신뢰도를 낮추기`n• 검색 범위를 \'전체 화면\'으로 변경, 2')
+            lines.append(f'    MsgBox, 16, 매크로 알림, 화면에서 "{alias}" 이미지를 찾지 못했습니다.`n`n[실패 원인]`n• 화면에 대상 이미지가 가려져 있거나 없음`n• 일치율이 기준 신뢰도 {confidence_val} 퍼센트에 미달`n`n[해결 방법]`n• 화면에 대상 창이 켜져 있는지 확인`n• 상세설정에서 일치 신뢰도를 낮추기`n• 검색 범위를 \'전체 화면\'으로 변경, 2')
             lines.append("    Return")
     else:
         lines.append(f'    Log("⚠️ [이미지 미탐지] 화면에서 \'{alias}\' 이미지를 찾지 못했으나 설정에 따라 계속 진행합니다.")')
@@ -5394,6 +5394,10 @@ def _expand_macro_steps(
                 if isinstance(source.get("inputs"), dict):
                     prepared["_subflow_inputs"] = dict(source["inputs"])
             action = str(prepared.get("action") or "")
+            if action == "flow_control" and int(prepared.get("jump_to") or 0) <= 0 and success_target:
+                # A child macro's terminal flow node returns from a standalone
+                # run. Inside a bundle it must hand control to the next child.
+                prepared["jump_to"] = success_target
             child_fail_field = "on_no_match" if action == "text_condition" else "on_fail"
             try:
                 has_internal_fail = int(prepared.get(child_fail_field) or 0) > 0

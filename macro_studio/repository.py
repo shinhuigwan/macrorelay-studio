@@ -490,6 +490,69 @@ class MacroRepository:
         self._append_macro_order(path.stem)
         return path
 
+    def save_macro_bundle(self, name: str, macro_names: Iterable[str]) -> Path:
+        """Create or update a sequential launcher while keeping child macros independent."""
+        bundle_name = self.safe_name(name)
+        ordered: list[str] = []
+        for value in macro_names:
+            child = str(value).strip()
+            if child and child not in ordered:
+                ordered.append(child)
+        if not ordered:
+            raise ValueError("실행 묶음에는 매크로가 하나 이상 필요합니다.")
+        if bundle_name in ordered:
+            raise ValueError("실행 묶음이 자기 자신을 호출할 수 없습니다.")
+        missing = [child for child in ordered if not self.macro_path(child).is_file()]
+        if missing:
+            raise FileNotFoundError(f"매크로를 찾을 수 없습니다: {', '.join(missing)}")
+
+        path = self.macro_path(bundle_name)
+        if path.exists():
+            existing = self.load_macro(bundle_name)
+            meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+            if not meta.get("macro_bundle"):
+                raise FileExistsError(f"'{bundle_name}' 이름은 개별 매크로가 사용 중입니다.")
+
+        steps: list[dict[str, Any]] = []
+        for index, child in enumerate(ordered, start=1):
+            next_step = index + 1
+            steps.append({
+                "action": "call_submacro",
+                "label": f"{index}. {child}",
+                "macro": child,
+                "result_var": f"bundle_{index}_success",
+                "on_success": next_step,
+                "on_fail": next_step,
+            })
+        steps.append({
+            "action": "flow_control",
+            "label": "실행 묶음 완료",
+            "jump_to": 0,
+            "repeat_count": 0,
+        })
+        payload = {
+            "name": bundle_name,
+            "description": "실행 묶음: " + " → ".join(ordered),
+            "meta": {
+                "coord_mode": "Screen",
+                "macro_bundle": True,
+                "bundle_items": ordered,
+                "bundle_continue_after_child_exit": True,
+            },
+            "steps": steps,
+            "graph_start_step": 1,
+            "graph_end_step": len(steps),
+            "graph_positions": {str(index): [(index - 1) * 280, 0] for index in range(1, len(steps) + 1)},
+        }
+        if path.exists():
+            self.save_macro(bundle_name, payload)
+        else:
+            payload["created_at"] = _utc_now_iso()
+            self._write_json(path, payload)
+            self._append_macro_order(bundle_name)
+        self.assign_macro_group([bundle_name], "실행 묶음")
+        return path
+
     def create_macro_unique(self, base_name: str, payload: dict[str, Any]) -> tuple[str, Path]:
         """Create a macro file with a guaranteed unique name without overwriting any existing file.
 
@@ -570,8 +633,8 @@ class MacroRepository:
         payload = self._read_json(self.assets_index_path, {})
         return payload if isinstance(payload, dict) else {}
 
-    def asset_path(self, alias: str) -> Path | None:
-        metadata = self.load_assets().get(alias)
+    def asset_path(self, alias: str, assets: dict[str, dict[str, Any]] | None = None) -> Path | None:
+        metadata = (assets if assets is not None else self.load_assets()).get(alias)
         if not isinstance(metadata, dict):
             return None
         relative = Path(str(metadata.get("file") or ""))

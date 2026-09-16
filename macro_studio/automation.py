@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -296,7 +297,8 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
             "table_copy", "table_paste", "table_excel_read", "table_excel_write",
             "set_var", "calc_var", "coord_mode", "call_submacro", "flow_control",
             "text_condition", "run_program", "terminate_program", "type_text",
-            "pixel_search", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio", "find_text_click"
+            "pixel_search", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio", "find_text_click",
+            "mouse_click", "inactive_click",
         }:
             window = event.get("window") if isinstance(event.get("window"), dict) else {}
             title = ACTION_TITLES.get(event_type, event_type)
@@ -310,6 +312,9 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                     "record_mode": record_mode,
                     "detail": str(event.get("detail") or title),
                     "target": _window_label(window),
+                    "step": dict(event.get("_step_payload") or {})
+                    if isinstance(event.get("_step_payload"), dict)
+                    else {},
                     **workflow,
                 }
             )
@@ -481,6 +486,11 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                 }
             )
         previous_time = last_time
+    for draft in drafts:
+        event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
+        payload = event.get("_step_payload")
+        if isinstance(payload, dict) and payload:
+            draft["step"] = deepcopy(payload)
     return drafts
 
 
@@ -874,6 +884,7 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
 
 class DraggableIconWrapper(QtWidgets.QWidget):
     clicked = QtCore.Signal(str)
+    favorite_toggled = QtCore.Signal(str, bool)
 
     def __init__(self, kind: str, icon_char: str, label: str, accent_color: str, parent=None):
         super().__init__(parent)
@@ -882,6 +893,7 @@ class DraggableIconWrapper(QtWidgets.QWidget):
         self.label_text = label
         self.accent_color = accent_color
         self._press_pos = QtCore.QPoint()
+        self._favorite = False
         self.setFixedSize(74, 58)
         self.setStyleSheet("background: transparent; border: none;")
         self.setCursor(QtCore.Qt.PointingHandCursor)
@@ -892,6 +904,7 @@ class DraggableIconWrapper(QtWidgets.QWidget):
         layout.setAlignment(QtCore.Qt.AlignCenter)
 
         self.icon_btn = QtWidgets.QLabel(icon_char)
+        self.icon_btn.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         self.icon_btn.setAlignment(QtCore.Qt.AlignCenter)
         self.icon_btn.setFixedSize(38, 38)
         self.icon_btn.setStyleSheet(f"""
@@ -911,12 +924,39 @@ class DraggableIconWrapper(QtWidgets.QWidget):
         """)
 
         self.name_label = QtWidgets.QLabel(label)
+        self.name_label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         self.name_label.setAlignment(QtCore.Qt.AlignCenter)
         self.name_label.setStyleSheet("color: #8A98B0; font-size: 7pt; font-weight: 500; background: transparent; border: none;")
 
         layout.addWidget(self.icon_btn, 0, QtCore.Qt.AlignCenter)
         layout.addWidget(self.name_label, 0, QtCore.Qt.AlignCenter)
-        self.setToolTip(f"'{label}' 노드 추가 (마우스로 끌어서 순서 변경 가능)")
+        self._update_tooltip()
+
+    def set_favorite(self, favorite: bool) -> None:
+        self._favorite = bool(favorite)
+        self.name_label.setText(("★ " if self._favorite else "") + self.label_text)
+        self.name_label.setStyleSheet(
+            "color: #FFD76A; font-size: 7pt; font-weight: 700; background: transparent; border: none;"
+            if self._favorite
+            else "color: #8A98B0; font-size: 7pt; font-weight: 500; background: transparent; border: none;"
+        )
+        self._update_tooltip()
+
+    def _update_tooltip(self) -> None:
+        favorite_hint = "즐겨찾기 해제" if self._favorite else "즐겨찾기에 추가"
+        self.setToolTip(
+            f"'{self.label_text}' 노드 추가\n"
+            "캔버스 노드선 위로 드래그하면 해당 연결 사이에 자동 삽입\n"
+            f"우클릭: {favorite_hint}"
+        )
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
+        menu = QtWidgets.QMenu(self)
+        action = menu.addAction("☆ 즐겨찾기 해제" if self._favorite else "★ 즐겨찾기에 추가")
+        chosen = menu.exec(event.globalPos())
+        if chosen == action:
+            self.favorite_toggled.emit(self.kind, not self._favorite)
+        event.accept()
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
@@ -1009,7 +1049,7 @@ class IconNodeToolbar(QtWidgets.QFrame):
         layout.setSpacing(4)
 
         header_layout = QtWidgets.QHBoxLayout()
-        header_title = QtWidgets.QLabel("노드 빠른 추가 | 아이콘을 클릭하면 선택한 노드가 현재 녹화 흐름에 추가됩니다. (아이콘을 드래그해 순서를 바꿀 수 있습니다)")
+        header_title = QtWidgets.QLabel("노드 빠른 추가 | 클릭=끝에 추가 · 캔버스 선 위로 드래그=사이에 삽입 · 우클릭=즐겨찾기")
         header_title.setStyleSheet("font-size: 8.5pt; font-weight: 700; color: #8A98B0;")
         header_layout.addWidget(header_title)
         header_layout.addStretch(1)
@@ -1034,9 +1074,10 @@ class IconNodeToolbar(QtWidgets.QFrame):
         self.container = ReorderableIconContainer()
         self.container.setStyleSheet("background: transparent;")
         self.container.installEventFilter(self)
-        self.container.reordered.connect(self._save_order)
+        self.container.reordered.connect(self._normalize_favorite_order)
 
         specs = [
+            ("mouse_click", "⌖", "좌표 클릭", "#7C6CFF"),
             ("ocr", "OCR", "OCR 인식", "#7C6CFF"),
             ("type_text", "T", "텍스트 입력", "#C47CFF"),
             ("wait", "◷", "대기", "#F5B942"),
@@ -1058,15 +1099,30 @@ class IconNodeToolbar(QtWidgets.QFrame):
             ("find_text_click", "🎯", "텍스트 클릭", "#4D9FFF"),
         ]
 
-        saved_order = QtCore.QSettings("TodayNews", "MacroStudio").value("icon_node_toolbar_order")
+        settings = QtCore.QSettings("TodayNews", "MacroStudio")
+        saved_order = settings.value("icon_node_toolbar_order")
+        saved_favorites = settings.value("icon_node_toolbar_favorites")
+        if isinstance(saved_favorites, str):
+            saved_favorites = [saved_favorites] if saved_favorites else []
+        self._favorites = {
+            str(value) for value in saved_favorites
+        } if isinstance(saved_favorites, list) else set()
         if isinstance(saved_order, list) and saved_order:
-            order_map = {str(k): idx for idx, k in enumerate(saved_order)}
-            specs.sort(key=lambda s: order_map.get(s[0], 999))
+            saved_kinds = [str(k) for k in saved_order]
+            order_map = {str(k): idx for idx, k in enumerate(saved_kinds)}
+            if "mouse_click" not in order_map:
+                order_map = {key: index + 1 for key, index in order_map.items()}
+                order_map["mouse_click"] = 0
+            specs.sort(key=lambda s: (s[0] not in self._favorites, order_map.get(s[0], 999)))
+        else:
+            specs.sort(key=lambda s: s[0] not in self._favorites)
 
         for kind, icon_char, label, accent_color in specs:
             wrapper = DraggableIconWrapper(kind, icon_char, label, accent_color)
             wrapper.installEventFilter(self)
             wrapper.clicked.connect(self.node_clicked.emit)
+            wrapper.favorite_toggled.connect(self._toggle_favorite)
+            wrapper.set_favorite(kind in self._favorites)
             self.container.layout_box.addWidget(wrapper)
 
         self.container.layout_box.addStretch(1)
@@ -1081,6 +1137,31 @@ class IconNodeToolbar(QtWidgets.QFrame):
             if isinstance(w, DraggableIconWrapper):
                 order.append(w.kind)
         QtCore.QSettings("TodayNews", "MacroStudio").setValue("icon_node_toolbar_order", order)
+
+    def _toggle_favorite(self, kind: str, favorite: bool) -> None:
+        if favorite:
+            self._favorites.add(str(kind))
+        else:
+            self._favorites.discard(str(kind))
+        settings = QtCore.QSettings("TodayNews", "MacroStudio")
+        settings.setValue("icon_node_toolbar_favorites", sorted(self._favorites))
+
+        self._normalize_favorite_order()
+
+    def _normalize_favorite_order(self) -> None:
+        wrappers: list[DraggableIconWrapper] = []
+        for index in range(self.container.layout_box.count()):
+            item = self.container.layout_box.itemAt(index)
+            widget = item.widget() if item else None
+            if isinstance(widget, DraggableIconWrapper):
+                wrappers.append(widget)
+        for wrapper in wrappers:
+            wrapper.set_favorite(wrapper.kind in self._favorites)
+            self.container.layout_box.removeWidget(wrapper)
+        wrappers.sort(key=lambda wrapper: wrapper.kind not in self._favorites)
+        for index, wrapper in enumerate(wrappers):
+            self.container.layout_box.insertWidget(index, wrapper)
+        self._save_order()
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.Wheel and isinstance(event, QtGui.QWheelEvent):
@@ -1113,6 +1194,7 @@ class RecordingBar(QtWidgets.QDialog):
     branch_requested = QtCore.Signal()
     events_deleted = QtCore.Signal(list)
     manual_node_requested = QtCore.Signal(str)
+    manual_node_drop_requested = QtCore.Signal(str, object)
 
     def __init__(self, repository=None, parent=None) -> None:
         if isinstance(repository, QtWidgets.QWidget) and parent is None:
@@ -1177,9 +1259,13 @@ class RecordingBar(QtWidgets.QDialog):
         self.live_canvas.link_requested.connect(self._connect_live_nodes)
         self.live_canvas.edge_delete_requested.connect(self._delete_live_edge)
         self.live_canvas.edges_delete_requested.connect(self._delete_live_edges_batch)
+        self.live_canvas.edge_delay_requested.connect(self._set_live_edge_delay)
+        self.live_canvas.edge_condition_delete_requested.connect(self._delete_live_condition)
+        self.live_canvas.edge_condition_retarget_requested.connect(self._retarget_live_condition)
         self.live_canvas.node_delete_requested.connect(self._delete_live_node)
         self.live_canvas.inspector_requested.connect(self._open_live_node_editor)
         self.live_canvas.multi_image_merge_requested.connect(self._merge_live_image_nodes)
+        self.live_canvas.quick_node_drop_requested.connect(self._on_quick_node_drop)
         self.live_canvas.set_macro({"steps": []})
         layout.addWidget(self.live_canvas, 1)
 
@@ -1196,6 +1282,7 @@ class RecordingBar(QtWidgets.QDialog):
         self._live_events: list[dict[str, Any]] = []
         self._live_link_overrides: dict[tuple[str, str], str | list[str] | None] = {}
         self._live_multi_groups: dict[str, str] = {}
+        self._live_step_payloads: dict[str, dict[str, Any]] = {}
         self._live_rebuild_pending = False
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(250)
@@ -1212,6 +1299,137 @@ class RecordingBar(QtWidgets.QDialog):
             self.branch_requested.emit()
         else:
             self.manual_node_requested.emit(kind)
+
+    def _on_quick_node_drop(self, kind: str, payload: object) -> None:
+        details = dict(payload) if isinstance(payload, dict) else {}
+        source = int(details.get("source") or 0)
+        target = int(details.get("target") or 0)
+        if 0 < source <= len(self.live_canvas.steps):
+            source_step = self.live_canvas.steps[source - 1]
+            details["source_event_id"] = str(source_step.get("_event_id") or "")
+            details["workflow_id"] = str(source_step.get("workflow_id") or "")
+        if 0 < target <= len(self.live_canvas.steps):
+            details["target_event_id"] = str(self.live_canvas.steps[target - 1].get("_event_id") or "")
+        self.manual_node_drop_requested.emit(str(kind), details)
+
+    def apply_quick_node_drop(
+        self,
+        event_id: str,
+        payload: dict[str, Any],
+        *,
+        rebuild: bool = True,
+    ) -> None:
+        """Place a new live node and splice it into the edge selected at drop time."""
+        if not event_id:
+            return
+        drop_x = float(payload.get("x") or 0.0)
+        drop_y = float(payload.get("y") or 0.0)
+        desired_position = [drop_x - 98.0, drop_y - 58.0]
+        source_id = str(payload.get("source_event_id") or "")
+        target_id = str(payload.get("target_event_id") or "")
+
+        source_node = None
+        target_node = None
+        source_step: dict[str, Any] = {}
+        target_step: dict[str, Any] = {}
+        for index, step in enumerate(self.live_canvas.steps, start=1):
+            current_id = str(step.get("_event_id") or "")
+            if current_id == source_id:
+                source_node = self.live_canvas.nodes.get(index)
+                source_step = step
+            if current_id == target_id:
+                target_node = self.live_canvas.nodes.get(index)
+                target_step = step
+
+        if source_node is not None and target_node is not None:
+            source_rect = source_node.sceneBoundingRect()
+            target_rect = target_node.sceneBoundingRect()
+            same_row = abs(source_rect.center().y() - target_rect.center().y()) <= 150.0
+            forward = target_rect.center().x() > source_rect.center().x()
+            if same_row and forward:
+                gap = 68.0
+                node_width = 196.0
+                min_x = source_rect.right() + gap
+                max_x = target_rect.left() - node_width - gap
+                desired_position[0] = (
+                    min(max(drop_x - node_width / 2.0, min_x), max_x)
+                    if max_x >= min_x
+                    else min_x
+                )
+                desired_position[1] = source_node.pos().y()
+                required_target_x = desired_position[0] + node_width + gap
+                shift_x = max(0.0, required_target_x - target_node.pos().x())
+                if shift_x > 0.0:
+                    target_workflow = str(target_step.get("workflow_id") or source_step.get("workflow_id") or "")
+                    target_x = target_node.pos().x()
+                    for index, node in self.live_canvas.nodes.items():
+                        step = self.live_canvas.steps[index - 1]
+                        node_id = str(step.get("_event_id") or "")
+                        if node_id in {source_id, event_id} or node.pos().x() < target_x - 1.0:
+                            continue
+                        workflow = str(step.get("workflow_id") or "")
+                        if target_workflow and workflow and workflow != target_workflow:
+                            continue
+                        moved = QtCore.QPointF(node.pos().x() + shift_x, node.pos().y())
+                        node.setPos(moved)
+                        if node_id:
+                            self._event_positions[node_id] = [round(moved.x(), 2), round(moved.y(), 2)]
+
+        # The dragged node is appended to the recording timeline, even though
+        # it is visually inserted in an older edge. Without this guard the old
+        # terminal node receives an automatic sequential edge back to the new
+        # node, producing an unintended long return line.
+        source_workflow = str(source_step.get("workflow_id") or "")
+        workflow_terminal: dict[str, Any] | None = None
+        for step in self.live_canvas.steps:
+            workflow = str(step.get("workflow_id") or "")
+            if source_workflow and workflow != source_workflow:
+                continue
+            workflow_terminal = step
+        if workflow_terminal is not None:
+            terminal_id = str(workflow_terminal.get("_event_id") or "")
+            terminal_targets = workflow_terminal.get("success_candidates")
+            has_explicit_target = bool(
+                isinstance(terminal_targets, list) and terminal_targets
+            ) or int(workflow_terminal.get("on_success") or 0) > 0
+            if terminal_id and terminal_id != source_id and not has_explicit_target:
+                self._live_link_overrides[(terminal_id, "success")] = None
+
+        self._event_positions[event_id] = desired_position
+        for index, step in enumerate(self.live_canvas.steps, start=1):
+            if str(step.get("_event_id") or "") != event_id:
+                continue
+            node = self.live_canvas.nodes.get(index)
+            if node is not None:
+                node.setPos(QtCore.QPointF(desired_position[0], desired_position[1]))
+            break
+        edge_kind = "fail" if str(payload.get("edge_kind") or "success") == "fail" else "success"
+        if not source_id or not target_id:
+            if rebuild:
+                self.update_live_events(self._live_events, force=True)
+            return
+
+        key = (source_id, edge_kind)
+        current = self._live_link_overrides.get(key)
+        if isinstance(current, list):
+            replaced = False
+            targets = []
+            for value in current:
+                if value == target_id and not replaced:
+                    targets.append(event_id)
+                    replaced = True
+                else:
+                    targets.append(value)
+            if not replaced:
+                targets.append(event_id)
+            self._live_link_overrides[key] = targets if len(targets) > 1 else targets[0]
+        else:
+            # The visible edge is authoritative even when it was produced by
+            # the automatic sequential flow and has no explicit override yet.
+            self._live_link_overrides[key] = event_id
+        self._live_link_overrides[(event_id, "success")] = target_id
+        if rebuild:
+            self.update_live_events(self._live_events, force=True)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
@@ -1443,7 +1661,8 @@ class RecordingBar(QtWidgets.QDialog):
             "table_copy", "table_paste", "table_excel_read", "table_excel_write",
             "set_var", "calc_var", "coord_mode", "call_submacro", "flow_control",
             "text_condition", "run_program", "terminate_program",
-            "pixel_search", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio"
+            "pixel_search", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio",
+            "mouse_click", "inactive_click",
         }:
             return {**common, "action": kind, "label": str(draft.get("detail") or ACTION_TITLES.get(kind, kind))}
         if kind == "find_text_click":
@@ -1491,6 +1710,11 @@ class RecordingBar(QtWidgets.QDialog):
         self._live_events = list(events)
         drafts = self._group_live_drafts(recording_drafts(events, include_waits=False))
         steps = [self._live_step(draft, index) for index, draft in enumerate(drafts, start=1)]
+        for step in steps:
+            event_id = str(step.get("_event_id") or "")
+            payload = self._live_step_payloads.get(event_id)
+            if payload:
+                step.update(deepcopy(payload))
         event_ids = tuple(str(step.get("_event_id") or "") for step in steps)
         signature = tuple(
             f"{event_id}|{','.join(str(value) for value in step.get('_member_event_ids') or [])}"
@@ -1620,6 +1844,96 @@ class RecordingBar(QtWidgets.QDialog):
                 self._live_link_overrides[key] = None
             self._schedule_live_rebuild()
 
+    def _save_live_step_payload(self, source: int) -> bool:
+        if not 0 < source <= len(self.live_canvas.steps):
+            return False
+        step = self.live_canvas.steps[source - 1]
+        event_id = str(step.get("_event_id") or "")
+        if not event_id:
+            return False
+        graph_only = {
+            "on_success", "on_fail", "success_candidates", "fail_candidates",
+            "stop_on_success", "abort_on_fail",
+        }
+        self._live_step_payloads[event_id] = {
+            key: deepcopy(value)
+            for key, value in step.items()
+            if not str(key).startswith("_") and key not in graph_only
+        }
+        return True
+
+    def _set_live_edge_delay(self, source: int, target: int, kind: str) -> None:
+        if not 0 < source <= len(self.live_canvas.steps):
+            return
+        step = self.live_canvas.steps[source - 1]
+        normalized_kind = "fail" if kind == "fail" else "success"
+        field = "on_fail" if normalized_kind == "fail" else "on_success"
+        candidates_key = "fail_candidates" if normalized_kind == "fail" else "success_candidates"
+        candidates = step.get(candidates_key) if isinstance(step.get(candidates_key), list) else []
+        if int(step.get(field) or 0) != target and target not in [int(value) for value in candidates]:
+            return
+
+        from .builder import EdgeSettingsDialog
+
+        delay_field = "on_fail_delay" if normalized_kind == "fail" else "on_success_delay"
+        rules = [
+            deepcopy(rule)
+            for rule in (step.get("edge_conditions") or [])
+            if isinstance(rule, dict) and str(rule.get("kind") or "success") == normalized_kind
+        ]
+        other_rules = [
+            deepcopy(rule)
+            for rule in (step.get("edge_conditions") or [])
+            if not isinstance(rule, dict) or str(rule.get("kind") or "success") != normalized_kind
+        ]
+        dialog = EdgeSettingsDialog(
+            len(self.live_canvas.steps),
+            normalized_kind,
+            int(step.get(delay_field) or 0),
+            rules,
+            self,
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        if dialog.delay_spin.value() > 0:
+            step[delay_field] = dialog.delay_spin.value()
+        else:
+            step.pop(delay_field, None)
+        combined = other_rules + dialog.rules
+        if combined:
+            step["edge_conditions"] = combined
+        else:
+            step.pop("edge_conditions", None)
+        if self._save_live_step_payload(source):
+            self.update_live_events(self._live_events, force=True)
+
+    def _delete_live_condition(self, source: int, condition_index: int) -> None:
+        if not 0 < source <= len(self.live_canvas.steps):
+            return
+        step = self.live_canvas.steps[source - 1]
+        rules = step.get("edge_conditions")
+        if not isinstance(rules, list) or not 0 <= condition_index < len(rules):
+            return
+        rules.pop(condition_index)
+        if not rules:
+            step.pop("edge_conditions", None)
+        if self._save_live_step_payload(source):
+            self.update_live_events(self._live_events, force=True)
+
+    def _retarget_live_condition(self, source: int, condition_index: int, target: int) -> None:
+        if not 0 < source <= len(self.live_canvas.steps) or not 0 < target <= len(self.live_canvas.steps):
+            return
+        step = self.live_canvas.steps[source - 1]
+        rules = step.get("edge_conditions")
+        if not isinstance(rules, list) or not 0 <= condition_index < len(rules):
+            return
+        rule = rules[condition_index]
+        if not isinstance(rule, dict):
+            return
+        rule["target"] = target
+        if self._save_live_step_payload(source):
+            self.update_live_events(self._live_events, force=True)
+
     def _delete_live_edges_batch(self, edge_specs: list[dict[str, Any]]) -> None:
         if not edge_specs:
             return
@@ -1685,6 +1999,9 @@ class RecordingBar(QtWidgets.QDialog):
 
     def multi_groups(self) -> dict[str, str]:
         return dict(self._live_multi_groups)
+
+    def step_payloads(self) -> dict[str, dict[str, Any]]:
+        return deepcopy(self._live_step_payloads)
 
 
 def _recorded_sample_image(event: dict[str, Any]) -> QtGui.QImage:
@@ -2528,13 +2845,17 @@ class SmartRecordingController(QtCore.QObject):
         self.bar.branch_requested.connect(self.request_workflow_branch)
         self.bar.events_deleted.connect(self._delete_recorded_events)
         self.bar.manual_node_requested.connect(self._add_manual_node)
+        self.bar.manual_node_drop_requested.connect(self._add_manual_node_at_drop)
         self.bar.show()
         self.bar.raise_()
         self.bar.activateWindow()
         self.process.start()
         self._capture_poll.start()
 
-    def _add_manual_node(self, kind: str) -> None:
+    def _add_manual_node_at_drop(self, kind: str, payload: object) -> None:
+        self._add_manual_node(kind, dict(payload) if isinstance(payload, dict) else {})
+
+    def _add_manual_node(self, kind: str, drop_payload: dict[str, Any] | None = None) -> None:
         if self._capture_in_progress:
             return
         self._capture_in_progress = True
@@ -2550,6 +2871,8 @@ class SmartRecordingController(QtCore.QObject):
                 "workflow_id": f"workflow-{self.bar.workflow_index:02d}" if self.bar else "workflow-01",
                 "window": window,
             }
+            if drop_payload and str(drop_payload.get("workflow_id") or ""):
+                event["workflow_id"] = str(drop_payload["workflow_id"])
 
             if kind == "ocr":
                 if self.bar is not None:
@@ -2594,6 +2917,49 @@ class SmartRecordingController(QtCore.QObject):
                 finally:
                     if self.bar is not None:
                         self.bar.show()
+            elif kind == "mouse_click":
+                if self.bar is not None:
+                    self.bar._restore_position = self.bar.pos()
+                    ignored = {int(self.bar.winId())}
+                    self.bar.hide()
+                else:
+                    ignored = set()
+                try:
+                    picker = WindowPickerDialog(
+                        parent=None,
+                        ignored_hwnds=ignored,
+                        hint_text="[ 좌표 클릭 지정 ] 클릭할 프로그램의 정확한 위치를 한 번 클릭하세요 · Esc 취소",
+                    )
+                    if picker.exec() == QtWidgets.QDialog.Accepted:
+                        screen_pt = picker.selected_screen_point()
+                        client_pt = picker.selected_client_point()
+                        if client_pt is None:
+                            client_pt = QtCore.QPoint(screen_pt)
+                        window_dict = {
+                            "title": picker.window_token,
+                            "exe": picker.exe_name,
+                            "hwnd": picker.window_hwnd,
+                        }
+                        event.update(
+                            {
+                                "window": window_dict,
+                                "x": int(client_pt.x()),
+                                "y": int(client_pt.y()),
+                                "screen_x": int(screen_pt.x()),
+                                "screen_y": int(screen_pt.y()),
+                                "coordinate_scope": "client" if picker.window_hwnd else "screen",
+                                "button": "Left",
+                                "count": 1,
+                                "detail": f"좌표 클릭 · {client_pt.x()}, {client_pt.y()}",
+                            }
+                        )
+                    else:
+                        return
+                finally:
+                    if self.bar is not None:
+                        self.bar.show()
+                        self.bar.raise_()
+                        self.bar.activateWindow()
             elif kind == "browser_action":
                 if self.bar is not None:
                     self.bar._restore_position = self.bar.pos()
@@ -2815,6 +3181,20 @@ class SmartRecordingController(QtCore.QObject):
                 step_template["duration"] = 1000
             elif kind in {"text", "key", "type_text"}:
                 step_template["text"] = str(event.get("text") or "")
+            elif kind == "mouse_click":
+                window_info = event.get("window") if isinstance(event.get("window"), dict) else {}
+                step_template.update(
+                    {
+                        "x": int(event.get("x") or 0),
+                        "y": int(event.get("y") or 0),
+                        "coordinate_scope": str(event.get("coordinate_scope") or "client"),
+                        "button": str(event.get("button") or "Left"),
+                        "count": int(event.get("count") or 1),
+                        "window": str(window_info.get("title") or ""),
+                        "window_exe": str(window_info.get("exe") or ""),
+                        "window_hwnd": int(window_info.get("hwnd") or 0),
+                    }
+                )
             elif kind in {"ocr", "find_text_click"}:
                 step_template["asset"] = str(event.get("asset") or "")
                 reg = event.get("region") or event.get("search_region")
@@ -2888,15 +3268,20 @@ class SmartRecordingController(QtCore.QObject):
                 step_template["lang"] = "kor+eng"
                 step_template["engine_preference"] = "auto"
 
-            # Popup detailed settings editor for the added node
-            from .builder import ActionEditorDialog
-            dlg = ActionEditorDialog(self.repository, step_template, parent=self.bar)
-            if dlg.exec() == QtWidgets.QDialog.Accepted:
-                edited_payload = dlg.payload()
-                if isinstance(edited_payload, dict):
-                    event["_step_payload"] = edited_payload
-                    if edited_payload.get("label"):
-                        event["detail"] = str(edited_payload["label"])
+            # A dragged quick-add node must appear immediately. Its defaults
+            # can be adjusted by double-clicking the node afterwards. Ordinary
+            # toolbar clicks retain the existing detailed-settings dialog.
+            if drop_payload:
+                event["_step_payload"] = dict(step_template)
+            else:
+                from .builder import ActionEditorDialog
+                dlg = ActionEditorDialog(self.repository, step_template, parent=self.bar)
+                if dlg.exec() == QtWidgets.QDialog.Accepted:
+                    edited_payload = dlg.payload()
+                    if isinstance(edited_payload, dict):
+                        event["_step_payload"] = edited_payload
+                        if edited_payload.get("label"):
+                            event["detail"] = str(edited_payload["label"])
 
             self._manual_captures.append(event)
             if self.bar is not None:
@@ -2904,7 +3289,9 @@ class SmartRecordingController(QtCore.QObject):
                     [*load_recording(self.output), *self._manual_captures],
                     key=lambda item: int(item.get("t") or 0),
                 )
-                self.bar.update_live_events(live_events)
+                if drop_payload:
+                    self.bar.apply_quick_node_drop(event_id, drop_payload, rebuild=False)
+                self.bar.update_live_events(live_events, force=bool(drop_payload))
         finally:
             self._capture_in_progress = False
 
@@ -3148,6 +3535,7 @@ class SmartRecordingController(QtCore.QObject):
         live_positions = self.bar.event_positions() if self.bar is not None else {}
         live_links = self.bar.event_links() if self.bar is not None else {}
         live_multi_groups = self.bar.multi_groups() if self.bar is not None else {}
+        live_step_payloads = self.bar.step_payloads() if self.bar is not None else {}
         if self.bar is not None:
             self.bar.close()
             self.bar.deleteLater()
@@ -3167,6 +3555,8 @@ class SmartRecordingController(QtCore.QObject):
                 event["_live_position"] = list(live_positions[event_id])
             if event_id in live_multi_groups:
                 event["_review_multi_group"] = live_multi_groups[event_id]
+            if event_id in live_step_payloads:
+                event["_step_payload"] = deepcopy(live_step_payloads[event_id])
             event_links: dict[str, Any] = {}
             for kind in ("success", "fail"):
                 key = (event_id, kind)
@@ -4050,9 +4440,13 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             record_mode = "branch" if str(draft.get("record_mode") or "action") == "branch" else "action"
             if draft.get("step") and isinstance(draft["step"], dict):
                 step_obj = dict(draft["step"])
+                source_event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
                 step_obj["_recording_mode"] = record_mode
                 step_obj["workflow_id"] = str(draft.get("workflow_id") or "")
                 step_obj["workflow_label"] = f"스마트 작업 {int(draft.get('workflow_index') or 1)}"
+                step_obj["_live_position"] = list(source_event.get("_live_position") or [])[:2]
+                step_obj["_recording_event_ids"] = [str(source_event.get("event_id") or "")]
+                step_obj["_live_links"] = dict(source_event.get("_live_links") or {})
                 steps.append(step_obj)
                 continue
             if kind == "wait":

@@ -16,6 +16,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .color_widgets import ColorToleranceBarWidget, ToleranceSpectrumBar
 from .repository import MacroRepository
+from .search_diagnostics import (
+    diagnose_capture_failure,
+    diagnose_image_result,
+    inactive_click_preflight,
+    predicted_click_points,
+)
 from .screen_coordinates import display_coordinate_maps, logical_point_to_native
 from .theme import COLORS
 
@@ -482,6 +488,7 @@ class InteractiveCanvas(QtWidgets.QWidget):
         self._active_alias: str = ""
         self._regions: dict[str, list[int]] = {}
         self._test_results: dict[str, dict[str, Any]] = {}
+        self._click_points: list[dict[str, Any]] = []
         self._drag_start: QtCore.QPoint | None = None
         self._drag_current: QtCore.QPoint | None = None
         self._hover_pos: QtCore.QPoint | None = None
@@ -514,10 +521,12 @@ class InteractiveCanvas(QtWidgets.QWidget):
         regions: dict[str, list[int]],
         test_results: dict[str, dict[str, Any]],
         active_alias: str = "",
+        click_points: list[dict[str, Any]] | None = None,
     ) -> None:
         self._regions = dict(regions)
         self._test_results = dict(test_results)
         self._active_alias = active_alias
+        self._click_points = list(click_points or [])
         self.update()
 
     def set_active_alias(self, alias: str) -> None:
@@ -604,7 +613,19 @@ class InteractiveCanvas(QtWidgets.QWidget):
                 else:
                     painter.drawText(QtCore.QPointF(hint_rect.left(), max(12.0, hint_rect.top() - 4)), f"실제 위치 ({res.get('full_score', 0):.0%})")
 
-        # 2. Draw active dragging box
+        # 2. Draw the exact click point that will be used after a match.
+        for point in self._click_points:
+            px = float(point.get("x") or 0) * s
+            py = float(point.get("y") or 0) * s
+            painter.setPen(QtGui.QPen(QtGui.QColor("#E879F9"), 2.2))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(232, 121, 249, 55)))
+            painter.drawEllipse(QtCore.QPointF(px, py), 8, 8)
+            painter.drawLine(QtCore.QPointF(px - 11, py), QtCore.QPointF(px + 11, py))
+            painter.drawLine(QtCore.QPointF(px, py - 11), QtCore.QPointF(px, py + 11))
+            painter.setFont(QtGui.QFont("Segoe UI", 8, QtGui.QFont.Bold))
+            painter.drawText(QtCore.QPointF(px + 10, max(12.0, py - 9)), "최종 클릭")
+
+        # 3. Draw active dragging box
         if self._drag_start and self._drag_current:
             r = QtCore.QRectF(self._drag_start, self._drag_current).normalized()
             painter.setPen(QtGui.QPen(QtGui.QColor("#38BDF8"), 2, QtCore.Qt.DashLine))
@@ -715,6 +736,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._base_y: int = 0
         self._capture_desc: str = ""
         self._test_results: dict[str, dict[str, Any]] = {}
+        self._click_preflight: dict[str, Any] = {}
         self._required_count: int = int(step.get("required_count") or len(self._aliases))
         self._match_condition: str = str(step.get("match_condition") or "all_matched").strip()
 
@@ -731,7 +753,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             elif step.get("custom_click_x") is not None and (int(step.get("custom_click_x") or 0) or int(step.get("custom_click_y") or 0)):
                 raw_target = "custom_coord"
             else:
-                raw_target = "each_image"
+                raw_target = "none"
         self._click_target: str = raw_target
         self._custom_click_x: int = int(step.get("custom_click_x") or 0)
         self._custom_click_y: int = int(step.get("custom_click_y") or 0)
@@ -778,6 +800,11 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self.lbl_target_info = QtWidgets.QLabel("대상: 확인 중…")
         self.lbl_target_info.setStyleSheet("color: #8A98B0; font-size: 9pt;")
         left_layout.addWidget(self.lbl_target_info)
+
+        self.lbl_click_preflight = QtWidgets.QLabel("클릭 검증: 확인 중…")
+        self.lbl_click_preflight.setWordWrap(True)
+        self.lbl_click_preflight.setStyleSheet("background:#101722; border:1px solid #2E3B50; border-radius:5px; padding:6px; color:#CBD5E1; font-size:8.8pt;")
+        left_layout.addWidget(self.lbl_click_preflight)
 
         # Multi-image Management Box
         if not self._is_color_mode:
@@ -921,7 +948,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             self.spin_click_x.setPrefix("X: ")
             self.spin_click_x.setSuffix(" px")
             self.spin_click_x.setStyleSheet("background: #0F172A; color: #A5B4FC; border: 1px solid #334155; border-radius: 4px; padding: 2px;")
-            self.spin_click_x.valueChanged.connect(lambda v: setattr(self, "_custom_click_x", int(v)))
+            self.spin_click_x.valueChanged.connect(lambda v: self._set_custom_click_coord(0, v))
 
             self.spin_click_y = QtWidgets.QSpinBox()
             self.spin_click_y.setRange(-100_000, 100_000)
@@ -929,7 +956,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             self.spin_click_y.setPrefix("Y: ")
             self.spin_click_y.setSuffix(" px")
             self.spin_click_y.setStyleSheet("background: #0F172A; color: #A5B4FC; border: 1px solid #334155; border-radius: 4px; padding: 2px;")
-            self.spin_click_y.valueChanged.connect(lambda v: setattr(self, "_custom_click_y", int(v)))
+            self.spin_click_y.valueChanged.connect(lambda v: self._set_custom_click_coord(1, v))
 
             self.custom_coord_row.addWidget(self.spin_click_x)
             self.custom_coord_row.addWidget(self.spin_click_y)
@@ -1012,13 +1039,13 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         # Bottom Buttons
         btn_row = QtWidgets.QHBoxLayout()
-        btn_save = QtWidgets.QPushButton("✔ 보정된 영역 저장 및 적용")
-        btn_save.setStyleSheet("background: #7C6CFF; color: white; font-weight: 800; font-size: 10pt; padding: 10px 16px; border-radius: 6px;")
-        btn_save.clicked.connect(self.accept)
+        self.btn_save = QtWidgets.QPushButton("✔ 보정된 영역 저장 및 적용")
+        self.btn_save.setStyleSheet("background: #7C6CFF; color: white; font-weight: 800; font-size: 10pt; padding: 10px 16px; border-radius: 6px;")
+        self.btn_save.clicked.connect(self.accept)
         btn_cancel = QtWidgets.QPushButton("닫기")
         btn_cancel.setStyleSheet("padding: 10px 14px; border-radius: 6px; background: #1E2330; color: #E2E8F0; border: 1px solid #2A3040;")
         btn_cancel.clicked.connect(self.reject)
-        btn_row.addWidget(btn_save, 1)
+        btn_row.addWidget(self.btn_save, 1)
         btn_row.addWidget(btn_cancel)
         left_layout.addLayout(btn_row)
 
@@ -1087,6 +1114,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._base_y = by
         self._capture_desc = desc
         self.lbl_target_info.setText(f"대상: {desc}")
+        self._refresh_click_preflight()
 
         if hasattr(self, "btn_toggle_mode"):
             mode = str(self.step.get("region_mode") or "screen").casefold()
@@ -1101,9 +1129,11 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
                 self.btn_toggle_mode.setToolTip("대상 프로그램을 클릭해 선택합니다. 이미지나 검색 영역을 드래그해도 그 아래 프로그램이 자동 지정됩니다.")
 
         if frame is None or frame.size == 0:
+            cause, guidance = diagnose_capture_failure(desc, self.step)
             self.lbl_banner_main.setText("❌ 화면 캡처 실패")
             self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #F87171;")
-            self.lbl_banner_sub.setText("대상 창을 찾지 못했거나 화면 캡처 권한이 없습니다.")
+            self.lbl_banner_sub.setText(f"원인: {cause} · {guidance}")
+            self.canvas.set_frame(None)
             return
 
         self.canvas.set_frame(frame)
@@ -1145,6 +1175,59 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             for alias, region in self._asset_regions.items()
             if isinstance(region, (list, tuple)) and len(region) >= 4
         }
+
+    def _predicted_click_points(self) -> list[dict[str, Any]]:
+        if self._is_color_mode:
+            return []
+        return predicted_click_points(
+            self._aliases,
+            self._test_results,
+            self._asset_offsets,
+            self._click_target,
+            (self._custom_click_x, self._custom_click_y),
+        )
+
+    def _refresh_canvas_data(self) -> None:
+        if not hasattr(self, "canvas"):
+            return
+        active = self.canvas._active_alias or (self._aliases[0] if self._aliases else "")
+        self.canvas.set_data(
+            self._canvas_regions(),
+            self._test_results,
+            active_alias=active,
+            click_points=self._predicted_click_points(),
+        )
+
+    def _refresh_click_preflight(self) -> None:
+        if not hasattr(self, "lbl_click_preflight"):
+            return
+        preview_step = deepcopy(self.step)
+        preview_step["click_enabled"] = self._click_target != "none" and not self._is_color_mode
+        preview_step["click_target"] = self._click_target
+        click = preview_step.get("click") if isinstance(preview_step.get("click"), dict) else {}
+        target_hwnd = 0
+        if str(click.get("mode") or "active").lower() == "inactive" and preview_step["click_enabled"]:
+            target_hwnd = _find_target_window(
+                str(click.get("window_exe") or preview_step.get("region_window_exe") or ""),
+                str(click.get("window") or preview_step.get("region_window") or ""),
+            )
+        target_class = str(_get_window_info(target_hwnd).get("class_name") or "") if target_hwnd else ""
+        status = inactive_click_preflight(preview_step, target_hwnd, target_class)
+        self._click_preflight = status
+        valid = bool(status.get("valid"))
+        required = bool(status.get("required"))
+        icon = "✅" if valid else "⛔"
+        self.lbl_click_preflight.setText(f"{icon} <b>{status.get('title', '')}</b><br>{status.get('detail', '')}")
+        if not valid:
+            style = "background:#450A0A; border:1px solid #DC2626; border-radius:5px; padding:6px; color:#FECACA; font-size:8.8pt;"
+        elif required:
+            style = "background:#064E3B; border:1px solid #059669; border-radius:5px; padding:6px; color:#A7F3D0; font-size:8.8pt;"
+        else:
+            style = "background:#101722; border:1px solid #2E3B50; border-radius:5px; padding:6px; color:#CBD5E1; font-size:8.8pt;"
+        self.lbl_click_preflight.setStyleSheet(style)
+        if hasattr(self, "btn_save"):
+            self.btn_save.setEnabled(valid)
+            self.btn_save.setToolTip("" if valid else "비활성 대상 창 검증에 실패하여 저장할 수 없습니다.")
 
     def _ignored_window_roots(self) -> set[int]:
         roots: set[int] = set()
@@ -1277,6 +1360,15 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             self._click_target = str(self.combo_click_target.currentData() or "each_image")
         if hasattr(self, "custom_coord_widget"):
             self.custom_coord_widget.setVisible(self._click_target == "custom_coord")
+        self._refresh_click_preflight()
+        self._refresh_canvas_data()
+
+    def _set_custom_click_coord(self, axis: int, value: int) -> None:
+        if axis == 0:
+            self._custom_click_x = int(value)
+        else:
+            self._custom_click_y = int(value)
+        self._refresh_canvas_data()
 
     def _pick_custom_click_point(self) -> None:
         from .action_editor import OffsetPointPickerDialog
@@ -1531,6 +1623,10 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
                 "reason": region_reason,
             }
 
+            diagnosis, detail = diagnose_image_result(results[alias])
+            results[alias]["diagnosis"] = diagnosis
+            results[alias]["diagnosis_detail"] = detail
+
         self._test_results = results
 
     def _evaluate_all_colors(self) -> None:
@@ -1633,7 +1729,13 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
     def _refresh_ui(self) -> None:
         active = self.canvas._active_alias or (self._aliases[0] if self._aliases else "")
-        self.canvas.set_data(self._canvas_regions(), self._test_results, active_alias=active)
+        self.canvas.set_data(
+            self._canvas_regions(),
+            self._test_results,
+            active_alias=active,
+            click_points=self._predicted_click_points(),
+        )
+        self._refresh_click_preflight()
 
         total = len(self._aliases)
         if total == 0:
@@ -1885,22 +1987,12 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
 
         # Row 3: Diagnostic / Hint
         if not found:
-            reason = res.get("reason")
-            if reason:
-                hint_lbl = QtWidgets.QLabel(f"⚠️ {reason}")
-                hint_lbl.setStyleSheet("color: #F87171; font-size: 8.5pt;")
-                vbox.addWidget(hint_lbl)
-            elif res.get("full_found"):
-                fy = res.get("full_y", 0)
-                diff = fy - (reg[1] + (reg[3] - reg[1]) // 2)
-                dir_str = f"아래로 {diff}px" if diff > 0 else f"위로 {abs(diff)}px"
-                hint_lbl = QtWidgets.QLabel(f"💡 실제 이미지는 {dir_str}에 있습니다! (노란 점선)")
-                hint_lbl.setStyleSheet("color: #FDE047; font-size: 8.5pt; font-weight: 600;")
-                vbox.addWidget(hint_lbl)
-            else:
-                hint_lbl = QtWidgets.QLabel("⚠️ 화면 전체에서도 이미지를 찾지 못했습니다.")
-                hint_lbl.setStyleSheet("color: #FCA5A5; font-size: 8.5pt;")
-                vbox.addWidget(hint_lbl)
+            diagnosis = str(res.get("diagnosis") or "탐지 실패")
+            detail = str(res.get("diagnosis_detail") or "현재 화면과 검색 설정을 확인하세요.")
+            hint_lbl = QtWidgets.QLabel(f"⚠️ <b>{diagnosis}</b> · {detail}")
+            hint_lbl.setWordWrap(True)
+            hint_lbl.setStyleSheet("color: #FCA5A5; font-size: 8.5pt;")
+            vbox.addWidget(hint_lbl)
 
         # Row 4: Card Action Buttons
         btn_box = QtWidgets.QHBoxLayout()
@@ -1941,6 +2033,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         if alias not in self._asset_offsets:
             self._asset_offsets[alias] = [0, 0]
         self._asset_offsets[alias][axis] = int(value)
+        self._refresh_canvas_data()
 
     def _select_active_alias(self, alias: str) -> None:
         self.canvas.set_active_alias(alias)

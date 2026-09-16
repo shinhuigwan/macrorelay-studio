@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .repository import MacroRepository
@@ -30,13 +31,26 @@ class ProjectValidator:
             return True
         return left == right or top == bottom
 
-    def validate(self) -> list[Issue]:
+    def validate(
+        self,
+        macro_name: str | None = None,
+        macro_payload: dict[str, Any] | None = None,
+    ) -> list[Issue]:
         issues: list[Issue] = []
         assets = self.repository.load_assets()
         tables = self.repository.load_tables()
-        for summary in self.repository.list_macros():
+        summaries = (
+            [SimpleNamespace(name=macro_name)]
+            if macro_name
+            else self.repository.list_macros()
+        )
+        for summary in summaries:
             try:
-                macro = self.repository.load_macro(summary.name)
+                macro = (
+                    macro_payload
+                    if macro_name and summary.name == macro_name and isinstance(macro_payload, dict)
+                    else self.repository.load_macro(summary.name)
+                )
             except (OSError, ValueError) as exc:
                 issues.append(Issue("error", "손상된 매크로", str(exc), summary.name))
                 continue
@@ -186,6 +200,63 @@ class ProjectValidator:
                             variable = str(rule.get("variable") or "")
                             if not variable or not variable.replace("_", "a").isalnum() or variable[0].isdigit():
                                 issues.append(Issue("error", "조건 분기 변수 오류", f"규칙 {rule_index}: '{variable}'", summary.name, index))
+        # 빌더에서 매크로 하나를 선택할 때는 현재 매크로와 그 매크로에서
+        # 실제로 도달할 수 있는 서브플로우만 따라가 순환을 검사합니다.
+        if macro_name:
+            call_graph: dict[str, set[str]] = {}
+            payloads: dict[str, dict[str, Any]] = {
+                macro_name: macro if isinstance(macro, dict) else {}
+            }
+            pending = [macro_name]
+            while pending:
+                current = pending.pop()
+                current_payload = payloads.get(current) or {}
+                targets = {
+                    str(step.get("macro") or "").strip()
+                    for step in current_payload.get("steps") or []
+                    if isinstance(step, dict)
+                    and step.get("action") == "call_submacro"
+                    and str(step.get("macro") or "").strip()
+                }
+                call_graph[current] = targets
+                for target in targets:
+                    if target in payloads or not self.repository.macro_path(target).is_file():
+                        continue
+                    try:
+                        child = self.repository.load_macro(target)
+                    except (OSError, ValueError):
+                        continue
+                    if isinstance(child, dict):
+                        payloads[target] = child
+                        pending.append(target)
+
+            states: dict[str, int] = {}
+            stack: list[str] = []
+            reported_cycles: set[tuple[str, ...]] = set()
+
+            def visit_reachable(current: str) -> None:
+                states[current] = 1
+                stack.append(current)
+                for target in call_graph.get(current, set()):
+                    if target not in call_graph:
+                        continue
+                    if states.get(target, 0) == 0:
+                        visit_reachable(target)
+                    elif states.get(target) == 1:
+                        cycle = tuple([*stack[stack.index(target) :], target])
+                        if len(cycle) == 2 and target == macro_name:
+                            continue
+                        if cycle not in reported_cycles:
+                            reported_cycles.add(cycle)
+                            issues.append(
+                                Issue("error", "서브플로우 간접 순환", " → ".join(cycle), macro_name)
+                            )
+                stack.pop()
+                states[current] = 2
+
+            visit_reachable(macro_name)
+            return issues
+
         call_graph: dict[str, set[str]] = {}
         for summary in self.repository.list_macros():
             try:

@@ -25,6 +25,7 @@ from .automation import (
     SmartRecordingController,
     configure_success_candidates,
 )
+from .bundle_dialog import MacroBundleDialog
 from .log_dialog import MacroLogDialog
 from .help_dialog import MacroHelpDialog
 from .inactive_click_lab import HandlePointPicker, InactiveClickLabDialog
@@ -905,6 +906,7 @@ class BuilderPage(QtWidgets.QWidget):
         self._inactive_handle_profiles = self._load_inactive_handle_profiles()
         self._last_recording_events = self._load_last_recording()
         self._subflow_parent_stack: list[tuple[str, int]] = []
+        self._submacro_target_cache: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
         self.shortcut_buttons: dict[str, QtWidgets.QPushButton] = {}
 
         root = QtWidgets.QVBoxLayout(self)
@@ -938,6 +940,9 @@ class BuilderPage(QtWidgets.QWidget):
         duplicate_btn = QtWidgets.QPushButton("복제")
         duplicate_btn.setToolTip("<b>현재 매크로 복제</b><br>현재 매크로의 모든 노드와 설정을 그대로 복사하여 새 이름으로 생성합니다.")
         duplicate_btn.clicked.connect(self._duplicate_macro)
+        bundle_btn = QtWidgets.QPushButton("🔗 실행 묶음")
+        bundle_btn.setToolTip("던전·성장·상점·이벤트처럼 따로 만든 매크로를 원하는 순서로 묶어 한 번에 실행합니다.")
+        bundle_btn.clicked.connect(self._create_or_edit_bundle)
         archive_btn = danger_button("보관")
         archive_btn.setToolTip("<b>현재 매크로 보관</b><br>현재 매크로를 안전하게 보관함으로 이동합니다. (언제든 복원 가능)")
         archive_btn.clicked.connect(self._archive_macro)
@@ -1131,6 +1136,7 @@ class BuilderPage(QtWidgets.QWidget):
         help_btn.clicked.connect(self._open_help_dialog)
 
         toolbar_top.addWidget(new_btn)
+        toolbar_top.addWidget(bundle_btn)
         toolbar_top.addWidget(duplicate_btn)
         toolbar_top.addWidget(archive_btn)
         archive_box_btn = QtWidgets.QPushButton("📦 보관함")
@@ -1931,14 +1937,12 @@ class BuilderPage(QtWidgets.QWidget):
         if previous:
             match = self._find_macro_item(previous)
             if match is not None:
-                self.macro_list.setCurrentItem(match)
-                self._select_macro(match, None)
+                self._activate_macro_item(match)
                 QtCore.QTimer.singleShot(0, lambda value=scroll_value: self.macro_list.verticalScrollBar().setValue(value))
                 return
         first = next((self.macro_list.item(index) for index in range(self.macro_list.count()) if self.macro_list.item(index).data(QtCore.Qt.UserRole)), None)
         if first is not None:
-            self.macro_list.setCurrentItem(first)
-            self._select_macro(first, None)
+            self._activate_macro_item(first)
         else:
             self._clear_editor()
         QtCore.QTimer.singleShot(0, lambda value=scroll_value: self.macro_list.verticalScrollBar().setValue(value))
@@ -1949,6 +1953,23 @@ class BuilderPage(QtWidgets.QWidget):
             if str(item.data(QtCore.Qt.UserRole) or "") == name:
                 return item
         return None
+
+    def _activate_macro_item(self, item: QtWidgets.QListWidgetItem) -> None:
+        signals_were_blocked = self.macro_list.blockSignals(True)
+        try:
+            self.macro_list.setCurrentItem(item)
+        finally:
+            self.macro_list.blockSignals(signals_were_blocked)
+        self._select_macro(item, None)
+
+    def _navigate_to_macro(self, name: str) -> None:
+        item = self._find_macro_item(name)
+        if item is None:
+            self.refresh(name)
+            return
+        self._activate_macro_item(item)
+        if not item.isHidden():
+            self.macro_list.scrollToItem(item, QtWidgets.QAbstractItemView.PositionAtCenter)
 
     def _selected_macro_names(self) -> list[str]:
         names = [str(item.data(QtCore.Qt.UserRole) or "") for item in self.macro_list.selectedItems()]
@@ -2078,12 +2099,83 @@ class BuilderPage(QtWidgets.QWidget):
         else:
             self.json_edit.clear()
         previews: dict[str, str] = {}
-        for alias in self.repository.load_assets():
-            path = self.repository.asset_path(alias)
+        asset_index = self.repository.load_assets()
+        used_aliases: set[str] = set()
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            primary = str(step.get("asset") or "").strip()
+            if primary:
+                used_aliases.add(primary)
+            aliases = step.get("assets")
+            if isinstance(aliases, list):
+                used_aliases.update(str(alias).strip() for alias in aliases if str(alias).strip())
+        for alias in used_aliases:
+            path = self.repository.asset_path(alias, asset_index)
             if path is not None:
                 previews[str(alias)] = str(path)
         self.node_canvas.set_asset_previews(previews)
+        self.node_canvas.set_submacro_links(self._submacro_link_details(steps))
         self.node_canvas.set_macro(self.current_macro, selected + 1 if steps else 0)
+
+    def _submacro_link_details(self, steps: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        links: dict[int, dict[str, Any]] = {}
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict) or str(step.get("action") or "") != "call_submacro":
+                continue
+            target = str(step.get("macro") or "").strip()
+            info: dict[str, Any] = {"macro": target, "exists": False, "entries": []}
+            if not target:
+                links[index] = info
+                continue
+            path = self.repository.macro_path(target)
+            try:
+                stat = path.stat()
+                stamp = (int(stat.st_mtime_ns), int(stat.st_size))
+            except OSError:
+                links[index] = info
+                continue
+            cached = self._submacro_target_cache.get(target)
+            if cached is not None and cached[0] == stamp:
+                links[index] = deepcopy(cached[1])
+                continue
+            try:
+                payload = self.repository.load_macro(target)
+            except (OSError, ValueError):
+                links[index] = info
+                continue
+            target_steps = list(payload.get("steps") or [])
+            entries: list[int] = []
+            raw_candidates = payload.get("start_search_candidates")
+            if isinstance(raw_candidates, list):
+                for value in raw_candidates:
+                    try:
+                        candidate = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 < candidate <= len(target_steps) and candidate not in entries:
+                        entries.append(candidate)
+            if not entries and target_steps:
+                try:
+                    start = int(payload.get("graph_start_step") or 1)
+                except (TypeError, ValueError):
+                    start = 1
+                entries.append(start if 0 < start <= len(target_steps) else 1)
+            info = {
+                "macro": target,
+                "exists": True,
+                "entries": [
+                    {
+                        "index": entry,
+                        "label": str(target_steps[entry - 1].get("label") or NodeCanvas.step_summary(target_steps[entry - 1])),
+                    }
+                    for entry in entries
+                    if isinstance(target_steps[entry - 1], dict)
+                ],
+            }
+            self._submacro_target_cache[target] = (stamp, deepcopy(info))
+            links[index] = info
+        return links
 
     @staticmethod
     def _step_summary(step: dict[str, Any]) -> str:
@@ -2143,7 +2235,8 @@ class BuilderPage(QtWidgets.QWidget):
 
     @QtCore.Slot(int)
     def _focus_inspector(self, index: int) -> None:
-        self._select_graph_node(index)
+        if self.steps_table.currentRow() != index - 1:
+            self._select_graph_node(index)
         steps = list((self.current_macro or {}).get("steps") or [])
         if 1 <= index <= len(steps) and str(steps[index - 1].get("action") or "") == "call_submacro":
             target = str(steps[index - 1].get("macro") or "").strip()
@@ -2152,7 +2245,7 @@ class BuilderPage(QtWidgets.QWidget):
                 return
             if self.current_name:
                 self._subflow_parent_stack.append((self.current_name, index))
-            self.refresh(target)
+            self._navigate_to_macro(target)
             self.subflow_back_button.setVisible(True)
             self.status.emit(f"'{target}' 서브플로우 내부를 열었습니다. 상위 흐름 버튼으로 돌아갈 수 있습니다.")
             return
@@ -2202,7 +2295,7 @@ class BuilderPage(QtWidgets.QWidget):
             self.subflow_back_button.setVisible(False)
             return
         parent_name, node_index = self._subflow_parent_stack.pop()
-        self.refresh(parent_name)
+        self._navigate_to_macro(parent_name)
         self._select_graph_node(node_index)
         self.subflow_back_button.setVisible(bool(self._subflow_parent_stack))
         self.status.emit(f"'{parent_name}' 상위 흐름으로 돌아왔습니다.")
@@ -4152,6 +4245,7 @@ class BuilderPage(QtWidgets.QWidget):
                 del history[:-50]
             self._redo_history.setdefault(self.current_name, []).clear()
         self.repository.save_macro(self.current_name, self.current_macro)
+        self._submacro_target_cache.pop(self.current_name, None)
         self._last_persisted_macro = current
         self.macro_title.setText(f"{self.current_name}  ·  {len(self.current_macro.get('steps') or [])}단계")
         regressions = [item for item in run_test_cases(self.current_macro) if not item.passed]
@@ -4219,6 +4313,24 @@ class BuilderPage(QtWidgets.QWidget):
         self.refresh(path.stem)
         self.data_changed.emit()
         self.status.emit(f"'{path.stem}' 매크로를 만들었습니다.")
+
+    def _create_or_edit_bundle(self) -> None:
+        bundle_name = ""
+        if self.current_macro:
+            meta = self.current_macro.get("meta") if isinstance(self.current_macro.get("meta"), dict) else {}
+            if meta.get("macro_bundle"):
+                bundle_name = self.current_name
+        dialog = MacroBundleDialog(self.repository, bundle_name, self.window())
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            path = self.repository.save_macro_bundle(dialog.name_edit.text(), dialog.selected_macros())
+        except (OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "실행 묶음 저장 실패", str(exc))
+            return
+        self.refresh(path.stem)
+        self.data_changed.emit()
+        self.status.emit(f"'{path.stem}' 실행 묶음을 저장했습니다. 실행 버튼으로 순서대로 시작할 수 있습니다.")
 
     def _duplicate_macro(self) -> None:
         if not self.current_name:
@@ -4546,7 +4658,7 @@ class BuilderPage(QtWidgets.QWidget):
         warnings: list[str] = []
         validator = ProjectValidator(self.repository)
         try:
-            validation_issues = [item for item in validator.validate() if item.macro == self.current_name]
+            validation_issues = validator.validate(self.current_name, self.current_macro)
         except Exception as exc:
             validation_issues = []
             warnings.append(f"프로젝트 검사 일부를 완료하지 못했습니다: {exc}")
@@ -4558,12 +4670,19 @@ class BuilderPage(QtWidgets.QWidget):
                 issues.append(message)
             else:
                 warnings.append(message)
+        opencv_checked = False
         ocr_checked = False
+        window_checks: dict[tuple[str, str], bool] = {}
         for index, step in enumerate((self.current_macro or {}).get("steps") or [], start=1):
             if not isinstance(step, dict):
                 continue
             action = str(step.get("action") or "")
-            if action in {"image_search", "screen_condition"} and str(step.get("engine") or "ahk").lower() == "opencv":
+            if (
+                action in {"image_search", "screen_condition"}
+                and str(step.get("engine") or "ahk").lower() == "opencv"
+                and not opencv_checked
+            ):
+                opencv_checked = True
                 try:
                     self.repository._ensure_opencv_runtime()
                 except Exception as exc:
@@ -4584,8 +4703,12 @@ class BuilderPage(QtWidgets.QWidget):
                 target_title, target_exe = str(step.get("region_window") or ""), str(step.get("region_window_exe") or "")
             elif action == "ocr" and str(step.get("capture_mode") or "screen") in {"window", "client"}:
                 target_title = str(step.get("window_title") or "")
-            if (target_title or target_exe) and not self._target_window_exists(target_title, target_exe):
-                warnings.append(f"{index}번 대상 창을 현재 찾지 못했습니다 · {target_exe or target_title}")
+            if target_title or target_exe:
+                target = (target_title, target_exe)
+                if target not in window_checks:
+                    window_checks[target] = self._target_window_exists(target_title, target_exe)
+                if not window_checks[target]:
+                    warnings.append(f"{index}번 대상 창을 현재 찾지 못했습니다 · {target_exe or target_title}")
         self._last_execution_warnings = list(dict.fromkeys(warnings))
         return list(dict.fromkeys(issues))
 

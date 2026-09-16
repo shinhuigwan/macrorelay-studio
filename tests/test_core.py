@@ -2896,13 +2896,21 @@ class UiSmokeTests(unittest.TestCase):
             parent["steps"] = [{"action": "call_submacro", "macro": "로그인 처리"}]
             repository.save_macro("상위", parent)
             child = repository.load_macro("로그인 처리")
-            child["steps"] = [{"action": "wait", "duration": 50}]
+            child["steps"] = [{"action": "wait", "duration": 50, "label": "로그인 준비"}]
+            child["graph_start_step"] = 1
             repository.save_macro("로그인 처리", child)
             app, window = create_app(root)
             builder = window.pages["builder"]
             builder.refresh("상위")
             self.assertEqual("서브플로우", builder.node_canvas.nodes[1].display_title)
             self.assertIn("로그인 처리", builder.node_canvas.step_summary(parent["steps"][0]))
+            link_info = builder.node_canvas.submacro_link_info(1)
+            self.assertEqual("로그인 처리", link_info["macro"])
+            self.assertEqual([{"index": 1, "label": "로그인 준비"}], link_info["entries"])
+            connection_details = builder.node_canvas.node_connection_details(1, parent["steps"][0])
+            self.assertTrue(any("현재 위치:" in detail and "상위" in detail for detail in connection_details))
+            self.assertTrue(any("호출 대상:" in detail and "로그인 처리" in detail for detail in connection_details))
+            self.assertTrue(any("진입 노드:" in detail and "1번" in detail for detail in connection_details))
             builder._focus_inspector(1)
             self.assertEqual("로그인 처리", builder.current_name)
             self.assertFalse(builder.subflow_back_button.isHidden())

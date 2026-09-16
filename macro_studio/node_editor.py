@@ -41,6 +41,7 @@ ACTION_STYLES: dict[str, tuple[str, str]] = {
     "wait_color": ("WAITCLR", "#F5B942"),
     "color_ratio": ("GAUGE", "#FF6B9D"),
     "multi_image_search": ("MULTI-IMG", "#38BDF8"),
+    "animation_search": ("ANIM", "#A78BFA"),
 }
 
 ACTION_TITLES = {
@@ -54,6 +55,7 @@ ACTION_TITLES = {
     "pixel_search": "색상 서치", "ocr_tracking": "OCR 추적",
     "multi_pixel_check": "다중 픽셀 체크", "wait_color": "색상 변화 대기", "color_ratio": "색상 비율 게이지",
     "multi_image_search": "멀티 이미지 서치",
+    "animation_search": "애니메이션 서치",
 }
 
 
@@ -843,7 +845,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.canvas = canvas
         self.collapsed = index in canvas.collapsed_nodes
         self.is_multi = (
-            str(step.get("action") or "") == "multi_image_search"
+            str(step.get("action") or "") in {"multi_image_search", "animation_search"}
             or (str(step.get("action") or "") == "image_search" and len(step.get("assets") or []) > 1)
         )
         self.is_multi_color = (
@@ -854,6 +856,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.display_title = (
             custom_label
             if custom_label
+            else "애니메이션 서치"
+            if str(step.get("action") or "") == "animation_search"
             else "멀티 이미지 서치"
             if self.is_multi
             else f"멀티 색상 서치 · {len(step.get('colors') or [])}개"
@@ -882,7 +886,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self._sync_compact_geometry()
 
         self.preview_badge: QtWidgets.QGraphicsSimpleTextItem | None = None
-        if str(step.get("action") or "") in {"image_search", "screen_condition", "multi_image_search"}:
+        if str(step.get("action") or "") in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
             primary = str(step.get("asset") or "").strip()
             if primary and primary not in aliases:
@@ -1663,8 +1667,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
         if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") == "pixel_search":
             act_color_test = menu.addAction("🔍 색상 검색 영역 검증 및 실시간 검사...")
         act_image_visual_test = None
-        if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") in {"image_search", "screen_condition", "multi_image_search"}:
-            is_mis = str(self.canvas.steps[self.index - 1].get("action") or "") == "multi_image_search"
+        if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
+            is_mis = str(self.canvas.steps[self.index - 1].get("action") or "") in {"multi_image_search", "animation_search"}
             act_image_visual_test = menu.addAction("🔍 멀티 이미지 시각화 및 실시간 검사 (미리보기)..." if is_mis else "🔍 이미지 검색 영역 검증 및 실시간 검사...")
         menu.addSeparator()
         if len(selected_indexes) >= 2:
@@ -3737,9 +3741,10 @@ class NodeCanvas(QtWidgets.QWidget):
         label = str(step.get("label") or "").strip()
         if label:
             return label
-        if action == "multi_image_search":
+        if action in {"multi_image_search", "animation_search"}:
             assets = step.get("assets") if isinstance(step.get("assets"), list) else []
-            return f"멀티 이미지 {len(assets)}개" if assets else "이미지 추가 필요 (미리보기/에디터)"
+            prefix = "애니메이션 프레임" if action == "animation_search" else "멀티 이미지"
+            return f"{prefix} {len(assets)}개" if assets else "이미지 추가 필요 (미리보기/에디터)"
         if action in {"image_search", "screen_condition"}:
             assets = step.get("assets") if isinstance(step.get("assets"), list) else []
             return f"멀티 이미지 {len(assets)}개" if len(assets) > 1 else str(step.get("asset") or "이미지 선택 필요")

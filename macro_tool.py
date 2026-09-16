@@ -52,6 +52,7 @@ ACTIONS = [
     "wait_color",
     "color_ratio",
     "multi_image_search",
+    "animation_search",
 ]
 
 
@@ -5260,7 +5261,7 @@ def render_step(
         return ["; call_submacro expanded"]
     if action == "text_condition":
         return render_text_condition(step, step_index)
-    if action in {"image_search", "screen_condition", "multi_image_search"}:
+    if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
         prepared = dict(step)
         prepared["click_enabled"] = False if action == "screen_condition" else bool(step.get("click_enabled"))
         return render_image_search(prepared, assets, step_index)
@@ -5418,12 +5419,12 @@ def _expand_macro_steps(
                 has_internal_fail = int(prepared.get(child_fail_field) or 0) > 0
             except (TypeError, ValueError):
                 has_internal_fail = False
-            if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "text_condition", "multi_image_search"} and not has_internal_fail:
+            if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "text_condition", "multi_image_search", "animation_search"} and not has_internal_fail:
                 if fail_target:
                     prepared[child_fail_field] = fail_target
                 else:
                     prepared["_subflow_abort_on_fail"] = True
-                if action in {"image_search", "screen_condition", "multi_image_search"}:
+                if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
                     # Route through the shared failure block so the parent
                     # result variable and failure output are both applied.
                     prepared["abort_on_fail"] = False
@@ -5479,7 +5480,7 @@ def render_macro_script(
                 or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
             )
         )
-        or step.get("action") == "multi_image_search"
+        or step.get("action") in {"multi_image_search", "animation_search"}
         for step in steps
     )
     if has_vision:
@@ -5659,7 +5660,7 @@ def render_macro_script(
         else:
             lines.extend(render_step(step, assets, count, browser_fast))
         if end_step and count == end_step:
-            if action not in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search"}:
+            if action not in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search"}:
                 lines.append("Return")
                 lines.append("")
                 continue
@@ -5668,10 +5669,10 @@ def render_macro_script(
             lines.append("")
             continue
 
-        if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search"}:
+        if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search"}:
             found_var = (
                 f"__step_found_{count}"
-                if action in {"image_search", "screen_condition", "multi_image_search"}
+                if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}
                 else f"__pixel_search_success_{count}"
                 if action == "pixel_search"
                 else f"__time_condition_success_{count}"
@@ -5684,7 +5685,7 @@ def render_macro_script(
             lines.extend("    " + line for line in render_subflow_success(step))
             lines.append(f"    MarkStepSuccess({count}, {on_success or (count + 1 if count < total_steps else 0)})")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
-            if action in {"image_search", "screen_condition", "multi_image_search"}:
+            if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; confidence=" . OpenCvBestScore . "; x=" . FoundX . "; y=" . FoundY . "; scale=" . Round(FoundScaleX, 3) . "x" . Round(FoundScaleY, 3) . "; elapsed_ms=" . VisionElapsed . "; cache=" . VisionCacheHit . "; captures=" . VisionCaptures . "; capture_reuse=" . VisionCaptureReuses)'
                 )
@@ -5706,7 +5707,7 @@ def render_macro_script(
                 lines.append(f"    __rep{count} := 0")
                 if repeat_var:
                     lines.append(f"    __rep_limit{count} := \"\"")
-            if action in {"image_search", "screen_condition", "multi_image_search"} and bool(step.get("repeat_on_success")):
+            if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"} and bool(step.get("repeat_on_success")):
                 repeat_on_success_delay = max(0, int(step.get("repeat_on_success_delay", 50) or 0))
                 lines.append(f'    Log("image search success loop: step {count}")')
                 if repeat_on_success_delay:
@@ -5728,7 +5729,7 @@ def render_macro_script(
             lines.append("else")
             lines.append("{")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "FAIL")')
-            if action in {"image_search", "screen_condition", "multi_image_search"}:
+            if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "image=" . MatchedImageName . "; best_confidence=" . OpenCvBestScore . "; result=not_found")'
                 )
@@ -5850,7 +5851,7 @@ def prepare_macro_for_runtime(macro: Dict[str, Any], runtime_mode: str = "auto")
                 "AutoHotkey 전용으로 내보낼 수 없는 Python 필수 단계가 있습니다: " + detail
             )
     for step in steps:
-        if not isinstance(step, dict) or step.get("action") not in {"image_search", "screen_condition", "multi_image_search"}:
+        if not isinstance(step, dict) or step.get("action") not in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             continue
         if mode == "ahk":
             if isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1:
@@ -5935,7 +5936,7 @@ def export_macro_payload(
                 or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
             )
         )
-        or step.get("action") == "multi_image_search"
+        or step.get("action") in {"multi_image_search", "animation_search"}
         for step in expanded_steps
     ):
         for helper_name in ("opencv_search.py", "vision_engine.py"):
@@ -5970,7 +5971,7 @@ def copy_assets_for_macro(macro: Dict[str, Any], destination: Path) -> None:
     assets = read_assets()
     aliases = set()
     for step in macro.get("steps", []):
-        if step.get("action") in {"image_search", "screen_condition", "multi_image_search"}:
+        if step.get("action") in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             alias = step.get("asset")
             if alias:
                 aliases.add(alias)

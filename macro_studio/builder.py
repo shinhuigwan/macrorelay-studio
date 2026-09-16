@@ -88,6 +88,7 @@ CATEGORIZED_ACTIONS: list[tuple[str, str, list[tuple[str, str, str]]]] = [
     ("🖼️ 화면 & 이미지", "#35C89A", [
         ("image_search", "이미지 서치", "화면에서 이미지를 찾아 중심 또는 오프셋을 클릭합니다."),
         ("multi_image_search", "멀티 이미지 서치", "여러 이미지를 동시에 탐색하고 일치 조건(전체/일부)을 판별합니다."),
+        ("animation_search", "애니메이션 서치", "1~2초 프레임을 분석해 움직이는 배경·효과를 자동 제외하고 찾습니다."),
         ("screen_condition", "화면 조건", "이미지가 화면에 있는지 확인하여 성공/실패로 분기합니다."),
     ]),
     ("🎯 색상 & 픽셀", "#FF6B9D", [
@@ -1650,7 +1651,7 @@ class BuilderPage(QtWidgets.QWidget):
         if not 0 <= row < len(steps):
             return
         step = steps[row]
-        if str(step.get("action") or "") == "multi_image_search":
+        if str(step.get("action") or "") in {"multi_image_search", "animation_search"}:
             self._open_node_image_visual_test(step_index)
             return
         if str(step.get("action") or "") not in {"image_search", "screen_condition"}:
@@ -2614,7 +2615,7 @@ class BuilderPage(QtWidgets.QWidget):
         if not 0 <= row < len(steps):
             return
         step = steps[row]
-        if str(step.get("action") or "") not in {"image_search", "screen_condition", "multi_image_search"}:
+        if str(step.get("action") or "") not in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             return
         # Auto-inherit target window from macro if not set
         if not step.get("region_window_exe"):
@@ -3042,6 +3043,7 @@ class BuilderPage(QtWidgets.QWidget):
         interactive_actions = {
             "image_search", "screen_condition", "inactive_click", "mouse_click",
             "pixel_search", "ocr", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio",
+            "animation_search",
         }
 
         step = None
@@ -3059,13 +3061,13 @@ class BuilderPage(QtWidgets.QWidget):
             step = deepcopy(ACTION_TEMPLATES.get(action, {}))
             step["action"] = action
 
-        if action in {"image_search", "screen_condition", "pixel_search", "ocr", "ocr_tracking", "multi_image_search"} and not step.get("region_window_exe"):
-            if action in {"image_search", "screen_condition", "multi_image_search"}:
+        if action in {"image_search", "screen_condition", "pixel_search", "ocr", "ocr_tracking", "multi_image_search", "animation_search"} and not step.get("region_window_exe"):
+            if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
                 step.setdefault("engine", "opencv")
                 step.setdefault("search_profile", "fast")
                 step.setdefault("confidence", 85)
                 step.setdefault("wait_condition", "appear")
-                if action == "multi_image_search":
+                if action in {"multi_image_search", "animation_search"}:
                     step.setdefault("match_condition", "all_matched")
                     step.setdefault("assets", [])
             for candidate in reversed(steps):
@@ -3076,7 +3078,7 @@ class BuilderPage(QtWidgets.QWidget):
                     step["region_coords"] = "relative"
                     step["region_window_exe"] = c_exe
                     step["region_window"] = c_win
-                    if action in {"image_search", "screen_condition", "multi_image_search"}:
+                    if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
                         click = step.setdefault("click", {})
                         click["mode"] = "inactive"
                         click["window_exe"] = c_exe

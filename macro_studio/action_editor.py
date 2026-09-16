@@ -258,7 +258,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
         repo = getattr(owner, "repository", None) or getattr(self.window(), "repository", None)
         step_dict = owner.build_step() if owner is not None and hasattr(owner, "build_step") else {}
         action = str(getattr(owner, "current_action", "image_search") or "image_search")
-        if action not in {"image_search", "multi_image_search"}:
+        if action not in {"image_search", "multi_image_search", "animation_search"}:
             action = "image_search"
         dialog = ImageSearchConfidenceDialog(
             repo,
@@ -428,6 +428,7 @@ ACTION_LABELS = {
     "wait_color": "색상 변화 대기",
     "color_ratio": "색상 비율 게이지",
     "multi_image_search": "멀티 이미지 서치",
+    "animation_search": "애니메이션 서치",
 }
 
 
@@ -1116,6 +1117,46 @@ EXCEL_FIELDS = [
 ]
 ACTION_FIELDS["table_excel_read"] = EXCEL_FIELDS
 ACTION_FIELDS["table_excel_write"] = EXCEL_FIELDS
+ACTION_FIELDS["animation_search"] = deepcopy(ACTION_FIELDS["multi_image_search"]) + [
+    FieldSpec(
+        "animation_capture_ms",
+        "프레임 수집 시간",
+        "duration",
+        1200,
+        300,
+        5000,
+        section="애니메이션 자동 분석",
+        tooltip="선택 영역의 변화를 분석하기 위해 화면을 수집하는 시간입니다. 보통 1~2초가 적당합니다.",
+    ),
+    FieldSpec(
+        "animation_frame_count",
+        "수집 프레임 수",
+        "int",
+        12,
+        3,
+        30,
+        section="애니메이션 자동 분석",
+        tooltip="자동 생성 당시 분석한 프레임 수입니다. 다시 캡처할 때 참고값으로 사용합니다.",
+    ),
+    FieldSpec(
+        "animation_stability_threshold",
+        "변화 무시 민감도",
+        "int",
+        22,
+        3,
+        80,
+        section="애니메이션 자동 분석",
+        tooltip="값이 낮을수록 조금만 움직여도 투명 영역으로 제외합니다.",
+    ),
+    FieldSpec(
+        "animation_auto_mask",
+        "변화 영역 자동 투명화",
+        "bool",
+        True,
+        section="애니메이션 자동 분석",
+        tooltip="회전 효과나 움직이는 배경을 자동으로 투명 처리한 PNG를 사용합니다.",
+    ),
+]
 COMMON_FIELD_KEYS = {"sleep_after"}
 
 
@@ -2755,6 +2796,7 @@ SECTION_TOOLTIPS: dict[str, str] = {
 
 ACTION_GUIDE_SUMMARIES: dict[str, str] = {
     "image_search": "<b>💡 이미지 서치 핵심 가이드</b><br>• <b>엔진</b>: 배율/크기 변화 대응은 <b>OpenCV</b>, 가장 빠른 반응속도는 <b>AutoHotkey</b> 권장<br>• <b>프리셋</b>: 오탐 방지는 <b>🎯 정밀도 우선</b>, 연타/고속은 <b>⚡ 속도 우선</b> 선택<br>• <b>실패 시 대체 클릭</b>: 대상을 못 찾았을 때 닫기(X)나 다른 영역을 대신 클릭하도록 설정 가능",
+    "animation_search": "<b>💡 애니메이션 서치 가이드</b><br>• 선택 영역을 약 1.2초 수집해 <b>고정된 아이콘 부분만 자동으로 남기고</b> 회전 효과·움직이는 배경은 투명 처리합니다.<br>• 생성된 대표 PNG 프레임 중 하나만 일치해도 성공하며, 실행 엔진은 항상 <b>OpenCV</b>입니다.<br>• 미리보기를 클릭하면 각 자동 마스크 이미지를 상세 편집할 수 있습니다.",
     "mouse_click": "<b>💡 마우스 클릭 가이드</b><br>• 실제 마우스 커서가 좌표로 이동하여 클릭합니다.<br>• 프로그램 창 위치가 바뀌어도 클릭되게 하려면 좌표 기준을 <b>'대상 프로그램 기준'</b>으로 설정하세요.",
     "inactive_click": "<b>💡 비활성 클릭 가이드</b><br>• 창이 다른 창 뒤에 가려져 있어도 마우스 이동 없이 백그라운드로 클릭을 전송합니다.<br>• 전송 방식은 <b>'자동'</b>으로 두시면 PostMessage와 ControlClick을 결합하여 최적 전송합니다.",
     "type_text": "<b>💡 텍스트 입력 가이드</b><br>• 한글, 영문, 특수문자, 줄바꿈을 대상 창에 타이핑합니다.<br>• 백그라운드 입력을 원하시면 방식을 <b>'비활성 창'</b>으로 설정하세요.",
@@ -2834,6 +2876,10 @@ class ActionEditor(QtWidgets.QWidget):
                 sections[spec.section] = form
                 body_layout.addWidget(group)
             widget = self._make_widget(spec)
+            if action == "animation_search" and spec.key == "engine" and isinstance(widget, QtWidgets.QComboBox):
+                ahk_index = widget.findData("ahk")
+                if ahk_index >= 0:
+                    widget.removeItem(ahk_index)
             if spec.tooltip:
                 label_widget = QtWidgets.QLabel(f"{spec.label} ⓘ")
                 tip_text = f"💡 [{spec.label}]\n{spec.tooltip}"
@@ -2843,7 +2889,7 @@ class ActionEditor(QtWidgets.QWidget):
             else:
                 sections[spec.section].addRow(spec.label, widget)
             self.widgets[action][spec.key] = widget
-            if action in {"image_search", "screen_condition", "multi_image_search"} and spec.key == "engine":
+            if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"} and spec.key == "engine":
                 preset_bar = QtWidgets.QWidget()
                 preset_layout = QtWidgets.QHBoxLayout(preset_bar)
                 preset_layout.setContentsMargins(0, 3, 0, 5)
@@ -2885,7 +2931,7 @@ class ActionEditor(QtWidgets.QWidget):
                 btn_pick_fail.setToolTip("화면에서 원하는 위치를 마우스 좌클릭으로 1번 찍어 실패 클릭 좌표를 자동 입력합니다.")
                 btn_pick_fail.clicked.connect(self._capture_fail_click_cursor)
                 sections[spec.section].addRow("", btn_pick_fail)
-            if action == "multi_image_search" and spec.key == "custom_click_y":
+            if action in {"multi_image_search", "animation_search"} and spec.key == "custom_click_y":
                 btn_pick_custom = QtWidgets.QPushButton("🎯 화면 클릭으로 지정 좌표 찍기")
                 btn_pick_custom.setStyleSheet("background: #1E1B4B; border: 1px solid #4338CA; color: #A5B4FC; font-weight: 700; padding: 5px;")
                 btn_pick_custom.setToolTip("화면에서 원하는 위치를 마우스 좌클릭으로 찍어 지정 클릭 좌표(X, Y)를 자동 입력합니다.")
@@ -2910,7 +2956,7 @@ class ActionEditor(QtWidgets.QWidget):
                 btn_layout.addWidget(btn_reset_offset, 1)
 
                 sections[spec.section].addRow("오프셋 지정", btn_row)
-        if action in {"image_search", "multi_image_search"}:
+        if action in {"image_search", "multi_image_search", "animation_search"}:
             region_mode = self.widgets[action].get("region_mode")
             if isinstance(region_mode, QtWidgets.QComboBox):
                 region_mode.currentIndexChanged.connect(
@@ -2958,7 +3004,7 @@ class ActionEditor(QtWidgets.QWidget):
             tol_bar = self.widgets[action].get("tolerance")
             if isinstance(color_edit, QtWidgets.QLineEdit) and isinstance(tol_bar, ColorToleranceBarWidget):
                 color_edit.textChanged.connect(lambda txt, tb=tol_bar: tb.setColor(txt))
-        if action in {"image_search", "screen_condition", "multi_image_search"}:
+        if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             engine = self.widgets[action].get("engine")
             if isinstance(engine, QtWidgets.QComboBox):
                 engine.currentIndexChanged.connect(lambda _idx, act=action: self._on_engine_changed(act))
@@ -2967,7 +3013,7 @@ class ActionEditor(QtWidgets.QWidget):
         return scroll
 
     def _update_engine_controls_state(self, action: str) -> None:
-        if action not in {"image_search", "screen_condition", "multi_image_search"}:
+        if action not in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             return
         widgets = self.widgets.get(action, {})
         engine_widget = widgets.get("engine")
@@ -2999,7 +3045,7 @@ class ActionEditor(QtWidgets.QWidget):
                 var_w.setEnabled(True)
 
     def _on_engine_changed(self, action: str) -> None:
-        if action not in {"image_search", "screen_condition"}:
+        if action not in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             return
         widgets = self.widgets.get(action, {})
         engine_widget = widgets.get("engine")
@@ -3266,7 +3312,7 @@ class ActionEditor(QtWidgets.QWidget):
                     ("🎯 실패 클릭 좌표 지정", self._capture_fail_click_cursor),
                 ]
             )
-        elif action == "multi_image_search":
+        elif action in {"multi_image_search", "animation_search"}:
             buttons.extend(
                 [
                     ("🔍 멀티 이미지 시각화 및 실시간 검사기 (미리보기)", self._open_region_visual_test),
@@ -3526,13 +3572,14 @@ class ActionEditor(QtWidgets.QWidget):
         self._restore_host_windows(hosts)
         if not accepted or client_point is None:
             return
-        self._set_field_value("multi_image_search", "custom_click_x", client_point.x())
-        self._set_field_value("multi_image_search", "custom_click_y", client_point.y())
-        self._set_field_value("multi_image_search", "click_target", "custom_coord")
+        action = self.current_action if self.current_action in {"multi_image_search", "animation_search"} else "multi_image_search"
+        self._set_field_value(action, "custom_click_x", client_point.x())
+        self._set_field_value(action, "custom_click_y", client_point.y())
+        self._set_field_value(action, "click_target", "custom_coord")
         if picker.exe_name:
-            self._set_field_value("multi_image_search", "region_window_exe", picker.exe_name)
+            self._set_field_value(action, "region_window_exe", picker.exe_name)
         if picker.window_token:
-            self._set_field_value("multi_image_search", "region_window", picker.window_token)
+            self._set_field_value(action, "region_window", picker.window_token)
         QtWidgets.QToolTip.showText(
             QtGui.QCursor.pos(),
             f"지정 클릭 좌표 X {client_point.x()}, Y {client_point.y()} 설정 완료",
@@ -4480,7 +4527,7 @@ class ActionEditor(QtWidgets.QWidget):
         )
 
     def _preset_multi_count_all(self) -> None:
-        action = "image_search"
+        action = self.current_action if self.current_action in {"image_search", "multi_image_search", "animation_search"} else "image_search"
         picker = self.widgets.get(action, {}).get("assets")
         count = len(picker.value()) if isinstance(picker, MultiAssetPicker) else 0
         if count <= 1:
@@ -4488,11 +4535,14 @@ class ActionEditor(QtWidgets.QWidget):
             count = len(raw_assets) if isinstance(raw_assets, list) else 1
         count = max(1, count)
 
-        self._set_field_value(action, "all_action", "count_only")
         self._set_field_value(action, "match_condition", "all_matched")
         self._set_field_value(action, "required_count", count)
         self._set_field_value(action, "store_count_var", "FoundCount")
-        self._set_field_value(action, "click_enabled", False)
+        if action == "image_search":
+            self._set_field_value(action, "all_action", "count_only")
+            self._set_field_value(action, "click_enabled", False)
+        else:
+            self._set_field_value(action, "click_target", "none")
 
         QtWidgets.QMessageBox.information(
             self,
@@ -4556,7 +4606,7 @@ class ActionEditor(QtWidgets.QWidget):
                 return
 
             action = self.current_action
-            if action in {"image_search", "multi_image_search"}:
+            if action in {"image_search", "multi_image_search", "animation_search"}:
                 updated_aliases = dlg.get_aliases()
                 updated_regs = dlg.get_asset_regions()
                 updated_offsets = dlg.get_asset_offsets()
@@ -4638,7 +4688,7 @@ class ActionEditor(QtWidgets.QWidget):
                     win.activateWindow()
 
     def _update_offset_preview(self) -> None:
-        action = self.current_action if self.current_action in {"image_search", "multi_image_search"} else "image_search"
+        action = self.current_action if self.current_action in {"image_search", "multi_image_search", "animation_search"} else "image_search"
         widgets = self.widgets.get(action, {})
         combo = widgets.get("asset")
         picker = widgets.get("assets")
@@ -4882,7 +4932,7 @@ class ActionEditor(QtWidgets.QWidget):
                 continue
             value = get_path(normalized, spec.key, spec.default)
             self._set_widget_value(self.widgets[action][spec.key], spec, value)
-        if action in {"image_search", "multi_image_search"}:
+        if action in {"image_search", "multi_image_search", "animation_search"}:
             picker = self.widgets[action].get("assets")
             offset_editor = self.widgets[action].get("click.offset")
             if isinstance(offset_editor, OffsetEditor):
@@ -4905,7 +4955,7 @@ class ActionEditor(QtWidgets.QWidget):
             tol_w = self.widgets.get("pixel_search", {}).get("tolerance")
             if isinstance(tol_w, ColorToleranceBarWidget):
                 tol_w.setColor(color_val)
-        if action in {"image_search", "screen_condition", "multi_image_search"}:
+        if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             current_engine = str(normalized.get("engine") or "opencv").lower()
             setattr(self, f"_last_engine_{action}", current_engine)
             if not hasattr(self, "_engine_configs"):
@@ -4928,7 +4978,7 @@ class ActionEditor(QtWidgets.QWidget):
         if getattr(self, "_current_search_preset", None):
             payload["search_preset"] = self._current_search_preset
         original_handle_method = str(self.original.get("method") or "") if action == "inactive_click" else ""
-        original_click = self.original.get("click") if action in {"image_search", "multi_image_search"} and isinstance(self.original.get("click"), dict) else {}
+        original_click = self.original.get("click") if action in {"image_search", "multi_image_search", "animation_search"} and isinstance(self.original.get("click"), dict) else {}
         payload["action"] = action
         for spec in ACTION_FIELDS.get(action, []):
             if spec.key in COMMON_FIELD_KEYS:
@@ -4938,7 +4988,7 @@ class ActionEditor(QtWidgets.QWidget):
                 remove_path(payload, spec.key)
             else:
                 set_path(payload, spec.key, value)
-        if action in {"image_search", "multi_image_search"}:
+        if action in {"image_search", "multi_image_search", "animation_search"}:
             # Always respect the user's chosen engine from the combobox
             engine_widget = self.widgets[action].get("engine")
             chosen_engine = str(self._widget_value(engine_widget, FieldSpec("engine", "", "choice", "opencv")) or "opencv").lower() if engine_widget else "opencv"
@@ -4946,7 +4996,7 @@ class ActionEditor(QtWidgets.QWidget):
 
             multi_assets = [str(value) for value in payload.get("assets") or [] if str(value).strip()]
             primary_asset = str(payload.get("asset") or "").strip()
-            if action == "multi_image_search" or len(multi_assets) > 1:
+            if action in {"multi_image_search", "animation_search"} or len(multi_assets) > 1:
                 if primary_asset and primary_asset not in multi_assets:
                     multi_assets.insert(0, primary_asset)
                 payload["assets"] = list(dict.fromkeys(multi_assets))
@@ -5215,7 +5265,7 @@ class ActionEditorDialog(QtWidgets.QDialog):
         raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
         raw_assets = step.get("assets") if isinstance(step.get("assets"), list) else []
         is_multi_image = (
-            action == "multi_image_search"
+            action in {"multi_image_search", "animation_search"}
             or (action == "image_search" and len(raw_assets) > 1)
         )
         is_multi_pixel = (
@@ -5226,7 +5276,10 @@ class ActionEditorDialog(QtWidgets.QDialog):
                 or "멀티" in str(step.get("label") or "")
             )
         )
-        if is_multi_image:
+        if action == "animation_search":
+            count = len(raw_assets)
+            action_name = f"애니메이션 서치 ({count}프레임)" if count > 0 else "애니메이션 서치"
+        elif is_multi_image:
             count = len(raw_assets)
             action_name = f"멀티 이미지 서치 ({count}개)" if count > 0 else "멀티 이미지 서치"
         elif is_multi_pixel:

@@ -534,6 +534,68 @@ def _native_region_image(rect: QtCore.QRect, fallback: QtGui.QImage) -> QtGui.QI
     return fallback
 
 
+def build_animation_templates(
+    frames: list[QtGui.QImage],
+    stability_threshold: int = 22,
+    max_templates: int = 4,
+) -> tuple[list[QtGui.QImage], float]:
+    """Create alpha-masked representative frames for an animated UI target.
+
+    Pixels that change during the sample window are made transparent.  The
+    remaining stable icon/letter pixels are therefore matched by OpenCV while
+    a rotating effect or changing background is ignored.
+    """
+    valid = [frame.convertToFormat(QtGui.QImage.Format_RGBA8888) for frame in frames if not frame.isNull()]
+    if not valid:
+        return [], 0.0
+    width, height = valid[0].width(), valid[0].height()
+    valid = [frame for frame in valid if frame.width() == width and frame.height() == height]
+    if not valid:
+        return [], 0.0
+    max_templates = max(1, min(int(max_templates), len(valid)))
+    indexes = sorted({round(index * (len(valid) - 1) / max(1, max_templates - 1)) for index in range(max_templates)})
+    try:
+        import numpy as np
+
+        arrays = []
+        for image in valid:
+            raw = np.frombuffer(image.bits(), dtype=np.uint8, count=image.sizeInBytes())
+            rgba = raw.reshape((height, image.bytesPerLine()))[:, : width * 4].reshape((height, width, 4)).copy()
+            arrays.append(rgba)
+        stack = np.stack([array[:, :, :3] for array in arrays], axis=0).astype(np.int16)
+        spread = (stack.max(axis=0) - stack.min(axis=0)).max(axis=2)
+        mask = (spread <= max(1, int(stability_threshold))).astype(np.uint8) * 255
+        try:
+            import cv2
+
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.erode(mask, kernel, iterations=1)
+        except Exception:
+            pass
+        stable_ratio = float((mask > 0).mean())
+        # If virtually the whole target animates, keeping the originals is a
+        # safer fallback than producing an unusable fully transparent PNG.
+        use_mask = int((mask > 0).sum()) >= max(25, int(width * height * 0.01))
+        output: list[QtGui.QImage] = []
+        for index in indexes:
+            rgba = arrays[index].copy()
+            if use_mask:
+                rgba[:, :, 3] = np.minimum(rgba[:, :, 3], mask)
+            qimage = QtGui.QImage(
+                rgba.data,
+                width,
+                height,
+                int(rgba.strides[0]),
+                QtGui.QImage.Format_RGBA8888,
+            )
+            output.append(qimage.copy())
+        return output, stable_ratio if use_mask else 1.0
+    except Exception:
+        return [valid[index].copy() for index in indexes], 1.0
+
+
 class PixelColorPickerDialog(QtWidgets.QDialog):
     """Fullscreen overlay with magnifier lens for precise pixel color extraction."""
 
@@ -1095,6 +1157,7 @@ class IconNodeToolbar(QtWidgets.QFrame):
             ("multi_pixel_check", "❖", "다중 픽셀", "#FF6B9D"),
             ("wait_color", "⏳", "색상 대기", "#F5B942"),
             ("color_ratio", "📊", "색상 비율", "#FF6B9D"),
+            ("animation_search", "◉", "애니메이션 서치", "#A78BFA"),
             ("ocr_tracking", "⊕", "OCR 추적", "#4D9FFF"),
             ("find_text_click", "🎯", "텍스트 클릭", "#4D9FFF"),
         ]
@@ -1692,6 +1755,7 @@ class RecordingBar(QtWidgets.QDialog):
             "set_var", "calc_var", "coord_mode", "call_submacro", "flow_control",
             "text_condition", "run_program", "terminate_program",
             "pixel_search", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio",
+            "animation_search",
             "mouse_click", "inactive_click",
         }:
             return {**common, "action": kind, "label": str(draft.get("detail") or ACTION_TITLES.get(kind, kind))}
@@ -2987,7 +3051,22 @@ class SmartRecordingController(QtCore.QObject):
             if drop_payload and str(drop_payload.get("workflow_id") or ""):
                 event["workflow_id"] = str(drop_payload["workflow_id"])
 
-            if kind == "ocr":
+            if kind == "animation_search":
+                if self.bar is not None:
+                    self.bar._restore_position = self.bar.pos()
+                    self.bar.hide()
+                try:
+                    wizard_step = QuickActionWizard.build("animation_search", self.repository, None)
+                    if not isinstance(wizard_step, dict):
+                        return
+                    event["_wizard_step"] = wizard_step
+                    event["detail"] = str(wizard_step.get("label") or "애니메이션 서치")
+                    event["asset"] = str(wizard_step.get("asset") or "")
+                finally:
+                    if self.bar is not None:
+                        self.bar.show()
+                        self.bar.raise_()
+            elif kind == "ocr":
                 if self.bar is not None:
                     self.bar._restore_position = self.bar.pos()
                     self.bar.hide()
@@ -3286,7 +3365,8 @@ class SmartRecordingController(QtCore.QObject):
                     })
 
             title = ACTION_TITLES.get(kind, kind)
-            step_template: dict[str, Any] = {
+            wizard_step = event.pop("_wizard_step", None)
+            step_template: dict[str, Any] = deepcopy(wizard_step) if isinstance(wizard_step, dict) else {
                 "action": "type_text" if kind in {"text", "key", "type_text"} else ("ocr" if kind == "find_text_click" else kind),
                 "label": str(event.get("detail") or title),
             }
@@ -3384,7 +3464,9 @@ class SmartRecordingController(QtCore.QObject):
             # A dragged quick-add node must appear immediately. Its defaults
             # can be adjusted by double-clicking the node afterwards. Ordinary
             # toolbar clicks retain the existing detailed-settings dialog.
-            if drop_payload:
+            if isinstance(wizard_step, dict):
+                event["_step_payload"] = dict(step_template)
+            elif drop_payload:
                 event["_step_payload"] = dict(step_template)
             else:
                 from .builder import ActionEditorDialog
@@ -5412,6 +5494,128 @@ class QuickActionWizard:
                     "retry_count": 2,
                     "label": f"{window_picker.exe_name or '비활성'} 클릭 ({cx}, {cy})",
                     "_automation": {"recorded_screen": [screen_pt.x(), screen_pt.y()]},
+                }
+            )
+            return step
+        if action == "animation_search":
+            QtWidgets.QApplication.processEvents()
+            QtCore.QThread.msleep(120)
+            pixmap, geometry = capture_virtual_desktop()
+            if pixmap.isNull() or not geometry.isValid():
+                return None
+            dialog = ScreenCaptureDialog(
+                pixmap,
+                geometry,
+                parent,
+                accept_on_release=True,
+                hint_text="⬚ 애니메이션 아이콘 영역을 드래그하세요 · 이후 1.2초 동안 자동 분석합니다",
+            )
+            try:
+                if dialog.exec() != QtWidgets.QDialog.Accepted:
+                    return None
+                rect = dialog.selected_native_screen_rect()
+                first_frame = dialog.captured_image()
+            finally:
+                dialog.deleteLater()
+            if not rect.isValid() or rect.width() < 4 or rect.height() < 4:
+                return None
+
+            QtWidgets.QApplication.processEvents()
+            QtCore.QThread.msleep(100)
+            progress = QtWidgets.QProgressDialog("애니메이션 변화 영역을 분석하고 있습니다…", "취소", 0, 12, parent)
+            progress.setWindowTitle("애니메이션 서치 자동 캡처")
+            progress.setWindowModality(QtCore.Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            frames: list[QtGui.QImage] = []
+            if not first_frame.isNull():
+                frames.append(first_frame)
+            try:
+                for frame_index in range(12):
+                    if progress.wasCanceled():
+                        return None
+                    captured = _native_region_image(rect, QtGui.QImage())
+                    if not captured.isNull():
+                        frames.append(captured)
+                    progress.setValue(frame_index + 1)
+                    QtWidgets.QApplication.processEvents()
+                    if frame_index < 11:
+                        QtCore.QThread.msleep(90)
+            finally:
+                progress.close()
+                progress.deleteLater()
+            templates, stable_ratio = build_animation_templates(frames, stability_threshold=22, max_templates=4)
+            if not templates:
+                return None
+
+            aliases: list[str] = []
+            batch_id = f"{datetime.now():%m%d_%H%M%S}_{uuid.uuid4().hex[:5]}"
+            for index, image in enumerate(templates, start=1):
+                aliases.append(repository.add_asset_image(image, f"anim_{batch_id}_{index:02d}"))
+
+            target = ActionEditor._window_target_at(rect.center(), set(), position_is_native=True)
+            margin = 120
+            if target:
+                scope = str(target.get("capture_scope") or "client")
+                origin = target.get("capture_origin") or target.get("client_origin") or [0, 0]
+                size = target.get("capture_size") or target.get("client_size") or [rect.width(), rect.height()]
+                ox, oy = int(origin[0]), int(origin[1])
+                sw, sh = max(1, int(size[0])), max(1, int(size[1]))
+                search_region = [
+                    max(0, rect.left() - ox - margin),
+                    max(0, rect.top() - oy - margin),
+                    min(sw, rect.x() + rect.width() - ox + margin),
+                    min(sh, rect.y() + rect.height() - oy + margin),
+                ]
+                region_mode = scope if scope in {"client", "window"} else "client"
+                region_coords = "relative"
+                window_token = str(target.get("window") or "")
+                window_exe = str(target.get("exe") or "")
+            else:
+                search_region = [
+                    rect.left() - margin,
+                    rect.top() - margin,
+                    rect.x() + rect.width() + margin,
+                    rect.y() + rect.height() + margin,
+                ]
+                region_mode = "screen"
+                region_coords = "screen"
+                window_token = ""
+                window_exe = ""
+
+            step.update(
+                {
+                    "asset": aliases[0],
+                    "assets": aliases,
+                    "engine": "opencv",
+                    "search_profile": "balanced",
+                    "confidence": 78,
+                    "match_condition": "at_least_1",
+                    "required_count": 1,
+                    "wait_condition": "appear",
+                    "timeout": 2000,
+                    "poll_delay": 45,
+                    "click_target": "first_image",
+                    "click_enabled": True,
+                    "click": {
+                        "mode": "inactive" if target else "active",
+                        "method": "auto",
+                        "button": "left",
+                        "count": 1,
+                        "offset": [0, 0],
+                        "window": window_token,
+                        "window_exe": window_exe,
+                    },
+                    "region_mode": region_mode,
+                    "region_coords": region_coords,
+                    "region_window": window_token,
+                    "region_window_exe": window_exe,
+                    "region": search_region,
+                    "animation_capture_ms": 1200,
+                    "animation_frame_count": len(frames),
+                    "animation_stability_threshold": 22,
+                    "animation_stable_ratio": round(stable_ratio, 4),
+                    "animation_auto_mask": True,
+                    "label": f"애니메이션 서치 ({len(aliases)}프레임)",
                 }
             )
             return step

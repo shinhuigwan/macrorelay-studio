@@ -171,6 +171,33 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("ClickY := FoundY + Round(MatchedOffsetY * FoundScaleY)", script)
         self.assertNotIn("engine=ahk", script)
 
+    def test_first_found_multi_image_click_uses_matched_asset_offset(self) -> None:
+        step = {
+            "action": "multi_image_search",
+            "asset": "first",
+            "assets": ["first", "second", "third", "fourth", "fifth"],
+            "engine": "opencv",
+            "match_condition": "at_least_1",
+            "click_target": "first_image",
+            "click_enabled": True,
+            "asset_offsets": {
+                "first": [0, 0],
+                "second": [0, 0],
+                "third": [0, 0],
+                "fourth": [0, 0],
+                "fifth": [137, -42],
+            },
+            "click": {"mode": "inactive", "button": "Left", "offset": [0, 0]},
+        }
+        assets = {alias: {"file": f"{alias}.png"} for alias in step["assets"]}
+        script = "\n".join(self.engine.render_image_search(step, assets, 7))
+
+        self.assertIn("else if (MatchedImageIndex = 5)", script)
+        self.assertIn("MatchedOffsetX := 137", script)
+        self.assertIn("MatchedOffsetY := -42", script)
+        self.assertIn("ClickX := FoundX + Round(MatchedOffsetX * FoundScaleX)", script)
+        self.assertNotIn("image center click: enabled", script)
+
     def test_vision_engine_multi_search_captures_region_once_and_selects_best(self) -> None:
         import vision_engine
 

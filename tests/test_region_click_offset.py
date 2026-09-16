@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -53,6 +55,39 @@ class RegionClickOffsetTests(unittest.TestCase):
         self.assertEqual(500, region_visual_left_panel_width(1311))
         self.assertEqual(534, region_visual_left_panel_width(1840))
         self.assertEqual(560, region_visual_left_panel_width(2400))
+
+    def test_visual_offsets_replace_stale_action_editor_offsets(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.action_editor import ActionEditor
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            for alias, colour in (("first", "#20C997"), ("fifth", "#7C6CFF")):
+                image = QtGui.QImage(24, 18, QtGui.QImage.Format_RGB32)
+                image.fill(QtGui.QColor(colour))
+                repository.add_asset_image(image, alias)
+
+            editor = ActionEditor(repository)
+            editor.refresh_sources()
+            editor.load_step(
+                {
+                    "action": "multi_image_search",
+                    "asset": "first",
+                    "assets": ["first", "fifth"],
+                    "asset_offsets": {"first": [1, 2], "fifth": [3, 4]},
+                    "click_target": "first_image",
+                }
+            )
+            editor._apply_visual_asset_offsets(
+                "multi_image_search",
+                ["first", "fifth"],
+                {"first": [0, 0], "fifth": [137, -42]},
+            )
+            rebuilt = editor.build_step()
+
+            self.assertEqual({"first": [0, 0], "fifth": [137, -42]}, rebuilt["asset_offsets"])
+            editor.close()
 
 
 if __name__ == "__main__":

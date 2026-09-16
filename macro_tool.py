@@ -3406,13 +3406,22 @@ def render_image_search(
         sleep_after = step.get("sleep_after")
         if sleep_after:
             lines.append(f"    if (!MacroDryRun)\n        Sleep, {sleep_after}")
-    elif click_info:
-        mode = str(click_info.get("mode", "active")).lower()
+    elif click_info or click_target == "first_image":
+        has_click_config = isinstance(click_info, dict) and bool(click_info)
+        click_info = click_info if isinstance(click_info, dict) else {}
+        mode = str(click_info.get("mode", "active" if has_click_config else "inactive")).lower()
         offset_values = click_info.get("offset") if isinstance(click_info.get("offset"), list) else [0, 0]
         click_offset = bool(click_info.get("click_offset"))
         if "click_offset" not in click_info:
             click_offset = any(int(value or 0) for value in offset_values[:2])
         click_image = bool(click_info.get("click_image")) if "click_image" in click_info else not click_offset
+        use_asset_offset = bool(raw_asset_offsets) and bool(asset_offsets)
+        if click_target == "first_image" and use_asset_offset:
+            # The live visual editor stores one click point per asset.  An
+            # explicit first-image target means exactly one click at the
+            # matched asset's saved point, not an extra centre click.
+            click_offset = True
+            click_image = False
         if mode != "inactive":
             act_window = click_info.get("window")
             act_exe = click_info.get("window_exe")
@@ -3441,7 +3450,7 @@ def render_image_search(
             if engine == "opencv":
                 info_use["_offset_scale_x"] = "FoundScaleX"
                 info_use["_offset_scale_y"] = "FoundScaleY"
-            if offset_override is None and len(asset_files) > 1 and asset_offsets:
+            if offset_override is None and use_asset_offset:
                 info_use["_offset_expr_x"] = "MatchedOffsetX"
                 info_use["_offset_expr_y"] = "MatchedOffsetY"
             lines.append("    if (MacroDryRun)")
@@ -3456,19 +3465,26 @@ def render_image_search(
                 lines.extend(f"        {line}" for line in render_click_from_hit(info_use))
             lines.append("    }")
         effective_offset = (offset_values + [0, 0])[:2]
-        if len(asset_files) > 1 and asset_offsets:
+        if use_asset_offset:
             lines.append(f"    MatchedOffsetX := {int(effective_offset[0] or 0)}")
             lines.append(f"    MatchedOffsetY := {int(effective_offset[1] or 0)}")
-            for match_index, (offset_x, offset_y) in enumerate(asset_offsets, start=1):
-                prefix = "if" if match_index == 1 else "else if"
-                lines.append(f"    {prefix} (MatchedImageIndex = {match_index})")
-                lines.append("    {")
-                lines.append(f"        MatchedOffsetX := {offset_x}")
-                lines.append(f"        MatchedOffsetY := {offset_y}")
-                lines.append("    }")
-            lines.append(
-                '    Log("multi image offset: match=" . MatchedImageIndex . " x=" . MatchedOffsetX . " y=" . MatchedOffsetY)'
-            )
+            if len(asset_files) == 1:
+                lines.append(f"    MatchedOffsetX := {asset_offsets[0][0]}")
+                lines.append(f"    MatchedOffsetY := {asset_offsets[0][1]}")
+            else:
+                for match_index, (offset_x, offset_y) in enumerate(asset_offsets, start=1):
+                    prefix = "if" if match_index == 1 else "else if"
+                    lines.append(f"    {prefix} (MatchedImageIndex = {match_index})")
+                    lines.append("    {")
+                    lines.append(f"        MatchedOffsetX := {offset_x}")
+                    lines.append(f"        MatchedOffsetY := {offset_y}")
+                    lines.append("    }")
+            if len(asset_files) > 1:
+                lines.append(
+                    '    Log("multi image offset: match=" . MatchedImageIndex . " x=" . MatchedOffsetX . " y=" . MatchedOffsetY)'
+                )
+            else:
+                lines.append('    Log("image asset offset: x=" . MatchedOffsetX . " y=" . MatchedOffsetY)')
         if click_image:
             lines.append('    Log("image center click: enabled")')
             emit_click(click_info, [0, 0])
@@ -3477,7 +3493,7 @@ def render_image_search(
             if between_click_delay:
                 lines.append(f"    if (!MacroDryRun)\n        Sleep, {between_click_delay}")
         if click_offset:
-            if len(asset_files) > 1 and asset_offsets:
+            if use_asset_offset:
                 lines.append('    Log("image offset click: base x=" . MatchedOffsetX . " y=" . MatchedOffsetY . " scale=" . Round(FoundScaleX, 3) . "," . Round(FoundScaleY, 3))')
             else:
                 lines.append(

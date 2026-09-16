@@ -4622,7 +4622,7 @@ class ActionEditor(QtWidgets.QWidget):
                     if updated_regs:
                         picker.set_asset_regions(updated_regs)
                     if updated_offsets:
-                        picker.set_offsets(updated_offsets)
+                        self._apply_visual_asset_offsets(action, updated_aliases, updated_offsets)
 
                 if updated_aliases:
                     self.original["assets"] = list(updated_aliases)
@@ -4686,6 +4686,40 @@ class ActionEditor(QtWidgets.QWidget):
                 win.setEnabled(True)
                 if hasattr(win, "activateWindow"):
                     win.activateWindow()
+
+    def _apply_visual_asset_offsets(
+        self,
+        action: str,
+        aliases: list[str],
+        offsets: dict[str, list[int]],
+    ) -> None:
+        """Synchronize visual-test offsets with both editor controls.
+
+        The asset picker and the offset editor keep separate UI state.  If only
+        the picker is refreshed, build_step() can later overwrite the accepted
+        visual-test values with stale offsets from the offset editor.
+        """
+        widgets = self.widgets.get(action, {})
+        picker = widgets.get("assets")
+        if isinstance(picker, MultiAssetPicker):
+            picker.set_offsets(offsets)
+
+        offset_editor = widgets.get("click.offset")
+        if not isinstance(offset_editor, OffsetEditor):
+            return
+        normalized_aliases = list(dict.fromkeys(str(alias) for alias in aliases if str(alias).strip()))
+        entries = [
+            (alias, path)
+            for alias in normalized_aliases
+            if (path := self.repository.asset_path(alias)) is not None
+        ]
+        if len(normalized_aliases) > 1:
+            offset_editor.set_multi_assets(entries, offsets)
+        elif normalized_aliases:
+            alias = normalized_aliases[0]
+            offset_editor.clear_multi_assets()
+            offset_editor.set_preview(self.repository.asset_path(alias))
+            offset_editor.set_value(offsets.get(alias, [0, 0]))
 
     def _update_offset_preview(self) -> None:
         action = self.current_action if self.current_action in {"image_search", "multi_image_search", "animation_search"} else "image_search"
@@ -5014,7 +5048,12 @@ class ActionEditor(QtWidgets.QWidget):
                 if isinstance(picker, MultiAssetPicker):
                     offset_editor = self.widgets[action].get("click.offset")
                     if isinstance(offset_editor, OffsetEditor):
-                        payload["asset_offsets"] = offset_editor.multi_offsets()
+                        picker_offsets = picker.offsets()
+                        picker_offsets.update(offset_editor.multi_offsets())
+                        payload["asset_offsets"] = {
+                            alias: list(picker_offsets.get(alias, [0, 0]))[:2]
+                            for alias in payload["assets"]
+                        }
                         picker.set_offsets(payload["asset_offsets"])
                     else:
                         payload["asset_offsets"] = picker.offsets()

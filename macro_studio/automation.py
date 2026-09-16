@@ -531,7 +531,20 @@ def _native_region_image(rect: QtCore.QRect, fallback: QtGui.QImage) -> QtGui.QI
             return qimage.copy()
     except Exception:
         pass
-    return fallback
+    if not fallback.isNull():
+        return fallback
+    # Some packaged Windows environments do not expose MSS/Pillow screen
+    # capture to the UI process.  Reuse Qt's proven multi-monitor capture and
+    # translate the physical selection back to its logical desktop rectangle.
+    try:
+        pixmap, geometry = capture_virtual_desktop()
+        logical_rect = native_rect_to_logical(rect)
+        local_rect = logical_rect.translated(-geometry.left(), -geometry.top()).intersected(pixmap.rect())
+        if not pixmap.isNull() and local_rect.isValid() and local_rect.width() > 1 and local_rect.height() > 1:
+            return pixmap.toImage().copy(local_rect)
+    except Exception:
+        pass
+    return QtGui.QImage()
 
 
 def build_animation_templates(
@@ -5526,6 +5539,25 @@ class QuickActionWizard:
             progress.setWindowTitle("애니메이션 서치 자동 캡처")
             progress.setWindowModality(QtCore.Qt.WindowModal)
             progress.setMinimumDuration(0)
+            progress.setMinimumWidth(360)
+            progress.show()
+            progress.adjustSize()
+            logical_target = native_rect_to_logical(rect)
+            target_screen = QtGui.QGuiApplication.screenAt(logical_target.center()) or QtGui.QGuiApplication.primaryScreen()
+            if target_screen is not None:
+                available = target_screen.availableGeometry()
+                candidates = (
+                    available.topLeft() + QtCore.QPoint(12, 12),
+                    QtCore.QPoint(available.right() - progress.width() - 12, available.top() + 12),
+                    QtCore.QPoint(available.left() + 12, available.bottom() - progress.height() - 12),
+                    QtCore.QPoint(available.right() - progress.width() - 12, available.bottom() - progress.height() - 12),
+                )
+                farthest = max(
+                    candidates,
+                    key=lambda point: (point.x() + progress.width() // 2 - logical_target.center().x()) ** 2
+                    + (point.y() + progress.height() // 2 - logical_target.center().y()) ** 2,
+                )
+                progress.move(farthest)
             frames: list[QtGui.QImage] = []
             if not first_frame.isNull():
                 frames.append(first_frame)
@@ -5543,6 +5575,13 @@ class QuickActionWizard:
             finally:
                 progress.close()
                 progress.deleteLater()
+            if len(frames) < 3:
+                QtWidgets.QMessageBox.warning(
+                    parent,
+                    "애니메이션 캡처 실패",
+                    "분석에 필요한 연속 프레임을 확보하지 못했습니다. 대상 창이 보이는 상태에서 다시 시도해 주세요.",
+                )
+                return None
             templates, stable_ratio = build_animation_templates(frames, stability_threshold=22, max_templates=4)
             if not templates:
                 return None

@@ -2275,7 +2275,11 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 path.lineTo(control)
             path.lineTo(end)
         elif self.route_side:
-            # Backward routing for other non-return links
+            # Outer-lane routing for return, long and conditional branches.
+            # Conditional branches deliberately consider every node in the
+            # horizontal span, not only nodes near the direct source/target
+            # corridor.  This keeps their vertical detour outside stacked
+            # nodes instead of cutting through a different row.
             source_rect = source_node.sceneBoundingRect()
             target_rect = target_node.sceneBoundingRect()
             span_left = min(start.x(), end.x())
@@ -2287,12 +2291,19 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 for node in self.canvas.nodes.values()
                 if node.sceneBoundingRect().right() >= span_left
                 and node.sceneBoundingRect().left() <= span_right
-                and node.sceneBoundingRect().bottom() >= corridor_top
-                and node.sceneBoundingRect().top() <= corridor_bottom
+                and (
+                    self.is_condition
+                    or (
+                        node.sceneBoundingRect().bottom() >= corridor_top
+                        and node.sceneBoundingRect().top() <= corridor_bottom
+                    )
+                )
             ]
             if not route_rects:
                 route_rects = [source_rect, target_rect]
-            margin = 52.0 + self.route_lane * 26.0
+            base_margin = 68.0 if self.is_condition else 52.0
+            lane_spacing = 30.0 if self.is_condition else 26.0
+            margin = base_margin + self.route_lane * lane_spacing
             if self.route_side == "top":
                 lane_y = min(rect.top() for rect in route_rects) - margin
             else:
@@ -4353,7 +4364,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self._route_edges()
 
     def _route_edges(self) -> None:
-        """Assign non-overlapping outer lanes to backward links, and route forward links via direct curves."""
+        """Assign collision-free outer lanes before drawing ordinary direct curves."""
         candidates: dict[str, list[tuple[float, float, EdgeItem]]] = {
             "top": [],
             "bottom": [],
@@ -4376,7 +4387,14 @@ class NodeCanvas(QtWidgets.QWidget):
             start = out_port.mapToScene(out_port.rect().center())
             in_port = target.in_success_port if edge.kind == "success" else target.in_fail_port
             end = in_port.mapToScene(in_port.rect().center())
-            if edge.is_return_link():
+            if edge.is_condition:
+                # Condition lines carry a separate meaning and are usually
+                # longer than ordinary flow links. Always keep them outside
+                # node bodies: success above, failure below. Manual waypoints
+                # were handled above and remain untouched.
+                side = "top" if edge.kind == "success" else "bottom"
+                candidates[side].append((min(start.x(), end.x()), max(start.x(), end.x()), edge))
+            elif edge.is_return_link():
                 side = "top" if edge.kind == "success" else "bottom"
                 candidates[side].append((min(start.x(), end.x()), max(start.x(), end.x()), edge))
             elif edge.is_row_wrap_link():

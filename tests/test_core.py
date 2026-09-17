@@ -3974,8 +3974,10 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(40, spin.value())
 
     def test_condition_edge_has_separate_label_and_style(self) -> None:
+        from PySide6 import QtWidgets
         from macro_studio.node_editor import NodeCanvas
 
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         canvas = NodeCanvas()
         canvas.set_macro(
             {
@@ -3995,7 +3997,51 @@ class UiSmokeTests(unittest.TestCase):
         conditional = next(edge for edge in canvas.edges if edge.is_condition)
         self.assertIn("횟수 >= 3", conditional.label.text())
         self.assertEqual(conditional.pen().style().name, "DashLine")
+        self.assertEqual("top", conditional.route_side)
         self.assertTrue(conditional.label.flags() & conditional.label.GraphicsItemFlag.ItemIgnoresTransformations)
+        canvas.close()
+        app.processEvents()
+
+    def test_condition_edges_use_outer_lanes_without_crossing_intermediate_nodes(self) -> None:
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro(
+            {
+                "steps": [
+                    {
+                        "action": "wait",
+                        "edge_conditions": [
+                            {
+                                "kind": "success",
+                                "label": "성공 조건 우회",
+                                "source": "edge_count",
+                                "operator": ">=",
+                                "value": 2,
+                                "target": 3,
+                            }
+                        ],
+                    },
+                    {"action": "wait"},
+                    {"action": "wait"},
+                ],
+                "graph_positions": {"1": [0, 0], "2": [350, 0], "3": [700, 0]},
+            }
+        )
+        app.processEvents()
+
+        conditional = next(edge for edge in canvas.edges if edge.is_condition)
+        middle_rect = canvas.nodes[2].sceneBoundingRect().adjusted(4.0, 4.0, -4.0, -4.0)
+        top = min(node.sceneBoundingRect().top() for node in canvas.nodes.values())
+        stroker = QtGui.QPainterPathStroker()
+        stroker.setWidth(4.0)
+        visible_stroke = stroker.createStroke(conditional.path())
+
+        self.assertEqual("top", conditional.route_side)
+        self.assertLess(conditional.path().boundingRect().top(), top - 60.0)
+        self.assertFalse(visible_stroke.intersects(middle_rect))
         canvas.close()
 
     def test_assets_reuse_existing_list_when_index_is_unchanged(self) -> None:

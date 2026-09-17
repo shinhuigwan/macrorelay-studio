@@ -326,6 +326,90 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertEqual(2, captures.call_count)
         self.assertEqual(1, state.capture_reuse_count)
 
+    def test_multi_pixel_uses_same_frame_n_of_m_and_real_flow_branches(self) -> None:
+        step = {
+            "action": "multi_pixel_check",
+            "pixels": json.dumps(
+                [
+                    {"x": 10, "y": 20, "color": "#112233", "tolerance": 5},
+                    {"x": 30, "y": 40, "color": "#445566", "tolerance": 7},
+                    {"x": 50, "y": 60, "color": "#778899", "tolerance": 9},
+                ]
+            ),
+            "match_policy": "at_least_n",
+            "required_count": 2,
+            "coord_mode": "Client",
+            "pixel_coords": "relative",
+            "window": "Sample ahk_exe sample.exe",
+            "window_exe": "sample.exe",
+            "stable_hits": 2,
+            "poll_delay": 30,
+            "action_on_found": "click_index",
+            "click_index": 3,
+            "click_offset_x": 4,
+            "click_offset_y": -2,
+            "on_success": 2,
+            "on_fail": 3,
+        }
+        macro = {
+            "name": "multi-pixel-flow",
+            "steps": [step, {"action": "wait", "duration": 10}, {"action": "wait", "duration": 20}],
+        }
+        script = self.engine.render_macro_script(macro, {})
+
+        self.assertIn('""cmd"":""multi_pixel""', script)
+        self.assertIn("MultiPixel_1_BaseX + 10", script)
+        self.assertIn('""required_count"":2', script)
+        self.assertIn('""stable_hits"":2', script)
+        self.assertIn("if (__multi_pixel_success_1)", script)
+        self.assertIn("Goto, Step2", script)
+        self.assertIn("Goto, Step3", script)
+        self.assertIn('VisionEngine_ParseField(MultiPixel_1_Resp, "click_x") + 4', script)
+
+    def test_vision_engine_multi_pixel_captures_one_frame_per_poll(self) -> None:
+        import vision_engine
+
+        class FakeFrame:
+            size = 1
+
+            def __getitem__(self, key):
+                y, x = key
+                colors = {
+                    (0, 0): (0x33, 0x22, 0x11),
+                    (20, 20): (0x66, 0x55, 0x44),
+                    (40, 40): (0x00, 0x00, 0x00),
+                }
+                return colors[(y, x)]
+
+        state = vision_engine.VisionState()
+        captures: list[tuple[int, int, int, int]] = []
+
+        def fake_capture(left, top, right, bottom, _grabber=None):
+            captures.append((left, top, right, bottom))
+            return FakeFrame()
+
+        request = {
+            "points": [
+                {"x": 100, "y": 200, "color": "#112233", "tolerance": 0, "index": 1},
+                {"x": 120, "y": 220, "color": "#445566", "tolerance": 0, "index": 2},
+                {"x": 140, "y": 240, "color": "#778899", "tolerance": 0, "index": 3},
+            ],
+            "match_policy": "at_least_n",
+            "required_count": 2,
+            "stable_hits": 2,
+            "timeout": 100,
+            "poll": 10,
+            "click_index": 2,
+        }
+        with mock.patch.object(vision_engine.search, "capture_region", side_effect=fake_capture):
+            result = state.multi_pixel(request)
+
+        self.assertTrue(result["found"])
+        self.assertEqual(2, result["match_count"])
+        self.assertEqual("1,2", result["matched_indexes_csv"])
+        self.assertEqual((120, 220), (result["click_x"], result["click_y"]))
+        self.assertEqual([(100, 200, 141, 241), (100, 200, 141, 241)], captures)
+
     def test_image_search_uses_centered_single_click_and_optimized_opencv(self) -> None:
         step = {
             "action": "image_search",
@@ -3504,6 +3588,101 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("input", typed["send_mode"])
             self.assertEqual("hello{Enter}", typed["text"])
             editor.close()
+
+    def test_multi_pixel_editor_defaults_to_client_and_preserves_legacy_screen_points(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.action_editor import ActionEditor, action_template
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        template = action_template("multi_pixel_check")
+        self.assertEqual("Client", template["coord_mode"])
+        self.assertEqual("relative", template["pixel_coords"])
+        with tempfile.TemporaryDirectory() as directory:
+            editor = ActionEditor(MacroRepository(Path(directory)))
+            legacy_pixels = [{"x": 1200, "y": 700, "color": "#112233", "tolerance": 10}]
+            editor.load_step({
+                "action": "multi_pixel_check",
+                "pixels": json.dumps(legacy_pixels),
+                "coord_mode": "Window",
+            })
+            rebuilt = editor.build_step()
+            self.assertEqual("Client", rebuilt["coord_mode"])
+            self.assertEqual("screen", rebuilt["pixel_coords"])
+            self.assertEqual((1200, 700), tuple(json.loads(rebuilt["pixels"])[0][key] for key in ("x", "y")))
+            editor.close()
+
+    def test_multi_pixel_picker_binds_first_pin_to_target_client(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.action_editor import ActionEditor
+        from macro_studio.automation import MultiPixelPickerDialog
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        pixmap = QtGui.QPixmap(400, 300)
+        pixmap.fill(QtGui.QColor("#112233"))
+        picker = MultiPixelPickerDialog(pixmap, QtCore.QRect(0, 0, 400, 300))
+        target = {
+            "window": "Sample ahk_exe sample.exe",
+            "exe": "sample.exe",
+            "hwnd": 77,
+            "capture_scope": "client",
+            "client_origin": [100, 200],
+        }
+
+        class FakeEvent:
+            @staticmethod
+            def button():
+                return QtCore.Qt.LeftButton
+
+            @staticmethod
+            def globalPosition():
+                return QtCore.QPointF(150, 250)
+
+        with (
+            mock.patch.object(ActionEditor, "_window_target_at", return_value=target),
+            mock.patch("macro_studio.automation.logical_point_to_native", side_effect=lambda point: QtCore.QPoint(point)),
+            mock.patch("macro_studio.automation._native_pixel_color", return_value=QtGui.QColor("#112233")),
+        ):
+            picker.mousePressEvent(FakeEvent())
+
+        self.assertEqual("Client", picker.coordinate_mode())
+        self.assertEqual("sample.exe", picker.selected_target()["exe"])
+        self.assertEqual((50, 50), (picker.selected_points()[0]["x"], picker.selected_points()[0]["y"]))
+        picker.close()
+
+    def test_multi_pixel_preview_shows_saved_and_current_colours(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.automation import MultiPixelPreviewDialog
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        image = QtGui.QImage(40, 30, QtGui.QImage.Format_RGB32)
+        image.fill(QtGui.QColor("#000000"))
+        image.setPixelColor(5, 6, QtGui.QColor("#112233"))
+        image.setPixelColor(12, 14, QtGui.QColor("#445566"))
+        step = {
+            "pixels": json.dumps([
+                {"x": 5, "y": 6, "color": "#112233", "enabled": True},
+                {"x": 12, "y": 14, "color": "#445566", "enabled": True},
+            ]),
+            "pixel_coords": "relative",
+            "window": "Sample ahk_exe sample.exe",
+            "window_exe": "sample.exe",
+            "match_policy": "all",
+            "tolerance": 10,
+        }
+        with (
+            mock.patch("macro_studio.automation._multi_pixel_target_client_rect", return_value=QtCore.QRect(100, 200, 40, 30)),
+            mock.patch("macro_studio.automation._native_region_image", return_value=image),
+        ):
+            dialog = MultiPixelPreviewDialog(step)
+            dialog.timer.stop()
+            dialog.refresh_preview()
+
+        self.assertEqual(2, dialog.list.count())
+        self.assertIn("저장 #112233", dialog.list.item(0).text())
+        self.assertIn("현재 #112233", dialog.list.item(0).text())
+        self.assertIn("참(TRUE)", dialog.result_label.text())
+        dialog.close()
 
     def test_builder_restores_action_forms_and_collapses_json(self) -> None:
         from PySide6 import QtWidgets

@@ -735,6 +735,125 @@ class VisionState:
                 "adaptive_poll_ms": self._adaptive_poll(poll_ms)[0],
             }
 
+    def multi_pixel(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate every configured point from one captured frame per poll."""
+        started = time.perf_counter()
+        with self._lock:
+            self.last_activity = time.time()
+            self.request_count += 1
+            raw_points = request.get("points")
+            points: list[dict[str, Any]] = []
+            for item in raw_points if isinstance(raw_points, list) else []:
+                if not isinstance(item, dict) or not bool(item.get("enabled", True)):
+                    continue
+                try:
+                    x = int(item.get("x"))
+                    y = int(item.get("y"))
+                    color = str(item.get("color") or "#FFFFFF").strip().lstrip("#")
+                    expected = int(color, 16)
+                except (TypeError, ValueError):
+                    continue
+                points.append(
+                    {
+                        "x": x,
+                        "y": y,
+                        "r": (expected >> 16) & 0xFF,
+                        "g": (expected >> 8) & 0xFF,
+                        "b": expected & 0xFF,
+                        "tolerance": max(0, min(255, int(item.get("tolerance") or 0))),
+                        "source_index": int(item.get("index") or len(points) + 1),
+                    }
+                )
+            if not points:
+                return {"ok": False, "found": False, "error": "NO_PIXELS", "detail": "no enabled pixels"}
+
+            left = min(item["x"] for item in points)
+            top = min(item["y"] for item in points)
+            right = max(item["x"] for item in points) + 1
+            bottom = max(item["y"] for item in points) + 1
+            policy = str(request.get("match_policy") or "all").casefold()
+            required = max(1, int(request.get("required_count") or 1))
+            if policy == "all":
+                required = len(points)
+            elif policy == "any":
+                required = 1
+            required = min(required, len(points))
+            stable_required = max(1, min(100, int(request.get("stable_hits") or 1)))
+            timeout_ms = max(0, int(request.get("timeout") or 0))
+            poll_ms = max(10, int(request.get("poll") or 30))
+            click_index = max(0, int(request.get("click_index") or 0))
+            deadline = time.perf_counter() + timeout_ms / 1000.0
+            stable_count = 0
+            best_count = 0
+            last_matches: list[dict[str, Any]] = []
+            captures = 0
+
+            while True:
+                cycle_started = time.perf_counter()
+                frame, _reused = self._capture(
+                    (left, top, right, bottom),
+                    str(request.get("capture_context") or "multi_pixel"),
+                    0,
+                )
+                captures += 1
+                matches: list[dict[str, Any]] = []
+                if frame is not None and getattr(frame, "size", 0):
+                    for item in points:
+                        pixel = frame[item["y"] - top, item["x"] - left]
+                        blue, green, red = (int(pixel[0]), int(pixel[1]), int(pixel[2]))
+                        tolerance = item["tolerance"]
+                        if max(abs(red - item["r"]), abs(green - item["g"]), abs(blue - item["b"])) <= tolerance:
+                            matches.append(item)
+                match_count = len(matches)
+                best_count = max(best_count, match_count)
+                if policy == "exact_n":
+                    satisfied = match_count == required
+                else:
+                    satisfied = match_count >= required
+                if satisfied:
+                    stable_count += 1
+                    last_matches = matches
+                else:
+                    stable_count = 0
+                    last_matches = matches
+                if stable_count >= stable_required:
+                    selected = next(
+                        (item for item in matches if item["source_index"] == click_index),
+                        matches[0] if matches else points[0],
+                    )
+                    return {
+                        "ok": True,
+                        "found": True,
+                        "match_count": match_count,
+                        "required_count": required,
+                        "stable_hits": stable_count,
+                        "matched_indexes_csv": ",".join(str(item["source_index"]) for item in matches),
+                        "x": int(matches[0]["x"] if matches else selected["x"]),
+                        "y": int(matches[0]["y"] if matches else selected["y"]),
+                        "click_x": int(selected["x"]),
+                        "click_y": int(selected["y"]),
+                        "capture_count": captures,
+                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                    }
+                if timeout_ms <= 0 or time.perf_counter() >= deadline:
+                    break
+                adaptive_poll, _cpu = self._adaptive_poll(poll_ms)
+                remaining = max(0.0, adaptive_poll / 1000.0 - (time.perf_counter() - cycle_started))
+                if remaining:
+                    time.sleep(remaining)
+
+            return {
+                "ok": True,
+                "found": False,
+                "match_count": len(last_matches),
+                "best_match_count": best_count,
+                "required_count": required,
+                "stable_hits": stable_count,
+                "matched_indexes_csv": ",".join(str(item["source_index"]) for item in last_matches),
+                "capture_count": captures,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            }
+
     def status(self) -> dict[str, Any]:
         return {
             "ok": True,
@@ -782,6 +901,8 @@ class VisionHandler(socketserver.StreamRequestHandler):
                 response = self.server.state.status()
             elif command == "search":
                 response = self.server.state.search(request)
+            elif command == "multi_pixel":
+                response = self.server.state.multi_pixel(request)
             elif command == "preload":
                 response = self.server.state.preload(request)
             elif command == "benchmark":

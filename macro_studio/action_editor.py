@@ -892,20 +892,39 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("match_policy", "일치 조건", "choice", "all", options=choice(
             ("모든 픽셀 일치 (AND) · 권장", "all"),
             ("하나 이상 일치 (OR)", "any"),
+            ("지정 개수 이상 일치 (N개 이상)", "at_least_n"),
+            ("지정 개수 정확히 일치", "exact_n"),
         )),
+        FieldSpec("required_count", "필요한 일치 개수", "int", 2, 1, 999, tooltip="N개 이상/정확히 일치 조건에서 사용할 개수입니다."),
         FieldSpec("tolerance", "색상 허용 오차", "int", 10, 0, 255, tooltip="낮을수록 더 정확하고 엄격하게 일치합니다."),
-        FieldSpec("coord_mode", "좌표 기준", "choice", "Screen", options=choice(
+        FieldSpec("coord_mode", "좌표 기준", "choice", "Client", options=choice(
+            ("대상 프로그램 내부 (Client) · 권장", "Client"),
             ("전체 화면 (Screen)", "Screen"),
-            ("대상 창 내부 (Client)", "Window"),
-        ), tooltip="창이 이동해도 창 내부 핀 위치를 유지하려면 '대상 창 내부'를 선택하세요.", section="동작 설정"),
+        ), tooltip="핀 선택 시 프로그램을 자동 감지합니다. 기존 전체 화면 노드는 이전 좌표 방식이 유지됩니다.", section="대상 프로그램"),
+        FieldSpec("pixel_coords", "픽셀 좌표 저장 방식", "choice", "relative", options=choice(
+            ("대상 프로그램 상대 좌표", "relative"),
+            ("화면 절대 좌표 · 기존 호환", "screen"),
+        ), section="대상 프로그램"),
+        FieldSpec("window", "대상 창", "text", "", placeholder="핀을 선택하면 자동 설정", section="대상 프로그램"),
+        FieldSpec("window_exe", "대상 프로그램", "text", "", placeholder="예: dnplayer.exe", section="대상 프로그램"),
         FieldSpec("action_on_found", "일치 시 동작", "choice", "branch", options=choice(
             ("성공 분기 (흐름 제어)", "branch"),
-            ("첫 번째 픽셀 클릭", "click_first"),
+            ("첫 번째 일치 픽셀 클릭", "click_first"),
+            ("지정 번호 픽셀 클릭", "click_index"),
             ("변수 저장 (일치 여부)", "store_var"),
         ), section="동작 설정"),
+        FieldSpec("click_index", "클릭할 픽셀 번호", "int", 1, 1, 999, section="동작 설정"),
+        FieldSpec("click_offset_x", "클릭 오프셋 X", "int", 0, -100_000, 100_000, section="동작 설정"),
+        FieldSpec("click_offset_y", "클릭 오프셋 Y", "int", 0, -100_000, 100_000, section="동작 설정"),
+        FieldSpec("click_mode", "클릭 방식", "choice", "active", options=choice(
+            ("일반 클릭", "active"),
+            ("비활성 클릭", "inactive"),
+        ), section="동작 설정"),
         FieldSpec("store_var", "결과 저장 변수", "text", "MultiPixelMatch", section="동작 설정"),
+        FieldSpec("store_count_var", "일치 개수 저장 변수", "text", "MultiPixelMatchCount", section="동작 설정"),
         FieldSpec("timeout", "검색 제한 시간", "duration", 1000, 0, 600_000, section="타이밍"),
-        FieldSpec("poll_delay", "반복 간격", "duration", 50, 10, 60_000, section="타이밍"),
+        FieldSpec("poll_delay", "검사 간격", "duration", 30, 10, 60_000, section="타이밍", tooltip="한 번 캡처한 동일 프레임에서 모든 픽셀을 판정합니다. 일반적으로 20~50ms를 권장합니다."),
+        FieldSpec("stable_hits", "연속 확인 횟수", "int", 1, 1, 100, section="타이밍", tooltip="화면 깜빡임 오판을 줄이려면 2~3회를 권장합니다."),
         FieldSpec("sleep_after", "완료 후 대기", "duration", 0, 0, 600_000, section="타이밍"),
     ],
     "wait_color": [
@@ -3604,6 +3623,8 @@ class ActionEditor(QtWidgets.QWidget):
             buttons.append(("▣ 2단계: OCR 영역 잡기 (드래그)", lambda: self._pick_ocr_track_offset(action)))
         elif action == "multi_pixel_check":
             buttons.append(("❖ 다중 픽셀 핀 찍기 (돋보기 좌클릭)", lambda: self._pick_multi_pixels(action)))
+            buttons.append(("🔍 선택 픽셀 미리보기 및 실시간 검사", lambda: self._preview_multi_pixels(action)))
+            buttons.append(("◎ 대상 프로그램 다시 지정", lambda: self._pick_window(action, "window")))
         elif action == "wait_color":
             buttons.append(("⏳ 목표 색상·좌표 추출 (돋보기 좌클릭)", lambda: self._pick_wait_color(action)))
             buttons.append(("▣ 대기 영역 잡기 (드래그)", lambda: self._pick_region(action, "search_region")))
@@ -4209,16 +4230,52 @@ class ActionEditor(QtWidgets.QWidget):
         from .automation import capture_virtual_desktop, MultiPixelPickerDialog
         import json
         hosts = self._hide_host_windows()
+        ignored_hwnds = self._host_hwnds(hosts)
         pixmap, geometry = capture_virtual_desktop()
         if pixmap.isNull() or not geometry.isValid():
             self._restore_host_windows(hosts)
             return
-        picker = MultiPixelPickerDialog(pixmap, geometry)
+        picker = MultiPixelPickerDialog(pixmap, geometry, ignored_hwnds=ignored_hwnds)
         accepted = picker.exec() == QtWidgets.QDialog.Accepted
         pts = picker.selected_points() if accepted else []
+        target = picker.selected_target() if accepted else {}
+        coordinate_mode = picker.coordinate_mode() if accepted else "Screen"
         self._restore_host_windows(hosts)
         if accepted and pts:
             self._set_field_value(action, "pixels", json.dumps(pts, ensure_ascii=False))
+            if coordinate_mode == "Client" and target:
+                self._set_field_value(action, "coord_mode", "Client")
+                self._set_field_value(action, "pixel_coords", "relative")
+                self._set_field_value(action, "window", str(target.get("window") or ""))
+                self._set_field_value(action, "window_exe", str(target.get("exe") or ""))
+                QtWidgets.QToolTip.showText(
+                    QtGui.QCursor.pos(),
+                    f"{target.get('exe') or '대상 프로그램'} 클라이언트 기준으로 {len(pts)}개 픽셀을 저장했습니다.",
+                    self,
+                )
+            else:
+                self._set_field_value(action, "coord_mode", "Screen")
+                self._set_field_value(action, "pixel_coords", "screen")
+
+    def _preview_multi_pixels(self, action: str) -> None:
+        from .automation import MultiPixelPreviewDialog
+
+        widgets = self.widgets.get(action, {})
+        draft: dict[str, Any] = {"action": action}
+        for spec in ACTION_FIELDS.get(action, []):
+            widget = widgets.get(spec.key)
+            if widget is not None:
+                draft[spec.key] = self._widget_value(widget, spec)
+        raw = draft.get("pixels") or "[]"
+        try:
+            points = __import__("json").loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            points = []
+        if not isinstance(points, list) or not points:
+            QtWidgets.QMessageBox.information(self, "다중 픽셀 미리보기", "먼저 '다중 픽셀 핀 찍기'로 픽셀을 선택하세요.")
+            return
+        dialog = MultiPixelPreviewDialog(draft, self.window())
+        dialog.exec()
 
     def _pick_ocr_track_target(self, action: str) -> None:
         from .automation import capture_virtual_desktop, ScreenCaptureDialog
@@ -4576,6 +4633,9 @@ class ActionEditor(QtWidgets.QWidget):
         else:
             self._set_field_value(action, "window", picker.window_token)
             self._set_field_value(action, "window_exe", picker.exe_name)
+            if action == "multi_pixel_check":
+                self._set_field_value(action, "coord_mode", "Client")
+                self._set_field_value(action, "pixel_coords", "relative")
 
     def _capture_image(self) -> QtGui.QImage:
         hosts = self._hide_host_windows()
@@ -5216,6 +5276,14 @@ class ActionEditor(QtWidgets.QWidget):
             selected_days = set("월화수목금") if legacy_mode == "weekdays" else set("토일") if legacy_mode == "weekend" else set(legacy_days) if legacy_mode == "custom" else set("월화수목금토일")
             for key, label in (("weekday_mon", "월"), ("weekday_tue", "화"), ("weekday_wed", "수"), ("weekday_thu", "목"), ("weekday_fri", "금"), ("weekday_sat", "토"), ("weekday_sun", "일")):
                 normalized.setdefault(key, label in selected_days)
+        if action == "multi_pixel_check":
+            # Legacy nodes stored absolute screen points even when the old UI
+            # displayed "Window".  Keep those coordinates untouched unless a
+            # new picker explicitly marks them as client-relative.
+            if "pixel_coords" not in step:
+                normalized["pixel_coords"] = "screen"
+            if str(normalized.get("coord_mode") or "").casefold() == "window":
+                normalized["coord_mode"] = "Client"
         for spec in ACTION_FIELDS.get(action, []):
             if spec.key in COMMON_FIELD_KEYS:
                 continue
@@ -5469,6 +5537,47 @@ class ActionEditor(QtWidgets.QWidget):
             if not str(click.get("window_exe") or "").strip():
                 click["window_exe"] = str(payload.get("region_window_exe") or "")
             payload["click"] = click
+        elif action == "multi_pixel_check":
+            raw_pixels = payload.get("pixels") or "[]"
+            try:
+                import json
+                parsed_pixels = json.loads(raw_pixels) if isinstance(raw_pixels, str) else list(raw_pixels)
+            except Exception:
+                parsed_pixels = []
+            global_tolerance = max(0, min(255, int(payload.get("tolerance") or 10)))
+            clean_pixels: list[dict[str, Any]] = []
+            for item in parsed_pixels if isinstance(parsed_pixels, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    x = int(item.get("x") or 0)
+                    y = int(item.get("y") or 0)
+                except (TypeError, ValueError):
+                    continue
+                color = str(item.get("color") or "#FFFFFF").strip().upper()
+                if not color.startswith("#"):
+                    color = f"#{color}"
+                clean_pixels.append({
+                    "x": x,
+                    "y": y,
+                    "color": color,
+                    "tolerance": max(0, min(255, int(item.get("tolerance", global_tolerance)))),
+                    "custom_tolerance": bool(item.get("custom_tolerance", False)),
+                    "enabled": bool(item.get("enabled", True)),
+                })
+            payload["pixels"] = json.dumps(clean_pixels, ensure_ascii=False)
+            enabled_count = sum(1 for item in clean_pixels if item.get("enabled", True))
+            policy = str(payload.get("match_policy") or "all").casefold()
+            if policy == "all":
+                payload["required_count"] = enabled_count
+            elif policy == "any":
+                payload["required_count"] = 1
+            else:
+                payload["required_count"] = max(1, min(enabled_count or 1, int(payload.get("required_count") or 1)))
+            mode = str(payload.get("coord_mode") or "Client").casefold()
+            payload["coord_mode"] = "Screen" if mode == "screen" else "Client"
+            coords = str(payload.get("pixel_coords") or "relative").casefold()
+            payload["pixel_coords"] = "screen" if coords == "screen" else "relative"
         if action == "inactive_click" and original_handle_method == "handle_probe":
             payload["method"] = "handle_probe"
             for key in ("target_control", "target_hwnd", "target_child_class"):

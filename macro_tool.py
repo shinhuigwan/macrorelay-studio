@@ -5021,8 +5021,8 @@ def render_ocr_tracking(step: Dict[str, Any], assets: Dict[str, Dict[str, Any]])
     return lines
 
 
-def render_multi_pixel_check(step: Dict[str, Any]) -> List[str]:
-    """Render AHK code checking multiple pixel coordinates & colors simultaneously."""
+def render_multi_pixel_check(step: Dict[str, Any], step_index: int = 0) -> List[str]:
+    """Render a same-frame multi-pixel condition through the local vision engine."""
     import json
     pixels_raw = step.get("pixels") or "[]"
     try:
@@ -5034,68 +5034,139 @@ def render_multi_pixel_check(step: Dict[str, Any]) -> List[str]:
             pixels = []
     except Exception:
         pixels = []
+    pixels = [item for item in pixels if isinstance(item, dict) and bool(item.get("enabled", True))]
     match_policy = str(step.get("match_policy") or "all").lower()
-    tolerance = int(step.get("tolerance") or 10)
+    if match_policy not in {"all", "any", "at_least_n", "exact_n"}:
+        match_policy = "all"
+    tolerance = max(0, min(255, int(step.get("tolerance") or 10)))
+    required_count = max(1, int(step.get("required_count") or 1))
+    if match_policy == "all":
+        required_count = max(1, len(pixels))
+    elif match_policy == "any":
+        required_count = 1
+    required_count = min(required_count, max(1, len(pixels)))
     action_on_found = str(step.get("action_on_found") or "branch")
-    store_var = str(step.get("store_var") or "MultiPixelMatch")
-    timeout = int(step.get("timeout") or 1000)
-    poll_delay = int(step.get("poll_delay") or 50)
-    sleep_after = int(step.get("sleep_after") or 0)
+    store_var = normalize_variable_name(step.get("store_var") or "MultiPixelMatch") or "MultiPixelMatch"
+    store_count_var = normalize_variable_name(step.get("store_count_var") or "MultiPixelMatchCount") or "MultiPixelMatchCount"
+    timeout = max(0, int(step.get("timeout") or 1000))
+    poll_delay = max(10, int(step.get("poll_delay") or 30))
+    stable_hits = max(1, min(100, int(step.get("stable_hits") or 1)))
+    sleep_after = max(0, int(step.get("sleep_after") or 0))
+    click_index = max(1, int(step.get("click_index") or 1))
+    click_offset_x = int(step.get("click_offset_x") or 0)
+    click_offset_y = int(step.get("click_offset_y") or 0)
+    click_mode = str(step.get("click_mode") or "active").casefold()
 
-    coord_mode = str(step.get("coord_mode") or "Screen")
+    coord_mode = str(step.get("coord_mode") or "Screen").casefold()
+    pixel_coords = str(step.get("pixel_coords") or "screen").casefold()
+    relative = coord_mode in {"client", "window"} and pixel_coords == "relative"
+    window = str(step.get("window") or "").strip()
+    window_exe = str(step.get("window_exe") or "").strip()
+    clean_exe = window_exe[8:].strip() if window_exe.casefold().startswith("ahk_exe ") else window_exe
+    found_var = f"__multi_pixel_success_{step_index}" if step_index else "__multi_pixel_success"
+    prefix = f"MultiPixel_{step_index}" if step_index else "MultiPixel"
     lines: List[str] = [
-        "; ── 다중 픽셀 패턴 체크 ──",
+        "; ── 다중 픽셀 동일 프레임 패턴 체크 ──",
+        f"{found_var} := 0",
         f"{store_var} := 0",
-        "MultiPixel_Start := A_TickCount",
-        f"MultiPixel_Timeout := {timeout}",
-        f"MultiPixel_PollDelay := {poll_delay}",
+        f"{store_count_var} := 0",
+        f"{prefix}_BaseX := 0",
+        f"{prefix}_BaseY := 0",
+        f"{prefix}_TargetHwnd := 0",
+        f"{prefix}_TargetValid := {0 if relative else 1}",
     ]
-    if coord_mode == "Window":
-        lines.append("CoordMode, Pixel, Window")
-    lines.append("Loop {")
-    lines.append("    MultiPixel_AllMatch := 1")
-    lines.append("    MultiPixel_AnyMatch := 0")
-    for idx, pt in enumerate(pixels, start=1):
-        px = int(pt.get("x") or 0)
-        py = int(pt.get("y") or 0)
-        pcolor = str(pt.get("color") or "#FFFFFF").strip()
-        p_hex = "0x" + (pcolor[1:] if pcolor.startswith("#") else pcolor).upper()
-        p_tol = int(pt.get("tolerance") or tolerance)
+    if relative:
         lines.extend([
-            f"    PixelGetColor, __cur_clr_{idx}, {px}, {py}, RGB",
-            f"    __r_cur := (__cur_clr_{idx} >> 16) & 0xFF, __g_cur := (__cur_clr_{idx} >> 8) & 0xFF, __b_cur := __cur_clr_{idx} & 0xFF",
-            f"    __r_tgt := ({p_hex} >> 16) & 0xFF, __g_tgt := ({p_hex} >> 8) & 0xFF, __b_tgt := {p_hex} & 0xFF",
-            f"    __diff := Abs(__r_cur - __r_tgt) + Abs(__g_cur - __g_tgt) + Abs(__b_cur - __b_tgt)",
-            f"    if (__diff <= ({p_tol} * 3)) {{",
-            "        MultiPixel_AnyMatch := 1",
-            "    } else {",
-            "        MultiPixel_AllMatch := 0",
-            "    }",
+            f'{prefix}_TargetHwnd := EnsureTargetWindow({prefix}_TargetHwnd, "{ahk_quote(window)}", "{ahk_quote(clean_exe)}")',
+            f"if ({prefix}_TargetHwnd)",
+            "{",
+            f"    VarSetCapacity({prefix}_Origin, 8, 0)",
+            f"    NumPut(0, {prefix}_Origin, 0, \"int\")",
+            f"    NumPut(0, {prefix}_Origin, 4, \"int\")",
+            f'    DllCall("ClientToScreen", "ptr", {prefix}_TargetHwnd, "ptr", &{prefix}_Origin)',
+            f"    {prefix}_BaseX := NumGet({prefix}_Origin, 0, \"int\")",
+            f"    {prefix}_BaseY := NumGet({prefix}_Origin, 4, \"int\")",
+            f"    {prefix}_TargetValid := 1",
+            "}",
+            "else",
+            f'    Log("multi pixel target window not found: {ahk_quote(window or clean_exe)}")',
         ])
-    if match_policy == "any":
-        check_cond = "MultiPixel_AnyMatch = 1"
-    else:
-        check_cond = "MultiPixel_AllMatch = 1"
+    if not pixels:
+        lines.extend([
+            f'Log("multi pixel configuration error: no enabled pixels")',
+            f'{found_var} := 0',
+        ])
+        return lines
+
     lines.extend([
-        f"    if ({check_cond}) {{",
-        f"        {store_var} := 1",
-        "        break",
+        f"if ({prefix}_TargetValid)",
+        "{",
+        f'    {prefix}_Payload := "{{""cmd"":""multi_pixel"",""points"":["',
+    ])
+    for index, point in enumerate(pixels, start=1):
+        x = int(point.get("x") or 0)
+        y = int(point.get("y") or 0)
+        color = str(point.get("color") or "#FFFFFF").strip().upper()
+        if not color.startswith("#"):
+            color = "#" + color
+        point_tolerance = max(0, min(255, int(point.get("tolerance", tolerance)))) if bool(point.get("custom_tolerance")) else tolerance
+        comma = "," if index > 1 else ""
+        x_expr = f"({prefix}_BaseX + {x})" if relative else str(x)
+        y_expr = f"({prefix}_BaseY + {y})" if relative else str(y)
+        lines.append(
+            f'    {prefix}_Payload .= "{comma}{{""x"":" . {x_expr} . ",""y"":" . {y_expr} . ",""color"":""{color}"",""tolerance"":{point_tolerance},""index"":{index}}}"'
+        )
+    lines.extend([
+        f'    {prefix}_Payload .= "],""match_policy"":""{match_policy}"",""required_count"":{required_count},""stable_hits"":{stable_hits},""timeout"":{timeout},""poll"":{poll_delay},""click_index"":{click_index}}}"',
+        f"    if (VisionEngineStarted != 1 and FileExist(VisionEngineScript))",
+        "    {",
+        '        VisionEngineCmd := """" . PythonExe . """ """ . VisionEngineScript . """ --server --port " . VisionEnginePort . " --idle-timeout 600 --log-file"',
+        "        Run, %VisionEngineCmd%, , Hide",
+        "        VisionEngineStarted := 1",
         "    }",
-        "    if (A_TickCount - MultiPixel_Start >= MultiPixel_Timeout)",
-        "        break",
-        f"    Sleep, %MultiPixel_PollDelay%",
+        f'    {prefix}_Resp := ""',
+        f"    {prefix}_Try := 0",
+        f'    while ({prefix}_Try < 30 and {prefix}_Resp = "")',
+        "    {",
+        f"        {prefix}_Resp := VisionEngine_Send({prefix}_Payload, VisionEnginePort)",
+        f'        if ({prefix}_Resp = "")',
+        "            Sleep, 50",
+        f"        {prefix}_Try += 1",
+        "    }",
+        f'    {found_var} := VisionEngine_IsTrue({prefix}_Resp, "found")',
+        f'    {store_var} := {found_var}',
+        f'    {store_count_var} := VisionEngine_ParseField({prefix}_Resp, "match_count") + 0',
+        f'    {prefix}_MatchedIndexes := VisionEngine_ParseField({prefix}_Resp, "matched_indexes_csv")',
+        f'    {prefix}_FirstX := VisionEngine_ParseField({prefix}_Resp, "x") + 0',
+        f'    {prefix}_FirstY := VisionEngine_ParseField({prefix}_Resp, "y") + 0',
+        f'    {prefix}_ClickX := VisionEngine_ParseField({prefix}_Resp, "click_x") + {click_offset_x}',
+        f'    {prefix}_ClickY := VisionEngine_ParseField({prefix}_Resp, "click_y") + {click_offset_y}',
+        f'    {prefix}_Elapsed := VisionEngine_ParseField({prefix}_Resp, "elapsed_ms")',
         "}",
     ])
-    if coord_mode == "Window":
-        lines.append("CoordMode, Pixel, Screen")
-    if action_on_found == "click_first" and pixels:
-        first_x = int(pixels[0].get("x") or 0)
-        first_y = int(pixels[0].get("y") or 0)
+    if action_on_found in {"click_first", "click_index"}:
         lines.extend([
-            f"if ({store_var} = 1) {{",
-            f"    Click, {first_x}, {first_y}",
-            "}",
+            f"if ({found_var})",
+            "{",
         ])
+        if click_mode == "inactive" and relative:
+            lines.extend([
+                f"    {prefix}_ClientX := {prefix}_ClickX",
+                f"    {prefix}_ClientY := {prefix}_ClickY",
+                f"    VarSetCapacity({prefix}_ClickPt, 8, 0)",
+                f"    NumPut({prefix}_ClientX, {prefix}_ClickPt, 0, \"int\")",
+                f"    NumPut({prefix}_ClientY, {prefix}_ClickPt, 4, \"int\")",
+                f'    DllCall("ScreenToClient", "ptr", {prefix}_TargetHwnd, "ptr", &{prefix}_ClickPt)',
+                f"    {prefix}_ClientX := NumGet({prefix}_ClickPt, 0, \"int\")",
+                f"    {prefix}_ClientY := NumGet({prefix}_ClickPt, 4, \"int\")",
+                f"    ControlClick, x%{prefix}_ClientX% y%{prefix}_ClientY%, ahk_id %{prefix}_TargetHwnd%,, Left, 1, NA",
+            ])
+        else:
+            lines.extend([
+                "    CoordMode, Mouse, Screen",
+                f"    Click, %{prefix}_ClickX%, %{prefix}_ClickY%",
+            ])
+        lines.append("}")
     if sleep_after > 0:
         lines.append(f"Sleep, {sleep_after}")
     return lines
@@ -5288,7 +5359,7 @@ def render_step(
     if action == "ocr_tracking":
         return render_ocr_tracking(step, assets)
     if action == "multi_pixel_check":
-        return render_multi_pixel_check(step)
+        return render_multi_pixel_check(step, step_index)
     if action == "wait_color":
         return render_wait_color(step)
     if action == "color_ratio":
@@ -5435,7 +5506,7 @@ def _expand_macro_steps(
                 has_internal_fail = int(prepared.get(child_fail_field) or 0) > 0
             except (TypeError, ValueError):
                 has_internal_fail = False
-            if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "text_condition", "multi_image_search", "animation_search"} and not has_internal_fail:
+            if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "text_condition", "multi_image_search", "animation_search", "multi_pixel_check"} and not has_internal_fail:
                 if fail_target:
                     prepared[child_fail_field] = fail_target
                 else:
@@ -5496,7 +5567,7 @@ def render_macro_script(
                 or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
             )
         )
-        or step.get("action") in {"multi_image_search", "animation_search"}
+        or step.get("action") in {"multi_image_search", "animation_search", "multi_pixel_check"}
         for step in steps
     )
     if has_vision:
@@ -5702,7 +5773,7 @@ def render_macro_script(
         else:
             lines.extend(render_step(step, assets, count, browser_fast))
         if end_step and count == end_step:
-            if action not in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search"}:
+            if action not in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search", "multi_pixel_check"}:
                 lines.append("Return")
                 lines.append("")
                 continue
@@ -5711,12 +5782,14 @@ def render_macro_script(
             lines.append("")
             continue
 
-        if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search"}:
+        if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search", "multi_pixel_check"}:
             found_var = (
                 f"__step_found_{count}"
                 if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}
                 else f"__pixel_search_success_{count}"
                 if action == "pixel_search"
+                else f"__multi_pixel_success_{count}"
+                if action == "multi_pixel_check"
                 else f"__time_condition_success_{count}"
                 if action == "datetime_condition"
                 else "__ocr_success"
@@ -5743,6 +5816,11 @@ def render_macro_script(
             elif action == "pixel_search":
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "matches=" . PixelSearch_MatchCount_{count} . "; first_x=" . PixelSearch_FirstX_{count} . "; first_y=" . PixelSearch_FirstY_{count})'
+                )
+            elif action == "multi_pixel_check":
+                multi_count_var = normalize_variable_name(step.get("store_count_var") or "MultiPixelMatchCount") or "MultiPixelMatchCount"
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "matches=" . MultiPixel_{count}_MatchedIndexes . "; count=" . {multi_count_var} . "; elapsed_ms=" . MultiPixel_{count}_Elapsed)'
                 )
             elif action == "ocr":
                 store_var = normalize_variable_name(step.get("store_var"))
@@ -5795,6 +5873,11 @@ def render_macro_script(
             elif action == "pixel_search":
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "matches=" . PixelSearch_MatchCount_{count} . "; result=not_found_or_condition_failed")'
+                )
+            elif action == "multi_pixel_check":
+                multi_count_var = normalize_variable_name(step.get("store_count_var") or "MultiPixelMatchCount") or "MultiPixelMatchCount"
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "count=" . {multi_count_var} . "; result=not_found_or_condition_failed")'
                 )
             elif action == "ocr":
                 lines.append(
@@ -5902,7 +5985,7 @@ def prepare_macro_for_runtime(macro: Dict[str, Any], runtime_mode: str = "auto")
             str(step.get("action") or "")
             for step in steps
             if isinstance(step, dict)
-            and str(step.get("action") or "") in {"browser_action", "ocr", "table_excel_read", "table_excel_write"}
+            and str(step.get("action") or "") in {"browser_action", "ocr", "table_excel_read", "table_excel_write", "multi_pixel_check"}
         }
         if python_actions:
             labels = {
@@ -5910,6 +5993,7 @@ def prepare_macro_for_runtime(macro: Dict[str, Any], runtime_mode: str = "auto")
                 "ocr": "OCR",
                 "table_excel_read": "Excel 읽기",
                 "table_excel_write": "Excel 쓰기",
+                "multi_pixel_check": "다중 픽셀 동일 프레임 검사",
             }
             detail = ", ".join(labels.get(action, action) for action in sorted(python_actions))
             raise ValueError(
@@ -6001,7 +6085,7 @@ def export_macro_payload(
                 or (isinstance(step.get("assets"), list) and len(step.get("assets") or []) > 1)
             )
         )
-        or step.get("action") in {"multi_image_search", "animation_search"}
+        or step.get("action") in {"multi_image_search", "animation_search", "multi_pixel_check"}
         for step in expanded_steps
     ):
         for helper_name in ("opencv_search.py", "vision_engine.py"):

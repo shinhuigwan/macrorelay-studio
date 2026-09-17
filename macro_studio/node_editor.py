@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -3855,6 +3856,21 @@ class NodeCanvas(QtWidgets.QWidget):
         if action in {"image_search", "screen_condition"}:
             assets = step.get("assets") if isinstance(step.get("assets"), list) else []
             return f"멀티 이미지 {len(assets)}개" if len(assets) > 1 else str(step.get("asset") or "이미지 선택 필요")
+        if action == "multi_pixel_check":
+            raw = step.get("pixels") or []
+            try:
+                points = json.loads(raw) if isinstance(raw, str) else list(raw)
+            except Exception:
+                points = []
+            count = sum(1 for item in points if isinstance(item, dict) and bool(item.get("enabled", True)))
+            policy = str(step.get("match_policy") or "all")
+            condition = {
+                "all": "모두",
+                "any": "1개 이상",
+                "at_least_n": f"{int(step.get('required_count') or 1)}개 이상",
+                "exact_n": f"정확히 {int(step.get('required_count') or 1)}개",
+            }.get(policy, policy)
+            return f"픽셀 {count}개 · {condition}"
         if action == "datetime_condition":
             if "weekday_enabled" in step:
                 day_text = str(step.get("custom_days") or "요일 지정") if step.get("weekday_enabled") else "매일"

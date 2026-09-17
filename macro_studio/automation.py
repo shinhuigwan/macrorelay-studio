@@ -19,7 +19,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .action_editor import ActionEditor, CoordinatePickerDialog, WindowPickerDialog, action_template
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
 from .node_editor import ACTION_TITLES
-from .screen_coordinates import logical_point_to_native, logical_rect_to_native, native_point_to_logical, native_rect_to_logical, rect_to_exclusive_list
+from .screen_coordinates import display_coordinate_maps, logical_point_to_native, logical_rect_to_native, native_point_to_logical, native_rect_to_logical, rect_to_exclusive_list
 from .theme import COLORS
 from .widgets import WheelSafeSpinBox
 
@@ -778,7 +778,14 @@ class PixelColorPickerDialog(QtWidgets.QDialog):
 class MultiPixelPickerDialog(QtWidgets.QDialog):
     """Fullscreen overlay with magnifier lens for extracting multiple pixel colors sequentially."""
 
-    def __init__(self, pixmap: QtGui.QPixmap, geometry: QtCore.QRect, parent=None) -> None:
+    def __init__(
+        self,
+        pixmap: QtGui.QPixmap,
+        geometry: QtCore.QRect,
+        parent=None,
+        *,
+        ignored_hwnds: set[int] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool
@@ -791,11 +798,20 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
         self._mouse_pos = QtGui.QCursor.pos()
         self._zoom = 8
         self._lens_size = 140
+        self._ignored_hwnds = set(ignored_hwnds or ())
+        self._target: dict[str, Any] | None = None
+        self._coordinate_mode = "Screen"
         self.setMouseTracking(True)
         self.setStyleSheet("background: transparent;")
 
     def selected_points(self) -> list[dict[str, Any]]:
         return self._points
+
+    def selected_target(self) -> dict[str, Any]:
+        return dict(self._target or {})
+
+    def coordinate_mode(self) -> str:
+        return self._coordinate_mode
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         self._mouse_pos = event.globalPosition().toPoint() if hasattr(event, 'globalPosition') else event.globalPos()
@@ -810,16 +826,44 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
             if 0 <= local_x < img.width() and 0 <= local_y < img.height():
                 native_pos = logical_point_to_native(screen_pos)
                 color = _native_pixel_color(native_pos, img.pixelColor(local_x, local_y))
+                target = ActionEditor._window_target_at(
+                    native_pos,
+                    self._ignored_hwnds,
+                    position_is_native=True,
+                )
+                if not self._points and target and str(target.get("capture_scope") or "") == "client":
+                    self._target = dict(target)
+                    self._coordinate_mode = "Client"
+                elif self._target:
+                    if not target or int(target.get("hwnd") or 0) != int(self._target.get("hwnd") or 0):
+                        QtWidgets.QToolTip.showText(
+                            screen_pos,
+                            "첫 번째 핀과 같은 대상 프로그램 안에서 선택하세요.",
+                            self,
+                        )
+                        return
+
+                stored_x = native_pos.x()
+                stored_y = native_pos.y()
+                if self._target and self._coordinate_mode == "Client":
+                    origin = self._target.get("client_origin") or [0, 0]
+                    stored_x -= int(origin[0])
+                    stored_y -= int(origin[1])
                 self._points.append({
-                    "x": native_pos.x(),
-                    "y": native_pos.y(),
+                    "x": stored_x,
+                    "y": stored_y,
                     "color": color.name().upper(),
                     "tolerance": 10,
+                    "custom_tolerance": False,
+                    "enabled": True,
                 })
                 self.update()
         elif event.button() == QtCore.Qt.RightButton:
             if self._points:
                 self._points.pop()
+                if not self._points:
+                    self._target = None
+                    self._coordinate_mode = "Screen"
                 self.update()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
@@ -844,8 +888,13 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
 
         # Draw already marked pin badges
         for idx, pt in enumerate(self._points, start=1):
-            px = pt["x"] - self._geometry.left()
-            py = pt["y"] - self._geometry.top()
+            native_point = QtCore.QPoint(int(pt["x"]), int(pt["y"]))
+            if self._target and self._coordinate_mode == "Client":
+                origin = self._target.get("client_origin") or [0, 0]
+                native_point += QtCore.QPoint(int(origin[0]), int(origin[1]))
+            logical_point = native_point_to_logical(native_point)
+            px = logical_point.x() - self._geometry.left()
+            py = logical_point.y() - self._geometry.top()
             clr = QtGui.QColor(pt["color"])
             painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 2))
             painter.setBrush(clr)
@@ -936,7 +985,8 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
                 f"{len(self._points)}개 선택됨",
             )
 
-        hint = f"[ 다중 픽셀 선택 ] 좌클릭: 핀 추가 ({len(self._points)}개) · 우클릭: 취소 · Enter: 완료 · ESC: 취소"
+        target_label = str((self._target or {}).get("exe") or "전체 화면")
+        hint = f"[ 다중 픽셀 선택 · {target_label} ] 좌클릭: 핀 추가 ({len(self._points)}개) · 우클릭: 취소 · Enter: 완료 · ESC: 취소"
         font = painter.font()
         font.setPointSize(11)
         font.setBold(True)
@@ -955,6 +1005,236 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
         painter.setPen(QtGui.QColor("#FFFFFF"))
         painter.drawText(hint_bg, QtCore.Qt.AlignCenter, hint)
         painter.end()
+
+
+def _multi_pixel_target_client_rect(window: str, window_exe: str) -> QtCore.QRect:
+    """Resolve the current physical client rectangle for a stored window selector."""
+    if not window and not window_exe:
+        return QtCore.QRect()
+    try:
+        from .image_search_test import _find_window
+
+        hwnd = int(_find_window(window_exe, window) or 0)
+        if not hwnd:
+            return QtCore.QRect()
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        origin = wintypes.POINT(0, 0)
+        if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+            return QtCore.QRect()
+        if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+            return QtCore.QRect()
+        return QtCore.QRect(
+            int(origin.x),
+            int(origin.y),
+            int(rect.right - rect.left),
+            int(rect.bottom - rect.top),
+        )
+    except Exception:
+        return QtCore.QRect()
+
+
+class MultiPixelPreviewCanvas(QtWidgets.QWidget):
+    """Scaled client screenshot with numbered pixel pins."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.image = QtGui.QImage()
+        self.points: list[dict[str, Any]] = []
+        self.capture_rect = QtCore.QRect()
+        self.relative = True
+        self.setMinimumSize(640, 420)
+
+    def set_snapshot(
+        self,
+        image: QtGui.QImage,
+        capture_rect: QtCore.QRect,
+        points: list[dict[str, Any]],
+        *,
+        relative: bool,
+    ) -> None:
+        self.image = QtGui.QImage(image)
+        self.capture_rect = QtCore.QRect(capture_rect)
+        self.points = [dict(item) for item in points]
+        self.relative = bool(relative)
+        self.update()
+
+    def _image_rect(self) -> QtCore.QRect:
+        if self.image.isNull():
+            return self.rect().adjusted(12, 12, -12, -12)
+        size = self.image.size().scaled(self.size() - QtCore.QSize(24, 24), QtCore.Qt.KeepAspectRatio)
+        return QtCore.QRect(QtCore.QPoint(), size).translated(
+            (self.width() - size.width()) // 2,
+            (self.height() - size.height()) // 2,
+        )
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor("#090B10"))
+        target = self._image_rect()
+        if self.image.isNull():
+            painter.setPen(QtGui.QColor("#F87171"))
+            painter.drawText(target, QtCore.Qt.AlignCenter, "대상 프로그램 화면을 캡처할 수 없습니다.")
+            return
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        painter.drawImage(target, self.image)
+        sx = target.width() / max(1, self.image.width())
+        sy = target.height() / max(1, self.image.height())
+        for index, point in enumerate(self.points, start=1):
+            if not bool(point.get("enabled", True)):
+                continue
+            px = int(point.get("x") or 0)
+            py = int(point.get("y") or 0)
+            if not self.relative:
+                px -= self.capture_rect.x()
+                py -= self.capture_rect.y()
+            x = target.x() + round(px * sx)
+            y = target.y() + round(py * sy)
+            color = QtGui.QColor(str(point.get("color") or "#FFFFFF"))
+            painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 2))
+            painter.setBrush(color)
+            painter.drawEllipse(QtCore.QPoint(x, y), 10, 10)
+            painter.setPen(QtGui.QColor("#000000") if color.lightness() > 128 else QtGui.QColor("#FFFFFF"))
+            painter.drawText(QtCore.QRect(x - 10, y - 10, 20, 20), QtCore.Qt.AlignCenter, str(index))
+
+
+class MultiPixelPreviewDialog(QtWidgets.QDialog):
+    """Live same-frame preview for a multi-pixel condition."""
+
+    def __init__(self, step: dict[str, Any], parent=None) -> None:
+        super().__init__(parent)
+        self.step = dict(step)
+        raw = self.step.get("pixels") or []
+        try:
+            self.points = json.loads(raw) if isinstance(raw, str) else list(raw)
+        except Exception:
+            self.points = []
+        self.points = [dict(item) for item in self.points if isinstance(item, dict)]
+        self.relative = str(self.step.get("pixel_coords") or "screen").casefold() == "relative"
+        self.setWindowTitle("다중 픽셀 · 미리보기 및 실시간 검사")
+        self.resize(1180, 760)
+
+        root = QtWidgets.QHBoxLayout(self)
+        side = QtWidgets.QVBoxLayout()
+        self.target_label = QtWidgets.QLabel()
+        self.target_label.setWordWrap(True)
+        self.result_label = QtWidgets.QLabel()
+        self.result_label.setWordWrap(True)
+        self.result_label.setStyleSheet("font-size:12pt; font-weight:800; padding:10px; border-radius:8px;")
+        self.list = QtWidgets.QListWidget()
+        self.list.setMinimumWidth(390)
+        side.addWidget(self.target_label)
+        side.addWidget(self.result_label)
+        side.addWidget(self.list, 1)
+        refresh = QtWidgets.QPushButton("↻ 지금 다시 검사")
+        refresh.clicked.connect(self.refresh_preview)
+        side.addWidget(refresh)
+        close = QtWidgets.QPushButton("닫기")
+        close.clicked.connect(self.accept)
+        side.addWidget(close)
+        root.addLayout(side, 0)
+        self.canvas = MultiPixelPreviewCanvas()
+        root.addWidget(self.canvas, 1)
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(350)
+        self.timer.timeout.connect(self.refresh_preview)
+        self.finished.connect(lambda _result: self.timer.stop())
+        self.timer.start()
+        self.refresh_preview()
+
+    @staticmethod
+    def _matches(current: QtGui.QColor, expected: QtGui.QColor, tolerance: int) -> bool:
+        return max(
+            abs(current.red() - expected.red()),
+            abs(current.green() - expected.green()),
+            abs(current.blue() - expected.blue()),
+        ) <= max(0, min(255, int(tolerance)))
+
+    def refresh_preview(self) -> None:
+        window = str(self.step.get("window") or "")
+        window_exe = str(self.step.get("window_exe") or "")
+        if self.relative:
+            capture_rect = _multi_pixel_target_client_rect(window, window_exe)
+        else:
+            desktop_rect = QtCore.QRect()
+            for mapping in display_coordinate_maps():
+                desktop_rect = desktop_rect.united(mapping.native)
+            active_points = [item for item in self.points if bool(item.get("enabled", True))]
+            if active_points:
+                xs = [int(item.get("x") or 0) for item in active_points]
+                ys = [int(item.get("y") or 0) for item in active_points]
+                capture_rect = QtCore.QRect(
+                    min(xs) - 100,
+                    min(ys) - 100,
+                    max(xs) - min(xs) + 201,
+                    max(ys) - min(ys) + 201,
+                ).intersected(desktop_rect)
+            else:
+                capture_rect = desktop_rect
+        image = _native_region_image(capture_rect, QtGui.QImage()) if capture_rect.isValid() else QtGui.QImage()
+        self.canvas.set_snapshot(image, capture_rect, self.points, relative=self.relative)
+        self.list.clear()
+        matched = 0
+        enabled = 0
+        global_tolerance = int(self.step.get("tolerance") or 10)
+        for index, point in enumerate(self.points, start=1):
+            if not bool(point.get("enabled", True)):
+                self.list.addItem(f"{index}. 비활성")
+                continue
+            enabled += 1
+            px = int(point.get("x") or 0)
+            py = int(point.get("y") or 0)
+            sample_x = px if self.relative else px - capture_rect.x()
+            sample_y = py if self.relative else py - capture_rect.y()
+            expected = QtGui.QColor(str(point.get("color") or "#FFFFFF"))
+            tolerance = int(point.get("tolerance", global_tolerance)) if bool(point.get("custom_tolerance")) else global_tolerance
+            current = image.pixelColor(sample_x, sample_y) if 0 <= sample_x < image.width() and 0 <= sample_y < image.height() else QtGui.QColor()
+            ok = current.isValid() and self._matches(current, expected, tolerance)
+            matched += int(ok)
+            state = "✓ 일치" if ok else "✕ 불일치"
+            current_name = current.name().upper() if current.isValid() else "범위 밖"
+            item = QtWidgets.QListWidgetItem(
+                f"{index}. {state}  저장 {expected.name().upper()}  현재 {current_name}  허용 ±{tolerance}\n"
+                f"    좌표 ({px}, {py})"
+            )
+            item.setForeground(QtGui.QColor("#4ADE80" if ok else "#F87171"))
+            item.setIcon(self._color_icon(expected))
+            self.list.addItem(item)
+
+        policy = str(self.step.get("match_policy") or "all").casefold()
+        required = int(self.step.get("required_count") or 2)
+        if policy == "any":
+            success = matched >= 1
+            condition = "1개 이상"
+        elif policy == "at_least_n":
+            success = matched >= required
+            condition = f"{required}개 이상"
+        elif policy == "exact_n":
+            success = matched == required
+            condition = f"정확히 {required}개"
+        else:
+            success = enabled > 0 and matched == enabled
+            condition = "모두"
+        self.result_label.setText(f"{'참(TRUE)' if success else '거짓(FALSE)'} · {matched}/{enabled}개 일치 · 조건: {condition}")
+        self.result_label.setStyleSheet(
+            f"font-size:12pt; font-weight:800; padding:10px; border-radius:8px; "
+            f"background:{'#143528' if success else '#3A171D'}; color:{'#4ADE80' if success else '#F87171'};"
+        )
+        self.target_label.setText(
+            f"대상: {window_exe or window or '전체 화면'} · "
+            f"{'클라이언트 상대 좌표' if self.relative else '화면 절대 좌표'}\n"
+            "모든 픽셀은 현재 한 화면 캡처에서 동시에 판정됩니다."
+        )
+
+    @staticmethod
+    def _color_icon(color: QtGui.QColor) -> QtGui.QIcon:
+        pixmap = QtGui.QPixmap(24, 24)
+        pixmap.fill(color)
+        return QtGui.QIcon(pixmap)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.timer.stop()
+        super().closeEvent(event)
 
 
 class DraggableIconWrapper(QtWidgets.QWidget):
@@ -3296,10 +3576,16 @@ class SmartRecordingController(QtCore.QObject):
                         if picker.exec() == QtWidgets.QDialog.Accepted:
                             pts = picker.selected_points()
                             if pts:
-                                import json
+                                target = picker.selected_target()
+                                coordinate_mode = picker.coordinate_mode()
                                 event.update({
                                     "pixels": json.dumps(pts, ensure_ascii=False),
                                     "match_policy": "all",
+                                    "required_count": len(pts),
+                                    "coord_mode": coordinate_mode,
+                                    "pixel_coords": "relative" if coordinate_mode == "Client" else "screen",
+                                    "window": str(target.get("window") or ""),
+                                    "window_exe": str(target.get("exe") or ""),
                                     "detail": f"다중 픽셀 체크 ({len(pts)}개 점)",
                                 })
                 finally:
@@ -5834,8 +6120,18 @@ class QuickActionWizard:
             pts = picker.selected_points()
             if not pts:
                 return None
-            import json
-            step.update({"pixels": json.dumps(pts, ensure_ascii=False), "label": f"다중 픽셀 체크 ({len(pts)}개 점)"})
+            target = picker.selected_target()
+            coordinate_mode = picker.coordinate_mode()
+            step.update({
+                "pixels": json.dumps(pts, ensure_ascii=False),
+                "match_policy": "all",
+                "required_count": len(pts),
+                "coord_mode": coordinate_mode,
+                "pixel_coords": "relative" if coordinate_mode == "Client" else "screen",
+                "window": str(target.get("window") or ""),
+                "window_exe": str(target.get("exe") or ""),
+                "label": f"다중 픽셀 체크 ({len(pts)}개 점)",
+            })
             return step
         if action == "wait_color":
             pixmap, geometry = capture_virtual_desktop()

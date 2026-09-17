@@ -2227,6 +2227,22 @@ class BuilderPage(QtWidgets.QWidget):
                 time_text += f"~{step.get('time_end') or '23:59'}"
             wait_text = " · 조건까지 대기" if step.get("wait_until") else ""
             return f"{time_text} · 날짜·시간 조건{wait_text}"
+        if action == "multi_pixel_check":
+            raw = step.get("pixels") or []
+            try:
+                points = json.loads(raw) if isinstance(raw, str) else list(raw)
+            except Exception:
+                points = []
+            count = sum(1 for item in points if isinstance(item, dict) and bool(item.get("enabled", True)))
+            policy = str(step.get("match_policy") or "all")
+            condition = {
+                "all": "모두",
+                "any": "1개 이상",
+                "at_least_n": f"{int(step.get('required_count') or 1)}개 이상",
+                "exact_n": f"정확히 {int(step.get('required_count') or 1)}개",
+            }.get(policy, policy)
+            target = str(step.get("window_exe") or "전체 화면")
+            return f"픽셀 {count}개 · {condition} · {target}"
         if action == "type_text":
             text = str(step.get("text") or "")
             return text[:30] or "텍스트 입력"

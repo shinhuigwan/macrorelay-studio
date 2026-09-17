@@ -96,6 +96,17 @@ class MacroHelpDialog(QtWidgets.QDialog):
     </ul>
 </div>
 
+<div style='background: #171D28; border: 1px solid #2B384E; border-radius: 8px; padding: 14px; margin-bottom: 14px;'>
+    <h3 style='color: #FF6B9D; margin-top: 0;'>❖ 다중 픽셀 동일 프레임 검사</h3>
+    <ul>
+        <li><b>대상 자동 지정</b>: 첫 핀을 찍은 프로그램이 자동 선택되고 좌표는 클라이언트 기준으로 저장됩니다.</li>
+        <li><b>실시간 미리보기</b>: 저장 색상과 현재 색상, 허용 오차, 픽셀별 일치 여부를 한 화면에서 확인합니다.</li>
+        <li><b>N-of-M 조건</b>: 모두, 하나 이상, 지정 개수 이상, 정확히 지정 개수 일치를 선택할 수 있습니다.</li>
+        <li><b>안정화</b>: 같은 프레임에서 모든 핀을 판정하고 연속 확인 횟수로 애니메이션·깜빡임 오판을 줄입니다.</li>
+        <li><b>후속 동작</b>: True/Fail 노드 분기 또는 일치 픽셀 일반/비활성 클릭과 오프셋을 사용할 수 있습니다.</li>
+    </ul>
+</div>
+
 <div style='background: #171D28; border: 1px solid #2B384E; border-radius: 8px; padding: 14px;'>
     <h3 style='color: #F87171; margin-top: 0;'>🎯 검색 실패 시 대체 클릭 (오프셋 클릭)</h3>
     <p>화면에서 대상을 못 찾았을 때 멈추지 않고, <b>창 닫기 버튼(X)이나 빈 화면을 대신 클릭</b>하도록 설정할 수 있습니다.</p>

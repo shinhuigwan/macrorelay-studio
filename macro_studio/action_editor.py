@@ -888,7 +888,7 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("poll_delay", "반복 간격", "duration", 100, 10, 60_000, section="타이밍"),
     ],
     "multi_pixel_check": [
-        FieldSpec("pixels", "픽셀 목록 (JSON/텍스트)", "multiline", "[]", tooltip='예: [{"x": 100, "y": 200, "color": "#FF0000"}]', placeholder='[{"x": 100, "y": 200, "color": "#FF0000"}]'),
+        FieldSpec("pixels", "색상 샘플 목록 (JSON/텍스트)", "multiline", "[]", tooltip='샘플 좌표는 색상을 추출한 위치입니다. 실제 판정은 아래 검색 영역 안에서 같은 색상을 찾습니다.', placeholder='[{"x": 100, "y": 200, "color": "#FF0000"}]'),
         FieldSpec("match_policy", "일치 조건", "choice", "all", options=choice(
             ("모든 픽셀 일치 (AND) · 권장", "all"),
             ("하나 이상 일치 (OR)", "any"),
@@ -907,6 +907,10 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         ), section="대상 프로그램"),
         FieldSpec("window", "대상 창", "text", "", placeholder="핀을 선택하면 자동 설정", section="대상 프로그램"),
         FieldSpec("window_exe", "대상 프로그램", "text", "", placeholder="예: dnplayer.exe", section="대상 프로그램"),
+        FieldSpec("search_region.0", "검색 영역 왼쪽", "int", 0, -100_000, 100_000, section="검색 영역", tooltip="대상 프로그램 클라이언트 기준 검색 영역입니다. 네 값이 모두 0이면 기존 고정 좌표 방식으로 호환 실행합니다."),
+        FieldSpec("search_region.1", "검색 영역 위", "int", 0, -100_000, 100_000, section="검색 영역"),
+        FieldSpec("search_region.2", "검색 영역 오른쪽", "int", 0, -100_000, 100_000, section="검색 영역"),
+        FieldSpec("search_region.3", "검색 영역 아래", "int", 0, -100_000, 100_000, section="검색 영역"),
         FieldSpec("action_on_found", "일치 시 동작", "choice", "branch", options=choice(
             ("성공 분기 (흐름 제어)", "branch"),
             ("첫 번째 일치 픽셀 클릭", "click_first"),
@@ -916,9 +920,9 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("click_index", "클릭할 픽셀 번호", "int", 1, 1, 999, section="동작 설정"),
         FieldSpec("click_offset_x", "클릭 오프셋 X", "int", 0, -100_000, 100_000, section="동작 설정"),
         FieldSpec("click_offset_y", "클릭 오프셋 Y", "int", 0, -100_000, 100_000, section="동작 설정"),
-        FieldSpec("click_mode", "클릭 방식", "choice", "active", options=choice(
+        FieldSpec("click_mode", "클릭 방식", "choice", "inactive", options=choice(
+            ("비활성 클릭 · 기본값", "inactive"),
             ("일반 클릭", "active"),
-            ("비활성 클릭", "inactive"),
         ), section="동작 설정"),
         FieldSpec("store_var", "결과 저장 변수", "text", "MultiPixelMatch", section="동작 설정"),
         FieldSpec("store_count_var", "일치 개수 저장 변수", "text", "MultiPixelMatchCount", section="동작 설정"),
@@ -2010,6 +2014,8 @@ def action_template(action: str) -> dict[str, Any]:
             continue
         if spec.default not in ("", False, None):
             set_path(payload, spec.key, deepcopy(spec.default))
+    if action == "multi_pixel_check":
+        payload.setdefault("search_region", [0, 0, 0, 0])
     return payload
 
 
@@ -2552,6 +2558,15 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
                 btn_edit.clicked.connect(lambda _, a=alias: self._open_image_editor(a))
                 crow.addWidget(btn_edit)
 
+                btn_remove = QtWidgets.QPushButton("🗑 제거")
+                btn_remove.setToolTip("이 검색 이미지를 목록에서 제거합니다. 이미지 파일 자체는 보관함에 남습니다.")
+                btn_remove.setStyleSheet(
+                    "background:#3A171D; border:1px solid #8B2635; color:#FDA4AF; "
+                    "font-weight:700; padding:4px 8px; border-radius:4px;"
+                )
+                btn_remove.clicked.connect(lambda _checked=False, a=alias: self._remove_alias(a))
+                crow.addWidget(btn_remove)
+
                 scroll_layout.addWidget(card)
 
             scroll_layout.addStretch(1)
@@ -2591,6 +2606,23 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         if self._alias_scroll is not None:
             self._alias_scroll.ensureWidgetVisible(card, 20, 50)
         card.setFocus(QtCore.Qt.OtherFocusReason)
+
+    def _remove_alias(self, alias: str) -> None:
+        alias = str(alias)
+        if alias not in self.aliases:
+            return
+        self.aliases.remove(alias)
+        self._asset_confidences.pop(alias, None)
+        self._asset_regions.pop(alias, None)
+        self._asset_routes.pop(alias, None)
+        self.conf_sliders.pop(alias, None)
+        self.region_widgets.pop(alias, None)
+        for outcome in ("true", "fail"):
+            self._route_buttons.pop((alias, outcome), None)
+        card = self._alias_cards.pop(alias, None)
+        if card is not None:
+            card.hide()
+            card.deleteLater()
 
     def _request_asset_route(self, alias: str, outcome: str) -> None:
         if outcome not in {"true", "fail"}:
@@ -2673,11 +2705,19 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
 
         dlg = RegionVisualTestDialog(cur_step, self.repository, asset_regions=self._asset_regions, parent=self)
         if dlg.exec() == QtWidgets.QDialog.Accepted:
+            new_aliases = dlg.get_aliases()
+            removed = set(self.aliases) - set(new_aliases)
+            for alias in list(removed):
+                self._remove_alias(alias)
+            for alias in new_aliases:
+                if alias not in self.aliases:
+                    self.aliases.append(alias)
+                    self._asset_confidences.setdefault(alias, self._confidence)
             for field in ("region_mode", "region_coords", "region_window", "region_window_exe"):
                 if field in dlg.step:
                     self.step[field] = dlg.step[field]
             updated_regs = dlg.get_asset_regions()
-            self._asset_regions.update(updated_regs)
+            self._asset_regions = {alias: list(reg) for alias, reg in updated_regs.items() if alias in self.aliases}
             for alias, reg in self._asset_regions.items():
                 if alias in self.region_widgets:
                     btn_reg, btn_clear = self.region_widgets[alias]
@@ -2689,6 +2729,8 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
                 if hasattr(self, "btn_pick_region"):
                     w_text = f"[{bounding[0]}, {bounding[1]}, {bounding[2]}, {bounding[3]}]"
                     self.btn_pick_region.setText(f"📐 검색 영역 지정됨: {w_text} (재지정 가능)")
+            elif not self.aliases:
+                self._search_region = None
 
     def get_bounding_region(self) -> list[int] | None:
         valid_regs = [r for r in self._asset_regions.values() if isinstance(r, (list, tuple)) and len(r) >= 4]
@@ -2729,9 +2771,13 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
 
     def get_asset_confidences(self) -> dict[str, int]:
         res: dict[str, int] = {}
-        for alias, (_, spin) in self.conf_sliders.items():
-            res[alias] = spin.value()
+        for alias in self.aliases:
+            controls = self.conf_sliders.get(alias)
+            res[alias] = controls[1].value() if controls is not None else int(self._asset_confidences.get(alias, self._confidence))
         return res
+
+    def get_aliases(self) -> list[str]:
+        return list(self.aliases)
 
     def search_region(self) -> list[int] | None:
         if self._search_region and len(self._search_region) >= 4:
@@ -2864,6 +2910,8 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
     def get_asset_regions(self) -> dict[str, list[int]]:
         res: dict[str, list[int]] = {}
         for alias, reg in self._asset_regions.items():
+            if alias not in self.aliases:
+                continue
             if isinstance(reg, (list, tuple)) and len(reg) >= 4:
                 try:
                     if int(reg[2]) > int(reg[0]) and int(reg[3]) > int(reg[1]):
@@ -3622,8 +3670,9 @@ class ActionEditor(QtWidgets.QWidget):
             buttons.append(("🎨 1단계-B: 추적 색상 스포이트", lambda: self._pick_ocr_track_color(action)))
             buttons.append(("▣ 2단계: OCR 영역 잡기 (드래그)", lambda: self._pick_ocr_track_offset(action)))
         elif action == "multi_pixel_check":
-            buttons.append(("❖ 다중 픽셀 핀 찍기 (돋보기 좌클릭)", lambda: self._pick_multi_pixels(action)))
-            buttons.append(("🔍 선택 픽셀 미리보기 및 실시간 검사", lambda: self._preview_multi_pixels(action)))
+            buttons.append(("❖ 검색 색상 샘플 선택 (돋보기 좌클릭)", lambda: self._pick_multi_pixels(action)))
+            buttons.append(("▣ 색상 검색 영역 지정 (드래그)", lambda: self._pick_region(action, "search_region")))
+            buttons.append(("🎯 클릭 위치로 오프셋 자동 계산", lambda: self._pick_multi_pixel_offset(action)))
             buttons.append(("◎ 대상 프로그램 다시 지정", lambda: self._pick_window(action, "window")))
         elif action == "wait_color":
             buttons.append(("⏳ 목표 색상·좌표 추출 (돋보기 좌클릭)", lambda: self._pick_wait_color(action)))
@@ -4235,7 +4284,19 @@ class ActionEditor(QtWidgets.QWidget):
         if pixmap.isNull() or not geometry.isValid():
             self._restore_host_windows(hosts)
             return
-        picker = MultiPixelPickerDialog(pixmap, geometry, ignored_hwnds=ignored_hwnds)
+        window_widget = self.widgets.get(action, {}).get("window")
+        exe_widget = self.widgets.get(action, {}).get("window_exe")
+        window_spec = next(item for item in ACTION_FIELDS[action] if item.key == "window")
+        exe_spec = next(item for item in ACTION_FIELDS[action] if item.key == "window_exe")
+        preferred_window = str(self._widget_value(window_widget, window_spec) or "")
+        preferred_exe = str(self._widget_value(exe_widget, exe_spec) or "")
+        picker = MultiPixelPickerDialog(
+            pixmap,
+            geometry,
+            ignored_hwnds=ignored_hwnds,
+            preferred_window=preferred_window,
+            preferred_exe=preferred_exe,
+        )
         accepted = picker.exec() == QtWidgets.QDialog.Accepted
         pts = picker.selected_points() if accepted else []
         target = picker.selected_target() if accepted else {}
@@ -4272,10 +4333,74 @@ class ActionEditor(QtWidgets.QWidget):
         except Exception:
             points = []
         if not isinstance(points, list) or not points:
-            QtWidgets.QMessageBox.information(self, "다중 픽셀 미리보기", "먼저 '다중 픽셀 핀 찍기'로 픽셀을 선택하세요.")
+            QtWidgets.QMessageBox.information(self, "다중 픽셀 미리보기", "먼저 '검색 색상 샘플 선택'으로 색상을 선택하세요.")
             return
         dialog = MultiPixelPreviewDialog(draft, self.window())
         dialog.exec()
+
+    def _pick_multi_pixel_offset(self, action: str) -> None:
+        """Set click offsets by clicking the intended destination once."""
+        import json
+        import ctypes
+        import ctypes.wintypes as wt
+
+        raw = self._widget_value(
+            self.widgets.get(action, {}).get("pixels"),
+            next(item for item in ACTION_FIELDS[action] if item.key == "pixels"),
+        )
+        try:
+            points = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+        except Exception:
+            points = []
+        points = [item for item in points if isinstance(item, dict) and bool(item.get("enabled", True))]
+        if not points:
+            QtWidgets.QMessageBox.information(self, "클릭 위치 지정", "먼저 검색할 색상 샘플을 하나 이상 선택하세요.")
+            return
+        click_index_widget = self.widgets.get(action, {}).get("click_index")
+        click_index_spec = next(item for item in ACTION_FIELDS[action] if item.key == "click_index")
+        click_index = int(self._widget_value(click_index_widget, click_index_spec) or 1)
+        reference = points[min(max(1, click_index), len(points)) - 1]
+
+        hosts = self._hide_host_windows()
+        picker = CoordinatePickerDialog()
+        accepted = picker.exec() == QtWidgets.QDialog.Accepted
+        screen_point = QtCore.QPoint(picker.point)
+        self._restore_host_windows(hosts)
+        if not accepted:
+            return
+
+        mode = "Client"
+        mode_widget = self.widgets.get(action, {}).get("coord_mode")
+        if mode_widget is not None:
+            mode_spec = next(item for item in ACTION_FIELDS[action] if item.key == "coord_mode")
+            mode = str(self._widget_value(mode_widget, mode_spec) or "Client")
+        destination = logical_point_to_native(screen_point)
+        if mode.casefold() != "screen":
+            window_widget = self.widgets.get(action, {}).get("window")
+            exe_widget = self.widgets.get(action, {}).get("window_exe")
+            window_spec = next(item for item in ACTION_FIELDS[action] if item.key == "window")
+            exe_spec = next(item for item in ACTION_FIELDS[action] if item.key == "window_exe")
+            window = str(self._widget_value(window_widget, window_spec) or "")
+            window_exe = str(self._widget_value(exe_widget, exe_spec) or "")
+            try:
+                from .image_search_test import _find_window
+                hwnd = int(_find_window(window_exe, window) or 0)
+                origin = wt.POINT(0, 0)
+                rect = wt.RECT()
+                if not hwnd or not ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect)) or not ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+                    raise RuntimeError("target window not found")
+                client_rect = QtCore.QRect(int(origin.x), int(origin.y), int(rect.right), int(rect.bottom))
+                if not client_rect.contains(destination):
+                    QtWidgets.QMessageBox.warning(self, "클릭 위치 지정", "저장된 대상 프로그램 내부를 클릭하세요.")
+                    return
+                destination -= QtCore.QPoint(int(origin.x), int(origin.y))
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "클릭 위치 지정", "저장된 대상 프로그램을 찾지 못했습니다. 대상 프로그램을 다시 지정하세요.")
+                return
+        self._set_field_value(action, "click_offset_x", destination.x() - int(reference.get("x") or 0))
+        self._set_field_value(action, "click_offset_y", destination.y() - int(reference.get("y") or 0))
+        self._set_field_value(action, "click_mode", "inactive")
+        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "클릭 위치를 기준으로 오프셋을 계산했고 비활성 클릭으로 설정했습니다.", self)
 
     def _pick_ocr_track_target(self, action: str) -> None:
         from .automation import capture_virtual_desktop, ScreenCaptureDialog
@@ -4490,6 +4615,23 @@ class ActionEditor(QtWidgets.QWidget):
                     if scope_val == "client":
                         is_client = True
 
+            # Multi-pixel checks use coord_mode/pixel_coords rather than the
+            # image-search region field names.  Treat these as the same client
+            # coordinate contract so the saved target always wins over the
+            # foreground window under the drag rectangle.
+            coord_mode_widget = self.widgets.get(action, {}).get("coord_mode")
+            if coord_mode_widget is not None:
+                spec = next((item for item in ACTION_FIELDS.get(action, []) if item.key == "coord_mode"), None)
+                if spec and str(self._widget_value(coord_mode_widget, spec) or "").casefold() in {"client", "window"}:
+                    is_client = True
+                    basis_mode = "client"
+            pixel_coords_widget = self.widgets.get(action, {}).get("pixel_coords")
+            if pixel_coords_widget is not None:
+                spec = next((item for item in ACTION_FIELDS.get(action, []) if item.key == "pixel_coords"), None)
+                if spec and str(self._widget_value(pixel_coords_widget, spec) or "").casefold() == "relative":
+                    is_client = True
+                    basis_mode = "client"
+
             client_origin = None
             target = None
 
@@ -4562,6 +4704,10 @@ class ActionEditor(QtWidgets.QWidget):
             if client_origin is not None and is_client:
                 if self.widgets.get(action, {}).get("region_coords") is not None:
                     self._set_field_value(action, "region_coords", "relative")
+                if self.widgets.get(action, {}).get("pixel_coords") is not None:
+                    self._set_field_value(action, "pixel_coords", "relative")
+                if self.widgets.get(action, {}).get("coord_mode") is not None:
+                    self._set_field_value(action, "coord_mode", "Client")
                 if basis_mode == "client" and self.widgets.get(action, {}).get("coordinate_scope") is not None:
                     self._set_field_value(action, "coordinate_scope", "client")
 
@@ -5244,8 +5390,9 @@ class ActionEditor(QtWidgets.QWidget):
                     normalized["region"] = list(r0)
                 if len(regions) > 1:
                     normalized["region2"] = list(regions[1])
-            if action == "image_search":
-                normalized["click_enabled"] = isinstance(normalized.get("click"), dict) and bool(normalized.get("click"))
+            if action == "image_search" and "click_enabled" not in normalized:
+                click = normalized.get("click") if isinstance(normalized.get("click"), dict) else {}
+                normalized["click_enabled"] = bool(click.get("click_image") or click.get("click_offset"))
         if action == "ocr":
             if not normalized.get("region") and normalized.get("search_region"):
                 normalized["region"] = list(normalized["search_region"])
@@ -5445,6 +5592,15 @@ class ActionEditor(QtWidgets.QWidget):
             else:
                 click_enabled = bool(payload.get("click_enabled", False))
                 payload["click_enabled"] = click_enabled
+            click_payload = payload.get("click") if isinstance(payload.get("click"), dict) else {}
+            if not bool(click_payload.get("click_image")) and not bool(click_payload.get("click_offset")) and click_target not in {"custom_coord", "each_image"}:
+                click_enabled = False
+                payload["click_enabled"] = False
+                payload["click_target"] = "none"
+            if str(payload.get("wait_condition") or "appear").casefold() == "vanish":
+                payload["click_enabled"] = False
+                payload["click_target"] = "none"
+                payload["repeat_on_success"] = False
 
             if click_target == "custom_coord":
                 if "click" not in payload or not isinstance(payload["click"], dict):
@@ -5564,6 +5720,7 @@ class ActionEditor(QtWidgets.QWidget):
                     "tolerance": max(0, min(255, int(item.get("tolerance", global_tolerance)))),
                     "custom_tolerance": bool(item.get("custom_tolerance", False)),
                     "enabled": bool(item.get("enabled", True)),
+                    **({"region": [int(value) for value in item.get("region")[:4]]} if isinstance(item.get("region"), list) and len(item.get("region")) >= 4 else {}),
                 })
             payload["pixels"] = json.dumps(clean_pixels, ensure_ascii=False)
             enabled_count = sum(1 for item in clean_pixels if item.get("enabled", True))

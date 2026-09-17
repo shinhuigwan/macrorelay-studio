@@ -599,6 +599,24 @@ class NodeColorPreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
         super().mousePressEvent(event)
 
 
+class NodeMultiPixelPreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
+    """Top-right shortcut for the multi-pixel live region preview."""
+
+    def __init__(self, canvas: "NodeCanvas", colors: list[str], step_index: int, parent=None) -> None:
+        super().__init__("▦", parent)
+        self.canvas = canvas
+        self.colors = colors
+        self.step_index = step_index
+        self.setAcceptHoverEvents(True)
+
+    def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            self.canvas.multi_pixel_visual_test_requested.emit(self.step_index)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class TriggerNodeItem(QtWidgets.QGraphicsObject):
     """Visual-only card for a macro-level image trigger.
 
@@ -916,6 +934,24 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 badge.setToolTip(f"<b>캡처 이미지</b><br>{live_pixmap.width()}×{live_pixmap.height()}{region_hint}<br>커서를 올리면 미리보기 · 클릭하면 상세 편집")
             else:
                 badge.setToolTip("이미지 미선택")
+            self.preview_badge = badge
+            badge.setVisible(not self.collapsed)
+        elif str(step.get("action") or "") == "multi_pixel_check":
+            raw = step.get("pixels") or []
+            try:
+                samples = json.loads(raw) if isinstance(raw, str) else list(raw)
+            except Exception:
+                samples = []
+            colors = [str(item.get("color") or "#FFFFFF") for item in samples if isinstance(item, dict) and bool(item.get("enabled", True))]
+            badge = NodeMultiPixelPreviewBadge(canvas, colors, index, self)
+            font = QtGui.QFont("Segoe UI Symbol", 9)
+            font.setBold(True)
+            badge.setFont(font)
+            badge.setBrush(QtGui.QColor(colors[0]) if colors and QtGui.QColor(colors[0]).isValid() else QtGui.QColor("#FF6B9D"))
+            badge.setPos(self.current_width() - 22, 6)
+            badge.setZValue(8)
+            badge.setCursor(QtCore.Qt.PointingHandCursor)
+            badge.setToolTip(f"<b>다중 픽셀 체크 ({len(colors)}색)</b><br>클릭하면 지정 영역의 실시간 색상 검사를 엽니다.")
             self.preview_badge = badge
             badge.setVisible(not self.collapsed)
         elif str(step.get("action") or "") == "pixel_search":
@@ -1674,6 +1710,9 @@ class NodeItem(QtWidgets.QGraphicsObject):
         act_color_test = None
         if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") == "pixel_search":
             act_color_test = menu.addAction("🔍 색상 검색 영역 검증 및 실시간 검사...")
+        act_multi_pixel_test = None
+        if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") == "multi_pixel_check":
+            act_multi_pixel_test = menu.addAction("🔍 다중 픽셀 검색 영역 미리보기 및 실시간 검사...")
         act_image_visual_test = None
         if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             is_mis = str(self.canvas.steps[self.index - 1].get("action") or "") in {"multi_image_search", "animation_search"}
@@ -1754,6 +1793,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
             self.canvas.multi_color_merge_requested.emit(selected_color_nodes)
         elif act_color_test is not None and chosen == act_color_test:
             self.canvas.color_visual_test_requested.emit(self.index)
+        elif act_multi_pixel_test is not None and chosen == act_multi_pixel_test:
+            self.canvas.multi_pixel_visual_test_requested.emit(self.index)
         elif act_image_visual_test is not None and chosen == act_image_visual_test:
             self.canvas.image_visual_test_requested.emit(self.index)
         elif chosen == duplicate:
@@ -3404,6 +3445,7 @@ class NodeCanvas(QtWidgets.QWidget):
     image_edit_requested = QtCore.Signal(int)
     color_visual_test_requested = QtCore.Signal(int)
     image_visual_test_requested = QtCore.Signal(int)
+    multi_pixel_visual_test_requested = QtCore.Signal(int)
     collapsed_changed = QtCore.Signal(list)
     multi_image_merge_requested = QtCore.Signal(list)
     multi_color_merge_requested = QtCore.Signal(list)

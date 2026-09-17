@@ -28,6 +28,16 @@ from .automation import (
 )
 from .bundle_dialog import MacroBundleDialog
 from .log_dialog import MacroLogDialog
+
+
+def _sync_multi_image_count_label(step: dict[str, Any], aliases: list[str]) -> None:
+    """Update only Studio-generated count labels; preserve user-written names."""
+    label = str(step.get("label") or "").strip()
+    prefix = "멀티 이미지 서치 "
+    suffix = "개"
+    count_text = label[len(prefix):-len(suffix)] if label.startswith(prefix) and label.endswith(suffix) else ""
+    if count_text.isdigit():
+        step["label"] = f"{prefix}{len(aliases)}{suffix}"
 from .help_dialog import MacroHelpDialog
 from .inactive_click_lab import HandlePointPicker, InactiveClickLabDialog
 from .image_editor import ImageEditorDialog
@@ -1456,6 +1466,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.asset_route_edit_requested.connect(self._edit_asset_route)
         self.node_canvas.color_visual_test_requested.connect(self._open_node_color_visual_test)
         self.node_canvas.image_visual_test_requested.connect(self._open_node_image_visual_test)
+        self.node_canvas.multi_pixel_visual_test_requested.connect(self._open_node_multi_pixel_visual_test)
         self.node_canvas.multi_image_merge_requested.connect(
             lambda indexes: QtCore.QTimer.singleShot(
                 0, lambda values=list(indexes): self._merge_graph_image_nodes(values)
@@ -1695,6 +1706,13 @@ class BuilderPage(QtWidgets.QWidget):
             focus_alias=focus_alias,
         )
         if exec_image_search_confidence_dialog(dialog) == QtWidgets.QDialog.Accepted:
+            aliases = dialog.get_aliases()
+            step["assets"] = aliases
+            if aliases:
+                step["asset"] = aliases[0]
+            else:
+                step.pop("asset", None)
+            _sync_multi_image_count_label(step, aliases)
             step["confidence"] = dialog.get_confidence()
             step["asset_confidences"] = dialog.get_asset_confidences()
             asset_routes = dialog.get_asset_routes()
@@ -1728,6 +1746,17 @@ class BuilderPage(QtWidgets.QWidget):
                 step.pop("region", None)
                 if isinstance(step.get("regions"), list) and step["regions"] == [[0, 0, 0, 0]]:
                     step.pop("regions", None)
+            for field in ("asset_offsets", "asset_confidences", "asset_regions", "asset_routes"):
+                mapping = step.get(field)
+                if isinstance(mapping, dict):
+                    filtered = {alias: value for alias, value in mapping.items() if alias in aliases}
+                    if filtered:
+                        step[field] = filtered
+                    else:
+                        step.pop(field, None)
+            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+            if automation:
+                automation["image_count"] = len(aliases)
             self._persist(f"{step_index}번 노드의 이미지 신뢰도 및 검색 영역 설정을 저장했습니다.")
             self._refresh_steps(row)
             self.status.emit(f"{step_index}번 노드 이미지 신뢰도 저장 완료 (신뢰도: {step['confidence']}%)")
@@ -2644,6 +2673,21 @@ class BuilderPage(QtWidgets.QWidget):
                 if hasattr(win, "activateWindow"):
                     win.activateWindow()
 
+    def _open_node_multi_pixel_visual_test(self, step_index: int) -> None:
+        steps = list((self.current_macro or {}).get("steps") or [])
+        row = int(step_index) - 1
+        if not 0 <= row < len(steps):
+            return
+        step = steps[row]
+        if str(step.get("action") or "") != "multi_pixel_check":
+            return
+        from .automation import MultiPixelPreviewDialog
+        dialog = MultiPixelPreviewDialog(step, self.window())
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
     def _open_node_image_visual_test(self, step_index: int) -> None:
         steps = list((self.current_macro or {}).get("steps") or [])
         row = int(step_index) - 1
@@ -2673,15 +2717,22 @@ class BuilderPage(QtWidgets.QWidget):
                     step["region_mode"] = dlg.step.get("region_mode", "client")
                     step["region_coords"] = dlg.step.get("region_coords", "relative")
                 aliases = dlg.get_aliases()
+                step["assets"] = aliases
                 if aliases:
-                    step["assets"] = aliases
                     step["asset"] = aliases[0]
+                else:
+                    step.pop("asset", None)
+                _sync_multi_image_count_label(step, aliases)
                 updated_regs = dlg.get_asset_regions()
                 if updated_regs:
                     step["asset_regions"] = updated_regs
+                else:
+                    step.pop("asset_regions", None)
                 offsets = dlg.get_asset_offsets()
                 if offsets:
                     step["asset_offsets"] = offsets
+                else:
+                    step.pop("asset_offsets", None)
                 click_target = dlg.get_click_target()
                 if click_target:
                     step["click_target"] = click_target
@@ -2705,6 +2756,21 @@ class BuilderPage(QtWidgets.QWidget):
                     step["search_region"] = bounding
                     step["region"] = bounding
                     step["regions"] = [bounding]
+                elif not aliases:
+                    step.pop("search_region", None)
+                    step.pop("region", None)
+                    step.pop("regions", None)
+                for field in ("asset_confidences", "asset_routes"):
+                    mapping = step.get(field)
+                    if isinstance(mapping, dict):
+                        filtered = {alias: value for alias, value in mapping.items() if alias in aliases}
+                        if filtered:
+                            step[field] = filtered
+                        else:
+                            step.pop(field, None)
+                automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+                if automation:
+                    automation["image_count"] = len(aliases)
                 self._persist(f"{step_index}번 노드의 멀티 이미지 및 검색 영역을 보정했습니다.")
                 self._refresh_steps(row)
         finally:

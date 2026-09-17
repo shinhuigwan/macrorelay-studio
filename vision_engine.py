@@ -736,7 +736,7 @@ class VisionState:
             }
 
     def multi_pixel(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Evaluate every configured point from one captured frame per poll."""
+        """Find each configured colour inside its region from one frame per poll."""
         started = time.perf_counter()
         with self._lock:
             self.last_activity = time.time()
@@ -753,6 +753,13 @@ class VisionState:
                     expected = int(color, 16)
                 except (TypeError, ValueError):
                     continue
+                raw_region = item.get("region")
+                try:
+                    region = [int(value) for value in raw_region[:4]] if isinstance(raw_region, list) and len(raw_region) >= 4 else [x, y, x + 1, y + 1]
+                except (TypeError, ValueError):
+                    region = [x, y, x + 1, y + 1]
+                if region[2] <= region[0] or region[3] <= region[1]:
+                    region = [x, y, x + 1, y + 1]
                 points.append(
                     {
                         "x": x,
@@ -762,15 +769,16 @@ class VisionState:
                         "b": expected & 0xFF,
                         "tolerance": max(0, min(255, int(item.get("tolerance") or 0))),
                         "source_index": int(item.get("index") or len(points) + 1),
+                        "region": region,
                     }
                 )
             if not points:
                 return {"ok": False, "found": False, "error": "NO_PIXELS", "detail": "no enabled pixels"}
 
-            left = min(item["x"] for item in points)
-            top = min(item["y"] for item in points)
-            right = max(item["x"] for item in points) + 1
-            bottom = max(item["y"] for item in points) + 1
+            left = min(item["region"][0] for item in points)
+            top = min(item["region"][1] for item in points)
+            right = max(item["region"][2] for item in points)
+            bottom = max(item["region"][3] for item in points)
             policy = str(request.get("match_policy") or "all").casefold()
             required = max(1, int(request.get("required_count") or 1))
             if policy == "all":
@@ -799,11 +807,23 @@ class VisionState:
                 matches: list[dict[str, Any]] = []
                 if frame is not None and getattr(frame, "size", 0):
                     for item in points:
-                        pixel = frame[item["y"] - top, item["x"] - left]
-                        blue, green, red = (int(pixel[0]), int(pixel[1]), int(pixel[2]))
+                        region = item["region"]
+                        x1 = max(0, region[0] - left)
+                        y1 = max(0, region[1] - top)
+                        x2 = min(frame.shape[1], region[2] - left)
+                        y2 = min(frame.shape[0], region[3] - top)
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        crop = frame[y1:y2, x1:x2, :3]
                         tolerance = item["tolerance"]
-                        if max(abs(red - item["r"]), abs(green - item["g"]), abs(blue - item["b"])) <= tolerance:
-                            matches.append(item)
+                        delta = abs(crop.astype("int16") - [item["b"], item["g"], item["r"]])
+                        mask = (delta <= tolerance).all(axis=2)
+                        locations = mask.nonzero()
+                        if locations[0].size:
+                            matched = dict(item)
+                            matched["x"] = int(left + x1 + locations[1][0])
+                            matched["y"] = int(top + y1 + locations[0][0])
+                            matches.append(matched)
                 match_count = len(matches)
                 best_count = max(best_count, match_count)
                 if policy == "exact_n":

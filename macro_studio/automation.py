@@ -785,6 +785,8 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
         parent=None,
         *,
         ignored_hwnds: set[int] | None = None,
+        preferred_window: str = "",
+        preferred_exe: str = "",
     ) -> None:
         super().__init__(parent)
         self.setWindowFlags(
@@ -801,6 +803,17 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
         self._ignored_hwnds = set(ignored_hwnds or ())
         self._target: dict[str, Any] | None = None
         self._coordinate_mode = "Screen"
+        hwnd, target_rect = _multi_pixel_target_info(preferred_window, preferred_exe)
+        if hwnd and target_rect.isValid():
+            self._target = {
+                "window": preferred_window,
+                "exe": preferred_exe,
+                "hwnd": hwnd,
+                "capture_scope": "client",
+                "client_origin": [target_rect.left(), target_rect.top()],
+                "rect": target_rect,
+            }
+            self._coordinate_mode = "Client"
         self.setMouseTracking(True)
         self.setStyleSheet("background: transparent;")
 
@@ -826,12 +839,15 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
             if 0 <= local_x < img.width() and 0 <= local_y < img.height():
                 native_pos = logical_point_to_native(screen_pos)
                 color = _native_pixel_color(native_pos, img.pixelColor(local_x, local_y))
-                target = ActionEditor._window_target_at(
-                    native_pos,
-                    self._ignored_hwnds,
-                    position_is_native=True,
-                )
-                if not self._points and target and str(target.get("capture_scope") or "") == "client":
+                if self._target:
+                    target = self._target if self._target.get("rect") and self._target["rect"].contains(native_pos) else None
+                else:
+                    target = ActionEditor._window_target_at(
+                        native_pos,
+                        self._ignored_hwnds,
+                        position_is_native=True,
+                    )
+                if not self._points and not self._target and target and str(target.get("capture_scope") or "") == "client":
                     self._target = dict(target)
                     self._coordinate_mode = "Client"
                 elif self._target:
@@ -861,7 +877,7 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
         elif event.button() == QtCore.Qt.RightButton:
             if self._points:
                 self._points.pop()
-                if not self._points:
+                if not self._points and not (self._target and self._target.get("window")):
                     self._target = None
                     self._coordinate_mode = "Screen"
                 self.update()
@@ -1007,35 +1023,55 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
         painter.end()
 
 
-def _multi_pixel_target_client_rect(window: str, window_exe: str) -> QtCore.QRect:
-    """Resolve the current physical client rectangle for a stored window selector."""
+def _multi_pixel_target_info(window: str, window_exe: str) -> tuple[int, QtCore.QRect]:
+    """Resolve the stored target first; never substitute the foreground window."""
     if not window and not window_exe:
-        return QtCore.QRect()
+        return 0, QtCore.QRect()
     try:
         from .image_search_test import _find_window
 
         hwnd = int(_find_window(window_exe, window) or 0)
         if not hwnd:
-            return QtCore.QRect()
+            return 0, QtCore.QRect()
         user32 = ctypes.windll.user32
         rect = wintypes.RECT()
         origin = wintypes.POINT(0, 0)
         if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
-            return QtCore.QRect()
+            return 0, QtCore.QRect()
         if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
-            return QtCore.QRect()
-        return QtCore.QRect(
+            return 0, QtCore.QRect()
+        return hwnd, QtCore.QRect(
             int(origin.x),
             int(origin.y),
             int(rect.right - rect.left),
             int(rect.bottom - rect.top),
         )
     except Exception:
-        return QtCore.QRect()
+        return 0, QtCore.QRect()
+
+
+def _multi_pixel_target_client_rect(window: str, window_exe: str) -> QtCore.QRect:
+    return _multi_pixel_target_info(window, window_exe)[1]
+
+
+def _multi_pixel_target_image(window: str, window_exe: str) -> tuple[QtGui.QImage, QtCore.QRect]:
+    """Capture the explicitly stored target window, including when it is not foreground."""
+    hwnd, rect = _multi_pixel_target_info(window, window_exe)
+    if not hwnd or not rect.isValid():
+        return QtGui.QImage(), rect
+    screen = QtGui.QGuiApplication.screenAt(rect.center()) or QtGui.QGuiApplication.primaryScreen()
+    if screen is not None:
+        pixmap = screen.grabWindow(hwnd, 0, 0, rect.width(), rect.height())
+        if not pixmap.isNull():
+            image = pixmap.toImage()
+            if image.size() != rect.size():
+                image = image.scaled(rect.size(), QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
+            return image, rect
+    return _native_region_image(rect, QtGui.QImage()), rect
 
 
 class MultiPixelPreviewCanvas(QtWidgets.QWidget):
-    """Scaled client screenshot with numbered pixel pins."""
+    """Scaled client screenshot with numbered colour samples and search regions."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1043,6 +1079,7 @@ class MultiPixelPreviewCanvas(QtWidgets.QWidget):
         self.points: list[dict[str, Any]] = []
         self.capture_rect = QtCore.QRect()
         self.relative = True
+        self.search_region: list[int] = []
         self.setMinimumSize(640, 420)
 
     def set_snapshot(
@@ -1052,11 +1089,13 @@ class MultiPixelPreviewCanvas(QtWidgets.QWidget):
         points: list[dict[str, Any]],
         *,
         relative: bool,
+        search_region: list[int] | None = None,
     ) -> None:
         self.image = QtGui.QImage(image)
         self.capture_rect = QtCore.QRect(capture_rect)
         self.points = [dict(item) for item in points]
         self.relative = bool(relative)
+        self.search_region = list(search_region or [])
         self.update()
 
     def _image_rect(self) -> QtCore.QRect:
@@ -1080,6 +1119,24 @@ class MultiPixelPreviewCanvas(QtWidgets.QWidget):
         painter.drawImage(target, self.image)
         sx = target.width() / max(1, self.image.width())
         sy = target.height() / max(1, self.image.height())
+        if len(self.search_region) >= 4:
+            left, top, right, bottom = [int(value) for value in self.search_region[:4]]
+            if not self.relative:
+                left -= self.capture_rect.x()
+                right -= self.capture_rect.x()
+                top -= self.capture_rect.y()
+                bottom -= self.capture_rect.y()
+            region_rect = QtCore.QRectF(
+                target.x() + left * sx,
+                target.y() + top * sy,
+                max(1.0, (right - left) * sx),
+                max(1.0, (bottom - top) * sy),
+            )
+            painter.setPen(QtGui.QPen(QtGui.QColor("#38BDF8"), 2, QtCore.Qt.DashLine))
+            painter.setBrush(QtGui.QColor(56, 189, 248, 28))
+            painter.drawRect(region_rect)
+            painter.setPen(QtGui.QColor("#A5E8FF"))
+            painter.drawText(region_rect.adjusted(5, 3, -5, -3), QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft, "색상 검색 영역")
         for index, point in enumerate(self.points, start=1):
             if not bool(point.get("enabled", True)):
                 continue
@@ -1111,6 +1168,13 @@ class MultiPixelPreviewDialog(QtWidgets.QDialog):
             self.points = []
         self.points = [dict(item) for item in self.points if isinstance(item, dict)]
         self.relative = str(self.step.get("pixel_coords") or "screen").casefold() == "relative"
+        raw_region = self.step.get("search_region") or []
+        try:
+            self.search_region = [int(value) for value in raw_region[:4]] if isinstance(raw_region, list) and len(raw_region) >= 4 else []
+        except (TypeError, ValueError):
+            self.search_region = []
+        if len(self.search_region) == 4 and (self.search_region[2] <= self.search_region[0] or self.search_region[3] <= self.search_region[1]):
+            self.search_region = []
         self.setWindowTitle("다중 픽셀 · 미리보기 및 실시간 검사")
         self.resize(1180, 760)
 
@@ -1150,17 +1214,49 @@ class MultiPixelPreviewDialog(QtWidgets.QDialog):
             abs(current.blue() - expected.blue()),
         ) <= max(0, min(255, int(tolerance)))
 
+    @classmethod
+    def _find_colour(cls, image: QtGui.QImage, region: QtCore.QRect, expected: QtGui.QColor, tolerance: int) -> tuple[bool, QtCore.QPoint, QtGui.QColor]:
+        region = region.intersected(image.rect())
+        if image.isNull() or not region.isValid() or region.isEmpty():
+            return False, QtCore.QPoint(), QtGui.QColor()
+        try:
+            import numpy as np
+            rgb = image.convertToFormat(QtGui.QImage.Format_RGBA8888)
+            data = np.frombuffer(rgb.bits(), dtype=np.uint8).reshape(rgb.height(), rgb.bytesPerLine())[:, : rgb.width() * 4].reshape(rgb.height(), rgb.width(), 4)
+            crop = data[region.top():region.y() + region.height(), region.left():region.x() + region.width(), :3]
+            target = np.array([expected.red(), expected.green(), expected.blue()], dtype=np.int16)
+            mask = (np.abs(crop.astype(np.int16) - target) <= max(0, min(255, int(tolerance)))).all(axis=2)
+            locations = np.argwhere(mask)
+            if locations.size:
+                y, x = locations[0]
+                point = QtCore.QPoint(region.left() + int(x), region.top() + int(y))
+                return True, point, image.pixelColor(point)
+        except Exception:
+            for y in range(region.top(), region.y() + region.height()):
+                for x in range(region.left(), region.x() + region.width()):
+                    current = image.pixelColor(x, y)
+                    if cls._matches(current, expected, tolerance):
+                        return True, QtCore.QPoint(x, y), current
+        return False, QtCore.QPoint(), QtGui.QColor()
+
     def refresh_preview(self) -> None:
         window = str(self.step.get("window") or "")
         window_exe = str(self.step.get("window_exe") or "")
         if self.relative:
-            capture_rect = _multi_pixel_target_client_rect(window, window_exe)
+            image, capture_rect = _multi_pixel_target_image(window, window_exe)
         else:
             desktop_rect = QtCore.QRect()
             for mapping in display_coordinate_maps():
                 desktop_rect = desktop_rect.united(mapping.native)
             active_points = [item for item in self.points if bool(item.get("enabled", True))]
-            if active_points:
+            if len(self.search_region) >= 4:
+                capture_rect = QtCore.QRect(
+                    self.search_region[0],
+                    self.search_region[1],
+                    self.search_region[2] - self.search_region[0],
+                    self.search_region[3] - self.search_region[1],
+                ).intersected(desktop_rect)
+            elif active_points:
                 xs = [int(item.get("x") or 0) for item in active_points]
                 ys = [int(item.get("y") or 0) for item in active_points]
                 capture_rect = QtCore.QRect(
@@ -1171,8 +1267,8 @@ class MultiPixelPreviewDialog(QtWidgets.QDialog):
                 ).intersected(desktop_rect)
             else:
                 capture_rect = desktop_rect
-        image = _native_region_image(capture_rect, QtGui.QImage()) if capture_rect.isValid() else QtGui.QImage()
-        self.canvas.set_snapshot(image, capture_rect, self.points, relative=self.relative)
+            image = _native_region_image(capture_rect, QtGui.QImage()) if capture_rect.isValid() else QtGui.QImage()
+        self.canvas.set_snapshot(image, capture_rect, self.points, relative=self.relative, search_region=self.search_region)
         self.list.clear()
         matched = 0
         enabled = 0
@@ -1184,18 +1280,25 @@ class MultiPixelPreviewDialog(QtWidgets.QDialog):
             enabled += 1
             px = int(point.get("x") or 0)
             py = int(point.get("y") or 0)
-            sample_x = px if self.relative else px - capture_rect.x()
-            sample_y = py if self.relative else py - capture_rect.y()
             expected = QtGui.QColor(str(point.get("color") or "#FFFFFF"))
             tolerance = int(point.get("tolerance", global_tolerance)) if bool(point.get("custom_tolerance")) else global_tolerance
-            current = image.pixelColor(sample_x, sample_y) if 0 <= sample_x < image.width() and 0 <= sample_y < image.height() else QtGui.QColor()
-            ok = current.isValid() and self._matches(current, expected, tolerance)
+            point_region = point.get("region") if isinstance(point.get("region"), list) else self.search_region
+            if isinstance(point_region, list) and len(point_region) >= 4:
+                values = [int(value) for value in point_region[:4]]
+                if not self.relative:
+                    values = [values[0] - capture_rect.x(), values[1] - capture_rect.y(), values[2] - capture_rect.x(), values[3] - capture_rect.y()]
+                region = QtCore.QRect(values[0], values[1], values[2] - values[0], values[3] - values[1])
+            else:
+                sample_x = px if self.relative else px - capture_rect.x()
+                sample_y = py if self.relative else py - capture_rect.y()
+                region = QtCore.QRect(sample_x, sample_y, 1, 1)
+            ok, found_point, current = self._find_colour(image, region, expected, tolerance)
             matched += int(ok)
             state = "✓ 일치" if ok else "✕ 불일치"
             current_name = current.name().upper() if current.isValid() else "범위 밖"
             item = QtWidgets.QListWidgetItem(
                 f"{index}. {state}  저장 {expected.name().upper()}  현재 {current_name}  허용 ±{tolerance}\n"
-                f"    좌표 ({px}, {py})"
+                f"    {'발견 위치 ' + str((found_point.x(), found_point.y())) if ok else '영역 내 미발견'}"
             )
             item.setForeground(QtGui.QColor("#4ADE80" if ok else "#F87171"))
             item.setIcon(self._color_icon(expected))
@@ -1223,7 +1326,7 @@ class MultiPixelPreviewDialog(QtWidgets.QDialog):
         self.target_label.setText(
             f"대상: {window_exe or window or '전체 화면'} · "
             f"{'클라이언트 상대 좌표' if self.relative else '화면 절대 좌표'}\n"
-            "모든 픽셀은 현재 한 화면 캡처에서 동시에 판정됩니다."
+            "모든 색상은 지정 영역의 동일한 한 화면 캡처에서 동시에 판정됩니다."
         )
 
     @staticmethod

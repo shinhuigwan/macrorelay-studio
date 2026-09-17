@@ -3206,6 +3206,9 @@ def render_image_search(
         lines.append(f'        MatchedImageName := "{ahk_quote(candidate_alias)}"')
     lines.append(f'    Log("✅ [이미지 검색 성공] 대상: {alias} (화면 발견 위치: X=" . FoundX . ", Y=" . FoundY . " 발견=" . {store_count_var} . "개)")')
     click_target = str(step.get("click_target") or "").strip().lower()
+    if wait_cond == "vanish":
+        # A successful vanish condition means there is no current hit to click.
+        click_target = "none"
     if not click_target:
         if bool(step.get("click_enabled")):
             if str(step.get("search_mode") or "").lower() == "all" and str(step.get("all_action") or "").lower() == "click_all":
@@ -5055,11 +5058,18 @@ def render_multi_pixel_check(step: Dict[str, Any], step_index: int = 0) -> List[
     click_index = max(1, int(step.get("click_index") or 1))
     click_offset_x = int(step.get("click_offset_x") or 0)
     click_offset_y = int(step.get("click_offset_y") or 0)
-    click_mode = str(step.get("click_mode") or "active").casefold()
+    click_mode = str(step.get("click_mode") or "inactive").casefold()
 
     coord_mode = str(step.get("coord_mode") or "Screen").casefold()
     pixel_coords = str(step.get("pixel_coords") or "screen").casefold()
     relative = coord_mode in {"client", "window"} and pixel_coords == "relative"
+    raw_search_region = step.get("search_region") or []
+    try:
+        common_region = [int(value) for value in raw_search_region[:4]] if isinstance(raw_search_region, (list, tuple)) and len(raw_search_region) >= 4 else []
+    except (TypeError, ValueError):
+        common_region = []
+    if len(common_region) == 4 and (common_region[2] <= common_region[0] or common_region[3] <= common_region[1]):
+        common_region = []
     window = str(step.get("window") or "").strip()
     window_exe = str(step.get("window_exe") or "").strip()
     clean_exe = window_exe[8:].strip() if window_exe.casefold().startswith("ahk_exe ") else window_exe
@@ -5113,8 +5123,16 @@ def render_multi_pixel_check(step: Dict[str, Any], step_index: int = 0) -> List[
         comma = "," if index > 1 else ""
         x_expr = f"({prefix}_BaseX + {x})" if relative else str(x)
         y_expr = f"({prefix}_BaseY + {y})" if relative else str(y)
+        raw_region = point.get("region") if isinstance(point.get("region"), (list, tuple)) else common_region
+        try:
+            region = [int(value) for value in raw_region[:4]] if len(raw_region) >= 4 else []
+        except (TypeError, ValueError):
+            region = []
+        if len(region) != 4 or region[2] <= region[0] or region[3] <= region[1]:
+            region = [x, y, x + 1, y + 1]
+        region_exprs = [f"({prefix}_BaseX + {region[0]})", f"({prefix}_BaseY + {region[1]})", f"({prefix}_BaseX + {region[2]})", f"({prefix}_BaseY + {region[3]})"] if relative else [str(value) for value in region]
         lines.append(
-            f'    {prefix}_Payload .= "{comma}{{""x"":" . {x_expr} . ",""y"":" . {y_expr} . ",""color"":""{color}"",""tolerance"":{point_tolerance},""index"":{index}}}"'
+            f'    {prefix}_Payload .= "{comma}{{""x"":" . {x_expr} . ",""y"":" . {y_expr} . ",""region"":[" . {region_exprs[0]} . "," . {region_exprs[1]} . "," . {region_exprs[2]} . "," . {region_exprs[3]} . "],""color"":""{color}"",""tolerance"":{point_tolerance},""index"":{index}}}"'
         )
     lines.extend([
         f'    {prefix}_Payload .= "],""match_policy"":""{match_policy}"",""required_count"":{required_count},""stable_hits"":{stable_hits},""timeout"":{timeout},""poll"":{poll_delay},""click_index"":{click_index}}}"',
@@ -5844,7 +5862,11 @@ def render_macro_script(
                 lines.append(f"    __rep{count} := 0")
                 if repeat_var:
                     lines.append(f"    __rep_limit{count} := \"\"")
-            if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"} and bool(step.get("repeat_on_success")):
+            if (
+                action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}
+                and bool(step.get("repeat_on_success"))
+                and str(step.get("wait_condition") or "appear").casefold() != "vanish"
+            ):
                 repeat_on_success_delay = max(0, int(step.get("repeat_on_success_delay", 50) or 0))
                 lines.append(f'    Log("image search success loop: step {count}")')
                 if repeat_on_success_delay:

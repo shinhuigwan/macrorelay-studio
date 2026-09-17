@@ -340,6 +340,7 @@ class EngineBehaviorTests(unittest.TestCase):
             "required_count": 2,
             "coord_mode": "Client",
             "pixel_coords": "relative",
+            "search_region": [5, 15, 80, 90],
             "window": "Sample ahk_exe sample.exe",
             "window_exe": "sample.exe",
             "stable_hits": 2,
@@ -359,6 +360,7 @@ class EngineBehaviorTests(unittest.TestCase):
 
         self.assertIn('""cmd"":""multi_pixel""', script)
         self.assertIn("MultiPixel_1_BaseX + 10", script)
+        self.assertIn('""region"":[" . (MultiPixel_1_BaseX + 5)', script)
         self.assertIn('""required_count"":2', script)
         self.assertIn('""stable_hits"":2', script)
         self.assertIn("if (__multi_pixel_success_1)", script)
@@ -369,30 +371,23 @@ class EngineBehaviorTests(unittest.TestCase):
     def test_vision_engine_multi_pixel_captures_one_frame_per_poll(self) -> None:
         import vision_engine
 
-        class FakeFrame:
-            size = 1
-
-            def __getitem__(self, key):
-                y, x = key
-                colors = {
-                    (0, 0): (0x33, 0x22, 0x11),
-                    (20, 20): (0x66, 0x55, 0x44),
-                    (40, 40): (0x00, 0x00, 0x00),
-                }
-                return colors[(y, x)]
+        import numpy as np
+        fake_frame = np.zeros((41, 41, 3), dtype=np.uint8)
+        fake_frame[2, 3] = (0x33, 0x22, 0x11)
+        fake_frame[25, 24] = (0x66, 0x55, 0x44)
 
         state = vision_engine.VisionState()
         captures: list[tuple[int, int, int, int]] = []
 
         def fake_capture(left, top, right, bottom, _grabber=None):
             captures.append((left, top, right, bottom))
-            return FakeFrame()
+            return fake_frame
 
         request = {
             "points": [
-                {"x": 100, "y": 200, "color": "#112233", "tolerance": 0, "index": 1},
-                {"x": 120, "y": 220, "color": "#445566", "tolerance": 0, "index": 2},
-                {"x": 140, "y": 240, "color": "#778899", "tolerance": 0, "index": 3},
+                {"x": 100, "y": 200, "region": [100, 200, 110, 210], "color": "#112233", "tolerance": 0, "index": 1},
+                {"x": 120, "y": 220, "region": [120, 220, 130, 230], "color": "#445566", "tolerance": 0, "index": 2},
+                {"x": 140, "y": 240, "region": [140, 240, 141, 241], "color": "#778899", "tolerance": 0, "index": 3},
             ],
             "match_policy": "at_least_n",
             "required_count": 2,
@@ -407,8 +402,25 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertTrue(result["found"])
         self.assertEqual(2, result["match_count"])
         self.assertEqual("1,2", result["matched_indexes_csv"])
-        self.assertEqual((120, 220), (result["click_x"], result["click_y"]))
+        self.assertEqual((124, 225), (result["click_x"], result["click_y"]))
         self.assertEqual([(100, 200, 141, 241), (100, 200, 141, 241)], captures)
+
+    def test_vanish_image_condition_never_clicks_missing_target(self) -> None:
+        step = {
+            "action": "image_search",
+            "asset": "spinner",
+            "assets": ["spinner", "loading"],
+            "engine": "opencv",
+            "wait_condition": "vanish",
+            "click_enabled": True,
+            "search_mode": "all",
+            "all_action": "click_all",
+            "click": {"mode": "inactive", "click_image": True},
+        }
+        script = self.engine.render_image_search(step, {"spinner": {"file": "a.png"}, "loading": {"file": "b.png"}}, step_index=1)
+        self.assertIn('image click skipped: click_target is none', "\n".join(script))
+        macro_script = self.engine.render_macro_script({"name": "vanish", "steps": [{**step, "repeat_on_success": True}]}, {"spinner": {"file": "a.png"}, "loading": {"file": "b.png"}})
+        self.assertNotIn("image search success loop", macro_script)
 
     def test_image_search_uses_centered_single_click_and_optimized_opencv(self) -> None:
         step = {
@@ -3598,6 +3610,8 @@ class UiSmokeTests(unittest.TestCase):
         template = action_template("multi_pixel_check")
         self.assertEqual("Client", template["coord_mode"])
         self.assertEqual("relative", template["pixel_coords"])
+        self.assertEqual("inactive", template["click_mode"])
+        self.assertEqual([0, 0, 0, 0], template["search_region"])
         with tempfile.TemporaryDirectory() as directory:
             editor = ActionEditor(MacroRepository(Path(directory)))
             legacy_pixels = [{"x": 1200, "y": 700, "color": "#112233", "tolerance": 10}]
@@ -3669,10 +3683,10 @@ class UiSmokeTests(unittest.TestCase):
             "window_exe": "sample.exe",
             "match_policy": "all",
             "tolerance": 10,
+            "search_region": [0, 0, 40, 30],
         }
         with (
-            mock.patch("macro_studio.automation._multi_pixel_target_client_rect", return_value=QtCore.QRect(100, 200, 40, 30)),
-            mock.patch("macro_studio.automation._native_region_image", return_value=image),
+            mock.patch("macro_studio.automation._multi_pixel_target_image", return_value=(image, QtCore.QRect(100, 200, 40, 30))),
         ):
             dialog = MultiPixelPreviewDialog(step)
             dialog.timer.stop()
@@ -3681,8 +3695,59 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(2, dialog.list.count())
         self.assertIn("저장 #112233", dialog.list.item(0).text())
         self.assertIn("현재 #112233", dialog.list.item(0).text())
+        self.assertIn("발견 위치", dialog.list.item(0).text())
         self.assertIn("참(TRUE)", dialog.result_label.text())
         dialog.close()
+
+    def test_multi_image_settings_can_remove_assets_without_deleting_files(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.action_editor import ImageSearchConfidenceDialog
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = ImageSearchConfidenceDialog(
+                MacroRepository(Path(directory)),
+                ["keep", "remove"],
+                asset_confidences={"keep": 90, "remove": 80},
+                asset_regions={"keep": [1, 2, 30, 40], "remove": [5, 6, 50, 60]},
+                step={"asset_routes": {"remove": {"true": 3}}},
+            )
+            dialog._remove_alias("remove")
+            self.assertEqual(["keep"], dialog.get_aliases())
+            self.assertEqual({"keep": 90}, dialog.get_asset_confidences())
+            self.assertEqual({"keep": [1, 2, 30, 40]}, dialog.get_asset_regions())
+            self.assertEqual({}, dialog.get_asset_routes())
+            dialog.close()
+
+    def test_generated_multi_image_label_tracks_removed_asset_count(self) -> None:
+        from macro_studio.builder import _sync_multi_image_count_label
+
+        generated = {"label": "멀티 이미지 서치 8개"}
+        _sync_multi_image_count_label(generated, ["a", "b", "c"])
+        self.assertEqual("멀티 이미지 서치 3개", generated["label"])
+        custom = {"label": "이벤트 닫기 후보"}
+        _sync_multi_image_count_label(custom, ["a"])
+        self.assertEqual("이벤트 닫기 후보", custom["label"])
+
+    def test_image_editor_preserves_explicit_click_disabled(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.action_editor import ActionEditor
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            editor = ActionEditor(MacroRepository(Path(directory)))
+            editor.load_step({
+                "action": "image_search",
+                "asset": "sample",
+                "click_enabled": False,
+                "click": {"mode": "inactive", "click_image": False, "click_offset": False},
+            })
+            rebuilt = editor.build_step()
+            self.assertFalse(rebuilt["click_enabled"])
+            self.assertEqual("none", rebuilt["click_target"])
+            editor.close()
 
     def test_builder_restores_action_forms_and_collapses_json(self) -> None:
         from PySide6 import QtWidgets

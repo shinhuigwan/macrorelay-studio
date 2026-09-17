@@ -185,6 +185,38 @@ class ProjectValidator:
                         issues.append(
                             Issue("error", "잘못된 단계 연결", f"{field}={target}", summary.name, index)
                         )
+                asset_routes = step.get("asset_routes")
+                if asset_routes and not isinstance(asset_routes, dict):
+                    issues.append(Issue("error", "잘못된 이미지별 분기", "asset_routes가 객체가 아닙니다.", summary.name, index))
+                elif isinstance(asset_routes, dict):
+                    known_assets = {
+                        str(value) for value in step.get("assets") or [] if str(value).strip()
+                    } if isinstance(step.get("assets"), list) else set()
+                    primary_asset = str(step.get("asset") or "").strip()
+                    if primary_asset:
+                        known_assets.add(primary_asset)
+                    for alias, route in asset_routes.items():
+                        if str(alias) not in known_assets:
+                            issues.append(Issue("warning", "분기 이미지 누락", f"'{alias}' 이미지가 현재 노드에 없습니다.", summary.name, index))
+                        if not isinstance(route, dict):
+                            issues.append(Issue("error", "잘못된 이미지별 분기", f"'{alias}' 분기 값이 객체가 아닙니다.", summary.name, index))
+                            continue
+                        for outcome in ("true", "fail"):
+                            try:
+                                target = int(route.get(outcome) or 0)
+                            except (TypeError, ValueError):
+                                issues.append(
+                                    Issue(
+                                        "error",
+                                        "잘못된 이미지별 분기",
+                                        f"{alias}.{outcome} 값이 노드 번호가 아닙니다.",
+                                        summary.name,
+                                        index,
+                                    )
+                                )
+                                continue
+                            if target and not 1 <= target <= len(steps):
+                                issues.append(Issue("error", "이미지별 분기 목적지 오류", f"{alias}.{outcome}={target}", summary.name, index))
                 conditions = step.get("edge_conditions") or []
                 if conditions and not isinstance(conditions, list):
                     issues.append(Issue("error", "잘못된 조건 분기", "edge_conditions가 배열이 아닙니다.", summary.name, index))

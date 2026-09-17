@@ -5605,6 +5605,32 @@ def render_macro_script(
             on_success_delay = 0
         if on_fail_delay < 0:
             on_fail_delay = 0
+        asset_aliases = [
+            str(value) for value in step.get("assets") or [] if str(value).strip()
+        ] if isinstance(step.get("assets"), list) else []
+        primary_asset = str(step.get("asset") or "").strip()
+        if primary_asset and primary_asset not in asset_aliases:
+            asset_aliases.insert(0, primary_asset)
+        raw_asset_routes = step.get("asset_routes") if isinstance(step.get("asset_routes"), dict) else {}
+        asset_true_routes: list[tuple[str, int]] = []
+        asset_fail_route: tuple[str, int] | None = None
+        route_alias_order = list(dict.fromkeys(asset_aliases + [str(alias) for alias in raw_asset_routes]))
+        for route_alias in route_alias_order:
+            route = raw_asset_routes.get(route_alias)
+            if not isinstance(route, dict):
+                continue
+            try:
+                true_target = int(route.get("true") or 0)
+            except (TypeError, ValueError):
+                true_target = 0
+            try:
+                fail_target = int(route.get("fail") or 0)
+            except (TypeError, ValueError):
+                fail_target = 0
+            if 1 <= true_target <= total_steps:
+                asset_true_routes.append((route_alias, true_target))
+            if asset_fail_route is None and 1 <= fail_target <= total_steps:
+                asset_fail_route = (route_alias, fail_target)
         has_repeat = repeat > 1 or bool(repeat_var)
         repeat_limit = f"__rep_limit{count}" if repeat_var else str(repeat)
 
@@ -5699,7 +5725,16 @@ def render_macro_script(
             lines.append("{")
             lines.append(f"    __node_retry_{count} := 0")
             lines.extend("    " + line for line in render_subflow_success(step))
-            lines.append(f"    MarkStepSuccess({count}, {on_success or (count + 1 if count < total_steps else 0)})")
+            default_success_target = on_success or (count + 1 if count < total_steps else 0)
+            route_var = f"__asset_true_route_{count}"
+            if asset_true_routes:
+                lines.append(f"    {route_var} := 0")
+                for route_alias, route_target in asset_true_routes:
+                    lines.append(f'    if (MatchedImageName = "{ahk_quote(route_alias)}")')
+                    lines.append(f"        {route_var} := {route_target}")
+                lines.append(f"    MarkStepSuccess({count}, {route_var} ? {route_var} : {default_success_target})")
+            else:
+                lines.append(f"    MarkStepSuccess({count}, {default_success_target})")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "SUCCESS")')
             if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
                 lines.append(
@@ -5715,6 +5750,14 @@ def render_macro_script(
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "text=" . OCR_LastText . "; confidence=" . OCR_LastConfidence . "; engine=" . OCR_LastEngine{variable_detail})'
                 )
+            if asset_true_routes:
+                lines.append(f"    if ({route_var})")
+                lines.append("    {")
+                lines.append(
+                    f'        Log("asset-specific True route: " . MatchedImageName . " -> step " . {route_var})'
+                )
+                lines.append(f'        Goto, % "Step" . {route_var}')
+                lines.append("    }")
             if has_repeat:
                 lines.append(f"    if (__rep{count} < {repeat_limit})")
                 lines.append("    {")
@@ -5771,6 +5814,12 @@ def render_macro_script(
             lines.append(f"    __node_retry_{count} := 0")
             lines.extend("    " + line for line in render_subflow_failure(step))
             lines.append(f"    MarkStepFailure({count})")
+            if asset_fail_route is not None:
+                fail_alias, fail_target = asset_fail_route
+                lines.append(
+                    f'    Log("asset-specific Fail route: {ahk_quote(fail_alias)} -> step {fail_target}")'
+                )
+                lines.append(f"    Goto, Step{fail_target}")
             if has_repeat:
                 lines.append(f"    if (__rep{count} < {repeat_limit})")
                 lines.append("    {")

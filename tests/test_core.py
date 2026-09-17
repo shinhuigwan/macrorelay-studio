@@ -198,6 +198,68 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("ClickX := FoundX + Round(MatchedOffsetX * FoundScaleX)", script)
         self.assertNotIn("image center click: enabled", script)
 
+    def test_multi_image_asset_true_route_preserves_default_fail_route(self) -> None:
+        assets = {
+            alias: {"file": f"{alias}.png"}
+            for alias in ("first", "second", "fifth")
+        }
+        macro = {
+            "name": "per-image-true-route",
+            "steps": [
+                {
+                    "action": "multi_image_search",
+                    "asset": "first",
+                    "assets": ["first", "second", "fifth"],
+                    "engine": "opencv",
+                    "click_target": "none",
+                    "abort_on_fail": False,
+                    "on_success": 4,
+                    "on_fail": 2,
+                    "asset_routes": {"fifth": {"true": 3}},
+                },
+                {"action": "wait", "duration": 10},
+                {"action": "wait", "duration": 20},
+                {"action": "wait", "duration": 30},
+            ],
+        }
+
+        script = self.engine.render_macro_script(macro, assets)
+        success = script.split('TraceStep(1, "multi_image_search", "SUCCESS")', 1)[1]
+        failure = script.split('TraceStep(1, "multi_image_search", "FAIL")', 1)[1]
+
+        self.assertIn('if (MatchedImageName = "fifth")', script)
+        self.assertIn("__asset_true_route_1 := 3", script)
+        self.assertIn('Goto, % "Step" . __asset_true_route_1', success)
+        self.assertNotIn("asset-specific Fail route", script)
+        self.assertIn("Goto, Step2", failure)
+
+    def test_multi_image_asset_fail_route_overrides_default_fail_only(self) -> None:
+        assets = {alias: {"file": f"{alias}.png"} for alias in ("first", "fifth")}
+        macro = {
+            "name": "per-image-fail-route",
+            "steps": [
+                {
+                    "action": "multi_image_search",
+                    "asset": "first",
+                    "assets": ["first", "fifth"],
+                    "engine": "opencv",
+                    "click_target": "none",
+                    "abort_on_fail": False,
+                    "on_success": 2,
+                    "on_fail": 2,
+                    "asset_routes": {"fifth": {"fail": 3}},
+                },
+                {"action": "wait", "duration": 10},
+                {"action": "wait", "duration": 20},
+            ],
+        }
+
+        script = self.engine.render_macro_script(macro, assets)
+
+        self.assertNotIn("__asset_true_route_1", script)
+        self.assertIn("asset-specific Fail route: fifth -> step 3", script)
+        self.assertIn("Goto, Step3", script)
+
     def test_vision_engine_multi_search_captures_region_once_and_selects_best(self) -> None:
         import vision_engine
 

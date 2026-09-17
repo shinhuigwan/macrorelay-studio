@@ -1559,6 +1559,13 @@ class NodeItem(QtWidgets.QGraphicsObject):
         event.accept()
 
     def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        if getattr(self.canvas, "_node_target_pick_active", False):
+            if event.button() == QtCore.Qt.LeftButton:
+                self.canvas.complete_node_target_pick(self.index)
+            elif event.button() == QtCore.Qt.RightButton:
+                self.canvas.cancel_node_target_pick()
+            event.accept()
+            return
         point = event.pos()
         w = self.current_width()
         if event.button() == QtCore.Qt.LeftButton and 0 <= point.y() <= 28:
@@ -3325,6 +3332,7 @@ class NodeCanvas(QtWidgets.QWidget):
     help_requested = QtCore.Signal()
     comments_changed = QtCore.Signal(list)
     quick_node_drop_requested = QtCore.Signal(str, object)
+    node_target_picked = QtCore.Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -3351,6 +3359,9 @@ class NodeCanvas(QtWidgets.QWidget):
         self._quick_drop_preview_items: list[QtWidgets.QGraphicsItem] = []
         self._quick_drop_candidate: EdgeItem | None = None
         self._quick_drop_kind = ""
+        self._node_target_pick_active = False
+        self._node_target_pick_excluded = 0
+        self._node_target_pick_previous_label = ""
         self.rubber_selecting = False
         self._asset_preview_paths: dict[str, Path] = {}
         self._preview_popup = ImagePreviewPopup(self)
@@ -3359,6 +3370,9 @@ class NodeCanvas(QtWidgets.QWidget):
         self._positions_timer.setSingleShot(True)
         self._positions_timer.setInterval(350)
         self._positions_timer.timeout.connect(lambda: self.positions_changed.emit(self.positions()))
+        self._target_pick_escape = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Escape), self)
+        self._target_pick_escape.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self._target_pick_escape.activated.connect(self.cancel_node_target_pick)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -4463,6 +4477,46 @@ class NodeCanvas(QtWidgets.QWidget):
                 continue
         if edge_specs:
             self.edges_delete_requested.emit(edge_specs)
+
+    def begin_node_target_pick(self, excluded_index: int = 0) -> None:
+        self.cancel_node_target_pick(emit=False)
+        self._node_target_pick_active = True
+        self._node_target_pick_excluded = int(excluded_index or 0)
+        self._node_target_pick_previous_label = self.flow_label.text()
+        self.flow_label.setText("🎯 다음 진행 노드를 클릭하세요 · Esc 취소")
+        self.flow_label.setStyleSheet("font-weight:800; color:#38E7FF; letter-spacing:0.4px;")
+        self.view.setCursor(QtCore.Qt.PointingHandCursor)
+        self.view.setFocus(QtCore.Qt.OtherFocusReason)
+        for index, node in self.nodes.items():
+            node.setOpacity(0.35 if index == self._node_target_pick_excluded else 1.0)
+            node.update()
+
+    def complete_node_target_pick(self, target: int) -> None:
+        if not self._node_target_pick_active:
+            return
+        target = int(target or 0)
+        if target <= 0 or target == self._node_target_pick_excluded:
+            QtWidgets.QApplication.beep()
+            return
+        self._finish_node_target_pick_ui()
+        self.node_target_picked.emit(target)
+
+    def cancel_node_target_pick(self, emit: bool = True) -> None:
+        if not self._node_target_pick_active:
+            return
+        self._finish_node_target_pick_ui()
+        if emit:
+            self.node_target_picked.emit(0)
+
+    def _finish_node_target_pick_ui(self) -> None:
+        self._node_target_pick_active = False
+        self._node_target_pick_excluded = 0
+        self.flow_label.setText(self._node_target_pick_previous_label or "FLOW CANVAS")
+        self.flow_label.setStyleSheet(f"font-weight:800; color:{COLORS['accent']}; letter-spacing:1px;")
+        self.view.unsetCursor()
+        for node in self.nodes.values():
+            node.setOpacity(1.0)
+            node.update()
 
     def select_node(self, index: int) -> None:
         if index not in self.nodes:

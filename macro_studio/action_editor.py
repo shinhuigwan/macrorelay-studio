@@ -17,6 +17,34 @@ from .widgets import WheelSafeSpinBox
 
 
 KOREAN_INITIALS = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+_ASSET_THUMBNAIL_CACHE: dict[tuple[str, int, int, int], QtGui.QPixmap] = {}
+
+
+def _asset_thumbnail(path: Path | None, width: int, height: int) -> QtGui.QPixmap:
+    """Decode a small thumbnail once instead of repeatedly loading full PNGs."""
+    if path is None or not Path(path).is_file():
+        return QtGui.QPixmap()
+    resolved = Path(path)
+    try:
+        stamp = resolved.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    key = (str(resolved), int(width), int(height), int(stamp))
+    cached = _ASSET_THUMBNAIL_CACHE.get(key)
+    if cached is not None and not cached.isNull():
+        return QtGui.QPixmap(cached)
+    reader = QtGui.QImageReader(str(resolved))
+    source_size = reader.size()
+    if source_size.isValid():
+        source_size.scale(max(1, int(width)), max(1, int(height)), QtCore.Qt.KeepAspectRatio)
+        reader.setScaledSize(source_size)
+    image = reader.read()
+    pixmap = QtGui.QPixmap.fromImage(image) if not image.isNull() else QtGui.QPixmap()
+    if not pixmap.isNull():
+        if len(_ASSET_THUMBNAIL_CACHE) >= 160:
+            _ASSET_THUMBNAIL_CACHE.clear()
+        _ASSET_THUMBNAIL_CACHE[key] = QtGui.QPixmap(pixmap)
+    return pixmap
 
 
 def korean_initial_text(value: str) -> str:
@@ -170,6 +198,10 @@ class MultiAssetPicker(QtWidgets.QWidget):
         self._asset_confidences: dict[str, int] = {}
         self._asset_regions: dict[str, list[int]] = {}
         self.preview_aliases: list[str] = []
+        self._preview_refresh_timer = QtCore.QTimer(self)
+        self._preview_refresh_timer.setSingleShot(True)
+        self._preview_refresh_timer.setInterval(0)
+        self._preview_refresh_timer.timeout.connect(self._refresh_previews)
 
     def set_options(self, values: list[str], preview_paths: dict[str, Path | None] | None = None) -> None:
         selected = set(self.value())
@@ -178,6 +210,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
             for alias, path in (preview_paths or {}).items()
             if path is not None and Path(path).is_file()
         }
+        blocker = QtCore.QSignalBlocker(self.list)
         self.list.clear()
         for value in values:
             item = QtWidgets.QListWidgetItem(str(value))
@@ -185,20 +218,17 @@ class MultiAssetPicker(QtWidgets.QWidget):
             item.setCheckState(QtCore.Qt.Checked if value in selected else QtCore.Qt.Unchecked)
             item.setSizeHint(QtCore.QSize(0, 44))
             path = self._preview_paths.get(str(value))
-            if path is not None:
-                pixmap = QtGui.QPixmap(str(path))
-                if not pixmap.isNull():
-                    item.setIcon(
-                        QtGui.QIcon(
-                            pixmap.scaled(108, 76, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-                        )
-                    )
+            pixmap = _asset_thumbnail(path, 108, 76)
+            if not pixmap.isNull():
+                item.setIcon(QtGui.QIcon(pixmap))
             item.setToolTip(str(value))
             self.list.addItem(item)
+        del blocker
         self._update_count()
 
     def set_value(self, values: Any) -> None:
         selected = {str(value) for value in values if str(value).strip()} if isinstance(values, list) else set()
+        blocker = QtCore.QSignalBlocker(self.list)
         known = {self.list.item(index).text() for index in range(self.list.count())}
         for missing in sorted(selected - known):
             item = QtWidgets.QListWidgetItem(missing)
@@ -207,6 +237,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
         for index in range(self.list.count()):
             item = self.list.item(index)
             item.setCheckState(QtCore.Qt.Checked if item.text() in selected else QtCore.Qt.Unchecked)
+        del blocker
         self._update_count()
 
     def value(self) -> list[str]:
@@ -222,7 +253,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
             for alias, offset in values.items():
                 if isinstance(offset, (list, tuple)) and len(offset) >= 2:
                     self._offsets[str(alias)] = [int(offset[0] or 0), int(offset[1] or 0)]
-        self._refresh_previews()
+        self._preview_refresh_timer.start()
 
     def offsets(self) -> dict[str, list[int]]:
         return {alias: list(self._offsets.get(alias, [0, 0])) for alias in self.value()}
@@ -230,7 +261,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
     def set_confidences(self, confidence: int, asset_confidences: dict[str, int] | None) -> None:
         self._confidence = max(1, min(100, int(confidence or 86)))
         self._asset_confidences = dict(asset_confidences or {})
-        self._refresh_previews()
+        self._preview_refresh_timer.start()
 
     def confidences(self) -> tuple[int, dict[str, int]]:
         return self._confidence, dict(self._asset_confidences)
@@ -246,7 +277,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
                             self._asset_regions[str(alias)] = [l, t, r, b]
                     except (TypeError, ValueError):
                         pass
-        self._refresh_previews()
+        self._preview_refresh_timer.start()
 
     def asset_regions(self) -> dict[str, list[int]]:
         return {alias: list(self._asset_regions[alias]) for alias in self.value() if alias in self._asset_regions}
@@ -270,10 +301,16 @@ class MultiAssetPicker(QtWidgets.QWidget):
             step=step_dict,
             asset_regions=self._asset_regions,
         )
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
+        if exec_image_search_confidence_dialog(dialog) == QtWidgets.QDialog.Accepted:
             self._confidence = dialog.get_confidence()
             self._asset_confidences = dialog.get_asset_confidences()
             self._asset_regions = dialog.get_asset_regions()
+            if owner is not None and hasattr(owner, "original"):
+                asset_routes = dialog.get_asset_routes()
+                if asset_routes:
+                    owner.original["asset_routes"] = asset_routes
+                else:
+                    owner.original.pop("asset_routes", None)
             bounding = dialog.get_bounding_region()
             if owner is not None and hasattr(owner, "_set_field_value"):
                 context = dialog.region_context()
@@ -305,8 +342,13 @@ class MultiAssetPicker(QtWidgets.QWidget):
         self._update_count()
 
     def _update_count(self) -> None:
-        self.count_label.setText(f"{len(self.value())}개 선택")
-        self._refresh_previews()
+        selected = self.value()
+        self.count_label.setText(f"{len(selected)}개 선택")
+        # Keep the public selection snapshot synchronous while the expensive
+        # card rebuild itself remains batched on the next event-loop turn.
+        self.preview_aliases = [alias for alias in selected if alias in self._preview_paths]
+        self.preview_scroll.setVisible(bool(self.preview_aliases))
+        self._preview_refresh_timer.start()
         self.selection_changed.emit()
 
     def _refresh_previews(self) -> None:
@@ -320,7 +362,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
             path = self._preview_paths.get(alias)
             if path is None:
                 continue
-            pixmap = QtGui.QPixmap(str(path))
+            pixmap = _asset_thumbnail(path, 150, 56)
             if pixmap.isNull():
                 continue
             card = QtWidgets.QFrame()
@@ -331,7 +373,7 @@ class MultiAssetPicker(QtWidgets.QWidget):
             card_layout.setSpacing(3)
             image = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
             image.setFixedSize(150, 56)
-            image.setPixmap(pixmap.scaled(image.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+            image.setPixmap(pixmap)
             image.setCursor(QtCore.Qt.PointingHandCursor)
             shown_name = QtGui.QFontMetrics(card.font()).elidedText(alias, QtCore.Qt.ElideMiddle, 148)
             name = QtWidgets.QLabel(shown_name, alignment=QtCore.Qt.AlignCenter)
@@ -2209,6 +2251,8 @@ class OCRFilterTuningDialog(QtWidgets.QDialog):
 class ImageSearchConfidenceDialog(QtWidgets.QDialog):
     """Dialog for adjusting image search confidence (1~100) individually and in batch, with image editor integration."""
 
+    RoutePickRequested = 37
+
     def __init__(
         self,
         repository: MacroRepository,
@@ -2230,6 +2274,20 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         self.aliases = [str(a) for a in aliases if str(a).strip()]
         self._confidence = max(1, min(100, int(confidence or 86)))
         self._asset_confidences = dict(asset_confidences or {})
+        self._asset_routes: dict[str, dict[str, int]] = {}
+        raw_routes = self.step.get("asset_routes") if isinstance(self.step.get("asset_routes"), dict) else {}
+        for alias, route in raw_routes.items():
+            if str(alias) not in self.aliases or not isinstance(route, dict):
+                continue
+            normalized: dict[str, int] = {}
+            for outcome in ("true", "fail"):
+                target = int(route.get(outcome) or 0)
+                if target > 0:
+                    normalized[outcome] = target
+            if normalized:
+                self._asset_routes[str(alias)] = normalized
+        self._route_buttons: dict[tuple[str, str], QtWidgets.QPushButton] = {}
+        self._route_pick_request: tuple[str, str] | None = None
 
         def _is_valid_reg(r: Any) -> bool:
             if isinstance(r, (list, tuple)) and len(r) >= 4:
@@ -2261,7 +2319,7 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
 
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
         self.setWindowTitle("이미지 서치 · 신뢰도 및 검색 영역 설정")
-        self.resize(880 if len(self.aliases) > 1 else 700, 560 if len(self.aliases) > 1 else 480)
+        self.resize(1120 if len(self.aliases) > 1 else 700, 620 if len(self.aliases) > 1 else 480)
         self.setStyleSheet("QDialog { background: #11151F; color: #E2E8F0; }")
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -2274,6 +2332,17 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         hdr_layout.addWidget(title_lbl)
         hdr_layout.addStretch(1)
         layout.addLayout(hdr_layout)
+
+        if len(self.aliases) > 1:
+            route_help = QtWidgets.QLabel(
+                "분기 버튼을 누른 뒤 캔버스에서 다음 노드를 클릭하세요. 설정하지 않은 True/Fail은 기존 노드선 설정을 그대로 사용합니다."
+            )
+            route_help.setWordWrap(True)
+            route_help.setStyleSheet(
+                "background:#172033; border:1px solid #334466; color:#B9C8E5; "
+                "padding:7px 10px; border-radius:6px; font-size:8.8pt;"
+            )
+            layout.addWidget(route_help)
 
         self.conf_sliders: dict[str, tuple[QtWidgets.QSlider, QtWidgets.QSpinBox]] = {}
         self.region_widgets: dict[str, tuple[QtWidgets.QPushButton, QtWidgets.QPushButton]] = {}
@@ -2289,9 +2358,9 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
             preview_lbl.setFixedHeight(150)
             preview_lbl.setStyleSheet("background: #171A22; border: 1px solid #2A3040; border-radius: 6px;")
             p = self.repository.asset_path(alias) if (alias and self.repository) else None
-            pixmap = QtGui.QPixmap(str(p)) if (p and Path(p).is_file()) else None
-            if pixmap and not pixmap.isNull():
-                preview_lbl.setPixmap(pixmap.scaled(280, 140, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+            pixmap = _asset_thumbnail(Path(p) if p else None, 280, 140)
+            if not pixmap.isNull():
+                preview_lbl.setPixmap(pixmap)
             else:
                 preview_lbl.setText("(이미지 미리보기 없음)")
             card_layout.addWidget(preview_lbl)
@@ -2387,9 +2456,9 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
                 thumb.setAlignment(QtCore.Qt.AlignCenter)
                 thumb.setStyleSheet("background: #0E1118; border: 1px solid #202636; border-radius: 4px;")
                 path = self.repository.asset_path(alias) if self.repository else None
-                pix = QtGui.QPixmap(str(path)) if (path and Path(path).is_file()) else None
-                if pix and not pix.isNull():
-                    thumb.setPixmap(pix.scaled(66, 46, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+                pix = _asset_thumbnail(Path(path) if path else None, 66, 46)
+                if not pix.isNull():
+                    thumb.setPixmap(pix)
                 else:
                     thumb.setText("No Img")
                 crow.addWidget(thumb)
@@ -2439,6 +2508,21 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
 
                 self.region_widgets[alias] = (btn_reg, btn_clear_reg)
 
+                btn_true = QtWidgets.QPushButton()
+                btn_fail = QtWidgets.QPushButton()
+                for outcome, route_btn in (("true", btn_true), ("fail", btn_fail)):
+                    route_btn.setFixedWidth(78)
+                    route_btn.clicked.connect(
+                        lambda _checked=False, a=alias, o=outcome: self._request_asset_route(a, o)
+                    )
+                    route_btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+                    route_btn.customContextMenuRequested.connect(
+                        lambda _pos, a=alias, o=outcome: self.clear_asset_route(a, o)
+                    )
+                    self._route_buttons[(alias, outcome)] = route_btn
+                    self._update_route_button(alias, outcome)
+                    crow.addWidget(route_btn)
+
                 btn_edit = QtWidgets.QPushButton("✏ 상세 편집")
                 btn_edit.setStyleSheet("background: #1E2330; border: 1px solid #3B455C; color: #E2E8F0; padding: 4px 8px; border-radius: 4px;")
                 btn_edit.clicked.connect(lambda _, a=alias: self._open_image_editor(a))
@@ -2469,6 +2553,74 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         btn_row.addWidget(btn_save)
         btn_row.addWidget(btn_cancel)
         layout.addLayout(btn_row)
+
+    def _request_asset_route(self, alias: str, outcome: str) -> None:
+        if outcome not in {"true", "fail"}:
+            return
+        self._route_pick_request = (str(alias), outcome)
+        self.done(self.RoutePickRequested)
+
+    def take_route_pick_request(self) -> tuple[str, str] | None:
+        request = self._route_pick_request
+        self._route_pick_request = None
+        return request
+
+    def set_asset_route(self, alias: str, outcome: str, target: int) -> None:
+        if alias not in self.aliases or outcome not in {"true", "fail"}:
+            return
+        target = int(target or 0)
+        if target > 0:
+            self._asset_routes.setdefault(alias, {})[outcome] = target
+        else:
+            self.clear_asset_route(alias, outcome)
+            return
+        self._update_route_button(alias, outcome)
+
+    def clear_asset_route(self, alias: str, outcome: str) -> None:
+        route = self._asset_routes.get(alias)
+        if isinstance(route, dict):
+            route.pop(outcome, None)
+            if not route:
+                self._asset_routes.pop(alias, None)
+        self._update_route_button(alias, outcome)
+
+    def _update_route_button(self, alias: str, outcome: str) -> None:
+        button = self._route_buttons.get((alias, outcome))
+        if button is None:
+            return
+        target = int((self._asset_routes.get(alias) or {}).get(outcome) or 0)
+        label = "True" if outcome == "true" else "Fail"
+        button.setText(f"{label}→{target}" if target else f"{label}→기본")
+        button.setToolTip(
+            f"{alias} 이미지의 {label} 분기 대상"
+            + (f": {target}번 노드\n좌클릭: 변경 · 우클릭: 기본 노드선 사용" if target else "\n좌클릭 후 캔버스에서 다음 노드를 선택")
+        )
+        if target:
+            colour = "#16A36A" if outcome == "true" else "#DC5470"
+            button.setStyleSheet(
+                f"background:{colour}; color:white; border:1px solid {colour}; "
+                "font-weight:800; border-radius:4px; padding:4px;"
+            )
+        else:
+            button.setStyleSheet(
+                "background:#1C2330; color:#AAB6C9; border:1px dashed #475569; "
+                "font-weight:700; border-radius:4px; padding:4px;"
+            )
+
+    def get_asset_routes(self) -> dict[str, dict[str, int]]:
+        result: dict[str, dict[str, int]] = {}
+        for alias in self.aliases:
+            route = self._asset_routes.get(alias)
+            if not isinstance(route, dict):
+                continue
+            normalized = {
+                outcome: int(route[outcome])
+                for outcome in ("true", "fail")
+                if int(route.get(outcome) or 0) > 0
+            }
+            if normalized:
+                result[alias] = normalized
+        return result
 
     def _open_visual_test(self) -> None:
         from .region_visual_test import RegionVisualTestDialog
@@ -2806,6 +2958,90 @@ ACTION_GUIDE_SUMMARIES: dict[str, str] = {
     "datetime_condition": "<b>💡 날짜·시간 조건 가이드</b><br>• 특정 날짜, 특정 요일(월~일), 또는 특정 시간대(예: 09:00~18:00)에만 매크로가 실행되도록 제어합니다.",
     "flow_control": "<b>💡 반복 이동 가이드</b><br>• 지정한 노드 번호로 다시 이동하여 루프(반복)를 형성합니다.<br>• 반복 횟수를 지정하면 무한 루프 없이 안전하게 순환합니다.",
 }
+
+
+def _find_builder_node_canvas(widget: QtWidgets.QWidget) -> QtWidgets.QWidget | None:
+    required = ("begin_node_target_pick", "node_target_picked", "selected_index")
+
+    # ActionEditorDialog is a top-level modal, but its QObject parent is still
+    # BuilderPage.  Walk that chain first so a different open Studio window is
+    # never selected accidentally.
+    current: QtCore.QObject | None = widget
+    while current is not None:
+        direct = getattr(current, "node_canvas", None)
+        if direct is not None and all(hasattr(direct, name) for name in required):
+            return direct
+        if isinstance(current, QtWidgets.QWidget):
+            for candidate in current.findChildren(QtWidgets.QWidget):
+                if all(hasattr(candidate, name) for name in required):
+                    return candidate
+        current = current.parent()
+
+    # Fallback for editors opened from a detached/non-standard host. Prefer a
+    # visible canvas and only inspect widgets that belong to this application.
+    fallback: QtWidgets.QWidget | None = None
+    for top_level in QtWidgets.QApplication.topLevelWidgets():
+        for candidate in top_level.findChildren(QtWidgets.QWidget):
+            if not all(hasattr(candidate, name) for name in required):
+                continue
+            if candidate.isVisible() and top_level.isVisible():
+                return candidate
+            fallback = fallback or candidate
+    if fallback is not None:
+        return fallback
+    return None
+
+
+def _pick_builder_node_target(dialog: ImageSearchConfidenceDialog) -> int:
+    canvas = _find_builder_node_canvas(dialog)
+    if canvas is None:
+        QtWidgets.QMessageBox.information(
+            dialog.parentWidget(),
+            "노드 선택 불가",
+            "현재 창에서 노드 캔버스를 찾지 못했습니다. 매크로 빌더에서 다시 열어 주세요.",
+        )
+        return 0
+
+    selected = int(canvas.selected_index() or 0)
+    result = {"target": 0}
+    loop = QtCore.QEventLoop(dialog)
+
+    def finish(target: int) -> None:
+        result["target"] = int(target or 0)
+        if loop.isRunning():
+            loop.quit()
+
+    canvas.node_target_picked.connect(finish)
+    try:
+        canvas.begin_node_target_pick(selected)
+        window = canvas.window()
+        if window is not None:
+            window.show()
+            window.raise_()
+            window.activateWindow()
+        loop.exec()
+    finally:
+        try:
+            canvas.node_target_picked.disconnect(finish)
+        except (RuntimeError, TypeError):
+            pass
+        if hasattr(canvas, "cancel_node_target_pick"):
+            canvas.cancel_node_target_pick(emit=False)
+    return result["target"]
+
+
+def exec_image_search_confidence_dialog(dialog: ImageSearchConfidenceDialog) -> int:
+    """Run the modal editor while temporarily yielding to canvas target picks."""
+    while True:
+        result = int(dialog.exec())
+        if result != ImageSearchConfidenceDialog.RoutePickRequested:
+            return result
+        request = dialog.take_route_pick_request()
+        if request is None:
+            continue
+        target = _pick_builder_node_target(dialog)
+        if target > 0:
+            dialog.set_asset_route(request[0], request[1], target)
 
 
 class ActionEditor(QtWidgets.QWidget):
@@ -5057,6 +5293,23 @@ class ActionEditor(QtWidgets.QWidget):
                         picker.set_offsets(payload["asset_offsets"])
                     else:
                         payload["asset_offsets"] = picker.offsets()
+                    raw_routes = payload.get("asset_routes") if isinstance(payload.get("asset_routes"), dict) else {}
+                    filtered_routes: dict[str, dict[str, int]] = {}
+                    for alias in payload["assets"]:
+                        route = raw_routes.get(alias)
+                        if not isinstance(route, dict):
+                            continue
+                        normalized_route = {
+                            outcome: int(route[outcome])
+                            for outcome in ("true", "fail")
+                            if int(route.get(outcome) or 0) > 0
+                        }
+                        if normalized_route:
+                            filtered_routes[alias] = normalized_route
+                    if filtered_routes:
+                        payload["asset_routes"] = filtered_routes
+                    else:
+                        payload.pop("asset_routes", None)
                     conf, asset_confs = picker.confidences()
                     if asset_confs:
                         payload["asset_confidences"] = asset_confs
@@ -5083,11 +5336,13 @@ class ActionEditor(QtWidgets.QWidget):
                 payload.pop("asset_offsets", None)
                 payload.pop("asset_confidences", None)
                 payload.pop("asset_regions", None)
+                payload.pop("asset_routes", None)
             else:
                 payload.pop("assets", None)
                 payload.pop("asset_offsets", None)
                 payload.pop("asset_confidences", None)
                 payload.pop("asset_regions", None)
+                payload.pop("asset_routes", None)
             click_target = str(payload.get("click_target") or "").lower().strip()
             if click_target in {"each_image", "first_image", "custom_coord"}:
                 click_enabled = True

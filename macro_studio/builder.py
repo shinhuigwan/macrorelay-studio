@@ -13,6 +13,7 @@ from .action_editor import (
     ActionEditorDialog,
     ImageSearchConfidenceDialog,
     action_template,
+    exec_image_search_confidence_dialog,
     korean_contains,
 )
 from .ai_macro_plan import validate_compiled_draft
@@ -1680,9 +1681,14 @@ class BuilderPage(QtWidgets.QWidget):
         dialog = ImageSearchConfidenceDialog(
             self.repository, aliases, cur_conf, cur_asset_conf, cur_region, self, step=step, asset_regions=cur_asset_regions
         )
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
+        if exec_image_search_confidence_dialog(dialog) == QtWidgets.QDialog.Accepted:
             step["confidence"] = dialog.get_confidence()
             step["asset_confidences"] = dialog.get_asset_confidences()
+            asset_routes = dialog.get_asset_routes()
+            if asset_routes:
+                step["asset_routes"] = asset_routes
+            else:
+                step.pop("asset_routes", None)
             new_asset_regs = dialog.get_asset_regions()
             if new_asset_regs:
                 step["asset_regions"] = new_asset_regs
@@ -3397,6 +3403,15 @@ class BuilderPage(QtWidgets.QWidget):
                 for rule in conditions:
                     if isinstance(rule, dict) and int(rule.get("target") or 0):
                         rule["target"] = int(rule["target"]) + base
+            asset_routes = step.get("asset_routes")
+            if isinstance(asset_routes, dict):
+                for route in asset_routes.values():
+                    if not isinstance(route, dict):
+                        continue
+                    for outcome in ("true", "fail"):
+                        target = int(route.get(outcome) or 0)
+                        if target:
+                            route[outcome] = target + base
         for step in prepared:
             step.pop("_live_position", None)
             if not str(step.get("workflow_id") or "").strip():
@@ -3991,6 +4006,23 @@ class BuilderPage(QtWidgets.QWidget):
                     step["edge_conditions"] = normalized
                 else:
                     step.pop("edge_conditions", None)
+            asset_routes = step.get("asset_routes")
+            if isinstance(asset_routes, dict):
+                normalized_routes: dict[str, dict[str, int]] = {}
+                for alias, route in asset_routes.items():
+                    if not isinstance(route, dict):
+                        continue
+                    normalized_route = {
+                        outcome: mapping[int(route[outcome])]
+                        for outcome in ("true", "fail")
+                        if int(route.get(outcome) or 0) in mapping
+                    }
+                    if normalized_route:
+                        normalized_routes[str(alias)] = normalized_route
+                if normalized_routes:
+                    step["asset_routes"] = normalized_routes
+                else:
+                    step.pop("asset_routes", None)
             block_steps.append(step)
         self.repository.save_automation_block(name, block_steps, description)
         self.status.emit(f"'{name}' 자동화 블록을 저장했습니다. 노드 {len(block_steps)}개")
@@ -4151,6 +4183,27 @@ class BuilderPage(QtWidgets.QWidget):
                     step["edge_conditions"] = normalized_rules
                 else:
                     step.pop("edge_conditions", None)
+            asset_routes = step.get("asset_routes")
+            if isinstance(asset_routes, dict):
+                normalized_asset_routes: dict[str, dict[str, int]] = {}
+                for alias, route in asset_routes.items():
+                    if not isinstance(route, dict):
+                        continue
+                    normalized_route: dict[str, int] = {}
+                    for outcome in ("true", "fail"):
+                        route_target = int(route.get(outcome) or 0)
+                        if route_target == deleted:
+                            continue
+                        if route_target > deleted:
+                            route_target -= 1
+                        if route_target > 0:
+                            normalized_route[outcome] = route_target
+                    if normalized_route:
+                        normalized_asset_routes[str(alias)] = normalized_route
+                if normalized_asset_routes:
+                    step["asset_routes"] = normalized_asset_routes
+                else:
+                    step.pop("asset_routes", None)
         if self.current_macro is None:
             return
         positions = self.current_macro.get("graph_positions") or {}
@@ -4239,6 +4292,15 @@ class BuilderPage(QtWidgets.QWidget):
                         value = int(rule.get("target") or 0)
                         if value in mapping:
                             rule["target"] = mapping[value]
+            asset_routes = step.get("asset_routes")
+            if isinstance(asset_routes, dict):
+                for route in asset_routes.values():
+                    if not isinstance(route, dict):
+                        continue
+                    for outcome in ("true", "fail"):
+                        value = int(route.get(outcome) or 0)
+                        if value in mapping:
+                            route[outcome] = mapping[value]
         positions = self.current_macro.get("graph_positions") or {}
         if isinstance(positions, dict):
             first = positions.pop(str(old_a), None)

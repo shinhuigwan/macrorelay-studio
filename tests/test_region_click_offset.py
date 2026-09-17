@@ -89,6 +89,55 @@ class RegionClickOffsetTests(unittest.TestCase):
             self.assertEqual({"first": [0, 0], "fifth": [137, -42]}, rebuilt["asset_offsets"])
             editor.close()
 
+    def test_multi_image_route_dialog_round_trips_each_outcome_independently(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.action_editor import ImageSearchConfidenceDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            for alias, colour in (("first", "#20C997"), ("fifth", "#7C6CFF")):
+                image = QtGui.QImage(24, 18, QtGui.QImage.Format_RGB32)
+                image.fill(QtGui.QColor(colour))
+                repository.add_asset_image(image, alias)
+
+            dialog = ImageSearchConfidenceDialog(
+                repository,
+                ["first", "fifth"],
+                86,
+                {},
+                None,
+                step={
+                    "action": "multi_image_search",
+                    "assets": ["first", "fifth"],
+                    "asset_routes": {"fifth": {"true": 3}},
+                },
+            )
+
+            self.assertEqual({"fifth": {"true": 3}}, dialog.get_asset_routes())
+            self.assertEqual("True→3", dialog._route_buttons[("fifth", "true")].text())
+            self.assertEqual("Fail→기본", dialog._route_buttons[("fifth", "fail")].text())
+
+            dialog.set_asset_route("fifth", "fail", 5)
+            self.assertEqual({"fifth": {"true": 3, "fail": 5}}, dialog.get_asset_routes())
+            dialog.clear_asset_route("fifth", "true")
+            self.assertEqual({"fifth": {"fail": 5}}, dialog.get_asset_routes())
+            self.assertEqual("True→기본", dialog._route_buttons[("fifth", "true")].text())
+            dialog.close()
+
+    def test_multi_asset_picker_batches_selection_change_signals(self) -> None:
+        from PySide6 import QtTest
+        from macro_studio.action_editor import MultiAssetPicker
+
+        picker = MultiAssetPicker()
+        picker.set_options(["one", "two", "three"])
+        spy = QtTest.QSignalSpy(picker.selection_changed)
+
+        picker.set_value(["one", "two", "three"])
+
+        self.assertEqual(1, spy.count())
+        picker.close()
+
 
 if __name__ == "__main__":
     unittest.main()

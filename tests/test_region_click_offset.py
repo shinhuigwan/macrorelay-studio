@@ -112,11 +112,14 @@ class RegionClickOffsetTests(unittest.TestCase):
                     "assets": ["first", "fifth"],
                     "asset_routes": {"fifth": {"true": 3}},
                 },
+                focus_alias="fifth",
             )
+            self.app.processEvents()
 
             self.assertEqual({"fifth": {"true": 3}}, dialog.get_asset_routes())
             self.assertEqual("True→3", dialog._route_buttons[("fifth", "true")].text())
             self.assertEqual("Fail→기본", dialog._route_buttons[("fifth", "fail")].text())
+            self.assertIn("#45CBB0", dialog._alias_cards["fifth"].styleSheet())
 
             dialog.set_asset_route("fifth", "fail", 5)
             self.assertEqual({"fifth": {"true": 3, "fail": 5}}, dialog.get_asset_routes())

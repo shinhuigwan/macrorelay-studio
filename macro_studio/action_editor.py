@@ -2263,6 +2263,7 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         parent=None,
         step: dict[str, Any] | None = None,
         asset_regions: dict[str, list[int]] | None = None,
+        focus_alias: str = "",
     ) -> None:
         if isinstance(search_region, QtWidgets.QWidget) and parent is None:
             parent = search_region
@@ -2288,6 +2289,8 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
                 self._asset_routes[str(alias)] = normalized
         self._route_buttons: dict[tuple[str, str], QtWidgets.QPushButton] = {}
         self._route_pick_request: tuple[str, str] | None = None
+        self._alias_cards: dict[str, QtWidgets.QFrame] = {}
+        self._alias_scroll: QtWidgets.QScrollArea | None = None
 
         def _is_valid_reg(r: Any) -> bool:
             if isinstance(r, (list, tuple)) and len(r) >= 4:
@@ -2436,6 +2439,7 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
             layout.addWidget(batch_box)
 
             scroll = QtWidgets.QScrollArea()
+            self._alias_scroll = scroll
             scroll.setWidgetResizable(True)
             scroll.setStyleSheet("QScrollArea { border: 1px solid #2A3040; border-radius: 8px; background: #131722; }")
             container = QtWidgets.QWidget()
@@ -2446,6 +2450,7 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
             for alias in self.aliases:
                 cur_val = self._asset_confidences.get(alias, self._confidence)
                 card = QtWidgets.QFrame()
+                self._alias_cards[alias] = card
                 card.setStyleSheet("QFrame { background: #171A22; border: 1px solid #2B354A; border-radius: 6px; padding: 6px; }")
                 crow = QtWidgets.QHBoxLayout(card)
                 crow.setContentsMargins(6, 4, 6, 4)
@@ -2553,6 +2558,20 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         btn_row.addWidget(btn_save)
         btn_row.addWidget(btn_cancel)
         layout.addLayout(btn_row)
+        if focus_alias:
+            QtCore.QTimer.singleShot(0, lambda alias=str(focus_alias): self.focus_alias(alias))
+
+    def focus_alias(self, alias: str) -> None:
+        card = self._alias_cards.get(str(alias))
+        if card is None:
+            return
+        card.setStyleSheet(
+            "QFrame { background:#17283A; border:2px solid #45CBB0; "
+            "border-radius:7px; padding:5px; }"
+        )
+        if self._alias_scroll is not None:
+            self._alias_scroll.ensureWidgetVisible(card, 20, 50)
+        card.setFocus(QtCore.Qt.OtherFocusReason)
 
     def _request_asset_route(self, alias: str, outcome: str) -> None:
         if outcome not in {"true", "fail"}:

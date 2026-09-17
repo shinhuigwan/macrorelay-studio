@@ -1803,6 +1803,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         condition_index: int = -1,
         rule: dict[str, Any] | None = None,
         candidate_index: int = 0,
+        asset_entries: list[tuple[int, str]] | None = None,
+        asset_outcome: str = "",
     ) -> None:
         super().__init__()
         self.canvas = canvas
@@ -1814,10 +1816,21 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self.is_secondary_candidate = candidate_index > 0
         self.rule = rule or {}
         self.is_condition = condition_index >= 0
+        self.asset_entries = list(asset_entries or [])
+        self.asset_outcome = str(asset_outcome or "")
+        self.is_asset_route = bool(self.asset_entries) and self.asset_outcome in {"true", "fail"}
         is_return_flow = self.is_return_link()
-        self.edge_type = "return" if is_return_flow else ("condition" if self.is_condition else "normal")
+        self.edge_type = (
+            "asset_route" if self.is_asset_route
+            else ("return" if is_return_flow else ("condition" if self.is_condition else "normal"))
+        )
 
-        if self.edge_type == "return":
+        if self.edge_type == "asset_route":
+            self.color = QtGui.QColor("#45CBB0" if self.asset_outcome == "true" else "#DE718B")
+            line_style = QtCore.Qt.DashLine
+            pen_width = 1.45
+            self.setOpacity(0.58)
+        elif self.edge_type == "return":
             self.color = QtGui.QColor("#2CDBB8" if kind == "success" else "#F06292")
             line_style = QtCore.Qt.DashLine
             pen_width = 2.4
@@ -1851,7 +1864,11 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self.label.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations, True)
         self.label.setAcceptedMouseButtons(QtCore.Qt.NoButton)
         self.setCursor(QtCore.Qt.OpenHandCursor)
-        self.setToolTip("선을 빈 공간으로 드래그해 즉시 끊거나, 다른 노드로 드래그해 다시 연결합니다.")
+        self.setToolTip(
+            "개별 이미지 분기선입니다. 더블클릭하면 해당 이미지 설정을 엽니다."
+            if self.is_asset_route
+            else "선을 빈 공간으로 드래그해 즉시 끊거나, 다른 노드로 드래그해 다시 연결합니다."
+        )
         self._drag_origin = QtCore.QPointF()
         self._dragging = False
         self.route_side = ""
@@ -1864,6 +1881,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self.update_path()
 
     def is_return_link(self) -> bool:
+        if getattr(self, "is_asset_route", False):
+            return False
         if getattr(self, "is_condition", False):
             return False
         source_node = self.canvas.nodes.get(self.source)
@@ -1926,11 +1945,12 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             return
         if selected:
             highlight = QtGui.QColor(
-                "#38E7FF" if self.kind == "success" and not self.is_condition
+                ("#63FFE0" if self.asset_outcome == "true" else "#FF8BA5") if self.is_asset_route
+                else "#38E7FF" if self.kind == "success" and not self.is_condition
                 else ("#FF4B72" if self.kind == "fail" and not self.is_condition else "#FFE600")
             )
-            style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") == "return" or self.is_condition else QtCore.Qt.SolidLine
-            self.setPen(QtGui.QPen(highlight, 4.2, style, QtCore.Qt.RoundCap))
+            style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") in {"return", "asset_route"} or self.is_condition else QtCore.Qt.SolidLine
+            self.setPen(QtGui.QPen(highlight, 3.0 if self.is_asset_route else 4.2, style, QtCore.Qt.RoundCap))
             self.setOpacity(1.0)
             self.setZValue(30)
             self.arrow.setBrush(highlight)
@@ -1941,7 +1961,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             node_selected = self.canvas.selected_indexes() if hasattr(self, "canvas") else []
             if not node_selected:
                 base_opacity = (
-                    0.38 if getattr(self, "edge_type", "") == "return" and self.kind == "success"
+                    0.58 if self.is_asset_route
+                    else 0.38 if getattr(self, "edge_type", "") == "return" and self.kind == "success"
                     else (0.35 if getattr(self, "edge_type", "") == "return"
                     else (0.50 if self.is_condition else 0.45))
                 )
@@ -1953,8 +1974,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 base_opacity = 0.18
                 self.setZValue(-2)
             self.setOpacity(base_opacity)
-            style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") == "return" or self.is_condition else QtCore.Qt.SolidLine
-            pen_width = 2.4 if getattr(self, "edge_type", "") == "return" else (3.0 if self.is_condition else 2.6)
+            style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") in {"return", "asset_route"} or self.is_condition else QtCore.Qt.SolidLine
+            pen_width = 1.45 if self.is_asset_route else (2.4 if getattr(self, "edge_type", "") == "return" else (3.0 if self.is_condition else 2.6))
             self.setPen(QtGui.QPen(self.color, pen_width, style, QtCore.Qt.RoundCap))
             self.arrow.setBrush(self.color)
             if hasattr(self, "target_arrow"):
@@ -2292,7 +2313,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 if node.sceneBoundingRect().right() >= span_left
                 and node.sceneBoundingRect().left() <= span_right
                 and (
-                    self.is_condition
+                    self.is_condition or self.is_asset_route
                     or (
                         node.sceneBoundingRect().bottom() >= corridor_top
                         and node.sceneBoundingRect().top() <= corridor_bottom
@@ -2301,8 +2322,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             ]
             if not route_rects:
                 route_rects = [source_rect, target_rect]
-            base_margin = 68.0 if self.is_condition else 52.0
-            lane_spacing = 30.0 if self.is_condition else 26.0
+            base_margin = 68.0 if self.is_condition else (60.0 if self.is_asset_route else 52.0)
+            lane_spacing = 30.0 if self.is_condition else (22.0 if self.is_asset_route else 26.0)
             margin = base_margin + self.route_lane * lane_spacing
             if self.route_side == "top":
                 lane_y = min(rect.top() for rect in route_rects) - margin
@@ -2341,7 +2362,19 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         transform.rotate(angle)
         self.arrow.setPolygon(transform.map(polygon))
 
-        if self.is_condition:
+        if self.is_asset_route:
+            numbers = "".join(
+                chr(0x2460 + number - 1) if 1 <= number <= 20 else f"[{number}]"
+                for number, _alias in self.asset_entries
+            )
+            outcome = "True" if self.asset_outcome == "true" else "Fail"
+            if len(self.asset_entries) == 1:
+                _number, alias = self.asset_entries[0]
+                short_alias = QtGui.QFontMetrics(self.label.font()).elidedText(alias, QtCore.Qt.ElideMiddle, 118)
+                text = f"{numbers} {short_alias} · {outcome} → {self.target}번"
+            else:
+                text = f"{numbers} 이미지 · {outcome} → {self.target}번"
+        elif self.is_condition:
             source_name = "횟수" if self.rule.get("source", "edge_count") == "edge_count" else str(self.rule.get("variable") or "변수")
             operator = str(self.rule.get("operator") or ">=")
             value = self.rule.get("value", 1)
@@ -2384,16 +2417,34 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         target_node = self.canvas.nodes.get(self.target)
         src_name = source_node.step.get("label") or getattr(source_node, "display_title", "노드") if source_node else f"{self.source}번"
         tgt_name = target_node.step.get("label") or getattr(target_node, "display_title", "노드") if target_node else f"{self.target}번"
-        kind_str = "성공" if self.kind == "success" else "실패"
-        self.setToolTip(
-            f"<b>{self.source}번 [{src_name}] {kind_str}</b> → <b>{self.target}번 [{tgt_name}]</b><br>"
-            "💡 <b>더블클릭 / 우클릭</b>: 딜레이 시간 및 분기 조건 추가<br>"
-            "💡 <b>빈 곳으로 드래그</b>: 연결선 즉시 삭제"
-        )
+        if self.is_asset_route:
+            outcome = "True(발견)" if self.asset_outcome == "true" else "Fail(미탐지)"
+            aliases = "<br>".join(f"{number}번 · {alias}" for number, alias in self.asset_entries)
+            self.setToolTip(
+                f"<b>개별 이미지 {outcome} 분기</b><br>{aliases}<br>"
+                f"→ <b>{self.target}번 [{tgt_name}]</b><br>💡 더블클릭: 해당 이미지 설정 열기"
+            )
+            entries = [
+                (alias, self.canvas._asset_preview_paths[alias])
+                for _number, alias in self.asset_entries
+                if alias in self.canvas._asset_preview_paths
+            ]
+            if entries:
+                self.canvas.show_image_preview(entries, event.screenPos())
+        else:
+            kind_str = "성공" if self.kind == "success" else "실패"
+            self.setToolTip(
+                f"<b>{self.source}번 [{src_name}] {kind_str}</b> → <b>{self.target}번 [{tgt_name}]</b><br>"
+                "💡 <b>더블클릭 / 우클릭</b>: 딜레이 시간 및 분기 조건 추가<br>"
+                "💡 <b>빈 곳으로 드래그</b>: 연결선 즉시 삭제"
+            )
 
-        highlight = QtGui.QColor("#38E7FF" if self.kind == "success" else "#FF5252" if self.kind == "fail" else COLORS["warning"])
-        style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") == "return" or self.is_condition else QtCore.Qt.SolidLine
-        self.setPen(QtGui.QPen(highlight, 4.2, style, QtCore.Qt.RoundCap))
+        highlight = QtGui.QColor(
+            ("#63FFE0" if self.asset_outcome == "true" else "#FF8BA5") if self.is_asset_route
+            else "#38E7FF" if self.kind == "success" else "#FF5252" if self.kind == "fail" else COLORS["warning"]
+        )
+        style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") in {"return", "asset_route"} or self.is_condition else QtCore.Qt.SolidLine
+        self.setPen(QtGui.QPen(highlight, 3.0 if self.is_asset_route else 4.2, style, QtCore.Qt.RoundCap))
         self.arrow.setBrush(highlight)
         if hasattr(self, "target_arrow"):
             self.target_arrow.setBrush(highlight)
@@ -2410,7 +2461,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             return
         selected = self.canvas.selected_indexes()
         if not selected:
-            base_opacity = 0.38 if getattr(self, "edge_type", "") == "return" and self.kind == "success" else (0.35 if getattr(self, "edge_type", "") == "return" else (0.50 if self.is_condition else 0.45))
+            base_opacity = 0.58 if self.is_asset_route else (0.38 if getattr(self, "edge_type", "") == "return" and self.kind == "success" else (0.35 if getattr(self, "edge_type", "") == "return" else (0.50 if self.is_condition else 0.45)))
             self.setZValue(-1)
         elif self.source in selected or self.target in selected:
             base_opacity = 1.0
@@ -2419,8 +2470,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             base_opacity = 0.18
             self.setZValue(-2)
         self.setOpacity(base_opacity)
-        style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") == "return" or self.is_condition else QtCore.Qt.SolidLine
-        pen_width = 2.4 if getattr(self, "edge_type", "") == "return" else (3.0 if self.is_condition else 2.6)
+        style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") in {"return", "asset_route"} or self.is_condition else QtCore.Qt.SolidLine
+        pen_width = 1.45 if self.is_asset_route else (2.4 if getattr(self, "edge_type", "") == "return" else (3.0 if self.is_condition else 2.6))
         self.setPen(QtGui.QPen(self.color, pen_width, style, QtCore.Qt.RoundCap))
         self.arrow.setBrush(self.color)
         if hasattr(self, "target_arrow"):
@@ -2432,10 +2483,16 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             source_node.update()
         if target_node:
             target_node.update()
+        if self.is_asset_route:
+            self.canvas.hide_image_preview()
         super().hoverLeaveEvent(event)
 
     def mouseDoubleClickEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
-        self.canvas.edge_delay_requested.emit(self.source, self.target, self.kind)
+        if self.is_asset_route:
+            alias = self.asset_entries[0][1] if self.asset_entries else ""
+            self.canvas.asset_route_edit_requested.emit(self.source, alias)
+        else:
+            self.canvas.edge_delay_requested.emit(self.source, self.target, self.kind)
         event.accept()
 
     def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
@@ -2449,6 +2506,9 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        if self.is_asset_route:
+            event.accept()
+            return
         if event.buttons() & QtCore.Qt.LeftButton:
             if event.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
                 event.accept()
@@ -2481,6 +2541,18 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:
+        if self.is_asset_route:
+            menu = QtWidgets.QMenu()
+            edit = menu.addAction("이 이미지의 분기 설정 열기")
+            hide = menu.addAction("개별 이미지 분기선 숨기기")
+            chosen = menu.exec(event.screenPos())
+            if chosen == edit:
+                alias = self.asset_entries[0][1] if self.asset_entries else ""
+                QtCore.QTimer.singleShot(0, lambda: self.canvas.asset_route_edit_requested.emit(self.source, alias))
+            elif chosen == hide:
+                self.canvas.set_asset_route_edges_visible(False)
+            event.accept()
+            return
         menu = QtWidgets.QMenu()
         delay = menu.addAction("연결 설정 · 딜레이와 조건 분기")
         add_condition = menu.addAction("＋ 조건 분기 바로 추가")
@@ -3344,6 +3416,7 @@ class NodeCanvas(QtWidgets.QWidget):
     comments_changed = QtCore.Signal(list)
     quick_node_drop_requested = QtCore.Signal(str, object)
     node_target_picked = QtCore.Signal(int)
+    asset_route_edit_requested = QtCore.Signal(int, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -3373,6 +3446,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self._node_target_pick_active = False
         self._node_target_pick_excluded = 0
         self._node_target_pick_previous_label = ""
+        self._asset_route_edges_visible = True
         self.rubber_selecting = False
         self._asset_preview_paths: dict[str, Path] = {}
         self._preview_popup = ImagePreviewPopup(self)
@@ -3409,6 +3483,13 @@ class NodeCanvas(QtWidgets.QWidget):
         reset.clicked.connect(self.view_reset_zoom)
         self.zoom_label = QtWidgets.QLabel("100%")
         self.zoom_label.setObjectName("Muted")
+        self.asset_route_toggle = QtWidgets.QPushButton("개별 분기선")
+        self.asset_route_toggle.setCheckable(True)
+        self.asset_route_toggle.setChecked(True)
+        self.asset_route_toggle.setToolTip(
+            "멀티 이미지 서치에서 특정 이미지에 지정한 True/Fail 보조 분기선을 표시하거나 숨깁니다."
+        )
+        self.asset_route_toggle.toggled.connect(self.set_asset_route_edges_visible)
         canvas_log_btn = QtWidgets.QPushButton("📋 성공·실패 로그")
         canvas_log_btn.setToolTip("<b>성공·실패 실행 로그</b><br>각 노드의 성공/실패 여부, 실패 시 쉬운 원인 분석과 개선 가이드를 실시간 확인합니다.")
         canvas_log_btn.clicked.connect(self.log_requested.emit)
@@ -3431,6 +3512,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.archive_btn.setToolTip("<b>노드 보관함 (📦)</b><br>삭제하거나 보관 처리한 노드 목록을 확인하고, 캔버스로 즉시 복원합니다.")
         self.archive_btn.clicked.connect(self.archive_requested.emit)
         toolbar_layout.addWidget(self.archive_btn)
+        toolbar_layout.addWidget(self.asset_route_toggle)
         toolbar_layout.addWidget(canvas_log_btn)
         toolbar_layout.addWidget(canvas_help_btn)
         self.branch_btn = QtWidgets.QPushButton("🔀 순차 분기 묶기")
@@ -3532,7 +3614,7 @@ class NodeCanvas(QtWidgets.QWidget):
         for edge in self.edges:
             if edge is cached:
                 continue
-            if edge.condition_index >= 0 or not edge.isVisible():
+            if edge.condition_index >= 0 or edge.is_asset_route or not edge.isVisible():
                 continue
             local_pos = edge.mapFromScene(scene_pos)
             if stroker.createStroke(edge.path()).contains(local_pos):
@@ -4080,6 +4162,15 @@ class NodeCanvas(QtWidgets.QWidget):
                     target = int(rule.get("target") or 0)
                     if target:
                         targets.append(target)
+            asset_routes = step.get("asset_routes")
+            if isinstance(asset_routes, dict):
+                for route in asset_routes.values():
+                    if not isinstance(route, dict):
+                        continue
+                    for outcome in ("true", "fail"):
+                        target = int(route.get(outcome) or 0)
+                        if target:
+                            targets.append(target)
             for target in targets:
                 if 0 < target <= total and target not in outgoing[index]:
                     outgoing[index].append(target)
@@ -4185,6 +4276,9 @@ class NodeCanvas(QtWidgets.QWidget):
 
     @staticmethod
     def edge_route_key(edge: EdgeItem) -> str:
+        if edge.is_asset_route:
+            aliases = ",".join(alias for _number, alias in edge.asset_entries)
+            return f"{edge.source}:asset_{edge.asset_outcome}:{edge.target}:{aliases}"
         return f"{edge.source}:{edge.kind}:{edge.target}:{edge.condition_index}"
 
     def route_points(self, edge: EdgeItem) -> list[QtCore.QPointF]:
@@ -4361,7 +4455,49 @@ class NodeCanvas(QtWidgets.QWidget):
                         edge = EdgeItem(self, index, target, kind, condition_index, rule)
                         self.scene.addItem(edge)
                         self.edges.append(edge)
+            if self._asset_route_edges_visible:
+                assets = step.get("assets") if isinstance(step.get("assets"), list) else []
+                primary = str(step.get("asset") or "").strip()
+                ordered_assets = [str(alias) for alias in assets if str(alias).strip()]
+                if primary and primary not in ordered_assets:
+                    ordered_assets.insert(0, primary)
+                asset_numbers = {alias: pos for pos, alias in enumerate(ordered_assets, start=1)}
+                route_groups: dict[tuple[str, int], list[tuple[int, str]]] = {}
+                asset_routes = step.get("asset_routes")
+                if isinstance(asset_routes, dict):
+                    for alias, route in asset_routes.items():
+                        alias = str(alias)
+                        if not isinstance(route, dict):
+                            continue
+                        number = int(asset_numbers.get(alias) or (len(asset_numbers) + 1))
+                        for outcome in ("true", "fail"):
+                            target = int(route.get(outcome) or 0)
+                            if target > 0:
+                                route_groups.setdefault((outcome, target), []).append((number, alias))
+                for (outcome, target), entries in route_groups.items():
+                    if index in self.nodes and target in self.nodes:
+                        kind = "success" if outcome == "true" else "fail"
+                        edge = EdgeItem(
+                            self,
+                            index,
+                            target,
+                            kind,
+                            asset_entries=sorted(entries),
+                            asset_outcome=outcome,
+                        )
+                        self.scene.addItem(edge)
+                        self.edges.append(edge)
         self._route_edges()
+
+    def set_asset_route_edges_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self._asset_route_edges_visible == visible:
+            return
+        self._asset_route_edges_visible = visible
+        blocker = QtCore.QSignalBlocker(self.asset_route_toggle)
+        self.asset_route_toggle.setChecked(visible)
+        del blocker
+        self.rebuild_edges()
 
     def _route_edges(self) -> None:
         """Assign collision-free outer lanes before drawing ordinary direct curves."""
@@ -4387,7 +4523,7 @@ class NodeCanvas(QtWidgets.QWidget):
             start = out_port.mapToScene(out_port.rect().center())
             in_port = target.in_success_port if edge.kind == "success" else target.in_fail_port
             end = in_port.mapToScene(in_port.rect().center())
-            if edge.is_condition:
+            if edge.is_condition or edge.is_asset_route:
                 # Condition lines carry a separate meaning and are usually
                 # longer than ordinary flow links. Always keep them outside
                 # node bodies: success above, failure below. Manual waypoints
@@ -4483,6 +4619,8 @@ class NodeCanvas(QtWidgets.QWidget):
         edge_specs = []
         for edge in edges:
             try:
+                if edge.is_asset_route:
+                    continue
                 edge_specs.append({
                     "source": int(edge.source),
                     "target": int(edge.target),

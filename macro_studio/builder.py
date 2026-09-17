@@ -1453,6 +1453,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.start_search_group_requested.connect(self._configure_start_search_candidates)
         self.node_canvas.log_requested.connect(self._open_logs)
         self.node_canvas.image_edit_requested.connect(self._edit_node_search_image)
+        self.node_canvas.asset_route_edit_requested.connect(self._edit_asset_route)
         self.node_canvas.color_visual_test_requested.connect(self._open_node_color_visual_test)
         self.node_canvas.image_visual_test_requested.connect(self._open_node_image_visual_test)
         self.node_canvas.multi_image_merge_requested.connect(
@@ -1646,16 +1647,20 @@ class BuilderPage(QtWidgets.QWidget):
         layout.addWidget(save_btn)
         return card
 
-    def _edit_node_search_image(self, step_index: int) -> None:
+    def _edit_asset_route(self, step_index: int, alias: str) -> None:
+        self.node_canvas.select_node(int(step_index))
+        self._edit_node_search_image(step_index, focus_alias=alias)
+
+    def _edit_node_search_image(self, step_index: int, focus_alias: str = "") -> None:
         steps = list((self.current_macro or {}).get("steps") or [])
         row = int(step_index) - 1
         if not 0 <= row < len(steps):
             return
         step = steps[row]
-        if str(step.get("action") or "") in {"multi_image_search", "animation_search"}:
+        if str(step.get("action") or "") in {"multi_image_search", "animation_search"} and not focus_alias:
             self._open_node_image_visual_test(step_index)
             return
-        if str(step.get("action") or "") not in {"image_search", "screen_condition"}:
+        if str(step.get("action") or "") not in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             return
         aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
         primary = str(step.get("asset") or "").strip()
@@ -1679,7 +1684,15 @@ class BuilderPage(QtWidgets.QWidget):
                 cur_region = None
         cur_asset_regions = step.get("asset_regions") if isinstance(step.get("asset_regions"), dict) else {}
         dialog = ImageSearchConfidenceDialog(
-            self.repository, aliases, cur_conf, cur_asset_conf, cur_region, self, step=step, asset_regions=cur_asset_regions
+            self.repository,
+            aliases,
+            cur_conf,
+            cur_asset_conf,
+            cur_region,
+            self,
+            step=step,
+            asset_regions=cur_asset_regions,
+            focus_alias=focus_alias,
         )
         if exec_image_search_confidence_dialog(dialog) == QtWidgets.QDialog.Accepted:
             step["confidence"] = dialog.get_confidence()

@@ -4002,6 +4002,51 @@ class UiSmokeTests(unittest.TestCase):
         canvas.close()
         app.processEvents()
 
+    def test_multi_image_asset_routes_render_grouped_thin_toggleable_edges(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro(
+            {
+                "steps": [
+                    {
+                        "action": "multi_image_search",
+                        "assets": ["first", "second", "third"],
+                        "on_success": 2,
+                        "asset_routes": {
+                            "second": {"true": 3},
+                            "third": {"true": 3, "fail": 2},
+                        },
+                    },
+                    {"action": "wait"},
+                    {"action": "wait"},
+                ],
+                "graph_positions": {"1": [0, 0], "2": [350, 0], "3": [700, 0]},
+            }
+        )
+        app.processEvents()
+
+        asset_edges = [edge for edge in canvas.edges if edge.is_asset_route]
+        self.assertEqual(2, len(asset_edges))
+        true_edge = next(edge for edge in asset_edges if edge.asset_outcome == "true")
+        fail_edge = next(edge for edge in asset_edges if edge.asset_outcome == "fail")
+        self.assertEqual([(2, "second"), (3, "third")], true_edge.asset_entries)
+        self.assertIn("②③ 이미지 · True → 3번", true_edge.label.text())
+        self.assertIn("③ third · Fail → 2번", fail_edge.label.text())
+        self.assertLess(true_edge.pen().widthF(), 2.0)
+        self.assertEqual("top", true_edge.route_side)
+        self.assertEqual("bottom", fail_edge.route_side)
+
+        canvas.set_asset_route_edges_visible(False)
+        self.assertFalse(any(edge.is_asset_route for edge in canvas.edges))
+        self.assertFalse(canvas.asset_route_toggle.isChecked())
+        canvas.set_asset_route_edges_visible(True)
+        self.assertEqual(2, len([edge for edge in canvas.edges if edge.is_asset_route]))
+        canvas.close()
+        app.processEvents()
+
     def test_condition_edges_use_outer_lanes_without_crossing_intermediate_nodes(self) -> None:
         from PySide6 import QtGui, QtWidgets
         from macro_studio.node_editor import NodeCanvas

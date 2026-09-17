@@ -2,6 +2,7 @@ $ErrorActionPreference = "SilentlyContinue"
 $studioRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $studioScript = Join-Path $studioRoot "run_studio.py"
 $legacyPackages = Join-Path $studioRoot ".venv\Lib\site-packages"
+$bundledOpenCvPackages = Join-Path $studioRoot "runtime\opencv\cp312\packages"
 $runtimeCandidates = @(
     @((Join-Path $studioRoot ".venv\Scripts\python.exe"), (Join-Path $studioRoot ".venv\Scripts\pythonw.exe"), $false),
     @((Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"), (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\pythonw.exe"), $false),
@@ -16,12 +17,17 @@ foreach ($candidate in $runtimeCandidates) {
         continue
     }
     if ($useLegacyPackages -and (Test-Path -LiteralPath $legacyPackages)) {
-        $env:PYTHONPATH = $legacyPackages
+        $packagePaths = @()
+        if (Test-Path -LiteralPath $bundledOpenCvPackages) {
+            $packagePaths += $bundledOpenCvPackages
+        }
+        $packagePaths += $legacyPackages
+        $env:PYTHONPATH = $packagePaths -join [IO.Path]::PathSeparator
     }
     else {
         Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
     }
-    & $python -c "from PySide6 import QtWidgets" 2>$null
+    & $python -c "from PySide6 import QtWidgets; import cv2, numpy" 2>$null
     if ($LASTEXITCODE -eq 0) {
         Remove-Item -LiteralPath (Join-Path $studioRoot "studio-launch-error.txt") -ErrorAction SilentlyContinue
         Start-Process -FilePath $pythonw -ArgumentList @($studioScript) -WorkingDirectory $studioRoot -WindowStyle Hidden

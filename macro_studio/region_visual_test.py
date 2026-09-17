@@ -14,6 +14,8 @@ import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+import opencv_search
+
 from .color_widgets import ColorToleranceBarWidget, ToleranceSpectrumBar
 from .repository import MacroRepository
 from .search_diagnostics import (
@@ -1632,12 +1634,50 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             if not path or not Path(path).is_file():
                 results[alias] = {"found": False, "score": 0.0, "reason": "이미지 파일 없음"}
                 continue
-            tmpl = _read_image_unicode(path)
-            if tmpl is None or tmpl.size == 0:
+            decoded = opencv_search.read_image_unicode(str(path), cv2, np)
+            if decoded is None or decoded.size == 0:
                 results[alias] = {"found": False, "score": 0.0, "reason": "이미지 디코딩 실패"}
                 continue
+            mask = None
+            if decoded.ndim == 3 and decoded.shape[2] == 4:
+                alpha = decoded[:, :, 3]
+                if int(np.count_nonzero(alpha > 8)):
+                    mask = np.where(alpha > 8, 255, 0).astype(np.uint8)
+                tmpl = decoded[:, :, :3]
+            elif decoded.ndim == 2:
+                tmpl = cv2.cvtColor(decoded, cv2.COLOR_GRAY2BGR)
+            else:
+                tmpl = decoded
+            tmpl, mask, crop_origin, canvas_size = opencv_search.trim_transparent_template(tmpl, mask, np)
             th, tw = tmpl.shape[:2]
+            canvas_w, canvas_h = canvas_size
             thresh = float(conf_map.get(alias, base_thresh * 100)) / 100.0
+            profile = str(self.step.get("search_profile") or "balanced").casefold()
+            if profile not in {"fast", "balanced", "precise"}:
+                profile = "balanced"
+
+            def runtime_match(search_frame: np.ndarray) -> tuple[Any, float]:
+                standard_cache: dict[Any, Any] = {}
+                if profile == "precise":
+                    probe, probe_score = opencv_search.adaptive_standard_match(
+                        search_frame, tmpl, mask, thresh, "fast", cv2, np,
+                        standard_cache, crop_origin=crop_origin,
+                        canvas_size=canvas_size, fallback_full=False,
+                    )
+                    if probe is not None:
+                        return probe, float(probe_score)
+                    precise_cache: dict[Any, Any] = {}
+                    match, score = opencv_search.adaptive_precise_match(
+                        search_frame, tmpl, mask, thresh, cv2, np,
+                        precise_cache, crop_origin=crop_origin,
+                        canvas_size=canvas_size,
+                    )
+                    return match, max(float(probe_score), float(score))
+                return opencv_search.adaptive_standard_match(
+                    search_frame, tmpl, mask, thresh, profile, cv2, np,
+                    standard_cache, crop_origin=crop_origin,
+                    canvas_size=canvas_size,
+                )
 
             # 1. Designated region test
             reg = self._asset_regions.get(alias)
@@ -1660,32 +1700,30 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             region_reason = ""
 
             if crop.shape[0] >= th and crop.shape[1] >= tw:
-                match_res = cv2.matchTemplate(crop, tmpl, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(match_res)
-                best_score = float(max_val)
-                if best_score >= thresh:
+                match, best_score = runtime_match(crop)
+                if match is not None:
+                    _confidence, location, matched_w, matched_h = match
                     found = True
-                    hit_x = cl + max_loc[0] + tw // 2
-                    hit_y = ct + max_loc[1] + th // 2
+                    hit_x = cl + int(location[0]) + int(matched_w) // 2
+                    hit_y = ct + int(location[1]) + int(matched_h) // 2
             else:
                 best_score = 0.0
                 rw = cr - cl
                 rh = cb - ct
                 if rw < tw or rh < th:
-                    region_reason = f"지정 영역({rw}×{rh})이 이미지({tw}×{th})보다 작음"
+                    region_reason = f"지정 영역({rw}×{rh})이 이미지({canvas_w}×{canvas_h})보다 작음"
 
             # 2. Full frame search to find where the image ACTUALLY is if missed
             full_found = False
             full_x, full_y = 0, 0
             full_score = 0.0
             if fh >= th and fw >= tw:
-                f_res = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
-                _, f_max_val, _, f_max_loc = cv2.minMaxLoc(f_res)
-                full_score = float(f_max_val)
-                if full_score >= thresh:
+                full_match, full_score = runtime_match(frame)
+                if full_match is not None:
+                    _confidence, full_location, matched_w, matched_h = full_match
                     full_found = True
-                    full_x = f_max_loc[0] + tw // 2
-                    full_y = f_max_loc[1] + th // 2
+                    full_x = int(full_location[0]) + int(matched_w) // 2
+                    full_y = int(full_location[1]) + int(matched_h) // 2
 
             results[alias] = {
                 "found": found,
@@ -1693,8 +1731,8 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
                 "threshold": thresh,
                 "hit_x": hit_x,
                 "hit_y": hit_y,
-                "tmpl_w": tw,
-                "tmpl_h": th,
+                "tmpl_w": canvas_w,
+                "tmpl_h": canvas_h,
                 "full_found": full_found,
                 "full_x": full_x,
                 "full_y": full_y,
@@ -1794,17 +1832,30 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             is_success = (matched_count >= req)
             cond_desc = f"최소 {req}개 이상 일치 시 참"
 
+        wait_condition = str(self.step.get("wait_condition") or "appear").casefold()
+        if not self._is_color_mode and wait_condition == "vanish":
+            # Runtime success for a vanish node means no image remains.  The
+            # previous preview labelled a visible image as success, which was
+            # the exact opposite of node execution and made valid searches
+            # look broken during step testing.
+            is_success = matched_count == 0
+            cond_desc = "등록 이미지가 모두 사라지면 참"
+
         if is_success:
             self.banner_box.setStyleSheet("background: #064E3B; border: 1px solid #059669; border-radius: 8px; padding: 8px;")
             self.lbl_banner_main.setText(f"✅ 탐지 성공! ({matched_count}/{total}개 {target_name} 일치 ➔ 참 판정)")
             self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #34D399;")
-            self.lbl_banner_sub.setText(f"조건: {cond_desc} 만족 ➔ [성공(참) 분기]로 정상 이동합니다.")
+            suffix = " (사라짐 대기)" if wait_condition == "vanish" and not self._is_color_mode else ""
+            self.lbl_banner_sub.setText(f"조건: {cond_desc} 만족{suffix} ➔ [성공(참) 분기]로 정상 이동합니다.")
             self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #A7F3D0;")
         else:
             self.banner_box.setStyleSheet("background: #450A0A; border: 1px solid #DC2626; border-radius: 8px; padding: 8px;")
             self.lbl_banner_main.setText(f"❌ 조건 미달 ({matched_count}/{total}개 {target_name} 일치 ➔ 거짓 판정)")
             self.lbl_banner_main.setStyleSheet("font-size: 11pt; font-weight: 800; color: #F87171;")
-            self.lbl_banner_sub.setText(f"조건: {cond_desc} (현재 {matched_count}개 일치) ➔ [실패(거짓) 분기]로 이동합니다.")
+            if wait_condition == "vanish" and not self._is_color_mode:
+                self.lbl_banner_sub.setText(f"이미지가 아직 {matched_count}개 보입니다. 이 노드는 '이미지 사라짐 대기'이므로 현재는 실패(거짓)입니다.")
+            else:
+                self.lbl_banner_sub.setText(f"조건: {cond_desc} (현재 {matched_count}개 일치) ➔ [실패(거짓) 분기]로 이동합니다.")
             self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #FECACA;")
 
     def _refresh_ui(self) -> None:

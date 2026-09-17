@@ -3749,6 +3749,31 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("none", rebuilt["click_target"])
             editor.close()
 
+    def test_image_editor_disabled_checkbox_overrides_stale_multi_click_target(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.action_editor import ActionEditor
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            editor = ActionEditor(MacroRepository(Path(directory)))
+            editor.load_step({
+                "action": "image_search",
+                "asset": "first",
+                "assets": ["first", "second"],
+                "click_enabled": False,
+                "click_target": "each_image",
+                "click": {"mode": "active", "click_image": True, "click_offset": False},
+            })
+            editor.widgets["image_search"]["click.mode"].setCurrentIndex(
+                editor.widgets["image_search"]["click.mode"].findData("inactive")
+            )
+            rebuilt = editor.build_step()
+            self.assertFalse(rebuilt["click_enabled"])
+            self.assertEqual("none", rebuilt["click_target"])
+            self.assertEqual("inactive", rebuilt["click"]["mode"])
+            editor.close()
+
     def test_builder_restores_action_forms_and_collapses_json(self) -> None:
         from PySide6 import QtWidgets
         from macro_studio.action_editor import ACTION_LABELS, ActionEditor, action_template

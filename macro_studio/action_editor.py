@@ -5578,6 +5578,19 @@ class ActionEditor(QtWidgets.QWidget):
                 payload.pop("asset_regions", None)
                 payload.pop("asset_routes", None)
             click_target = str(payload.get("click_target") or "").lower().strip()
+            if action == "image_search":
+                # ``image_search`` exposes the explicit "찾으면 클릭" checkbox,
+                # while old merged multi-image nodes may also retain a hidden
+                # ``click_target`` value.  The hidden legacy value must never
+                # turn clicking back on after the user cleared the checkbox.
+                if not bool(payload.get("click_enabled", False)):
+                    click_target = "none"
+                    payload["click_target"] = "none"
+                elif click_target == "none":
+                    click_payload = payload.get("click") if isinstance(payload.get("click"), dict) else {}
+                    if bool(click_payload.get("click_image")) or bool(click_payload.get("click_offset")):
+                        click_target = "first_image"
+                        payload["click_target"] = "first_image"
             if click_target in {"each_image", "first_image", "custom_coord"}:
                 click_enabled = True
                 payload["click_enabled"] = True
@@ -5630,9 +5643,11 @@ class ActionEditor(QtWidgets.QWidget):
             else:
                 payload.pop("regions", None)
                 payload.pop("region", None)
-            if not click_enabled and click_target != "custom_coord":
-                payload.pop("click", None)
-            elif str(original_click.get("method") or "") == "handle_probe" and isinstance(payload.get("click"), dict):
+            # Keep the selected active/inactive mode even while clicking is
+            # disabled.  Runtime is gated by click_target="none", and retaining
+            # these harmless preferences prevents the UI from reverting to an
+            # old/default active click the next time the node is edited.
+            if str(original_click.get("method") or "") == "handle_probe" and isinstance(payload.get("click"), dict):
                 payload["click"]["method"] = "handle_probe"
                 for key in ("target_control", "target_hwnd", "target_child_class"):
                     if key in original_click:

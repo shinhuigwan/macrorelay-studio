@@ -86,6 +86,16 @@ class MacroHelpDialog(QtWidgets.QDialog):
     </ul>
 </div>
 
+<div style='background: #171D28; border: 1px solid #2B384E; border-radius: 8px; padding: 14px; margin-bottom: 14px;'>
+    <h3 style='color: #63FFE0; margin-top: 0;'>🔍 이미지 지정·상세 편집 확대</h3>
+    <ul>
+        <li><b>휠 확대·축소</b>: 이미지 지정 화면과 상세 편집창에서 마우스 휠을 돌리면 커서가 가리키는 부분을 중심으로 확대됩니다.</li>
+        <li><b>화면 이동</b>: 최초 이미지 지정 화면은 마우스 가운데 버튼을 누른 채 드래그해 확대된 화면을 이동할 수 있습니다.</li>
+        <li><b>100% 복귀</b>: 숫자 <code>0</code> 키를 누르면 원래 보기 배율로 돌아갑니다.</li>
+        <li><b>검색 안전성</b>: 확대는 화면 표시용입니다. 실제로 저장되는 PNG와 OpenCV가 검색하는 원본 픽셀은 바뀌지 않습니다.</li>
+    </ul>
+</div>
+
 <div style='background: #171D28; border: 1px solid #2B384E; border-radius: 8px; padding: 14px;'>
     <h3 style='color: #F87171; margin-top: 0;'>🎯 검색 실패 시 대체 클릭 (오프셋 클릭)</h3>
     <p>화면에서 대상을 못 찾았을 때 멈추지 않고, <b>창 닫기 버튼(X)이나 빈 화면을 대신 클릭</b>하도록 설정할 수 있습니다.</p>

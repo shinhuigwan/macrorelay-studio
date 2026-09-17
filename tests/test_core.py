@@ -4453,6 +4453,63 @@ class UiSmokeTests(unittest.TestCase):
             dialog.save()
             self.assertTrue(any((root / ".history" / "assets" / "sample").glob("*.png")))
 
+    def test_capture_zoom_maps_selection_to_original_screen_pixels(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.image_editor import ScreenCaptureDialog
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        source = QtGui.QPixmap(400, 300)
+        source.fill(QtGui.QColor("#234567"))
+        original_key = source.cacheKey()
+        dialog = ScreenCaptureDialog(source, QtCore.QRect(50, 60, 400, 300))
+        dialog._selection = QtCore.QRect(120, 90, 40, 30)
+        dialog._set_zoom(2.0, QtCore.QPoint(200, 150))
+
+        self.assertAlmostEqual(100.0, dialog._view_origin.x(), places=2)
+        self.assertAlmostEqual(75.0, dialog._view_origin.y(), places=2)
+        self.assertEqual(QtCore.QRect(40, 30, 80, 60), dialog.rubber.geometry())
+        self.assertEqual(QtCore.QRect(170, 150, 40, 30), dialog.selected_screen_rect())
+        captured = dialog.captured_image()
+        self.assertEqual((40, 30), (captured.width(), captured.height()))
+        self.assertEqual(original_key, source.cacheKey(), "보기 전용 확대가 원본 캡처를 변경하면 안 됩니다.")
+        dialog.close()
+        app.processEvents()
+
+    def test_image_editor_plain_wheel_zoom_preserves_original_pixel_selection(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.image_editor import ImageEditorDialog
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "zoom.png"
+            image = QtGui.QImage(100, 80, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#336699"))
+            self.assertTrue(image.save(str(path)))
+            dialog = ImageEditorDialog(path, "zoom", root / ".history")
+            dialog.set_zoom(1.0)
+            original_rect = QtCore.QRect(10, 12, 20, 16)
+            dialog.selection = dialog._view_rect(original_rect)
+            dialog.rubber.setGeometry(dialog.selection)
+
+            event = QtGui.QWheelEvent(
+                QtCore.QPointF(15, 15),
+                QtCore.QPointF(15, 15),
+                QtCore.QPoint(),
+                QtCore.QPoint(0, 120),
+                QtCore.Qt.NoButton,
+                QtCore.Qt.NoModifier,
+                QtCore.Qt.NoScrollPhase,
+                False,
+            )
+            QtWidgets.QApplication.sendEvent(dialog.view, event)
+
+            self.assertGreater(dialog.zoom, 1.0)
+            self.assertEqual(original_rect, dialog._image_rect(dialog.selection))
+            self.assertEqual((100, 80), (dialog.image.width(), dialog.image.height()))
+            dialog.close()
+            app.processEvents()
+
     def test_image_editor_precision_brush_and_connected_colour_cutout(self) -> None:
         from PySide6 import QtCore, QtGui
         from macro_studio.image_editor import ImageEditorDialog

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 
 class NodeGroupCollapseTests(unittest.TestCase):
@@ -243,6 +245,54 @@ class NodeGroupCollapseTests(unittest.TestCase):
         self.assertEqual(anchor_pos.y(), canvas.nodes[3].pos().y())
         self.assertGreater(canvas.nodes[2].pos().x(), canvas.nodes[1].pos().x())
         self.assertGreater(canvas.nodes[3].pos().x(), canvas.nodes[2].pos().x())
+        canvas.close()
+
+    def test_low_zoom_edge_paint_never_fills_open_path(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.node_editor import EdgeItem
+
+        edge = SimpleNamespace(
+            pen=lambda: QtGui.QPen(QtGui.QColor("#38E7FF"), 2.6),
+            path=lambda: QtGui.QPainterPath(QtCore.QPointF(0, 0)),
+        )
+        painter = mock.Mock()
+        painter.worldTransform.return_value = QtGui.QTransform.fromScale(0.5, 0.5)
+        option = QtWidgets.QStyleOptionGraphicsItem()
+
+        EdgeItem.paint(edge, painter, option)
+
+        painter.setBrush.assert_called_once_with(QtCore.Qt.NoBrush)
+
+    def test_interactive_drag_updates_only_connected_edges_until_release(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro({
+            "steps": [
+                {"action": "wait", "on_success": 2},
+                {"action": "wait", "on_success": 3},
+                {"action": "wait"},
+            ],
+            "graph_positions": {"1": [0, 0], "2": [300, 0], "3": [600, 0]},
+        })
+        first_edge = next(edge for edge in canvas.edges if edge.source == 1)
+        second_edge = next(edge for edge in canvas.edges if edge.source == 2)
+        first_edge.update_path = mock.Mock()
+        second_edge.update_path = mock.Mock()
+
+        with mock.patch.object(canvas, "_route_edges") as full_route:
+            canvas.begin_node_move()
+            canvas.node_moved(1)
+            canvas._move_frame_timer.stop()
+            canvas._flush_node_move_frame()
+            full_route.assert_not_called()
+            first_edge.update_path.assert_called_once_with()
+            second_edge.update_path.assert_not_called()
+
+            canvas.finish_node_move()
+            full_route.assert_called_once_with()
         canvas.close()
 
 

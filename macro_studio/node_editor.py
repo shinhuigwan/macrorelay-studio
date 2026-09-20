@@ -859,6 +859,7 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
             event.accept()
             return
         if event.button() == QtCore.Qt.LeftButton and self._header_rect().contains(event.pos()):
+            self.canvas.begin_node_move()
             self._drag_origin = event.scenePos()
             self._node_origins = {}
             for index in self.indexes:
@@ -1571,7 +1572,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
     def itemChange(self, change, value):
         result = super().itemChange(change, value)
         if change == QtWidgets.QGraphicsItem.ItemPositionHasChanged and not self.canvas.suspended:
-            self.canvas.node_moved()
+            self.canvas.node_moved(self.index)
         if change == QtWidgets.QGraphicsItem.ItemSelectedHasChanged:
             self.update()
             if bool(value) and not self.canvas.suspended and not self.canvas.rubber_selecting:
@@ -1677,6 +1678,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 event.accept()
                 return
         if event.button() == QtCore.Qt.LeftButton:
+            self.canvas.begin_node_move()
             lane = self.canvas.workflow_lane_for_node(self.index)
             self._workflow_drag_bounds = QtCore.QRectF(lane._rect) if lane is not None else None
         super().mousePressEvent(event)
@@ -2031,6 +2033,10 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             painter.save()
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
             painter.setPen(QtGui.QPen(orig_pen.color(), boost_w, orig_pen.style(), QtCore.Qt.RoundCap))
+            # Never inherit a fill brush from a previously painted lane/group.
+            # Filling an open edge path implicitly closes it and creates huge
+            # cyan/red polygons at low zoom.
+            painter.setBrush(QtCore.Qt.NoBrush)
             painter.drawPath(self.path())
             painter.restore()
         else:
@@ -3367,6 +3373,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
                 return
             # 5. Header dragged -> Move all member nodes together
             if pos.y() <= self.HEADER_HEIGHT:
+                self.canvas.begin_node_move()
                 self._dragging_group = True
                 self._drag_start_scene = event.scenePos()
                 self._group_origin = QtCore.QPointF(self.pos())
@@ -3618,8 +3625,10 @@ class NodeCanvas(QtWidgets.QWidget):
         self._positions_timer.timeout.connect(lambda: self.positions_changed.emit(self.positions()))
         self._move_frame_timer = QtCore.QTimer(self)
         self._move_frame_timer.setSingleShot(True)
-        self._move_frame_timer.setInterval(16)
+        self._move_frame_timer.setInterval(24)
         self._move_frame_timer.timeout.connect(self._flush_node_move_frame)
+        self._node_drag_active = False
+        self._moving_node_indexes: set[int] = set()
         self._selection_anchor_index = 0
         self._selection_snapshot: set[int] = set()
         self._target_pick_escape = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Escape), self)
@@ -4679,14 +4688,30 @@ class NodeCanvas(QtWidgets.QWidget):
         edge.update_path()
         self.routes_changed.emit(dict(self.manual_routes))
 
-    def node_moved(self) -> None:
+    def begin_node_move(self) -> None:
+        self._node_drag_active = True
+        self._moving_node_indexes.clear()
+
+    def node_moved(self, index: int = 0) -> None:
         if self.suspended:
             return
+        if index > 0:
+            self._moving_node_indexes.add(int(index))
         if not self._move_frame_timer.isActive():
             self._move_frame_timer.start()
         self._positions_timer.start()
 
     def _flush_node_move_frame(self) -> None:
+        if self._node_drag_active and self._moving_node_indexes:
+            # Full collision routing is O(edges * nodes). During an active
+            # drag, update only connections touching moved nodes and defer the
+            # complete lane/group calculation until mouse release.
+            moved = set(self._moving_node_indexes)
+            self._moving_node_indexes.clear()
+            for edge in self.edges:
+                if edge.source in moved or edge.target in moved:
+                    edge.update_path()
+            return
         self._route_edges()
         self._sync_workflow_lanes()
         self._sync_node_groups()
@@ -4696,6 +4721,8 @@ class NodeCanvas(QtWidgets.QWidget):
     def finish_node_move(self) -> None:
         if self.suspended:
             return
+        self._node_drag_active = False
+        self._moving_node_indexes.clear()
         if self._move_frame_timer.isActive():
             self._move_frame_timer.stop()
         self._flush_node_move_frame()

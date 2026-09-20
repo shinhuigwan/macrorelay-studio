@@ -678,6 +678,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode == 0:
+                try:
+                    process.wait(timeout=1.0)
+                except Exception:
+                    pass
                 return
         try:
             process.terminate()
@@ -694,11 +698,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not running:
             self.show_status("현재 실행 중인 매크로가 없습니다.")
             self._update_macro_run_state()
+            self.repository.shutdown_vision_engine_if_idle()
             return
         stopped = 0
         for pid, (name, process, _result_path, _progress_path, _click_path) in running:
             self._append_run_log(f"사용자 정지 요청 | {name} | PID {pid}", "WARN")
             self._terminate_macro_process(pid, process)
+            self.repository.release_macro_process(process)
             self._set_running_node(name, 0)
             self._running_macro_processes.pop(pid, None)
             self._seen_click_traces.pop(pid, None)
@@ -711,6 +717,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_run_log(f"사용자 정지 완료 | {name} | PID {pid}", "WARN")
             stopped += 1
         self._run_monitor.stop()
+        self.repository.shutdown_vision_engine_if_idle()
         self._update_macro_run_state()
         self.show_status(f"실행 중인 매크로 {stopped}개를 정지했습니다.")
 
@@ -856,6 +863,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     missing()
             finished.append(pid)
         for pid in finished:
+            entry = self._running_macro_processes.get(pid)
+            if entry is not None:
+                self.repository.release_macro_process(entry[1])
             self._running_macro_processes.pop(pid, None)
             self._seen_click_traces.pop(pid, None)
             self._run_control_paths.pop(pid, None)
@@ -866,6 +876,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._failure_capture_steps = {key for key in self._failure_capture_steps if key[0] != pid}
         if not self._running_macro_processes:
             self._run_monitor.stop()
+            self.repository.shutdown_vision_engine_if_idle()
         self._update_macro_run_state()
 
     def _sample_run_resources(self, pid: int) -> None:
@@ -1127,7 +1138,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def show_status(self, message: str) -> None:
         self.statusBar().showMessage(message, 7000)
 
+    def shutdown_runtime(self) -> None:
+        """Idempotently stop macros and the now-unused shared vision engine."""
+        if self._running_macro_processes:
+            self.stop_running_macros()
+        else:
+            self.repository.shutdown_vision_engine_if_idle()
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        # Generated AutoHotkey scripts are independent child processes.  Stop
+        # this Studio session's process trees before the UI and its monitor go
+        # away, otherwise the macro keeps clicking after the window is closed.
+        self.shutdown_runtime()
         self._run_monitor.stop()
         self._event_trigger_timer.stop()
         if self._event_trigger_future is not None:

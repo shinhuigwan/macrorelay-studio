@@ -54,6 +54,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.total_steps: int = 0
         self.current_macro_payload: dict[str, Any] = {}
         self._compact_mode = False
+        self._shutting_down = False
 
         self._stopwatch_timer = QtCore.QTimer(self)
         self._stopwatch_timer.setInterval(50)
@@ -421,10 +422,15 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             settings.setValue("last_macro", self.macro_combo.currentData() or self.macro_combo.currentText())
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if self.is_running:
-            self.stop_macro()
+        self.shutdown_runtime()
         self._save_settings()
         super().closeEvent(event)
+
+    def shutdown_runtime(self) -> None:
+        """Idempotently stop the Player-owned macro before the UI exits."""
+        self._shutting_down = True
+        self.stop_macro()
+        self.repository.shutdown_vision_engine_if_idle()
 
     def _toggle_always_on_top(self, checked: bool) -> None:
         pos = self.pos()
@@ -556,7 +562,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
     def start_macro(self) -> None:
         """Start or restart the selected macro with turbo speed."""
-        if self.is_running:
+        if self._shutting_down or self.is_running:
             return
         macro_name = self.macro_combo.currentData()
         if not macro_name:
@@ -637,6 +643,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
     def stop_macro(self) -> None:
         """Immediately and forcibly terminate the running macro."""
         if not self.is_running and not self.current_process:
+            self.repository.shutdown_vision_engine_if_idle()
             return
 
         proc = self.current_process
@@ -648,15 +655,28 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
         if proc:
             pid = getattr(proc, "pid", None)
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            tree_stopped = False
             if pid:
                 try:
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=1.0)
+                    result = subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True,
+                        timeout=1.5,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    tree_stopped = result.returncode == 0
                 except Exception:
                     pass
+            if not tree_stopped:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+            self.repository.release_macro_process(proc)
 
         self.lbl_status.setText("🔴 비상 정지됨")
         self.lbl_status.setStyleSheet("color: #F85149; font-size: 13px; font-weight: 800;")
@@ -669,6 +689,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self._sync_control_button_labels()
 
         self.log_edit.appendPlainText(f"[{time.strftime('%H:%M:%S')}] ⏹ 매크로 정지 완료")
+        self.repository.shutdown_vision_engine_if_idle()
 
     def _update_stopwatch(self) -> None:
         if not self.is_running or self.is_paused:
@@ -733,6 +754,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             self.lbl_status.setStyleSheet("color: #3FB950; font-size: 13px; font-weight: 800;")
 
     def _handle_finished(self, return_code: int) -> None:
+        self.repository.release_macro_process(self.current_process)
         self.is_running = False
         self.is_paused = False
         self._stopwatch_timer.stop()
@@ -746,7 +768,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             self.log_edit.appendPlainText(f"[{time.strftime('%H:%M:%S')}] ✔ 매크로 1회 정상 완료 ({self.lbl_timer.text()})")
 
             # Check infinite loop option
-            if self.chk_loop.isChecked():
+            if self.chk_loop.isChecked() and not self._shutting_down:
                 self.log_edit.appendPlainText(f"[{time.strftime('%H:%M:%S')}] 🔁 무한 반복: 다음 회차 즉시 시작...")
                 QtCore.QTimer.singleShot(150, self.start_macro)
                 return
@@ -773,6 +795,7 @@ def launch_player(macro_name: str = "") -> int:
 
     repo = MacroRepository()
     window = MacroPlayerWindow(repository=repo, default_macro=macro_name)
+    app.aboutToQuit.connect(window.shutdown_runtime)
 
     icon_path = repo.root / "branding" / "macrorelay-runner.ico"
     if not icon_path.exists():

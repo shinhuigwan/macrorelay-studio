@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ctypes
 import os
 import shutil
 import socket
@@ -1906,6 +1907,29 @@ internal static class Program
         process.macrorelay_checkpoint_path = checkpoint_path  # type: ignore[attr-defined]
         process.macrorelay_resume_step = int(environment.get("MACRORELAY_RESUME_STEP", "0") or 0)  # type: ignore[attr-defined]
         process.macrorelay_dry_run = bool(dry_run)  # type: ignore[attr-defined]
+        active_dir = result_dir / "active"
+        run_marker = active_dir / f"{process.pid}-{uuid.uuid4().hex}.json"
+        try:
+            active_dir.mkdir(parents=True, exist_ok=True)
+            run_marker.write_text(
+                json.dumps({"pid": int(process.pid), "script": str(script), "started": _utc_now_iso()}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            # Never return an untracked automation process: if ownership cannot
+            # be recorded, terminate it immediately instead of risking an
+            # orphan that continues clicking after the UI exits.
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                process.kill()
+            raise
+        process.macrorelay_run_marker = run_marker  # type: ignore[attr-defined]
         return process
 
     @staticmethod
@@ -1922,6 +1946,70 @@ internal static class Program
                 chunks.append(chunk)
         result = json.loads(b"".join(chunks).decode("utf-8", errors="replace") or "{}")
         return result if isinstance(result, dict) else {}
+
+    def _has_running_macro_process(self) -> bool:
+        """Return True while any registered MacroRelay macro process is alive."""
+        active_dir = self.exports_dir / ".run_results" / "active"
+        if not active_dir.is_dir():
+            return False
+        running = False
+        for marker in active_dir.glob("*.json"):
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8-sig"))
+                pid = int(payload.get("pid") or 0) if isinstance(payload, dict) else 0
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                marker.unlink(missing_ok=True)
+                continue
+            if self._pid_is_running(pid):
+                running = True
+            else:
+                marker.unlink(missing_ok=True)
+        return running
+
+    @staticmethod
+    def _pid_is_running(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            try:
+                kernel32 = ctypes.windll.kernel32
+                kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+                kernel32.OpenProcess.restype = ctypes.c_void_p
+                kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+                kernel32.GetExitCodeProcess.restype = ctypes.c_bool
+                kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+                kernel32.CloseHandle.restype = ctypes.c_bool
+                handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+                if not handle:
+                    return False
+                try:
+                    code = ctypes.c_ulong()
+                    return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and int(code.value) == 259
+                finally:
+                    kernel32.CloseHandle(handle)
+            except Exception:
+                return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def release_macro_process(process: object | None) -> None:
+        marker = getattr(process, "macrorelay_run_marker", None) if process is not None else None
+        if isinstance(marker, Path):
+            marker.unlink(missing_ok=True)
+
+    def shutdown_vision_engine_if_idle(self) -> bool:
+        """Stop the shared OpenCV server only when no macro still depends on it."""
+        if self._has_running_macro_process():
+            return False
+        try:
+            response = self._vision_request({"cmd": "shutdown"}, timeout=0.4)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        return bool(response.get("ok"))
 
     def _preload_vision_templates(self, payload: dict[str, Any], python: Path, packages: Path) -> None:
         aliases: list[str] = []

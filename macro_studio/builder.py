@@ -1486,6 +1486,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.help_requested.connect(self._open_help_dialog)
         self.node_canvas.node_add_at_requested.connect(self._add_step_at_position)
         self.node_canvas.group_flow_changed.connect(self._graph_group_flow_changed)
+        self.node_canvas.workflow_membership_changed.connect(self._graph_workflow_membership_changed)
 
         list_page = QtWidgets.QWidget()
         list_layout = QtWidgets.QVBoxLayout(list_page)
@@ -2430,6 +2431,13 @@ class BuilderPage(QtWidgets.QWidget):
         self.current_macro["steps"] = self.node_canvas.steps
         self._persist("노드 그룹의 다음 작업 흐름을 저장했습니다.")
         self._refresh_steps(max(0, self.steps_table.currentRow()))
+
+    @QtCore.Slot()
+    def _graph_workflow_membership_changed(self) -> None:
+        if self.current_macro is None:
+            return
+        self.current_macro["steps"] = self.node_canvas.steps
+        self._persist("스마트 작업 그룹 소속을 저장했습니다.")
 
     def _save_graph_positions(self) -> None:
         if not self.current_name or self.current_macro is None:

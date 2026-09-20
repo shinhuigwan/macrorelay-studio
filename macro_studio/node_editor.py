@@ -886,6 +886,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.index = index
         self.step = step
         self.canvas = canvas
+        self._workflow_drag_bounds: QtCore.QRectF | None = None
         self.collapsed = index in canvas.collapsed_nodes
         self.is_multi = (
             str(step.get("action") or "") in {"multi_image_search", "animation_search"}
@@ -1562,6 +1563,9 @@ class NodeItem(QtWidgets.QGraphicsObject):
 
     def mouseReleaseEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
         super().mouseReleaseEvent(event)
+        if not self.canvas.suspended and self._workflow_drag_bounds is not None:
+            self.canvas.check_node_workflow_membership(self, self._workflow_drag_bounds)
+        self._workflow_drag_bounds = None
         if not self.canvas.suspended and hasattr(self.canvas, "check_node_group_membership"):
             self.canvas.check_node_group_membership(self)
 
@@ -1654,6 +1658,9 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 self.canvas.set_nodes_collapsed(indexes, not self.collapsed)
                 event.accept()
                 return
+        if event.button() == QtCore.Qt.LeftButton:
+            lane = self.canvas.workflow_lane_for_node(self.index)
+            self._workflow_drag_bounds = QtCore.QRectF(lane._rect) if lane is not None else None
         super().mousePressEvent(event)
 
     def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:
@@ -1690,6 +1697,17 @@ class NodeItem(QtWidgets.QGraphicsObject):
         if current_group is not None:
             act_leave_group = menu.addAction(f"📤 노드 그룹 '{current_group.title}'에서 제외")
             act_split_to_new = menu.addAction(f"📤 현재 그룹에서 분리 (새 그룹으로 독립)")
+
+        workflow_steps = [
+            idx for idx in selected_indexes
+            if 0 < idx <= len(self.canvas.steps)
+            and str(self.canvas.steps[idx - 1].get("workflow_id") or "").strip()
+        ]
+        act_leave_workflow = None
+        if workflow_steps:
+            first = self.canvas.steps[workflow_steps[0] - 1]
+            workflow_label = str(first.get("workflow_label") or first.get("workflow_id") or "스마트 작업").strip()
+            act_leave_workflow = menu.addAction(f"📤 '{workflow_label}'에서 제외")
 
         add_group_menu = None
         group_actions = {}
@@ -1789,6 +1807,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 other_colors = [c for c in NODE_GROUP_THEMES.keys() if c != getattr(current_group, "color_name", "yellow")]
                 new_color = other_colors[0] if other_colors else "blue"
                 self.canvas.add_comment_box_for_selection(title=new_title, color=new_color)
+        elif act_leave_workflow and chosen == act_leave_workflow:
+            self.canvas.detach_nodes_from_workflow(workflow_steps)
         elif add_group_menu and chosen in group_actions:
             target_group = group_actions[chosen]
             for idx in selected_indexes:
@@ -3536,6 +3556,7 @@ class NodeCanvas(QtWidgets.QWidget):
     quick_node_drop_requested = QtCore.Signal(str, object)
     node_add_at_requested = QtCore.Signal(str, object)
     group_flow_changed = QtCore.Signal()
+    workflow_membership_changed = QtCore.Signal()
     node_target_picked = QtCore.Signal(int)
     asset_route_edit_requested = QtCore.Signal(int, str)
 
@@ -4723,6 +4744,40 @@ class NodeCanvas(QtWidgets.QWidget):
     def _sync_workflow_lanes(self) -> None:
         for lane in self.workflow_items:
             lane.sync_rect()
+
+    def workflow_lane_for_node(self, node_index: int) -> WorkflowLaneItem | None:
+        return next((lane for lane in self.workflow_items if node_index in lane.indexes), None)
+
+    def check_node_workflow_membership(self, node: NodeItem, original_bounds: QtCore.QRectF) -> None:
+        """Detach a node when it is deliberately dragged outside its smart-workflow lane."""
+        if not original_bounds.isValid():
+            return
+        center = node.sceneBoundingRect().center()
+        if original_bounds.adjusted(-8.0, -8.0, 8.0, 8.0).contains(center):
+            return
+        self.detach_nodes_from_workflow([node.index])
+
+    def detach_nodes_from_workflow(self, indexes: list[int]) -> None:
+        changed = False
+        for index in {int(value) for value in indexes}:
+            if not (0 < index <= len(self.steps)):
+                continue
+            step = self.steps[index - 1]
+            if not str(step.get("workflow_id") or "").strip():
+                continue
+            step.pop("workflow_id", None)
+            step.pop("workflow_label", None)
+            changed = True
+        if not changed:
+            return
+        for lane in list(self.workflow_items):
+            if lane.scene() is self.scene:
+                self.scene.removeItem(lane)
+        self.workflow_items = []
+        self._add_workflow_lanes()
+        self._route_edges()
+        self._update_scene_bounds()
+        self.workflow_membership_changed.emit()
 
     def rebuild_edges(self) -> None:
         for edge in self.edges:

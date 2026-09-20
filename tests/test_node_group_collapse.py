@@ -128,6 +128,34 @@ class NodeGroupCollapseTests(unittest.TestCase):
         self.assertEqual([], canvas.dump_comments())
         canvas.close()
 
+    def test_dragging_node_out_of_smart_workflow_detaches_without_changing_edges(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro({
+            "steps": [
+                {"action": "wait", "workflow_id": "smart-1", "workflow_label": "스마트 작업 1", "on_success": 2},
+                {"action": "wait", "workflow_id": "smart-1", "workflow_label": "스마트 작업 1"},
+            ],
+            "graph_positions": {"1": [0, 0], "2": [300, 0]},
+        })
+        app.processEvents()
+        original = QtCore.QRectF(canvas.workflow_items[0]._rect)
+        canvas.nodes[1].setPos(original.right() + 200, original.bottom() + 200)
+
+        changed = []
+        canvas.workflow_membership_changed.connect(lambda: changed.append(True))
+        canvas.check_node_workflow_membership(canvas.nodes[1], original)
+
+        self.assertNotIn("workflow_id", canvas.steps[0])
+        self.assertEqual("smart-1", canvas.steps[1]["workflow_id"])
+        self.assertEqual([2], canvas.workflow_items[0].indexes)
+        self.assertTrue(any(edge.source == 1 and edge.target == 2 for edge in canvas.edges))
+        self.assertEqual([True], changed)
+        canvas.close()
+
 
 if __name__ == "__main__":
     unittest.main()

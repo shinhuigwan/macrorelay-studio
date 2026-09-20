@@ -229,6 +229,12 @@ class NodeGraphView(QtWidgets.QGraphicsView):
             event.accept()
             return
         if event.button() == QtCore.Qt.LeftButton and not self.itemAt(event.position().toPoint()):
+            if event.modifiers() & QtCore.Qt.ControlModifier:
+                # Reserve Ctrl + double-click for the contextual node picker.
+                # Consuming the first press prevents rubber selection or a
+                # pending toolbar placement from firing before the double-click.
+                event.accept()
+                return
             canvas = self.parent()
             if isinstance(canvas, NodeCanvas):
                 if canvas.commit_pending_node_placement(self.mapToScene(event.position().toPoint())):
@@ -240,8 +246,16 @@ class NodeGraphView(QtWidgets.QGraphicsView):
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton and not self.itemAt(event.position().toPoint()):
             canvas = self.parent()
-            if isinstance(canvas, NodeCanvas):
-                canvas.request_node_add_at(self.mapToScene(event.position().toPoint()))
+            if event.modifiers() & QtCore.Qt.ControlModifier:
+                if isinstance(canvas, NodeCanvas):
+                    canvas.request_node_add_at(self.mapToScene(event.position().toPoint()))
+            else:
+                # Preserve the original canvas navigation gesture: keep the
+                # second left press held and drag to pan the view.
+                self._panning = True
+                self._double_click_pan = True
+                self._pan_start = event.position().toPoint()
+                self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -3610,7 +3624,7 @@ class NodeCanvas(QtWidgets.QWidget):
         legend = QtWidgets.QLabel(
             f"<span style='color:{COLORS['success']}'>● 성공</span>  "
             f"<span style='color:{COLORS['danger']}'>● 실패</span>  "
-            "<span style='color:#9DA7BA'>· 빈 바닥 더블클릭=노드 추가 · 가운데 버튼 드래그=이동 · 선 바깥 드롭=제거</span>"
+            "<span style='color:#9DA7BA'>· 빈 바닥 더블클릭 드래그=이동 · Ctrl+더블클릭=노드 선택 추가 · 가운데 버튼 드래그=이동 · 선 바깥 드롭=제거</span>"
         )
         legend.setObjectName("Muted")
         legend.setMinimumWidth(0)

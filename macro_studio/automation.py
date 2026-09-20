@@ -6077,13 +6077,69 @@ class QuickActionWizard:
                 return None
             prefix = "cond" if is_cond else "img"
             alias = f"{prefix}_{datetime.now():%m%d_%H%M%S}"
+
+            ignored_hwnds: set[int] = set()
+            if sys.platform == "win32":
+                try:
+                    user32 = ctypes.windll.user32
+                    for widget in QtWidgets.QApplication.topLevelWidgets():
+                        root = int(user32.GetAncestor(int(widget.winId()), 2) or int(widget.winId()))
+                        if root:
+                            ignored_hwnds.add(root)
+                except Exception:
+                    ignored_hwnds.clear()
+            target = ActionEditor._window_target_at(
+                rect.center(), ignored_hwnds, position_is_native=True
+            )
+
+            region_dialog = ScreenCaptureDialog(
+                pixmap,
+                geometry,
+                parent,
+                accept_on_release=False,
+                hint_text="[ 2단계 · 검색 영역 지정 ] 실제로 검색할 범위를 드래그한 뒤 Enter · Esc 취소",
+            )
+            try:
+                if region_dialog.exec() != QtWidgets.QDialog.Accepted:
+                    return None
+                selected_region = region_dialog.selected_native_screen_rect()
+            finally:
+                region_dialog.deleteLater()
+            if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
+                return None
+
+            window_token = ""
+            window_exe = ""
+            region_mode = "screen"
+            region_coords = "screen"
+            search_region = rect_to_exclusive_list(selected_region)
+            if target:
+                scope = str(target.get("capture_scope") or "client")
+                origin = target.get("capture_origin") or target.get("client_origin") or [0, 0]
+                size = target.get("capture_size") or target.get("client_size") or [0, 0]
+                ox, oy = int(origin[0]), int(origin[1])
+                sw, sh = max(0, int(size[0])), max(0, int(size[1]))
+                target_rect = QtCore.QRect(ox, oy, sw, sh)
+                if target_rect.isValid():
+                    selected_region = selected_region.intersected(target_rect)
+                if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
+                    QtWidgets.QMessageBox.warning(
+                        parent,
+                        "검색 영역 확인",
+                        "검색 영역은 처음 이미지를 선택한 대상 프로그램 안에서 지정해 주세요.",
+                    )
+                    return None
+                search_region = [
+                    selected_region.left() - ox,
+                    selected_region.top() - oy,
+                    selected_region.left() - ox + selected_region.width(),
+                    selected_region.top() - oy + selected_region.height(),
+                ]
+                region_mode = scope if scope in {"client", "window"} else "client"
+                region_coords = "relative"
+                window_token = str(target.get("window") or "")
+                window_exe = str(target.get("exe") or "")
             alias = repository.add_asset_image(image, alias)
-            search_region = [
-                rect.left() - 100,
-                rect.top() - 100,
-                rect.x() + rect.width() + 100,
-                rect.y() + rect.height() + 100,
-            ]
             step.update(
                 {
                     "asset": alias,
@@ -6093,12 +6149,17 @@ class QuickActionWizard:
                     "confidence": 85,
                     "wait_condition": "appear",
                     "timeout": 3000,
-                    "region_mode": "screen",
-                    "region_coords": "screen",
+                    "region_mode": region_mode,
+                    "region_coords": region_coords,
+                    "region_window": window_token,
+                    "region_window_exe": window_exe,
                     "region": search_region,
                     "click_enabled": not is_cond,
                     "click": {
-                        "mode": "active",
+                        "mode": "inactive" if target else "active",
+                        "method": "auto",
+                        "window": window_token,
+                        "window_exe": window_exe,
                         "click_image": not is_cond,
                         "click_offset": False,
                         "count": 1,
@@ -6174,12 +6235,91 @@ class QuickActionWizard:
             if picker.exec() != QtWidgets.QDialog.Accepted:
                 return None
             color = picker.selected_color()
-            if not color:
+            point = picker.selected_point()
+            if not color or point is None:
                 return None
+
+            ignored_hwnds: set[int] = set()
+            if sys.platform == "win32":
+                try:
+                    user32 = ctypes.windll.user32
+                    for widget in QtWidgets.QApplication.topLevelWidgets():
+                        root = int(user32.GetAncestor(int(widget.winId()), 2) or int(widget.winId()))
+                        if root:
+                            ignored_hwnds.add(root)
+                except Exception:
+                    ignored_hwnds.clear()
+            target = ActionEditor._window_target_at(
+                point, ignored_hwnds, position_is_native=True
+            )
+            region_dialog = ScreenCaptureDialog(
+                pixmap,
+                geometry,
+                parent,
+                accept_on_release=False,
+                hint_text="[ 2단계 · 색상 검색 영역 지정 ] 같은 색상을 찾을 범위를 드래그한 뒤 Enter · Esc 취소",
+            )
+            try:
+                if region_dialog.exec() != QtWidgets.QDialog.Accepted:
+                    return None
+                selected_region = region_dialog.selected_native_screen_rect()
+            finally:
+                region_dialog.deleteLater()
+            if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
+                return None
+
+            window_token = ""
+            window_exe = ""
+            region_mode = "screen"
+            region_coords = "screen"
+            search_region = rect_to_exclusive_list(selected_region)
+            stored_x, stored_y = point.x(), point.y()
+            if target:
+                scope = str(target.get("capture_scope") or "client")
+                origin = target.get("capture_origin") or target.get("client_origin") or [0, 0]
+                size = target.get("capture_size") or target.get("client_size") or [0, 0]
+                ox, oy = int(origin[0]), int(origin[1])
+                target_rect = QtCore.QRect(ox, oy, max(0, int(size[0])), max(0, int(size[1])))
+                if target_rect.isValid():
+                    selected_region = selected_region.intersected(target_rect)
+                if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
+                    QtWidgets.QMessageBox.warning(
+                        parent,
+                        "검색 영역 확인",
+                        "검색 영역은 색상을 선택한 대상 프로그램 안에서 지정해 주세요.",
+                    )
+                    return None
+                search_region = [
+                    selected_region.left() - ox,
+                    selected_region.top() - oy,
+                    selected_region.left() - ox + selected_region.width(),
+                    selected_region.top() - oy + selected_region.height(),
+                ]
+                stored_x -= ox
+                stored_y -= oy
+                region_mode = scope if scope in {"client", "window"} else "client"
+                region_coords = "relative"
+                window_token = str(target.get("window") or "")
+                window_exe = str(target.get("exe") or "")
             step.update({
                 "color": color.name().upper(),
                 "tolerance": 15,
                 "action_on_found": "click",
+                "x": stored_x,
+                "y": stored_y,
+                "region_mode": region_mode,
+                "region_coords": region_coords,
+                "region_window": window_token,
+                "region_window_exe": window_exe,
+                "search_region": search_region,
+                "click": {
+                    "mode": "inactive" if target else "active",
+                    "method": "auto",
+                    "button": "Left",
+                    "count": 1,
+                    "window": window_token,
+                    "window_exe": window_exe,
+                },
                 "label": f"색상 서치 ({color.name().upper()})",
             })
             return step

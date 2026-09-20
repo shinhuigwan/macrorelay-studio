@@ -200,11 +200,11 @@ class ActionButtonTile(QtWidgets.QPushButton):
 class CategorizedActionDialog(QtWidgets.QDialog):
     """Wide rectangular action picker organized into thematic categories with live Korean search."""
 
-    def __init__(self, current_action: str = "", parent=None) -> None:
+    def __init__(self, current_action: str = "", parent=None, *, placement_only: bool = False) -> None:
         super().__init__(parent)
         self.selected_action = current_action or "mouse_click"
         self.add_immediately = False
-        self.setWindowTitle("추가할 노드 액션 선택")
+        self.setWindowTitle("커서 위치에 추가할 노드 액션 선택" if placement_only else "추가할 노드 액션 선택")
         self.resize(920, 600)
         self.setStyleSheet("QDialog { background: #11151F; color: #E2E8F0; }")
 
@@ -317,6 +317,7 @@ class CategorizedActionDialog(QtWidgets.QDialog):
         btn_select = QtWidgets.QPushButton("선택만 하고 닫기")
         btn_select.setStyleSheet("padding: 7px 14px; border-radius: 6px; background: #1B2130; color: #DDE5F4; border: 1px solid #2C374E; font-size: 9pt;")
         btn_select.clicked.connect(self._confirm_select_only)
+        btn_select.setVisible(not placement_only)
         bottom.addWidget(btn_select)
 
         btn_cancel = QtWidgets.QPushButton("취소 (Esc)")
@@ -1091,7 +1092,7 @@ class BuilderPage(QtWidgets.QWidget):
                 background: #151A26;
             }
         """)
-        self.add_node_button.setToolTip("<b>노드 배치 추가 (+)</b><br>버튼을 누른 뒤 캔버스에서 원하는 위치를 클릭하면 연결되지 않은 노드가 생성됩니다.<br>빈 캔버스를 더블클릭해도 현재 선택 액션을 그 위치에 추가할 수 있습니다.<br>💡 <i>Shift 키를 누르면 빈 템플릿으로 추가됩니다.</i>")
+        self.add_node_button.setToolTip("<b>노드 배치 추가 (+)</b><br>버튼을 누른 뒤 캔버스에서 원하는 위치를 클릭하면 스마트 설정 후 연결되지 않은 노드가 생성됩니다.<br><b>Ctrl + 빈 캔버스 더블클릭</b>으로 해당 위치에서 액션 선택창을 열 수 있습니다.<br>일반 더블클릭 드래그는 캔버스를 이동합니다.<br>💡 <i>Shift 키를 누르면 빈 템플릿으로 추가됩니다.</i>")
         self.add_node_button.clicked.connect(self._arm_step_placement)
         self.action_combo.currentIndexChanged.connect(self._update_add_node_label)
         self.action_combo.node_addition_requested.connect(self._arm_step_placement)
@@ -3151,8 +3152,18 @@ class BuilderPage(QtWidgets.QWidget):
 
     @QtCore.Slot(str, object)
     def _add_step_at_position(self, action_override: str, scene_position: object) -> None:
-        action = action_override if action_override else self._selected_action(self.action_combo)
         position = scene_position if isinstance(scene_position, QtCore.QPointF) else self.node_canvas.preferred_add_position()
+        action = str(action_override or "")
+        if not action:
+            current = self._selected_action(self.action_combo)
+            dialog = CategorizedActionDialog(current, self.window(), placement_only=True)
+            if dialog.exec() != QtWidgets.QDialog.Accepted or not dialog.selected_action:
+                self.status.emit("노드 추가를 취소했습니다.")
+                return
+            action = str(dialog.selected_action)
+            combo_index = self.action_combo.findData(action)
+            if combo_index >= 0:
+                self.action_combo.setCurrentIndex(combo_index)
         self._add_step(action, position)
 
     def _add_step(self, action_override: Any = None, scene_position: QtCore.QPointF | None = None) -> None:

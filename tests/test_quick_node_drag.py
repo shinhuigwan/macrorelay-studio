@@ -70,6 +70,114 @@ class QuickNodeDragTests(unittest.TestCase):
         self.assertIn("new", bar._event_positions)
         bar.close()
 
+    def test_canvas_double_click_pans_and_ctrl_double_click_requests_action_picker(self) -> None:
+        from PySide6 import QtCore, QtTest
+
+        app, canvas = self._canvas()
+        canvas.resize(900, 620)
+        canvas.show()
+        app.processEvents()
+        point = QtCore.QPoint(canvas.view.viewport().width() - 24, canvas.view.viewport().height() - 24)
+        requested: list[tuple[str, object]] = []
+        canvas.node_add_at_requested.connect(lambda action, pos: requested.append((action, pos)))
+
+        QtTest.QTest.mouseDClick(
+            canvas.view.viewport(),
+            QtCore.Qt.LeftButton,
+            QtCore.Qt.ControlModifier,
+            point,
+        )
+        app.processEvents()
+        self.assertEqual(1, len(requested))
+        self.assertEqual("", requested[0][0])
+
+        QtTest.QTest.mouseDClick(canvas.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
+        app.processEvents()
+        self.assertEqual(1, len(requested))
+        canvas.close()
+
+    def test_quick_wizards_restore_two_stage_image_and_pixel_regions(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio import automation
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        pixmap = QtGui.QPixmap(1000, 800)
+        pixmap.fill(QtGui.QColor("#203040"))
+        geometry = QtCore.QRect(0, 0, 1000, 800)
+        target = {
+            "window": "Game ahk_exe game.exe",
+            "exe": "game.exe",
+            "capture_scope": "client",
+            "capture_origin": [50, 50],
+            "capture_size": [500, 500],
+        }
+
+        class Repository:
+            @staticmethod
+            def add_asset_image(_image, alias):
+                return alias
+
+        class CaptureDialog:
+            def __init__(self, rect, image=None):
+                self.rect = rect
+                self.image = image or QtGui.QImage(20, 20, QtGui.QImage.Format_RGB32)
+
+            @staticmethod
+            def exec():
+                return QtWidgets.QDialog.Accepted
+
+            def selected_native_screen_rect(self):
+                return QtCore.QRect(self.rect)
+
+            def captured_image(self):
+                return self.image
+
+            @staticmethod
+            def deleteLater():
+                return None
+
+        image_dialogs = [
+            CaptureDialog(QtCore.QRect(150, 150, 20, 20)),
+            CaptureDialog(QtCore.QRect(100, 100, 300, 300)),
+        ]
+        with mock.patch.object(automation, "capture_virtual_desktop", return_value=(pixmap, geometry)), \
+             mock.patch.object(automation, "ScreenCaptureDialog", side_effect=image_dialogs), \
+             mock.patch.object(automation.ActionEditor, "_window_target_at", return_value=target), \
+             mock.patch.object(automation.QtCore.QThread, "msleep"):
+            image_step = automation.QuickActionWizard.build("image_search", Repository())
+
+        self.assertEqual([50, 50, 350, 350], image_step["region"])
+        self.assertEqual("client", image_step["region_mode"])
+        self.assertEqual("relative", image_step["region_coords"])
+        self.assertEqual("game.exe", image_step["region_window_exe"])
+        self.assertEqual("inactive", image_step["click"]["mode"])
+
+        class PixelPicker:
+            @staticmethod
+            def exec():
+                return QtWidgets.QDialog.Accepted
+
+            @staticmethod
+            def selected_color():
+                return QtGui.QColor("#44AA77")
+
+            @staticmethod
+            def selected_point():
+                return QtCore.QPoint(200, 210)
+
+        with mock.patch.object(automation, "capture_virtual_desktop", return_value=(pixmap, geometry)), \
+             mock.patch.object(automation, "PixelColorPickerDialog", return_value=PixelPicker()), \
+             mock.patch.object(automation, "ScreenCaptureDialog", return_value=CaptureDialog(QtCore.QRect(90, 80, 200, 180))), \
+             mock.patch.object(automation.ActionEditor, "_window_target_at", return_value=target), \
+             mock.patch.object(automation.QtCore.QThread, "msleep"):
+            pixel_step = automation.QuickActionWizard.build("pixel_search", Repository())
+
+        self.assertEqual([40, 30, 240, 210], pixel_step["search_region"])
+        self.assertEqual([150, 160], [pixel_step["x"], pixel_step["y"]])
+        self.assertEqual("game.exe", pixel_step["region_window_exe"])
+        self.assertEqual("inactive", pixel_step["click"]["mode"])
+        app.processEvents()
+
     def test_live_splice_replaces_only_selected_connection(self) -> None:
         from PySide6 import QtWidgets
         from macro_studio.automation import RecordingBar

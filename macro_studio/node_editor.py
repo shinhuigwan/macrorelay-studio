@@ -819,7 +819,12 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
 
     def mouseDoubleClickEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
         if self._header_rect().contains(event.pos()):
-            self.toggle_fold()
+            if event.pos().x() <= self._rect.x() + 26:
+                self.toggle_fold()
+            else:
+                self._dragging = False
+                self.setCursor(QtCore.Qt.OpenHandCursor)
+                self.canvas.workflow_rename_requested.emit(self.workflow_id)
             event.accept()
 
     def toggle_fold(self) -> None:
@@ -3557,6 +3562,7 @@ class NodeCanvas(QtWidgets.QWidget):
     node_add_at_requested = QtCore.Signal(str, object)
     group_flow_changed = QtCore.Signal()
     workflow_membership_changed = QtCore.Signal()
+    workflow_rename_requested = QtCore.Signal(str)
     node_target_picked = QtCore.Signal(int)
     asset_route_edit_requested = QtCore.Signal(int, str)
 
@@ -3590,6 +3596,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self._display_numbers: dict[int, int] = {}
         self._node_target_pick_active = False
         self._node_target_pick_excluded = 0
+        self._node_target_pick_eligible: set[int] | None = None
         self._node_target_pick_previous_label = ""
         self._asset_route_edges_visible = True
         self.rubber_selecting = False
@@ -5021,24 +5028,37 @@ class NodeCanvas(QtWidgets.QWidget):
         if edge_specs:
             self.edges_delete_requested.emit(edge_specs)
 
-    def begin_node_target_pick(self, excluded_index: int = 0) -> None:
+    def begin_node_target_pick(
+        self,
+        excluded_index: int = 0,
+        eligible_indexes: set[int] | None = None,
+        prompt: str = "🎯 다음 진행 노드를 클릭하세요 · Esc 취소",
+    ) -> None:
         self.cancel_node_target_pick(emit=False)
         self._node_target_pick_active = True
         self._node_target_pick_excluded = int(excluded_index or 0)
+        self._node_target_pick_eligible = {int(value) for value in eligible_indexes} if eligible_indexes is not None else None
         self._node_target_pick_previous_label = self.flow_label.text()
-        self.flow_label.setText("🎯 다음 진행 노드를 클릭하세요 · Esc 취소")
+        self.flow_label.setText(prompt)
         self.flow_label.setStyleSheet("font-weight:800; color:#38E7FF; letter-spacing:0.4px;")
         self.view.setCursor(QtCore.Qt.PointingHandCursor)
         self.view.setFocus(QtCore.Qt.OtherFocusReason)
         for index, node in self.nodes.items():
-            node.setOpacity(0.35 if index == self._node_target_pick_excluded else 1.0)
+            unavailable = index == self._node_target_pick_excluded
+            if self._node_target_pick_eligible is not None:
+                unavailable = unavailable or index not in self._node_target_pick_eligible
+            node.setOpacity(0.22 if unavailable else 1.0)
             node.update()
 
     def complete_node_target_pick(self, target: int) -> None:
         if not self._node_target_pick_active:
             return
         target = int(target or 0)
-        if target <= 0 or target == self._node_target_pick_excluded:
+        if (
+            target <= 0
+            or target == self._node_target_pick_excluded
+            or (self._node_target_pick_eligible is not None and target not in self._node_target_pick_eligible)
+        ):
             QtWidgets.QApplication.beep()
             return
         self._finish_node_target_pick_ui()
@@ -5057,6 +5077,7 @@ class NodeCanvas(QtWidgets.QWidget):
     def _finish_node_target_pick_ui(self) -> None:
         self._node_target_pick_active = False
         self._node_target_pick_excluded = 0
+        self._node_target_pick_eligible = None
         self.flow_label.setText(self._node_target_pick_previous_label or "FLOW CANVAS")
         self.flow_label.setStyleSheet(f"font-weight:800; color:{COLORS['accent']}; letter-spacing:1px;")
         self.view.unsetCursor()

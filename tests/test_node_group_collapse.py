@@ -156,6 +156,47 @@ class NodeGroupCollapseTests(unittest.TestCase):
         self.assertEqual([True], changed)
         canvas.close()
 
+    def test_branch_workflows_follow_success_edges_but_leave_shared_merge_outside(self) -> None:
+        from macro_studio.builder import _assign_connected_branch_workflows
+
+        steps = [
+            {"action": "wait", "on_success": 2, "on_fail": 3},
+            {"action": "wait", "on_success": 5},
+            {"action": "wait", "on_success": 4},
+            {"action": "wait", "on_success": 6},
+            {"action": "wait", "on_success": 6},
+            {"action": "wait", "stop_on_success": True},
+        ]
+        assigned = _assign_connected_branch_workflows(steps, [1, 3])
+
+        self.assertEqual([1, 2, 5], assigned[1])
+        self.assertEqual([3, 4], assigned[3])
+        self.assertEqual("branch-lane-1", steps[1]["workflow_id"])
+        self.assertEqual("branch-lane-3", steps[3]["workflow_id"])
+        self.assertNotIn("workflow_id", steps[5])
+
+    def test_branch_target_picker_highlights_only_eligible_workflow_nodes(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro({"steps": [
+            {"action": "wait"},
+            {"action": "wait", "workflow_id": "branch-lane-2", "workflow_label": "2번 분기"},
+        ]})
+        picked = []
+        canvas.node_target_picked.connect(picked.append)
+        canvas.begin_node_target_pick(eligible_indexes={2}, prompt="분기 선택")
+
+        self.assertLess(canvas.nodes[1].opacity(), canvas.nodes[2].opacity())
+        canvas.complete_node_target_pick(1)
+        self.assertEqual([], picked)
+        canvas.complete_node_target_pick(2)
+        app.processEvents()
+        self.assertEqual([2], picked)
+        canvas.close()
+
 
 if __name__ == "__main__":
     unittest.main()

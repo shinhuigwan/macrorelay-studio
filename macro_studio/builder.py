@@ -53,6 +53,72 @@ from .widgets import Card, PageHeader, WheelSafeSpinBox, danger_button, primary_
 ACTION_TEMPLATES: dict[str, dict[str, Any]] = {action: action_template(action) for action in ACTION_LABELS}
 
 
+def _branch_success_targets(steps: list[dict[str, Any]], index: int) -> list[int]:
+    """Return only the normal success-flow targets used to grow a visual branch."""
+    if not 0 < index <= len(steps):
+        return []
+    step = steps[index - 1]
+    raw_candidates = step.get("success_candidates")
+    targets: list[int] = []
+    if isinstance(raw_candidates, list) and raw_candidates:
+        targets.extend(int(value) for value in raw_candidates if str(value).lstrip("-").isdigit())
+    else:
+        target = int(step.get("on_success") or 0)
+        if target:
+            targets.append(target)
+        elif index < len(steps) and not bool(step.get("stop_on_success")):
+            targets.append(index + 1)
+    return [target for target in targets if 0 < target <= len(steps)]
+
+
+def _assign_connected_branch_workflows(steps: list[dict[str, Any]], roots: list[int]) -> dict[int, list[int]]:
+    """Assign success-connected nodes to branch roots without swallowing other roots or shared merges."""
+    ordered_roots = [int(value) for value in roots if 0 < int(value) <= len(steps)]
+    root_set = set(ordered_roots)
+    reachable: dict[int, set[int]] = {}
+    for root in ordered_roots:
+        seen = {root}
+        pending = [root]
+        while pending:
+            source = pending.pop(0)
+            for target in _branch_success_targets(steps, source):
+                if target in root_set and target != root:
+                    continue
+                if target in seen:
+                    continue
+                seen.add(target)
+                pending.append(target)
+        reachable[root] = seen
+
+    owners: dict[int, list[int]] = {}
+    for root, indexes in reachable.items():
+        for index in indexes:
+            owners.setdefault(index, []).append(root)
+
+    assigned: dict[int, list[int]] = {root: [] for root in ordered_roots}
+    for position, root in enumerate(ordered_roots, start=1):
+        root_step = steps[root - 1]
+        workflow_id = f"branch-lane-{root}"
+        existing_label = str(root_step.get("workflow_label") or "").strip()
+        label = existing_label if existing_label and str(root_step.get("workflow_id") or "") == workflow_id else f"{position}번 분기"
+        for index in sorted(reachable[root]):
+            if index != root and len(owners.get(index, [])) != 1:
+                continue
+            step = steps[index - 1]
+            step["workflow_id"] = workflow_id
+            step["workflow_label"] = label
+            assigned[root].append(index)
+
+    for index, branch_owners in owners.items():
+        if len(branch_owners) <= 1 or index in root_set:
+            continue
+        step = steps[index - 1]
+        if str(step.get("workflow_id") or "").startswith("branch-lane-"):
+            step.pop("workflow_id", None)
+            step.pop("workflow_label", None)
+    return assigned
+
+
 def _raise_modal_dialog(dialog: QtWidgets.QDialog) -> None:
     """Keep nested dialogs visible without crashing if they close immediately."""
     try:
@@ -1435,10 +1501,29 @@ class BuilderPage(QtWidgets.QWidget):
         self.redo_button = QtWidgets.QPushButton("↷ 다시 실행")
         self.redo_button.setToolTip("취소한 매크로 편집 다시 실행 (Ctrl+Y)")
         self.redo_button.clicked.connect(self.redo_edit)
+        self.branch_connect_button = QtWidgets.QPushButton("🔀 선택 분기 연결")
+        self.branch_connect_button.setToolTip("선택한 노드를 실패 시 다음 분기로 순서대로 연결하고, 각 분기의 성공 흐름을 자동으로 그룹화합니다.")
+        self.branch_connect_button.clicked.connect(
+            lambda: self._configure_branch_chain(self.node_canvas.selected_indexes())
+        )
+        self.branch_manage_button = QtWidgets.QToolButton()
+        self.branch_manage_button.setText("분기 추가·해제 ▾")
+        self.branch_manage_button.setToolTip("선택 노드의 분기 소속을 생성·편입·제외하고 분기 이름을 변경합니다.")
+        self.branch_manage_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        branch_menu = QtWidgets.QMenu(self.branch_manage_button)
+        branch_menu.addAction("➕ 선택 노드로 새 분기 추가", self._create_branch_from_selection)
+        branch_menu.addAction("📥 선택 노드를 기존 분기에 추가", self._begin_add_selection_to_branch)
+        branch_menu.addAction("📤 선택 노드를 분기에서 제외", self._remove_selection_from_branch)
+        branch_menu.addSeparator()
+        branch_menu.addAction("✏️ 선택 분기 이름 변경", self._rename_selected_branch)
+        branch_menu.addAction("⛓️ 선택 노드의 분기 연결 해제", lambda: self._remove_branch_chain(self.node_canvas.selected_indexes()))
+        self.branch_manage_button.setMenu(branch_menu)
         node_actions.addWidget(self.undo_button)
         node_actions.addWidget(self.redo_button)
         node_actions.addWidget(self.duplicate_node_button)
         node_actions.addWidget(self.test_node_button)
+        node_actions.addWidget(self.branch_connect_button)
+        node_actions.addWidget(self.branch_manage_button)
         node_actions.addWidget(self.node_more_button)
         node_actions.addStretch(1)
         self._update_history_buttons()
@@ -1487,6 +1572,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.node_add_at_requested.connect(self._add_step_at_position)
         self.node_canvas.group_flow_changed.connect(self._graph_group_flow_changed)
         self.node_canvas.workflow_membership_changed.connect(self._graph_workflow_membership_changed)
+        self.node_canvas.workflow_rename_requested.connect(self._rename_selected_branch)
 
         list_page = QtWidgets.QWidget()
         list_layout = QtWidgets.QVBoxLayout(list_page)
@@ -3308,6 +3394,146 @@ class BuilderPage(QtWidgets.QWidget):
         )
         self._refresh_steps(candidates[0] - 1)
 
+    @QtCore.Slot()
+    def _create_branch_from_selection(self) -> None:
+        if not self.current_macro:
+            return
+        steps = self.current_macro.get("steps") or []
+        selected = sorted({int(value) for value in self.node_canvas.selected_indexes() if 0 < int(value) <= len(steps)})
+        if not selected:
+            self.status.emit("새 분기에 넣을 노드를 먼저 선택하세요.")
+            return
+        existing_ids = {
+            str(step.get("workflow_id") or "").strip()
+            for step in steps
+            if str(step.get("workflow_id") or "").strip()
+        }
+        branch_number = 1 + sum(identifier.startswith("branch-lane-") for identifier in existing_ids)
+        default_label = f"{branch_number}번 분기"
+        label, accepted = QtWidgets.QInputDialog.getText(self, "새 분기 추가", "분기 이름", text=default_label)
+        if not accepted or not label.strip():
+            return
+        root = selected[0]
+        workflow_id = f"branch-lane-{root}"
+        root_step = steps[root - 1]
+        root_step["workflow_id"] = workflow_id
+        root_step["workflow_label"] = label.strip()
+        automation = root_step.get("_automation") if isinstance(root_step.get("_automation"), dict) else {}
+        automation["branch_root"] = True
+        root_step["_automation"] = automation
+        _assign_connected_branch_workflows(steps, [root])
+        for index in selected:
+            steps[index - 1]["workflow_id"] = workflow_id
+            steps[index - 1]["workflow_label"] = label.strip()
+        self._persist(f"'{label.strip()}' 분기를 추가했습니다.")
+        self._refresh_steps(root - 1)
+
+    def _begin_add_selection_to_branch(self) -> None:
+        if not self.current_macro:
+            return
+        steps = self.current_macro.get("steps") or []
+        selected = sorted({int(value) for value in self.node_canvas.selected_indexes() if 0 < int(value) <= len(steps)})
+        if not selected:
+            self.status.emit("기존 분기에 넣을 노드를 먼저 선택하세요.")
+            return
+        if any(bool((steps[index - 1].get("_automation") or {}).get("branch_root")) for index in selected):
+            self.status.emit("분기 시작 노드는 먼저 '분기 연결 해제' 후 이동하세요.")
+            return
+        eligible = {
+            index for index, step in enumerate(steps, start=1)
+            if index not in selected and str(step.get("workflow_id") or "").strip()
+        }
+        if not eligible:
+            self.status.emit("추가할 대상 분기가 없습니다. 먼저 분기를 생성하세요.")
+            return
+
+        self.node_canvas.cancel_node_target_pick()
+
+        def finish(target: int) -> None:
+            try:
+                self.node_canvas.node_target_picked.disconnect(finish)
+            except (RuntimeError, TypeError):
+                pass
+            if not target or not (0 < target <= len(steps)):
+                self.status.emit("분기 추가를 취소했습니다.")
+                return
+            target_step = steps[target - 1]
+            workflow_id = str(target_step.get("workflow_id") or "").strip()
+            label = str(target_step.get("workflow_label") or workflow_id).strip()
+            if not workflow_id:
+                return
+            for index in selected:
+                steps[index - 1]["workflow_id"] = workflow_id
+                steps[index - 1]["workflow_label"] = label
+            self._persist(f"선택 노드 {len(selected)}개를 '{label}'에 추가했습니다.")
+            self._refresh_steps(selected[0] - 1)
+
+        self.node_canvas.node_target_picked.connect(finish)
+        self.node_canvas.begin_node_target_pick(
+            eligible_indexes=eligible,
+            prompt="🎯 추가할 분기의 영역 안 노드를 클릭하세요 · Esc 취소",
+        )
+        self.status.emit("강조된 노드 중 하나를 클릭하면 해당 분기에 추가됩니다.")
+
+    def _remove_selection_from_branch(self) -> None:
+        if not self.current_macro:
+            return
+        steps = self.current_macro.get("steps") or []
+        selected = self.node_canvas.selected_indexes()
+        changed = 0
+        for index in selected:
+            if not 0 < int(index) <= len(steps):
+                continue
+            step = steps[int(index) - 1]
+            if not str(step.get("workflow_id") or "").strip():
+                continue
+            step.pop("workflow_id", None)
+            step.pop("workflow_label", None)
+            changed += 1
+        if not changed:
+            self.status.emit("분기에서 제외할 노드를 선택하세요.")
+            return
+        self._persist(f"선택 노드 {changed}개를 분기에서 제외했습니다.")
+        self._refresh_steps(max(0, int(selected[0]) - 1))
+
+    def _rename_selected_branch(self, workflow_id: str = "") -> None:
+        if not self.current_macro:
+            return
+        steps = self.current_macro.get("steps") or []
+        available: dict[str, str] = {}
+        for step in steps:
+            identifier = str(step.get("workflow_id") or "").strip()
+            if identifier:
+                available.setdefault(identifier, str(step.get("workflow_label") or identifier).strip())
+        if not workflow_id:
+            selected_ids = {
+                str(steps[index - 1].get("workflow_id") or "").strip()
+                for index in self.node_canvas.selected_indexes()
+                if 0 < index <= len(steps) and str(steps[index - 1].get("workflow_id") or "").strip()
+            }
+            if len(selected_ids) == 1:
+                workflow_id = next(iter(selected_ids))
+            elif available:
+                labels = [f"{label}  ({identifier})" for identifier, label in available.items()]
+                choice, accepted = QtWidgets.QInputDialog.getItem(self, "분기 이름 변경", "변경할 분기", labels, 0, False)
+                if not accepted:
+                    return
+                workflow_id = list(available)[labels.index(choice)]
+        if workflow_id not in available:
+            self.status.emit("이름을 변경할 분기를 선택하세요.")
+            return
+        label, accepted = QtWidgets.QInputDialog.getText(
+            self, "분기 이름 변경", "새 분기 이름", text=available[workflow_id]
+        )
+        label = label.strip()
+        if not accepted or not label:
+            return
+        for step in steps:
+            if str(step.get("workflow_id") or "").strip() == workflow_id:
+                step["workflow_label"] = label
+        self._persist(f"분기 이름을 '{label}'(으)로 변경했습니다.")
+        self._refresh_steps(max(0, self.steps_table.currentRow()))
+
     @QtCore.Slot(list)
     def _configure_branch_chain(self, selected_indexes: list[int]) -> None:
         if not self.current_macro:
@@ -3383,16 +3609,22 @@ class BuilderPage(QtWidgets.QWidget):
             automation["candidate_position"] = position + 1
             automation["candidate_count"] = len(candidates)
             automation["hide_candidate_fail_edge"] = True
+            automation["branch_root"] = True
             step["_automation"] = automation
 
             # Assign workflow lane so colored bounding area border renders around each branch (like Smart Recording F7)
-            step["workflow_id"] = f"branch-lane-{index}"
-            step["workflow_label"] = f"{position + 1}번 분기"
+            workflow_id = f"branch-lane-{index}"
+            if str(step.get("workflow_id") or "").strip() != workflow_id:
+                step["workflow_label"] = f"{position + 1}번 분기"
+            step["workflow_id"] = workflow_id
+
+        assigned = _assign_connected_branch_workflows(steps, candidates)
 
         chain_desc = " ➔ ".join(f"#{i}" for i in candidates)
         self._persist(f"순차 분기 체인 생성 ({chain_desc})")
         self._refresh_steps(candidates[0] - 1)
-        self.status.emit(f"🔀 순차 분기 연결 완료: {chain_desc} (실패 시 다음 분기 순차 실행)")
+        member_count = sum(len(indexes) for indexes in assigned.values())
+        self.status.emit(f"🔀 순차 분기 연결 완료: {chain_desc} · 성공 흐름 {member_count}개 노드 자동 포함")
 
     @QtCore.Slot(int)
     def _configure_single_branch(self, source_index: int) -> None:
@@ -3464,23 +3696,61 @@ class BuilderPage(QtWidgets.QWidget):
         if not self.current_macro:
             return
         steps = self.current_macro.get("steps") or []
-        count = 0
-        for idx in selected_indexes:
-            if 0 < idx <= len(steps):
-                steps[idx - 1].pop("on_fail", None)
-                automation = steps[idx - 1].get("_automation")
-                if isinstance(automation, dict):
-                    automation.pop("branch_chain", None)
-                    automation.pop("candidate_position", None)
-                    automation.pop("candidate_count", None)
-                    if not automation:
-                        steps[idx - 1].pop("_automation", None)
-                if str(steps[idx - 1].get("workflow_id") or "").startswith("branch-lane-"):
-                    steps[idx - 1].pop("workflow_id", None)
-                    steps[idx - 1].pop("workflow_label", None)
-                count += 1
+        selected = {int(value) for value in selected_indexes if 0 < int(value) <= len(steps)}
+        if not selected:
+            self.status.emit("연결을 해제할 분기 노드를 선택하세요.")
+            return
+        workflow_ids = {
+            str(steps[index - 1].get("workflow_id") or "").strip()
+            for index in selected
+            if str(steps[index - 1].get("workflow_id") or "").strip()
+        }
+        roots_to_remove = {
+            index for index, step in enumerate(steps, start=1)
+            if (
+                index in selected
+                or str(step.get("workflow_id") or "").strip() in workflow_ids
+            )
+            and bool((step.get("_automation") or {}).get("branch_root") or (step.get("_automation") or {}).get("branch_chain"))
+        }
+        roots_to_remove.update(selected if not roots_to_remove else set())
+
+        for step in steps:
+            if str(step.get("workflow_id") or "").strip() in workflow_ids:
+                step.pop("workflow_id", None)
+                step.pop("workflow_label", None)
+
+        for index in roots_to_remove:
+            step = steps[index - 1]
+            step.pop("on_fail", None)
+            step.pop("abort_on_fail", None)
+            automation = step.get("_automation")
+            if isinstance(automation, dict):
+                for key in ("branch_chain", "branch_root", "candidate_position", "candidate_count", "hide_candidate_fail_edge"):
+                    automation.pop(key, None)
+                if not automation:
+                    step.pop("_automation", None)
+
+        remaining_roots = []
+        for index, step in enumerate(steps, start=1):
+            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+            if automation.get("branch_chain") and automation.get("branch_root"):
+                remaining_roots.append((int(automation.get("candidate_position") or index), index))
+        remaining = [index for _position, index in sorted(remaining_roots)]
+        for position, index in enumerate(remaining):
+            step = steps[index - 1]
+            automation = step.get("_automation")
+            automation["candidate_position"] = position + 1
+            automation["candidate_count"] = len(remaining)
+            if position + 1 < len(remaining):
+                step["on_fail"] = remaining[position + 1]
+                step["abort_on_fail"] = False
+            else:
+                step.pop("on_fail", None)
+                step["abort_on_fail"] = True
+        count = len(roots_to_remove)
         self._persist(f"선택한 {count}개 노드의 분기 연결을 해제했습니다.")
-        self._refresh_steps(selected_indexes[0] - 1 if selected_indexes else 0)
+        self._refresh_steps(min(selected) - 1)
         self.status.emit("선택 노드 분기 해제 완료")
 
     def _append_automation_steps(self, new_steps: list[dict[str, Any]], message: str) -> None:

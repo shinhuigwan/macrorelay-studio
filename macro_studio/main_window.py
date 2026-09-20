@@ -77,10 +77,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings = QtCore.QSettings("MacroRelay", "Studio")
         self._sidebar_collapsed = bool(self.settings.value("sidebar_collapsed", True, type=bool))
         self._resolved_shortcuts: dict[str, str] = {}
-        geometry = self.settings.value("geometry")
-        if geometry:
-            self.restoreGeometry(geometry)
-        if str(self.settings.value("layout_version", "")) != "2.14-wide":
+        has_saved_geometry = self.settings.contains("window/normal_geometry") or self.settings.contains("geometry")
+        if not has_saved_geometry and str(self.settings.value("layout_version", "")) != "2.14-wide":
             self.resize(1780, max(900, self.height()))
             self.settings.setValue("layout_version", "2.14-wide")
 
@@ -120,6 +118,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.switch_page("builder")
         self._mini_hud = FloatingMiniHUD(self)
         self._last_click_pixmap: QtGui.QPixmap | None = None
+        self._restore_window_placement()
+
+    @staticmethod
+    def _clamp_window_rect(rect: QtCore.QRect, screens: list[QtCore.QRect]) -> QtCore.QRect:
+        """Keep a restored window usable after monitor or resolution changes."""
+        if not rect.isValid() or not screens:
+            return QtCore.QRect(rect)
+        target = max(
+            screens,
+            key=lambda screen: screen.intersected(rect).width() * screen.intersected(rect).height(),
+        )
+        width = min(max(1120, rect.width()), target.width())
+        height = min(max(700, rect.height()), target.height())
+        left = min(max(rect.left(), target.left()), target.right() - width + 1)
+        top = min(max(rect.top(), target.top()), target.bottom() - height + 1)
+        return QtCore.QRect(left, top, width, height)
+
+    def _restore_window_placement(self) -> None:
+        screens = [screen.availableGeometry() for screen in QtGui.QGuiApplication.screens()]
+        saved_rect = self.settings.value("window/normal_geometry")
+        if isinstance(saved_rect, QtCore.QRect) and saved_rect.isValid():
+            self.setGeometry(self._clamp_window_rect(saved_rect, screens))
+        else:
+            legacy_geometry = self.settings.value("geometry")
+            if legacy_geometry:
+                self.restoreGeometry(legacy_geometry)
+                self.setGeometry(self._clamp_window_rect(self.normalGeometry(), screens))
+        if self.settings.value("window/maximized", False, type=bool):
+            self.setWindowState(self.windowState() | QtCore.Qt.WindowMaximized)
+
+    def _save_window_placement(self) -> None:
+        normal_rect = self.normalGeometry() if self.isMaximized() or self.isFullScreen() else self.geometry()
+        self.settings.setValue("window/normal_geometry", normal_rect)
+        self.settings.setValue("window/maximized", self.isMaximized())
+        self.settings.setValue("geometry", self.saveGeometry())  # legacy compatibility
+        self.settings.sync()
 
     def _build_sidebar(self) -> QtWidgets.QWidget:
         sidebar = QtWidgets.QWidget()
@@ -1163,6 +1197,6 @@ class MainWindow(QtWidgets.QMainWindow):
             app.removeEventFilter(self)
         if hasattr(self, "_mini_hud") and self._mini_hud:
             self._mini_hud.close()
-        self.settings.setValue("geometry", self.saveGeometry())
+        self._save_window_placement()
         self.settings.setValue("sidebar_collapsed", self._sidebar_collapsed)
         super().closeEvent(event)

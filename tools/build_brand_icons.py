@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import sys
+import argparse
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -33,7 +33,7 @@ def make_icon(source: Image.Image, size: int = 1024, runner: bool = False) -> Im
     y = (size - mark.height) // 2
     icon.alpha_composite(mark, (x, y))
     if runner:
-        dot_radius = int(size * 0.105)
+        dot_radius = int(size * 0.12)
         cx = int(size * 0.79)
         cy = int(size * 0.79)
         ring = int(size * 0.025)
@@ -44,26 +44,40 @@ def make_icon(source: Image.Image, size: int = 1024, runner: bool = False) -> Im
         )
         draw.ellipse(
             (cx - dot_radius, cy - dot_radius, cx + dot_radius, cy + dot_radius),
-            fill="#35C89A",
+            fill="#1F6FEB",
+        )
+        play_half_height = int(dot_radius * 0.50)
+        play_left = cx - int(dot_radius * 0.23)
+        draw.polygon(
+            (
+                (play_left, cy - play_half_height),
+                (play_left, cy + play_half_height),
+                (cx + int(dot_radius * 0.55), cy),
+            ),
+            fill="#FFFFFF",
         )
     return icon
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: build_brand_icons.py SOURCE_PNG OUTPUT_DIR")
-    source_path = Path(sys.argv[1])
-    output_dir = Path(sys.argv[2])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("source_png", type=Path)
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--runner-only", action="store_true", help="Studio icon files are left unchanged")
+    args = parser.parse_args()
+    source_path = args.source_png
+    output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     source = Image.open(source_path)
     studio = make_icon(source)
     runner = make_icon(source, runner=True)
     sizes = [(16, 16), (20, 20), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-    studio.save(output_dir / "macrorelay-studio.png")
     runner.save(output_dir / "macrorelay-runner.png")
-    studio.save(output_dir / "macrorelay-studio.ico", format="ICO", sizes=sizes)
     runner.save(output_dir / "macrorelay-runner.ico", format="ICO", sizes=sizes)
     runner.resize((32, 32), Image.Resampling.LANCZOS).save(output_dir / "macrorelay-tray.png")
+    if not args.runner_only:
+        studio.save(output_dir / "macrorelay-studio.png")
+        studio.save(output_dir / "macrorelay-studio.ico", format="ICO", sizes=sizes)
     return 0
 
 

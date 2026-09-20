@@ -281,15 +281,26 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
         self.main_layout.addWidget(self.select_card)
 
-        self.lbl_compact_macro = QtWidgets.QLabel("선택된 매크로 없음", self)
+        self.compact_header = QtWidgets.QWidget(self)
+        compact_header_layout = QtWidgets.QHBoxLayout(self.compact_header)
+        compact_header_layout.setContentsMargins(0, 0, 0, 0)
+        compact_header_layout.setSpacing(6)
+        self.lbl_compact_macro = QtWidgets.QLabel("선택된 매크로 없음", self.compact_header)
         self.lbl_compact_macro.setAlignment(QtCore.Qt.AlignCenter)
         self.lbl_compact_macro.setStyleSheet(
             "background:#161B22; border:1px solid #30363D; border-radius:7px; "
             "color:#E6EDF3; font-size:12px; font-weight:800; padding:7px 10px;"
         )
         self.lbl_compact_macro.setToolTip("현재 선택되었거나 실행 중인 매크로")
-        self.lbl_compact_macro.hide()
-        self.main_layout.addWidget(self.lbl_compact_macro)
+        compact_header_layout.addWidget(self.lbl_compact_macro, 1)
+        self.btn_normal_mode = QtWidgets.QToolButton(self.compact_header)
+        self.btn_normal_mode.setText("▣ 일반 모드")
+        self.btn_normal_mode.setToolTip("전체 플레이어 화면으로 돌아갑니다. (F8)")
+        self.btn_normal_mode.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_normal_mode.clicked.connect(lambda: self.btn_compact.setChecked(False))
+        compact_header_layout.addWidget(self.btn_normal_mode)
+        self.compact_header.hide()
+        self.main_layout.addWidget(self.compact_header)
 
         # 3. Mode & Loop Options
         self.opts_card = QtWidgets.QFrame(self)
@@ -449,12 +460,12 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             self.opts_card.hide()
             self.dash_card.hide()
             self.log_edit.hide()
-            self.lbl_compact_macro.show()
+            self.compact_header.show()
             self.main_layout.setContentsMargins(8, 7, 8, 8)
             self.main_layout.setSpacing(6)
-            self.setMinimumSize(360, 108)
+            self.setMinimumSize(390, 108)
             self.setMaximumHeight(145)
-            self.resize(420, 118)
+            self.resize(460, 118)
             self.setWindowTitle("⚡ Macro Player · F8 일반 모드")
         else:
             self.header_widget.show()
@@ -462,7 +473,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             self.opts_card.show()
             self.dash_card.show()
             self.log_edit.show()
-            self.lbl_compact_macro.hide()
+            self.compact_header.hide()
             self.main_layout.setContentsMargins(14, 12, 14, 14)
             self.main_layout.setSpacing(10)
             self.setMaximumHeight(16777215)

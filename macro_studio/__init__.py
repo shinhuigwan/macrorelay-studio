@@ -1,3 +1,3 @@
 """MacroRelay Studio package."""
 
-__version__ = "2.58.5"
+__version__ = "2.58.6"

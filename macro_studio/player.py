@@ -11,12 +11,30 @@ import os
 import subprocess
 import sys
 import time
+import ctypes
 from pathlib import Path
 from typing import Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .repository import MacroRepository, MacroSummary
+
+
+_PLAYER_MUTEX_NAME = "Local\\MacroRelayPlayerStandalone"
+
+
+def _acquire_player_mutex() -> int:
+    """Keep desktop/studio launches from opening duplicate player windows."""
+    if sys.platform != "win32":
+        return 1
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = int(kernel32.CreateMutexW(None, True, _PLAYER_MUTEX_NAME) or 0)
+    if handle and int(kernel32.GetLastError()) == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return 0
+    return handle
 
 
 class MacroPlayerWindow(QtWidgets.QMainWindow):
@@ -514,10 +532,14 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.start_time = time.time()
         self.elapsed_offset = 0.0
         self.loop_count += 1
+        self.current_step = 0
 
         self.lbl_status.setText(f"🟢 실행 중 ({mode_str})")
         self.lbl_status.setStyleSheet("color: #3FB950; font-size: 13px; font-weight: 800;")
         self.lbl_loop_count.setText(f"{self.loop_count}회차 실행")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat(f"0 / {self.total_steps} 단계")
+        self.lbl_step_detail.setText("실행 준비 중 · 첫 노드 상태를 확인하고 있습니다.")
 
         self.btn_run.setEnabled(False)
         self.btn_pause.setEnabled(True)
@@ -613,29 +635,50 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
         # Update step progress
         progress_path = getattr(self.current_process, "macrorelay_progress_path", None)
-        if progress_path and os.path.exists(progress_path):
-            try:
-                with open(progress_path, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                if content.isdigit():
-                    step_num = int(content)
-                    if step_num != self.current_step and step_num > 0:
-                        self.current_step = step_num
-                        self.progress_bar.setValue(self.current_step)
-                        self.progress_bar.setFormat(f"{self.current_step} / {self.total_steps} 단계")
-
-                        steps = self.current_macro_payload.get("steps") or []
-                        if 0 < self.current_step <= len(steps):
-                            st = steps[self.current_step - 1]
-                            action = st.get("action", "step")
-                            label = st.get("label") or action
-                            self.lbl_step_detail.setText(f"진행 중: {self.current_step}번 [{label}]")
-            except Exception:
-                pass
+        step_num = self._read_progress_file(progress_path)
+        if step_num > 0:
+            self._show_running_step(step_num)
 
         if ret is not None:
             # Process terminated
             self._handle_finished(ret)
+
+    @staticmethod
+    def _read_progress_file(progress_path: Any) -> int:
+        """Read AHK's UTF-8 progress file, including its optional BOM."""
+        if not progress_path:
+            return 0
+        path = Path(progress_path)
+        if not path.is_file():
+            return 0
+        try:
+            return max(0, int(path.read_text(encoding="utf-8-sig").strip()))
+        except (OSError, TypeError, ValueError):
+            return 0
+
+    def _show_running_step(self, step_num: int) -> None:
+        self.current_step = int(step_num)
+        self.progress_bar.setValue(self.current_step)
+        self.progress_bar.setFormat(f"{self.current_step} / {self.total_steps} 단계")
+
+        steps = self.current_macro_payload.get("steps") or []
+        if not 0 < self.current_step <= len(steps):
+            self.lbl_step_detail.setText(f"진행 중: {self.current_step}번 노드")
+            self.lbl_status.setText(f"🟢 실행 중 · {self.current_step}번 노드")
+            return
+
+        step = steps[self.current_step - 1]
+        action = str(step.get("action") or "step")
+        label = str(step.get("label") or step.get("name") or action)
+        self.lbl_step_detail.setText(
+            f"현재 실행 노드: {self.current_step}번 · {label}  ({action})"
+        )
+        if self.is_paused:
+            self.lbl_status.setText(f"🟡 일시정지 · {self.current_step}번 [{label}]")
+            self.lbl_status.setStyleSheet("color: #D29922; font-size: 13px; font-weight: 800;")
+        else:
+            self.lbl_status.setText(f"🟢 실행 중 · {self.current_step}번 [{label}]")
+            self.lbl_status.setStyleSheet("color: #3FB950; font-size: 13px; font-weight: 800;")
 
     def _handle_finished(self, return_code: int) -> None:
         self.is_running = False
@@ -668,6 +711,9 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
 def launch_player(macro_name: str = "") -> int:
     """Entry point to launch the standalone Macro Player."""
+    mutex_handle = _acquire_player_mutex()
+    if not mutex_handle:
+        return 0
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     app.setApplicationName("MacroRelay Player")
     app.setStyle("Fusion")
@@ -684,7 +730,12 @@ def launch_player(macro_name: str = "") -> int:
 
     window.show()
     window.move_to_cursor()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        if sys.platform == "win32" and mutex_handle != 1:
+            ctypes.windll.kernel32.ReleaseMutex(ctypes.c_void_p(mutex_handle))
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(mutex_handle))
 
 
 if __name__ == "__main__":

@@ -1,10 +1,12 @@
 $ErrorActionPreference = "SilentlyContinue"
 $studioRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $playerScript = Join-Path $studioRoot "run_player.py"
+$runtimePackages = Join-Path $studioRoot "runtime_packages"
 $legacyPackages = Join-Path $studioRoot ".venv\Lib\site-packages"
+$bundledOpenCvPackages = Join-Path $studioRoot "runtime\opencv\cp312\packages"
 $runtimeCandidates = @(
-    @((Join-Path $studioRoot ".venv\Scripts\python.exe"), (Join-Path $studioRoot ".venv\Scripts\pythonw.exe"), $false),
-    @((Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"), (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\pythonw.exe"), $false),
+    @((Join-Path $studioRoot ".venv\Scripts\python.exe"), (Join-Path $studioRoot ".venv\Scripts\pythonw.exe"), $true),
+    @((Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"), (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\pythonw.exe"), $true),
     @((Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"), (Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\pythonw.exe"), $true)
 )
 
@@ -15,13 +17,23 @@ foreach ($candidate in $runtimeCandidates) {
     if (-not (Test-Path -LiteralPath $python) -or -not (Test-Path -LiteralPath $pythonw)) {
         continue
     }
+    $packagePaths = @()
+    if (Test-Path -LiteralPath $runtimePackages) {
+        $packagePaths += $runtimePackages
+    }
+    if (Test-Path -LiteralPath $bundledOpenCvPackages) {
+        $packagePaths += $bundledOpenCvPackages
+    }
     if ($useLegacyPackages -and (Test-Path -LiteralPath $legacyPackages)) {
-        $env:PYTHONPATH = $legacyPackages
+        $packagePaths += $legacyPackages
+    }
+    if ($packagePaths.Count -gt 0) {
+        $env:PYTHONPATH = $packagePaths -join [IO.Path]::PathSeparator
     }
     else {
         Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
     }
-    & $python -c "from PySide6 import QtWidgets" 2>$null
+    & $python -c "from PySide6 import QtWidgets; import macro_studio.player" 2>$null
     if ($LASTEXITCODE -eq 0) {
         Remove-Item -LiteralPath (Join-Path $studioRoot "player-launch-error.txt") -ErrorAction SilentlyContinue
         Start-Process -FilePath $pythonw -ArgumentList @($playerScript) -WorkingDirectory $studioRoot -WindowStyle Hidden

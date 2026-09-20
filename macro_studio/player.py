@@ -218,24 +218,26 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
         central_widget = QtWidgets.QWidget(self)
         self.setCentralWidget(central_widget)
-        main_layout = QtWidgets.QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(14, 12, 14, 14)
-        main_layout.setSpacing(10)
+        self.main_layout = QtWidgets.QVBoxLayout(central_widget)
+        self.main_layout.setContentsMargins(14, 12, 14, 14)
+        self.main_layout.setSpacing(10)
 
         # 1. Top Bar: Brand, Always-on-top, Compact toggle
-        top_bar = QtWidgets.QHBoxLayout()
+        self.header_widget = QtWidgets.QWidget(self)
+        top_bar = QtWidgets.QHBoxLayout(self.header_widget)
+        top_bar.setContentsMargins(0, 0, 0, 0)
         top_bar.setSpacing(8)
 
-        brand_label = QtWidgets.QLabel("⚡ <b>MACRO PLAYER</b>")
-        brand_label.setStyleSheet("color: #58A6FF; font-size: 13px; font-weight: 800;")
-        top_bar.addWidget(brand_label)
+        self.brand_label = QtWidgets.QLabel("⚡ <b>MACRO PLAYER</b>")
+        self.brand_label.setStyleSheet("color: #58A6FF; font-size: 13px; font-weight: 800;")
+        top_bar.addWidget(self.brand_label)
 
-        ver_badge = QtWidgets.QLabel("TURBO")
-        ver_badge.setStyleSheet(
+        self.ver_badge = QtWidgets.QLabel("TURBO")
+        self.ver_badge.setStyleSheet(
             "background: #1F6FEB; color: white; font-size: 9px; font-weight: 800; "
             "border-radius: 4px; padding: 2px 5px;"
         )
-        top_bar.addWidget(ver_badge)
+        top_bar.addWidget(self.ver_badge)
         top_bar.addStretch()
 
         self.btn_pin = QtWidgets.QToolButton(self)
@@ -252,12 +254,12 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_compact.toggled.connect(self._toggle_compact_mode)
         top_bar.addWidget(self.btn_compact)
 
-        main_layout.addLayout(top_bar)
+        self.main_layout.addWidget(self.header_widget)
 
         # 2. Macro Selection Card
-        select_card = QtWidgets.QFrame(self)
-        select_card.setObjectName("Card")
-        select_layout = QtWidgets.QHBoxLayout(select_card)
+        self.select_card = QtWidgets.QFrame(self)
+        self.select_card.setObjectName("Card")
+        select_layout = QtWidgets.QHBoxLayout(self.select_card)
         select_layout.setContentsMargins(10, 8, 10, 8)
         select_layout.setSpacing(8)
 
@@ -276,7 +278,17 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_refresh.clicked.connect(self.refresh_macro_list)
         select_layout.addWidget(self.btn_refresh)
 
-        main_layout.addWidget(select_card)
+        self.main_layout.addWidget(self.select_card)
+
+        self.lbl_compact_macro = QtWidgets.QLabel("선택된 매크로 없음", self)
+        self.lbl_compact_macro.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_compact_macro.setStyleSheet(
+            "background:#161B22; border:1px solid #30363D; border-radius:7px; "
+            "color:#E6EDF3; font-size:12px; font-weight:800; padding:7px 10px;"
+        )
+        self.lbl_compact_macro.setToolTip("현재 선택되었거나 실행 중인 매크로")
+        self.lbl_compact_macro.hide()
+        self.main_layout.addWidget(self.lbl_compact_macro)
 
         # 3. Mode & Loop Options
         self.opts_card = QtWidgets.QFrame(self)
@@ -296,7 +308,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         opts_layout.addWidget(self.chk_loop)
 
         opts_layout.addStretch()
-        main_layout.addWidget(self.opts_card)
+        self.main_layout.addWidget(self.opts_card)
 
         # 4. Live Dashboard Card
         self.dash_card = QtWidgets.QFrame(self)
@@ -334,7 +346,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.progress_bar.setFormat("0 / 0 단계")
         dash_layout.addWidget(self.progress_bar)
 
-        main_layout.addWidget(self.dash_card)
+        self.main_layout.addWidget(self.dash_card)
 
         # 5. Big Control Buttons Bar
         ctrl_bar = QtWidgets.QHBoxLayout()
@@ -360,7 +372,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_stop.clicked.connect(self.stop_macro)
         ctrl_bar.addWidget(self.btn_stop, 3)
 
-        main_layout.addLayout(ctrl_bar)
+        self.main_layout.addLayout(ctrl_bar)
 
         # 6. Global Shortcuts
         self._shortcut_f5 = QtGui.QShortcut(QtGui.QKeySequence("F5"), self)
@@ -381,7 +393,10 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             "color: #8B949E; font-family: 'Consolas', monospace; font-size: 11px;"
         )
         self.log_edit.appendPlainText("Macro Player 준비 완료. 매크로를 선택하고 [F5]를 누르세요.")
-        main_layout.addWidget(self.log_edit)
+        self.main_layout.addWidget(self.log_edit)
+
+        self._shortcut_f8 = QtGui.QShortcut(QtGui.QKeySequence("F8"), self)
+        self._shortcut_f8.activated.connect(lambda: self.btn_compact.toggle())
 
     def _load_settings(self) -> None:
         settings = QtCore.QSettings("MacroRelay", "Player")
@@ -423,18 +438,50 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
     def _toggle_compact_mode(self, checked: bool) -> None:
         self._compact_mode = checked
         if checked:
+            self.header_widget.hide()
+            self.select_card.hide()
             self.opts_card.hide()
+            self.dash_card.hide()
             self.log_edit.hide()
-            self.progress_bar.hide()
-            self.setMinimumHeight(160)
-            self.adjustSize()
+            self.lbl_compact_macro.show()
+            self.main_layout.setContentsMargins(8, 7, 8, 8)
+            self.main_layout.setSpacing(6)
+            self.setMinimumSize(360, 108)
+            self.setMaximumHeight(145)
+            self.resize(420, 118)
+            self.setWindowTitle("⚡ Macro Player · F8 일반 모드")
         else:
+            self.header_widget.show()
+            self.select_card.show()
             self.opts_card.show()
+            self.dash_card.show()
             self.log_edit.show()
-            self.progress_bar.show()
-            self.setMinimumHeight(220)
+            self.lbl_compact_macro.hide()
+            self.main_layout.setContentsMargins(14, 12, 14, 14)
+            self.main_layout.setSpacing(10)
+            self.setMaximumHeight(16777215)
+            self.setMinimumSize(380, 220)
             self.resize(self.width(), 430)
+            self.setWindowTitle("⚡ Macro Player")
+        self._sync_control_button_labels()
         self._save_settings()
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._compact_mode:
+            self.btn_compact.setChecked(False)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _sync_control_button_labels(self) -> None:
+        if self._compact_mode:
+            self.btn_run.setText("▶ 실행")
+            self.btn_pause.setText("▶ 재개" if self.is_paused else "Ⅱ 일시정지")
+            self.btn_stop.setText("■ 종료")
+        else:
+            self.btn_run.setText("▶ 실 행  [F5]")
+            self.btn_pause.setText("▶ 계속 진행 [F7]" if self.is_paused else "⏸ 일시정지 [F7]")
+            self.btn_stop.setText("⏹ 비상 정지  [F6]")
 
     def move_to_cursor(self) -> None:
         """Position the player window near the mouse cursor, clamped within screen bounds."""
@@ -488,6 +535,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         if index < 0 or index >= self.macro_combo.count():
             return
         name = self.macro_combo.itemData(index)
+        self.lbl_compact_macro.setText(str(name or "선택된 매크로 없음"))
         try:
             self.current_macro_payload = self.repository.load_macro(name)
             steps = self.current_macro_payload.get("steps") or []
@@ -545,6 +593,8 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_pause.setEnabled(True)
         self.btn_pause.setText("⏸ 일시정지 [F7]")
         self.btn_stop.setEnabled(True)
+        self.lbl_compact_macro.setText(str(macro_name))
+        self._sync_control_button_labels()
 
         self._stopwatch_timer.start()
         self._monitor_timer.start()
@@ -582,6 +632,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             self.start_time = time.time() - self.elapsed_offset
             self._stopwatch_timer.start()
             self.log_edit.appendPlainText(f"[{time.strftime('%H:%M:%S')}] ▶ 매크로 재개")
+        self._sync_control_button_labels()
 
     def stop_macro(self) -> None:
         """Immediately and forcibly terminate the running macro."""
@@ -615,6 +666,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("⏸ 일시정지 [F7]")
         self.btn_stop.setEnabled(False)
+        self._sync_control_button_labels()
 
         self.log_edit.appendPlainText(f"[{time.strftime('%H:%M:%S')}] ⏹ 매크로 정지 완료")
 
@@ -707,6 +759,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_run.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
+        self._sync_control_button_labels()
 
 
 def launch_player(macro_name: str = "") -> int:

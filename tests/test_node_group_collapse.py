@@ -197,6 +197,54 @@ class NodeGroupCollapseTests(unittest.TestCase):
         self.assertEqual([2], picked)
         canvas.close()
 
+    def test_folded_workflow_lane_becomes_a_compact_header_card(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas, WorkflowLaneItem
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro({
+            "steps": [
+                {"action": "wait", "workflow_id": "branch-lane-1", "workflow_label": "1번 분기"},
+                {"action": "wait", "workflow_id": "branch-lane-1", "workflow_label": "1번 분기"},
+            ],
+            "graph_positions": {"1": [0, 0], "2": [700, 0]},
+        })
+        lane = canvas.workflow_items[0]
+        self.assertGreater(lane._rect.width(), WorkflowLaneItem.COLLAPSED_WIDTH)
+
+        lane.toggle_fold()
+        app.processEvents()
+        self.assertTrue(lane.folded)
+        self.assertAlmostEqual(WorkflowLaneItem.COLLAPSED_WIDTH, lane._rect.width())
+        self.assertTrue(all(not node.isVisible() for node in canvas.nodes.values()))
+        canvas.close()
+
+    def test_alignment_keeps_first_selected_node_as_anchor(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro({
+            "steps": [{"action": "wait"}, {"action": "wait"}, {"action": "wait"}],
+            "graph_positions": {"1": [400, 220], "2": [0, 0], "3": [100, 500]},
+        })
+        canvas.nodes[1].setSelected(True)
+        canvas.nodes[2].setSelected(True)
+        canvas.nodes[3].setSelected(True)
+        app.processEvents()
+        anchor_pos = canvas.nodes[1].pos()
+
+        canvas.align_selected_nodes("top")
+
+        self.assertEqual(anchor_pos, canvas.nodes[1].pos())
+        self.assertEqual(anchor_pos.y(), canvas.nodes[2].pos().y())
+        self.assertEqual(anchor_pos.y(), canvas.nodes[3].pos().y())
+        self.assertGreater(canvas.nodes[2].pos().x(), canvas.nodes[1].pos().x())
+        self.assertGreater(canvas.nodes[3].pos().x(), canvas.nodes[2].pos().x())
+        canvas.close()
+
 
 if __name__ == "__main__":
     unittest.main()

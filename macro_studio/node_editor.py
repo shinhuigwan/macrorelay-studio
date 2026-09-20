@@ -143,6 +143,9 @@ class NodeGraphView(QtWidgets.QGraphicsView):
             | QtGui.QPainter.SmoothPixmapTransform
         )
         self.setViewportUpdateMode(QtWidgets.QGraphicsView.BoundingRectViewportUpdate)
+        self.setOptimizationFlag(QtWidgets.QGraphicsView.DontSavePainterState, True)
+        self.setOptimizationFlag(QtWidgets.QGraphicsView.DontAdjustForAntialiasing, True)
+        self.setCacheMode(QtWidgets.QGraphicsView.CacheBackground)
         self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
         self.setDragMode(QtWidgets.QGraphicsView.RubberBandDrag)
@@ -303,10 +306,10 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                 if len(selected_nodes) >= 2:
                     act_branch = menu.addAction(f"🔀 선택 노드 {len(selected_nodes)}개를 순차 분기로 연결")
                     align_sub = menu.addMenu(f"📐 선택 노드 {len(selected_nodes)}개 일괄 정렬")
-                    act_align_top = align_sub.addAction("📐 상단 일렬 맞춤 (Top)")
-                    act_align_bottom = align_sub.addAction("📐 하단 일렬 맞춤 (Bottom)")
-                    act_align_left = align_sub.addAction("📐 좌측 일렬 맞춤 (Left)")
-                    act_align_right = align_sub.addAction("📐 우측 일렬 맞춤 (Right)")
+                    act_align_top = align_sub.addAction("→ 첫 노드 기준 가로 일렬")
+                    act_align_bottom = align_sub.addAction("↓ 첫 노드 아래 가로 일렬")
+                    act_align_left = align_sub.addAction("↓ 첫 노드 기준 세로 일렬")
+                    act_align_right = align_sub.addAction("→ 첫 노드 오른쪽 세로 일렬")
                     align_sub.addSeparator()
                     act_align_dh = align_sub.addAction("↔ 가로 간격 균등 분배")
                     act_align_dv = align_sub.addAction("↕ 세로 간격 균등 분배")
@@ -704,8 +707,9 @@ class TriggerNodeItem(QtWidgets.QGraphicsObject):
 class WorkflowLaneItem(QtWidgets.QGraphicsObject):
     """Interactive workflow lane header — drag to move all nodes, double-click to fold."""
 
-    HEADER_HEIGHT = 36.0
+    HEADER_HEIGHT = 42.0
     PADDING = 26.0
+    COLLAPSED_WIDTH = 230.0
 
     def __init__(
         self,
@@ -758,10 +762,8 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
                 rect = rect.united(node.sceneBoundingRect()) if not rect.isNull() else node.sceneBoundingRect()
         if rect.isNull():
             if not self._rect.isNull():
-                self._rect = QtCore.QRectF(
-                    self._rect.x(), self._rect.y(),
-                    max(self._rect.width(), 160), self.HEADER_HEIGHT + 8,
-                )
+                width = self.COLLAPSED_WIDTH if self.folded else max(self._rect.width(), 160)
+                self._rect = QtCore.QRectF(self._rect.x(), self._rect.y(), width, self.HEADER_HEIGHT)
             return
         self._rect = rect.adjusted(-self.PADDING, -52, self.PADDING, 30)
         self.update()
@@ -777,7 +779,7 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         bg = QtGui.QColor(self.color)
         bg.setAlpha(26 if zoom < 0.85 else 18)
-        painter.setPen(QtGui.QPen(self.color, line_w, QtCore.Qt.DashLine))
+        painter.setPen(QtGui.QPen(self.color, 2.0 if self.folded else line_w, QtCore.Qt.SolidLine if self.folded else QtCore.Qt.DashLine))
         painter.setBrush(bg)
         painter.drawRoundedRect(self._rect, 14, 14)
 
@@ -790,15 +792,21 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
         painter.setPen(QtCore.Qt.NoPen)
         painter.fillPath(hp, hbg)
 
-        arrow_font = QtGui.QFont("Segoe UI Symbol", int(9.5 * font_boost), QtGui.QFont.Bold)
+        toggle_rect = self._toggle_rect()
+        toggle_bg = QtGui.QColor(self.color)
+        toggle_bg.setAlpha(150)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(toggle_bg)
+        painter.drawRoundedRect(toggle_rect, 7, 7)
+        arrow_font = QtGui.QFont("Segoe UI Symbol", int(13 * font_boost), QtGui.QFont.Bold)
         painter.setFont(arrow_font)
-        painter.setPen(self.color.lighter(150))
-        painter.drawText(QtCore.QRectF(hr.x() + 8, hr.y(), 16, self.HEADER_HEIGHT), QtCore.Qt.AlignVCenter, "▸" if self.folded else "▾")
+        painter.setPen(QtGui.QColor("#FFFFFF"))
+        painter.drawText(toggle_rect, QtCore.Qt.AlignCenter, "▸" if self.folded else "▾")
 
         label_font = QtGui.QFont("Malgun Gothic", int(10 * font_boost), QtGui.QFont.Bold)
         painter.setFont(label_font)
         painter.setPen(self.color.lighter(140))
-        lx, lw = hr.x() + 26, hr.width() - 42
+        lx, lw = hr.x() + 44, hr.width() - 62
         metrics = QtGui.QFontMetrics(label_font)
         display_label = self.label_text if any(k in self.label_text for k in ("작업", "분기")) else f"작업 {self.group_index + 1} · {self.label_text}"
         painter.drawText(QtCore.QRectF(lx, hr.y(), lw, self.HEADER_HEIGHT), QtCore.Qt.AlignVCenter, metrics.elidedText(display_label, QtCore.Qt.ElideRight, int(lw)))
@@ -817,9 +825,12 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
     def _header_rect(self) -> QtCore.QRectF:
         return QtCore.QRectF(self._rect.x(), self._rect.y(), self._rect.width(), self.HEADER_HEIGHT)
 
+    def _toggle_rect(self) -> QtCore.QRectF:
+        return QtCore.QRectF(self._rect.x() + 6, self._rect.y() + 6, 30, 30)
+
     def mouseDoubleClickEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
         if self._header_rect().contains(event.pos()):
-            if event.pos().x() <= self._rect.x() + 26:
+            if self._toggle_rect().contains(event.pos()):
                 self.toggle_fold()
             else:
                 self._dragging = False
@@ -843,6 +854,10 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
         self.update()
 
     def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton and self._toggle_rect().contains(event.pos()):
+            self.toggle_fold()
+            event.accept()
+            return
         if event.button() == QtCore.Qt.LeftButton and self._header_rect().contains(event.pos()):
             self._drag_origin = event.scenePos()
             self._node_origins = {}
@@ -863,9 +878,6 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
                 node = self.canvas.nodes.get(index)
                 if node is not None:
                     node.setPos(origin + delta)
-            self.canvas._route_edges()
-            self.sync_rect()
-            self.canvas._sync_node_groups()
             event.accept()
         else:
             super().mouseMoveEvent(event)
@@ -874,7 +886,7 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
         if self._dragging:
             self._dragging = False
             self.setCursor(QtCore.Qt.OpenHandCursor)
-            self.canvas.node_moved()
+            self.canvas.finish_node_move()
             event.accept()
         else:
             super().mouseReleaseEvent(event)
@@ -1568,6 +1580,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
 
     def mouseReleaseEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
         super().mouseReleaseEvent(event)
+        self.canvas.finish_node_move()
         if not self.canvas.suspended and self._workflow_drag_bounds is not None:
             self.canvas.check_node_workflow_membership(self, self._workflow_drag_bounds)
         self._workflow_drag_bounds = None
@@ -1735,10 +1748,10 @@ class NodeItem(QtWidgets.QGraphicsObject):
         act_dist_v = None
         if len(selected_indexes) >= 2:
             align_sub = menu.addMenu(f"📐 선택 노드 {len(selected_indexes)}개 일괄 정렬")
-            act_al_left = align_sub.addAction("← 좌측 일렬 맞춤")
-            act_al_right = align_sub.addAction("→ 우측 일렬 맞춤")
-            act_al_top = align_sub.addAction("↑ 상단 수평 맞춤")
-            act_al_bottom = align_sub.addAction("↓ 하단 수평 맞춤")
+            act_al_left = align_sub.addAction("↓ 첫 노드 기준 세로 일렬")
+            act_al_right = align_sub.addAction("→ 첫 노드 오른쪽 세로 일렬")
+            act_al_top = align_sub.addAction("→ 첫 노드 기준 가로 일렬")
+            act_al_bottom = align_sub.addAction("↓ 첫 노드 아래 가로 일렬")
             align_sub.addSeparator()
             act_dist_h = align_sub.addAction("↔ 가로 간격 균등 분배")
             act_dist_v = align_sub.addAction("↕ 세로 간격 균등 분배")
@@ -3387,10 +3400,6 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
                     node.setPos(origin + delta)
             if self.collapsed:
                 self.setPos(self._group_origin + delta)
-            else:
-                self.canvas._route_edges()
-                self.canvas._sync_workflow_lanes()
-                self.sync_rect()
             event.accept()
             return
 
@@ -3406,7 +3415,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         if self._dragging_group:
             self._dragging_group = False
             self.setCursor(QtCore.Qt.OpenHandCursor)
-            self.canvas.node_moved()
+            self.canvas.finish_node_move()
             self.canvas.positions_changed.emit(self.canvas.positions())
             self.canvas.comments_changed.emit(self.canvas.dump_comments())
             event.accept()
@@ -3607,6 +3616,12 @@ class NodeCanvas(QtWidgets.QWidget):
         self._positions_timer.setSingleShot(True)
         self._positions_timer.setInterval(350)
         self._positions_timer.timeout.connect(lambda: self.positions_changed.emit(self.positions()))
+        self._move_frame_timer = QtCore.QTimer(self)
+        self._move_frame_timer.setSingleShot(True)
+        self._move_frame_timer.setInterval(16)
+        self._move_frame_timer.timeout.connect(self._flush_node_move_frame)
+        self._selection_anchor_index = 0
+        self._selection_snapshot: set[int] = set()
         self._target_pick_escape = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Escape), self)
         self._target_pick_escape.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
         self._target_pick_escape.activated.connect(self.cancel_node_target_pick)
@@ -3676,10 +3691,10 @@ class NodeCanvas(QtWidgets.QWidget):
         self.align_btn = QtWidgets.QPushButton("📐 정렬 ▼")
         self.align_btn.setToolTip("<b>선택 노드 일괄 정렬</b><br>선택한 2개 이상의 노드를 상단/하단/좌측/우측/가로/세로로 단번에 정렬합니다.")
         align_menu = QtWidgets.QMenu(self.align_btn)
-        act_a_top = align_menu.addAction("📐 상단 일렬 맞춤")
-        act_a_bottom = align_menu.addAction("📐 하단 일렬 맞춤")
-        act_a_left = align_menu.addAction("📐 좌측 일렬 맞춤")
-        act_a_right = align_menu.addAction("📐 우측 일렬 맞춤")
+        act_a_top = align_menu.addAction("→ 첫 노드 기준 가로 일렬")
+        act_a_bottom = align_menu.addAction("↓ 첫 노드 아래 가로 일렬")
+        act_a_left = align_menu.addAction("↓ 첫 노드 기준 세로 일렬")
+        act_a_right = align_menu.addAction("→ 첫 노드 오른쪽 세로 일렬")
         align_menu.addSeparator()
         act_dist_h = align_menu.addAction("↔ 가로 간격 균등 분배")
         act_dist_v = align_menu.addAction("↕ 세로 간격 균등 분배")
@@ -4459,6 +4474,12 @@ class NodeCanvas(QtWidgets.QWidget):
         self.rubber_selecting = False
         selected = self.selected_indexes()
         if selected:
+            if self._selection_anchor_index not in selected:
+                self._selection_anchor_index = min(
+                    selected,
+                    key=lambda index: (self.nodes[index].pos().x(), self.nodes[index].pos().y(), index),
+                )
+            self._selection_snapshot = set(selected)
             # Update the inspector only once, after QGraphicsView has finalized
             # the complete rubber-band selection.
             self.node_selected.emit(selected[-1])
@@ -4659,13 +4680,27 @@ class NodeCanvas(QtWidgets.QWidget):
         self.routes_changed.emit(dict(self.manual_routes))
 
     def node_moved(self) -> None:
+        if self.suspended:
+            return
+        if not self._move_frame_timer.isActive():
+            self._move_frame_timer.start()
+        self._positions_timer.start()
+
+    def _flush_node_move_frame(self) -> None:
         self._route_edges()
         self._sync_workflow_lanes()
         self._sync_node_groups()
-        self._refresh_display_numbers()
-        self._positions_timer.start()
         if hasattr(self, "minimap") and self.minimap and self.minimap.expanded and self.minimap.isVisible():
             self.minimap.preview.update()
+
+    def finish_node_move(self) -> None:
+        if self.suspended:
+            return
+        if self._move_frame_timer.isActive():
+            self._move_frame_timer.stop()
+        self._flush_node_move_frame()
+        self._refresh_display_numbers()
+        self._positions_timer.start()
 
     def _sync_node_groups(self) -> None:
         for group in list(getattr(self, "comments", [])):
@@ -5154,6 +5189,17 @@ class NodeCanvas(QtWidgets.QWidget):
         if self.suspended:
             return
         selected = self.selected_indexes()
+        selected_set = set(selected)
+        if not self.rubber_selecting:
+            added = selected_set - self._selection_snapshot
+            if len(selected) == 1:
+                self._selection_anchor_index = selected[0]
+            elif self._selection_anchor_index not in selected_set:
+                self._selection_anchor_index = min(
+                    added or selected_set,
+                    key=lambda index: (self.nodes[index].pos().x(), self.nodes[index].pos().y(), index),
+                ) if selected_set else 0
+            self._selection_snapshot = selected_set
         if len(selected) == 1:
             self._highlight_connected_edges(selected[0])
         else:
@@ -5187,86 +5233,51 @@ class NodeCanvas(QtWidgets.QWidget):
             return
 
         gap_y = 50.0
-        gap_x = 100.0
+        gap_x = 72.0
+        anchor = self.nodes.get(self._selection_anchor_index)
+        if anchor not in selected_nodes:
+            anchor = min(selected_nodes, key=lambda node: (node.pos().x(), node.pos().y(), node.index))
+            self._selection_anchor_index = anchor.index
+        others = [node for node in selected_nodes if node is not anchor]
 
-        if mode == "left":
-            min_x = min(n.pos().x() for n in selected_nodes)
-            sorted_nodes = sorted(selected_nodes, key=lambda n: (n.pos().y(), n.index))
-            for idx, n in enumerate(sorted_nodes):
-                if idx == 0:
-                    n.setPos(min_x, n.pos().y())
-                else:
-                    prev = sorted_nodes[idx - 1]
-                    prev_bottom = prev.pos().y() + prev.boundingRect().height()
-                    curr_y = max(n.pos().y(), prev_bottom + gap_y)
-                    n.setPos(min_x, curr_y)
-        elif mode == "right":
-            max_right = max(n.pos().x() + n.boundingRect().width() for n in selected_nodes)
-            sorted_nodes = sorted(selected_nodes, key=lambda n: (n.pos().y(), n.index))
-            for idx, n in enumerate(sorted_nodes):
-                w = n.boundingRect().width()
-                target_x = max_right - w
-                if idx == 0:
-                    n.setPos(target_x, n.pos().y())
-                else:
-                    prev = sorted_nodes[idx - 1]
-                    prev_bottom = prev.pos().y() + prev.boundingRect().height()
-                    curr_y = max(n.pos().y(), prev_bottom + gap_y)
-                    n.setPos(target_x, curr_y)
-        elif mode == "top":
-            min_y = min(n.pos().y() for n in selected_nodes)
-            sorted_nodes = sorted(selected_nodes, key=lambda n: (n.pos().x(), n.index))
-            for idx, n in enumerate(sorted_nodes):
-                if idx == 0:
-                    n.setPos(n.pos().x(), min_y)
-                else:
-                    prev = sorted_nodes[idx - 1]
-                    prev_right = prev.pos().x() + prev.boundingRect().width()
-                    curr_x = max(n.pos().x(), prev_right + gap_x)
-                    n.setPos(curr_x, min_y)
-        elif mode == "bottom":
-            max_bottom = max(n.pos().y() + n.boundingRect().height() for n in selected_nodes)
-            sorted_nodes = sorted(selected_nodes, key=lambda n: (n.pos().x(), n.index))
-            for idx, n in enumerate(sorted_nodes):
-                h = n.boundingRect().height()
-                target_y = max_bottom - h
-                if idx == 0:
-                    n.setPos(n.pos().x(), target_y)
-                else:
-                    prev = sorted_nodes[idx - 1]
-                    prev_right = prev.pos().x() + prev.boundingRect().width()
-                    curr_x = max(n.pos().x(), prev_right + gap_x)
-                    n.setPos(curr_x, target_y)
-        elif mode == "distribute_h":
-            sorted_nodes = sorted(selected_nodes, key=lambda n: n.pos().x())
-            first_x = sorted_nodes[0].pos().x()
-            last_x = sorted_nodes[-1].pos().x()
-            if len(sorted_nodes) > 2 and last_x > first_x:
-                total_span = last_x - first_x
-                step = total_span / (len(sorted_nodes) - 1)
-                for idx, n in enumerate(sorted_nodes):
-                    n.setPos(first_x + idx * step, n.pos().y())
-            else:
-                for idx, n in enumerate(sorted_nodes):
-                    if idx > 0:
-                        prev = sorted_nodes[idx - 1]
-                        n.setPos(prev.pos().x() + prev.boundingRect().width() + gap_x, n.pos().y())
-        elif mode == "distribute_v":
-            sorted_nodes = sorted(selected_nodes, key=lambda n: n.pos().y())
-            first_y = sorted_nodes[0].pos().y()
-            last_y = sorted_nodes[-1].pos().y()
-            if len(sorted_nodes) > 2 and last_y > first_y:
-                total_span = last_y - first_y
-                step = total_span / (len(sorted_nodes) - 1)
-                for idx, n in enumerate(sorted_nodes):
-                    n.setPos(n.pos().x(), first_y + idx * step)
-            else:
-                for idx, n in enumerate(sorted_nodes):
-                    if idx > 0:
-                        prev = sorted_nodes[idx - 1]
-                        n.setPos(n.pos().x(), prev.pos().y() + prev.boundingRect().height() + gap_y)
+        self.suspended = True
+        try:
+            if mode == "top":
+                cursor_x = anchor.pos().x() + anchor.current_width() + gap_x
+                for node in sorted(others, key=lambda item: (item.pos().x(), item.pos().y(), item.index)):
+                    node.setPos(cursor_x, anchor.pos().y())
+                    cursor_x += node.current_width() + gap_x
+            elif mode == "bottom":
+                cursor_x = anchor.pos().x()
+                target_y = anchor.pos().y() + anchor.boundingRect().height() + gap_y
+                for node in sorted(others, key=lambda item: (item.pos().x(), item.pos().y(), item.index)):
+                    node.setPos(cursor_x, target_y)
+                    cursor_x += node.current_width() + gap_x
+            elif mode == "left":
+                cursor_y = anchor.pos().y() + anchor.boundingRect().height() + gap_y
+                for node in sorted(others, key=lambda item: (item.pos().y(), item.pos().x(), item.index)):
+                    node.setPos(anchor.pos().x(), cursor_y)
+                    cursor_y += node.boundingRect().height() + gap_y
+            elif mode == "right":
+                target_x = anchor.pos().x() + anchor.current_width() + gap_x
+                cursor_y = anchor.pos().y()
+                for node in sorted(others, key=lambda item: (item.pos().y(), item.pos().x(), item.index)):
+                    node.setPos(target_x, cursor_y)
+                    cursor_y += node.boundingRect().height() + gap_y
+            elif mode == "distribute_h":
+                cursor_x = anchor.pos().x() + anchor.current_width() + gap_x
+                for node in sorted(others, key=lambda item: (item.pos().x(), item.index)):
+                    node.setPos(cursor_x, node.pos().y())
+                    cursor_x += node.current_width() + gap_x
+            elif mode == "distribute_v":
+                cursor_y = anchor.pos().y() + anchor.boundingRect().height() + gap_y
+                for node in sorted(others, key=lambda item: (item.pos().y(), item.index)):
+                    node.setPos(node.pos().x(), cursor_y)
+                    cursor_y += node.boundingRect().height() + gap_y
+        finally:
+            self.suspended = False
 
-        self._route_edges()
+        self.finish_node_move()
         self.positions_changed.emit(self.positions())
         if hasattr(self, "minimap") and self.minimap.expanded:
             self.minimap.preview.update()

@@ -3,7 +3,6 @@ $studioRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $playerScript = Join-Path $studioRoot "run_player.py"
 $runtimePackages = Join-Path $studioRoot "runtime_packages"
 $legacyPackages = Join-Path $studioRoot ".venv\Lib\site-packages"
-$bundledOpenCvPackages = Join-Path $studioRoot "runtime\opencv\cp312\packages"
 $runtimeCandidates = @(
     @((Join-Path $studioRoot ".venv\Scripts\python.exe"), (Join-Path $studioRoot ".venv\Scripts\pythonw.exe"), $true),
     @((Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"), (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\pythonw.exe"), $true),
@@ -17,12 +16,14 @@ foreach ($candidate in $runtimeCandidates) {
     if (-not (Test-Path -LiteralPath $python) -or -not (Test-Path -LiteralPath $pythonw)) {
         continue
     }
+    $pythonTag = (& $python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')" 2>$null | Select-Object -First 1)
+    $candidateOpenCvPackages = if ($pythonTag) { Join-Path $studioRoot "runtime\opencv\$pythonTag\packages" } else { "" }
     $packagePaths = @()
     if (Test-Path -LiteralPath $runtimePackages) {
         $packagePaths += $runtimePackages
     }
-    if (Test-Path -LiteralPath $bundledOpenCvPackages) {
-        $packagePaths += $bundledOpenCvPackages
+    if ($candidateOpenCvPackages -and (Test-Path -LiteralPath $candidateOpenCvPackages)) {
+        $packagePaths += $candidateOpenCvPackages
     }
     if ($useLegacyPackages -and (Test-Path -LiteralPath $legacyPackages)) {
         $packagePaths += $legacyPackages

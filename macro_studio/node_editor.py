@@ -231,15 +231,17 @@ class NodeGraphView(QtWidgets.QGraphicsView):
         if event.button() == QtCore.Qt.LeftButton and not self.itemAt(event.position().toPoint()):
             canvas = self.parent()
             if isinstance(canvas, NodeCanvas):
+                if canvas.commit_pending_node_placement(self.mapToScene(event.position().toPoint())):
+                    event.accept()
+                    return
                 canvas.begin_rubber_selection()
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton and not self.itemAt(event.position().toPoint()):
-            self._panning = True
-            self._double_click_pan = True
-            self._pan_start = event.position().toPoint()
-            self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
+            canvas = self.parent()
+            if isinstance(canvas, NodeCanvas):
+                canvas.request_node_add_at(self.mapToScene(event.position().toPoint()))
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -295,6 +297,10 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                     act_align_dh = align_sub.addAction("↔ 가로 간격 균등 분배")
                     act_align_dv = align_sub.addAction("↕ 세로 간격 균등 분배")
                     menu.addSeparator()
+                act_collapse_nodes = menu.addAction(f"⊟ 선택 노드 {len(selected_nodes)}개 접기") if selected_nodes else None
+                act_expand_nodes = menu.addAction(f"⊞ 선택 노드 {len(selected_nodes)}개 펼치기") if selected_nodes else None
+                if selected_nodes:
+                    menu.addSeparator()
                 act_group = menu.addAction("🗂️ 여기에 새 노드 그룹 추가...")
                 act_archive = menu.addAction("📦 노드 보관함 열기...")
                 act_auto = menu.addAction("자동 정렬")
@@ -303,7 +309,11 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                 if not chosen:
                     event.accept()
                     return
-                if act_branch is not None and chosen == act_branch:
+                if act_collapse_nodes is not None and chosen == act_collapse_nodes:
+                    canvas.set_nodes_collapsed(selected_nodes, True)
+                elif act_expand_nodes is not None and chosen == act_expand_nodes:
+                    canvas.set_nodes_collapsed(selected_nodes, False)
+                elif act_branch is not None and chosen == act_branch:
                     canvas.branch_chain_requested.emit(selected_nodes)
                 elif chosen == act_align_top:
                     canvas.align_selected_nodes("top")
@@ -1308,6 +1318,9 @@ class NodeItem(QtWidgets.QGraphicsObject):
         action = str(self.step.get("action") or "step")
         action_title = self.display_title
         badge, accent = ("MULTI", "#38E7FF") if getattr(self, "is_multi", False) else ACTION_STYLES.get(action, ("STEP", COLORS["muted"]))
+        group_theme = self.canvas.node_group_theme(self.index)
+        if group_theme is not None:
+            accent = str(group_theme["header"])
         selected = self.isSelected()
         running = self.index == self.canvas.active_step
         execution = self.canvas.execution_states.get(self.index, {})
@@ -1339,6 +1352,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
             if selected
             else COLORS["warning"]
             if candidate_position
+            else str(group_theme["border"])
+            if group_theme is not None
             else "#363E54"
         )
         border_width = 3.8 if running else (2.5 if needs_setup else 2.2 if selected else max(1.6, 1.2 * line_boost ** 0.5))
@@ -1361,11 +1376,11 @@ class NodeItem(QtWidgets.QGraphicsObject):
         num_font_size = max(8, int(8.5 * font_boost))
         num_font = QtGui.QFont("Segoe UI", num_font_size, QtGui.QFont.Bold)
         painter.setPen(QtCore.Qt.NoPen)
-        painter.setBrush(QtGui.QColor("#6F62D9"))
+        painter.setBrush(QtGui.QColor(str(group_theme["border"])) if group_theme is not None else QtGui.QColor("#6F62D9"))
         painter.drawRoundedRect(QtCore.QRectF(5, 4, 22, 20), 5, 5)
         painter.setPen(QtGui.QColor("#FFFFFF"))
         painter.setFont(num_font)
-        painter.drawText(QtCore.QRectF(5, 4, 22, 20), QtCore.Qt.AlignCenter, str(self.index))
+        painter.drawText(QtCore.QRectF(5, 4, 22, 20), QtCore.Qt.AlignCenter, str(self.canvas.display_number(self.index)))
 
         # Action Title (Crisp white bold title)
         title_font_size = max(9, int(9.5 * font_boost))
@@ -2176,9 +2191,9 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 delay = int(step.get("on_success_delay") or 0)
                 success_candidates = step.get("success_candidates") or []
                 if isinstance(success_candidates, list) and self.target in success_candidates:
-                    text = f"성공 후보 {success_candidates.index(self.target) + 1}/{len(success_candidates)} ({self.target}번 복귀)"
+                    text = f"성공 후보 {success_candidates.index(self.target) + 1}/{len(success_candidates)} (실행 {self.canvas.display_number(self.target)}로 복귀)"
                 else:
-                    text = f"성공 시 {self.target}번으로 복귀"
+                    text = f"성공 시 실행 {self.canvas.display_number(self.target)}로 복귀"
                 if delay:
                     text += f" · {delay}ms"
                 self.label.setText(text)
@@ -2235,9 +2250,9 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 delay = int(step.get("on_fail_delay") or 0)
                 fail_candidates = step.get("fail_candidates") or []
                 if isinstance(fail_candidates, list) and self.target in fail_candidates:
-                    text = f"실패 후보 {fail_candidates.index(self.target) + 1}/{len(fail_candidates)} ({self.target}번 복귀)"
+                    text = f"실패 후보 {fail_candidates.index(self.target) + 1}/{len(fail_candidates)} (실행 {self.canvas.display_number(self.target)}로 복귀)"
                 else:
-                    text = f"실패 시 {self.target}번으로 복귀"
+                    text = f"실패 시 실행 {self.canvas.display_number(self.target)}로 복귀"
                 if delay:
                     text += f" · {delay}ms"
                 self.label.setText(text)
@@ -2991,12 +3006,18 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         rect: QtCore.QRectF,
         canvas: "NodeCanvas",
         node_indexes: list[int] | None = None,
+        next_group_id: str = "",
+        unconnected_success: str = "next",
+        unconnected_fail: str = "next",
     ) -> None:
         super().__init__()
         self.comment_id = comment_id or uuid.uuid4().hex[:8]
         self.title = title or "노드 그룹"
         self.color_name = color if color in NODE_GROUP_THEMES else "yellow"
         self.node_indexes: list[int] = [int(i) for i in (node_indexes or [])]
+        self.next_group_id = str(next_group_id or "")
+        self.unconnected_success = str(unconnected_success or "next")
+        self.unconnected_fail = str(unconnected_fail or "next")
         self.box_rect = QtCore.QRectF(0, 0, max(self.MIN_WIDTH, rect.width()), max(self.MIN_HEIGHT, rect.height()))
         self.canvas = canvas
         self.collapsed = False
@@ -3033,7 +3054,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
 
     def _collapse_btn_rect(self) -> QtCore.QRectF:
         r = self.box_rect
-        return QtCore.QRectF(r.right() - 74, r.top() + 4, 20, 22)
+        return QtCore.QRectF(r.left() + 5, r.top() + 4, 20, 22)
 
     def _is_in_close_btn(self, pos: QtCore.QPointF) -> bool:
         return self._close_btn_rect().contains(pos)
@@ -3108,6 +3129,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
             self.node_indexes.append(node_index)
             self.sync_rect()
             self.canvas._refresh_collapsed_group_visibility()
+            self.canvas._refresh_group_node_styles()
             self.canvas.comments_changed.emit(self.canvas.dump_comments())
 
     def remove_node(self, node_index: int) -> None:
@@ -3115,6 +3137,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
             self.node_indexes.remove(node_index)
             self.sync_rect()
             self.canvas._refresh_collapsed_group_visibility()
+            self.canvas._refresh_group_node_styles()
             self.canvas.comments_changed.emit(self.canvas.dump_comments())
 
     def set_collapsed(self, collapsed: bool, notify: bool = True) -> None:
@@ -3145,6 +3168,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         if color_name in NODE_GROUP_THEMES:
             self.color_name = color_name
             self.update()
+            self.canvas._refresh_group_node_styles()
             self.canvas.comments_changed.emit(self.canvas.dump_comments())
 
     def _show_color_popup(self, screen_pos: QtCore.QPointF | QtCore.QPoint) -> None:
@@ -3180,9 +3204,9 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         painter.setPen(QtGui.QColor(theme["text"]))
         font = QtGui.QFont("Pretendard", 10, QtGui.QFont.Bold)
         painter.setFont(font)
-        text_rect = header_rect.adjusted(10, 0, -84, 0)
+        text_rect = header_rect.adjusted(30, 0, -58, 0)
         metrics = QtGui.QFontMetrics(font)
-        title_str = f"{'▸' if self.collapsed else '▾'} 🗂️ {self.title}"
+        title_str = f"🗂️ {self.title}"
         if self.node_indexes:
             title_str += f" ({len(self.node_indexes)}개)"
         painter.drawText(text_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, metrics.elidedText(title_str, QtCore.Qt.ElideRight, int(text_rect.width())))
@@ -3367,6 +3391,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
     def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:
         menu = QtWidgets.QMenu()
         act_toggle = menu.addAction("▾ 그룹 펼치기" if self.collapsed else "▸ 그룹 접기")
+        act_flow = menu.addAction("🔗 그룹 흐름 설정...")
         menu.addSeparator()
         act_edit = menu.addAction("✏️ 그룹 이름 수정...")
         color_menu = menu.addMenu("🎨 색상 변경")
@@ -3402,6 +3427,43 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
             return
         if chosen == act_toggle:
             self.set_collapsed(not self.collapsed)
+        elif chosen == act_flow:
+            dialog = QtWidgets.QDialog(self.canvas.window())
+            dialog.setWindowTitle(f"그룹 흐름 설정 · {self.title}")
+            form = QtWidgets.QFormLayout(dialog)
+            next_combo = QtWidgets.QComboBox(dialog)
+            next_combo.addItem("다음 그룹 없음 · 종료", "")
+            for group in self.canvas.comments:
+                if group is not self:
+                    next_combo.addItem(group.title, group.comment_id)
+            selected_next = next_combo.findData(self.next_group_id)
+            next_combo.setCurrentIndex(max(0, selected_next))
+            policy_items = (("다음 그룹으로 계속", "next"), ("현재 그룹 다시 시도", "retry"), ("매크로 종료", "stop"))
+            success_combo = QtWidgets.QComboBox(dialog)
+            fail_combo = QtWidgets.QComboBox(dialog)
+            for label, value in policy_items:
+                success_combo.addItem(label, value)
+                fail_combo.addItem(label, value)
+            success_combo.setCurrentIndex(max(0, success_combo.findData(self.unconnected_success)))
+            fail_combo.setCurrentIndex(max(0, fail_combo.findData(self.unconnected_fail)))
+            form.addRow("다음 그룹", next_combo)
+            form.addRow("연결 없는 성공", success_combo)
+            form.addRow("연결 없는 실패", fail_combo)
+            info = QtWidgets.QLabel("노드에 직접 연결된 성공·실패선이 있으면 해당 연결이 항상 우선합니다.")
+            info.setWordWrap(True)
+            form.addRow(info)
+            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+            buttons.button(QtWidgets.QDialogButtonBox.Save).setText("저장")
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            form.addRow(buttons)
+            if dialog.exec() == QtWidgets.QDialog.Accepted:
+                self.next_group_id = str(next_combo.currentData() or "")
+                self.unconnected_success = str(success_combo.currentData() or "next")
+                self.unconnected_fail = str(fail_combo.currentData() or "next")
+                self.canvas.apply_group_flow_routes()
+                self.canvas.comments_changed.emit(self.canvas.dump_comments())
+                self.canvas.group_flow_changed.emit()
         elif chosen == act_edit:
             new_title, ok = QtWidgets.QInputDialog.getText(
                 None, "노드 그룹 이름 수정", "새 노드 그룹 이름을 입력하세요:", text=self.title
@@ -3458,6 +3520,8 @@ class NodeCanvas(QtWidgets.QWidget):
     help_requested = QtCore.Signal()
     comments_changed = QtCore.Signal(list)
     quick_node_drop_requested = QtCore.Signal(str, object)
+    node_add_at_requested = QtCore.Signal(str, object)
+    group_flow_changed = QtCore.Signal()
     node_target_picked = QtCore.Signal(int)
     asset_route_edit_requested = QtCore.Signal(int, str)
 
@@ -3486,6 +3550,9 @@ class NodeCanvas(QtWidgets.QWidget):
         self._quick_drop_preview_items: list[QtWidgets.QGraphicsItem] = []
         self._quick_drop_candidate: EdgeItem | None = None
         self._quick_drop_kind = ""
+        self._pending_node_kind = ""
+        self._group_proxy_edges: list[QtWidgets.QGraphicsItem] = []
+        self._display_numbers: dict[int, int] = {}
         self._node_target_pick_active = False
         self._node_target_pick_excluded = 0
         self._node_target_pick_previous_label = ""
@@ -3543,7 +3610,7 @@ class NodeCanvas(QtWidgets.QWidget):
         legend = QtWidgets.QLabel(
             f"<span style='color:{COLORS['success']}'>● 성공</span>  "
             f"<span style='color:{COLORS['danger']}'>● 실패</span>  "
-            "<span style='color:#9DA7BA'>· 선 선택→손잡이 드래그=경로 · 선 바깥 드롭=제거 · 바닥 더블클릭 유지=이동</span>"
+            "<span style='color:#9DA7BA'>· 빈 바닥 더블클릭=노드 추가 · 가운데 버튼 드래그=이동 · 선 바깥 드롭=제거</span>"
         )
         legend.setObjectName("Muted")
         legend.setMinimumWidth(0)
@@ -3641,6 +3708,237 @@ class NodeCanvas(QtWidgets.QWidget):
         self.view.verticalScrollBar().valueChanged.connect(self._update_minimap_preview)
         self.view.zoom_changed.connect(self._update_minimap_preview)
 
+    def begin_node_placement(self, kind: str) -> None:
+        self._pending_node_kind = str(kind or "")
+        if self._pending_node_kind:
+            self.flow_label.setText("캔버스에서 생성 위치를 클릭하세요 · Esc 취소")
+            self.view.viewport().setCursor(QtCore.Qt.CrossCursor)
+
+    def cancel_node_placement(self) -> None:
+        self._pending_node_kind = ""
+        self.flow_label.setText("FLOW CANVAS")
+        self.view.viewport().unsetCursor()
+
+    def commit_pending_node_placement(self, scene_pos: QtCore.QPointF) -> bool:
+        if not self._pending_node_kind:
+            return False
+        kind = self._pending_node_kind
+        self.cancel_node_placement()
+        self.node_add_at_requested.emit(kind, QtCore.QPointF(scene_pos))
+        return True
+
+    def request_node_add_at(self, scene_pos: QtCore.QPointF) -> None:
+        self.cancel_node_placement()
+        self.node_add_at_requested.emit("", QtCore.QPointF(scene_pos))
+
+    def preferred_add_position(self) -> QtCore.QPointF:
+        return self.view.mapToScene(self.view.viewport().rect().center())
+
+    def group_for_node(self, index: int, *, collapsed_only: bool = False) -> NodeGroupItem | None:
+        for group in self.comments:
+            if int(index) in getattr(group, "node_indexes", []):
+                if not collapsed_only or bool(getattr(group, "collapsed", False)):
+                    return group
+        return None
+
+    def node_group_theme(self, index: int) -> dict[str, Any] | None:
+        group = self.group_for_node(index)
+        if group is None:
+            return None
+        return NODE_GROUP_THEMES.get(group.color_name)
+
+    def _refresh_group_node_styles(self) -> None:
+        for node in self.nodes.values():
+            node.update()
+        self._sync_node_groups()
+
+    def _execution_targets(self, index: int) -> list[int]:
+        if not 0 < index <= len(self.steps):
+            return []
+        step = self.steps[index - 1]
+        targets: list[int] = []
+        success_candidates = step.get("success_candidates")
+        if isinstance(success_candidates, list) and success_candidates:
+            targets.extend(int(value) for value in success_candidates if str(value).lstrip("-").isdigit())
+        else:
+            success = int(step.get("on_success") or 0)
+            if success:
+                targets.append(success)
+            elif index < len(self.steps) and not bool(step.get("stop_on_success")):
+                targets.append(index + 1)
+        failure = int(step.get("on_fail") or 0)
+        if failure:
+            targets.append(failure)
+        for rule in step.get("edge_conditions") or []:
+            if isinstance(rule, dict) and int(rule.get("target") or 0):
+                targets.append(int(rule["target"]))
+        result: list[int] = []
+        for target in targets:
+            if 0 < target <= len(self.steps) and target not in result:
+                result.append(target)
+        return result
+
+    def _refresh_display_numbers(self) -> None:
+        total = len(self.steps)
+        if not total:
+            self._display_numbers = {}
+            return
+        start = self.start_step if 0 < self.start_step <= total else 1
+        order: list[int] = []
+        pending = [start]
+        while pending:
+            index = pending.pop(0)
+            if index in order:
+                continue
+            order.append(index)
+            for target in self._execution_targets(index):
+                if target not in order and target not in pending:
+                    pending.append(target)
+        remaining = sorted(
+            (index for index in range(1, total + 1) if index not in order),
+            key=lambda index: (self.nodes.get(index).pos().x() if index in self.nodes else 0.0,
+                               self.nodes.get(index).pos().y() if index in self.nodes else 0.0),
+        )
+        order.extend(remaining)
+        self._display_numbers = {index: position for position, index in enumerate(order, start=1)}
+        for node in self.nodes.values():
+            node.update()
+
+    def display_number(self, index: int) -> int:
+        return int(self._display_numbers.get(int(index), int(index)))
+
+    def _group_entry_index(self, group: NodeGroupItem) -> int:
+        members = [int(index) for index in group.node_indexes if int(index) in self.nodes]
+        if not members:
+            return 0
+        member_set = set(members)
+        incoming = {
+            target
+            for source in range(1, len(self.steps) + 1)
+            for target in self._execution_targets(source)
+            if source not in member_set and target in member_set
+        }
+        candidates = list(incoming) or members
+        return min(candidates, key=lambda value: (self.display_number(value), value))
+
+    def apply_group_flow_routes(self) -> None:
+        # Remove only routes previously generated by this feature. User-made
+        # node connections are never replaced.
+        for step in self.steps:
+            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+            generated = automation.pop("group_flow_generated", None)
+            if isinstance(generated, dict):
+                for kind in ("success", "fail"):
+                    if kind not in generated:
+                        continue
+                    if kind == "success":
+                        step.pop("on_success", None)
+                        step.pop("stop_on_success", None)
+                    else:
+                        step.pop("on_fail", None)
+                        step.pop("abort_on_fail", None)
+            if automation:
+                step["_automation"] = automation
+            else:
+                step.pop("_automation", None)
+
+        groups = {group.comment_id: group for group in self.comments}
+        for group in self.comments:
+            members = {int(index) for index in group.node_indexes if 0 < int(index) <= len(self.steps)}
+            if not members:
+                continue
+            own_entry = self._group_entry_index(group)
+            next_group = groups.get(group.next_group_id)
+            next_entry = self._group_entry_index(next_group) if next_group is not None else 0
+            for index in sorted(members):
+                step = self.steps[index - 1]
+                generated: dict[str, Any] = {}
+                success_explicit = bool(step.get("on_success") or step.get("success_candidates") or step.get("stop_on_success"))
+                implicit_next_inside = index < len(self.steps) and index + 1 in members
+                if not success_explicit and not implicit_next_inside:
+                    policy = group.unconnected_success
+                    target = next_entry if policy == "next" else own_entry if policy == "retry" else 0
+                    if target:
+                        step["on_success"] = target
+                    else:
+                        step["stop_on_success"] = True
+                    generated["success"] = {"group": group.comment_id, "policy": policy, "target": target}
+
+                fail_explicit = bool(step.get("on_fail") or step.get("fail_candidates"))
+                if not fail_explicit:
+                    policy = group.unconnected_fail
+                    target = next_entry if policy == "next" else own_entry if policy == "retry" else 0
+                    if target:
+                        step["on_fail"] = target
+                        step["abort_on_fail"] = False
+                    else:
+                        step["abort_on_fail"] = True
+                    generated["fail"] = {"group": group.comment_id, "policy": policy, "target": target}
+                if generated:
+                    automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
+                    automation["group_flow_generated"] = generated
+                    step["_automation"] = automation
+        self.rebuild_edges()
+        self._refresh_display_numbers()
+
+    def _clear_group_proxy_edges(self) -> None:
+        for item in self._group_proxy_edges:
+            try:
+                if item.scene() is self.scene:
+                    self.scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._group_proxy_edges = []
+
+    def _rebuild_group_proxy_edges(self) -> None:
+        self._clear_group_proxy_edges()
+        for edge in self.edges:
+            source_group = self.group_for_node(edge.source, collapsed_only=True)
+            target_group = self.group_for_node(edge.target, collapsed_only=True)
+            if source_group is None and target_group is None:
+                edge.setVisible(True)
+                continue
+            if source_group is not None and source_group is target_group:
+                edge.setVisible(False)
+                continue
+            edge.setVisible(False)
+            source_node = self.nodes.get(edge.source)
+            target_node = self.nodes.get(edge.target)
+            if source_node is None or target_node is None:
+                continue
+            if source_group is not None:
+                rect = source_group.sceneBoundingRect()
+                start = QtCore.QPointF(rect.right(), rect.center().y() + (-7 if edge.kind == "success" else 7))
+            else:
+                port = source_node.out_success_port if edge.kind == "success" else source_node.out_fail_port
+                start = port.mapToScene(port.rect().center())
+            if target_group is not None:
+                rect = target_group.sceneBoundingRect()
+                end = QtCore.QPointF(rect.left(), rect.center().y() + (-7 if edge.kind == "success" else 7))
+            else:
+                port = target_node.in_success_port if edge.kind == "success" else target_node.in_fail_port
+                end = port.mapToScene(port.rect().center())
+            bend = max(55.0, abs(end.x() - start.x()) * 0.42)
+            direction = 1.0 if end.x() >= start.x() else -1.0
+            path = QtGui.QPainterPath(start)
+            path.cubicTo(start.x() + direction * bend, start.y(), end.x() - direction * bend, end.y(), end.x(), end.y())
+            proxy = QtWidgets.QGraphicsPathItem(path)
+            color = QtGui.QColor(COLORS["success"] if edge.kind == "success" else COLORS["danger"])
+            proxy.setPen(QtGui.QPen(color, 2.4, QtCore.Qt.DashLine, QtCore.Qt.RoundCap))
+            proxy.setOpacity(0.72)
+            proxy.setZValue(3)
+            proxy.setToolTip(
+                f"접힌 그룹 연결 · {'성공' if edge.kind == 'success' else '실패'} · "
+                f"실행 {self.display_number(edge.source)} → 실행 {self.display_number(edge.target)}"
+            )
+            label = QtWidgets.QGraphicsSimpleTextItem("성공" if edge.kind == "success" else "실패", proxy)
+            label.setBrush(color.lighter(135))
+            label.setFont(QtGui.QFont("Malgun Gothic", 7, QtGui.QFont.Bold))
+            mid = path.pointAtPercent(0.5)
+            label.setPos(mid + QtCore.QPointF(-12, -17 if edge.kind == "success" else 4))
+            self.scene.addItem(proxy)
+            self._group_proxy_edges.append(proxy)
+
     def _quick_drop_edge_at(self, scene_pos: QtCore.QPointF) -> EdgeItem | None:
         """Return the normal edge that a quick-add node would split."""
         direct: list[EdgeItem] = []
@@ -3702,53 +4000,11 @@ class NodeCanvas(QtWidgets.QWidget):
         self._quick_drop_kind = ""
 
     def preview_quick_node_drop(self, kind: str, scene_pos: QtCore.QPointF) -> None:
-        candidate = self._quick_drop_edge_at(scene_pos)
-        if candidate is None:
-            self.clear_quick_node_preview()
-            return
-
-        source = self.nodes.get(candidate.source)
-        target = self.nodes.get(candidate.target)
-        if source is None or target is None:
-            self.clear_quick_node_preview()
-            return
-
-        out_port = source.out_success_port if candidate.kind == "success" else source.out_fail_port
-        in_port = target.in_success_port if candidate.kind == "success" else target.in_fail_port
-        start = out_port.mapToScene(out_port.rect().center())
-        end = in_port.mapToScene(in_port.rect().center())
-        half_icon = 25.0
-        left = QtCore.QPointF(scene_pos.x() - half_icon, scene_pos.y())
-        right = QtCore.QPointF(scene_pos.x() + half_icon, scene_pos.y())
-        paths = (self._quick_preview_path(start, left), self._quick_preview_path(right, end))
-
-        # Reuse the four path items while the cursor moves. Recreating graphics
-        # items on every drag event caused noticeable lag on dense canvases.
-        if len(self._quick_drop_preview_items) != 4:
-            self.clear_quick_node_preview()
-            glow = QtGui.QColor("#1498C8")
-            glow.setAlpha(105)
-            for index in range(4):
-                path_item = QtWidgets.QGraphicsPathItem()
-                path_item.setPen(
-                    QtGui.QPen(glow, 9.0, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
-                    if index < 2
-                    else QtGui.QPen(QtGui.QColor("#55F4FF"), 3.8, QtCore.Qt.DashLine, QtCore.Qt.RoundCap)
-                )
-                path_item.setZValue(998 if index < 2 else 999)
-                path_item.setAcceptedMouseButtons(QtCore.Qt.NoButton)
-                self.scene.addItem(path_item)
-                self._quick_drop_preview_items.append(path_item)
-
-        self._quick_drop_preview_items[0].setPath(paths[0])
-        self._quick_drop_preview_items[1].setPath(paths[1])
-        self._quick_drop_preview_items[2].setPath(paths[0])
-        self._quick_drop_preview_items[3].setPath(paths[1])
-        self._quick_drop_candidate = candidate
-        self._quick_drop_kind = str(kind)
+        # Quick-added nodes are deliberately independent. Merely hovering over
+        # an existing edge must never imply that the graph will be rewired.
+        self.clear_quick_node_preview()
 
     def commit_quick_node_drop(self, kind: str, scene_pos: QtCore.QPointF) -> None:
-        candidate = self._quick_drop_candidate or self._quick_drop_edge_at(scene_pos)
         payload: dict[str, Any] = {
             "x": round(scene_pos.x(), 2),
             "y": round(scene_pos.y(), 2),
@@ -3756,15 +4012,6 @@ class NodeCanvas(QtWidgets.QWidget):
             "target": 0,
             "edge_kind": "success",
         }
-        if candidate is not None:
-            payload.update(
-                {
-                    "source": candidate.source,
-                    "target": candidate.target,
-                    "edge_kind": candidate.kind,
-                    "candidate_index": candidate.candidate_index,
-                }
-            )
         self.clear_quick_node_preview()
         self.quick_node_drop_requested.emit(str(kind), payload)
 
@@ -3968,6 +4215,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.nodes = {}
         self.workflow_items = []
         self.comments = []
+        self._group_proxy_edges = []
         self.trigger_node = None
         self.trigger_edge = None
         self.scene.clear()
@@ -4014,6 +4262,9 @@ class NodeCanvas(QtWidgets.QWidget):
         self.rebuild_edges()
         self._add_trigger_visual()
         self._load_comment_boxes()
+        if any(group.next_group_id for group in self.comments):
+            self.apply_group_flow_routes()
+        self._refresh_display_numbers()
         rect = self.scene.itemsBoundingRect()
         if rect.isEmpty():
             rect = QtCore.QRectF(-500, -350, 1000, 700)
@@ -4295,19 +4546,25 @@ class NodeCanvas(QtWidgets.QWidget):
         """Adjust horizontal spacing between adjacent nodes in each row so gaps stay consistent."""
         if not self.nodes:
             return
-        rows: dict[int, list[NodeItem]] = {}
-        for node in self.nodes.values():
-            row_key = int(round(node.pos().y() / 150.0))
-            rows.setdefault(row_key, []).append(node)
-        for row_nodes in rows.values():
+        rows: list[list[NodeItem]] = []
+        for node in sorted(self.nodes.values(), key=lambda item: (item.pos().y(), item.pos().x())):
+            row = next((candidate for candidate in rows if abs(candidate[0].pos().y() - node.pos().y()) <= 64.0), None)
+            if row is None:
+                row = []
+                rows.append(row)
+            row.append(node)
+        for row_nodes in rows:
             if len(row_nodes) <= 1:
                 continue
             row_nodes.sort(key=lambda n: n.pos().x())
+            anchor_x = row_nodes[0].pos().x()
+            row_nodes[0].setPos(anchor_x, row_nodes[0].pos().y())
             for i in range(1, len(row_nodes)):
                 prev = row_nodes[i - 1]
                 curr = row_nodes[i]
-                desired_x = prev.pos().x() + prev.current_width() + 100.0
+                desired_x = prev.pos().x() + prev.current_width() + 72.0
                 curr.setPos(desired_x, curr.pos().y())
+        self._sync_node_groups()
 
     def set_nodes_collapsed(self, indexes: list[int], collapsed: bool) -> None:
         changed = False
@@ -4363,6 +4620,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self._route_edges()
         self._sync_workflow_lanes()
         self._sync_node_groups()
+        self._refresh_display_numbers()
         self._positions_timer.start()
         if hasattr(self, "minimap") and self.minimap and self.minimap.expanded and self.minimap.isVisible():
             self.minimap.preview.update()
@@ -4396,6 +4654,7 @@ class NodeCanvas(QtWidgets.QWidget):
             self.trigger_edge.setVisible(target_index not in hidden_indexes)
         if self.trigger_node is not None:
             self.trigger_node.setVisible(True)
+        self._rebuild_group_proxy_edges()
         if hasattr(self, "minimap") and self.minimap and self.minimap.isVisible():
             self.minimap.preview.update()
 
@@ -4650,6 +4909,7 @@ class NodeCanvas(QtWidgets.QWidget):
         for edge in self.edges:
             if getattr(edge, "is_secondary_candidate", False):
                 edge.update_path()
+        self._rebuild_group_proxy_edges()
 
     def remove_edge(self, source: int, target: int, kind: str, condition_index: int = -1) -> None:
         for edge in list(self.edges):
@@ -4716,6 +4976,9 @@ class NodeCanvas(QtWidgets.QWidget):
         self.node_target_picked.emit(target)
 
     def cancel_node_target_pick(self, emit: bool = True) -> None:
+        if self._pending_node_kind:
+            self.cancel_node_placement()
+            return
         if not self._node_target_pick_active:
             return
         self._finish_node_target_pick_ui()
@@ -4948,6 +5211,9 @@ class NodeCanvas(QtWidgets.QWidget):
                     QtCore.QRectF(x, y, w, h),
                     self,
                     node_indexes=[int(i) for i in loaded_indexes if str(i).isdigit()],
+                    next_group_id=str(c.get("next_group_id") or ""),
+                    unconnected_success=str(c.get("unconnected_success") or "next"),
+                    unconnected_fail=str(c.get("unconnected_fail") or "next"),
                 )
                 self.comments.append(box)
                 self.scene.addItem(box)
@@ -4955,6 +5221,7 @@ class NodeCanvas(QtWidgets.QWidget):
                 if bool(c.get("collapsed", False)):
                     box.set_collapsed(True, notify=False)
         self._refresh_collapsed_group_visibility()
+        self._refresh_group_node_styles()
 
     def _add_default_comment_box(self, color: str = "yellow") -> None:
         if self.selected_indexes():
@@ -5117,6 +5384,9 @@ class NodeCanvas(QtWidgets.QWidget):
         width: float = 440.0,
         height: float = 260.0,
         node_indexes: list[int] | None = None,
+        next_group_id: str = "",
+        unconnected_success: str = "next",
+        unconnected_fail: str = "next",
     ) -> NodeGroupItem:
         box = NodeGroupItem(
             uuid.uuid4().hex[:8],
@@ -5125,10 +5395,14 @@ class NodeCanvas(QtWidgets.QWidget):
             QtCore.QRectF(pos.x(), pos.y(), width, height),
             self,
             node_indexes=node_indexes or [],
+            next_group_id=next_group_id,
+            unconnected_success=unconnected_success,
+            unconnected_fail=unconnected_fail,
         )
         self.comments.append(box)
         self.scene.addItem(box)
         box.sync_rect()
+        self._refresh_group_node_styles()
         self.comments_changed.emit(self.dump_comments())
         return box
 
@@ -5143,6 +5417,7 @@ class NodeCanvas(QtWidgets.QWidget):
             pass
         if was_collapsed:
             self._refresh_collapsed_group_visibility()
+        self._refresh_group_node_styles()
         self.comments_changed.emit(self.dump_comments())
 
     def dump_comments(self) -> list[dict[str, Any]]:
@@ -5160,6 +5435,9 @@ class NodeCanvas(QtWidgets.QWidget):
                         "h": round(b.box_rect.height(), 1),
                         "node_indexes": list(getattr(b, "node_indexes", [])),
                         "collapsed": bool(getattr(b, "collapsed", False)),
+                        "next_group_id": str(getattr(b, "next_group_id", "") or ""),
+                        "unconnected_success": str(getattr(b, "unconnected_success", "next") or "next"),
+                        "unconnected_fail": str(getattr(b, "unconnected_fail", "next") or "next"),
                     })
             except (RuntimeError, AttributeError):
                 pass

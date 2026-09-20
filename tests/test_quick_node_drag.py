@@ -30,9 +30,7 @@ class QuickNodeDragTests(unittest.TestCase):
         app.processEvents()
         return app, canvas
 
-    def test_preview_finds_edge_and_emits_splice_metadata(self) -> None:
-        from PySide6 import QtWidgets
-
+    def test_drop_on_edge_stays_disconnected_and_has_no_preview_line(self) -> None:
         app, canvas = self._canvas()
         edge = canvas.edges[0]
         scene_pos = edge.sceneBoundingRect().center()
@@ -42,20 +40,35 @@ class QuickNodeDragTests(unittest.TestCase):
         )
 
         canvas.preview_quick_node_drop("wait", scene_pos)
-        self.assertIs(canvas._quick_drop_candidate, edge)
-        self.assertEqual(4, len(canvas._quick_drop_preview_items))
-        self.assertTrue(
-            all(isinstance(item, QtWidgets.QGraphicsPathItem) for item in canvas._quick_drop_preview_items)
-        )
+        self.assertIsNone(canvas._quick_drop_candidate)
+        self.assertEqual([], canvas._quick_drop_preview_items)
         canvas.commit_quick_node_drop("wait", scene_pos)
         app.processEvents()
 
         self.assertEqual("wait", received[0][0])
-        self.assertEqual(1, received[0][1]["source"])
-        self.assertEqual(2, received[0][1]["target"])
+        self.assertEqual(0, received[0][1]["source"])
+        self.assertEqual(0, received[0][1]["target"])
         self.assertEqual("success", received[0][1]["edge_kind"])
         self.assertEqual([], canvas._quick_drop_preview_items)
         canvas.close()
+
+    def test_independent_live_drop_does_not_change_existing_routes(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingBar
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        bar = RecordingBar(repository=None)
+        events = [
+            {"type": "wait", "event_id": "source", "t": 1, "duration": 1},
+            {"type": "wait", "event_id": "tail", "t": 2, "duration": 1},
+        ]
+        bar._live_events = list(events)
+        bar.update_live_events(events, force=True)
+        bar.apply_quick_node_drop("new", {"x": 180, "y": 30}, rebuild=False)
+
+        self.assertEqual({}, bar._live_link_overrides)
+        self.assertIn("new", bar._event_positions)
+        bar.close()
 
     def test_live_splice_replaces_only_selected_connection(self) -> None:
         from PySide6 import QtWidgets

@@ -1091,10 +1091,10 @@ class BuilderPage(QtWidgets.QWidget):
                 background: #151A26;
             }
         """)
-        self.add_node_button.setToolTip("<b>노드 스마트 추가 (+)</b><br>선택한 액션 노드를 캔버스에 추가합니다.<br>이미지 서치나 비활성 클릭 등은 화면 캡처 및 좌표 지정이 즉시 실행됩니다.<br>💡 <i>Shift 키를 누른 채 클릭하면 빈 템플릿 노드로 추가됩니다.</i>")
-        self.add_node_button.clicked.connect(self._add_step)
+        self.add_node_button.setToolTip("<b>노드 배치 추가 (+)</b><br>버튼을 누른 뒤 캔버스에서 원하는 위치를 클릭하면 연결되지 않은 노드가 생성됩니다.<br>빈 캔버스를 더블클릭해도 현재 선택 액션을 그 위치에 추가할 수 있습니다.<br>💡 <i>Shift 키를 누르면 빈 템플릿으로 추가됩니다.</i>")
+        self.add_node_button.clicked.connect(self._arm_step_placement)
         self.action_combo.currentIndexChanged.connect(self._update_add_node_label)
-        self.action_combo.node_addition_requested.connect(self._add_step)
+        self.action_combo.node_addition_requested.connect(self._arm_step_placement)
 
         wizard_btn = QtWidgets.QPushButton("⚡ 자동 설정")
         wizard_btn.setToolTip("선택한 액션을 짧은 안내에 따라 자동 구성합니다.")
@@ -1483,6 +1483,8 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.single_branch_requested.connect(self._configure_single_branch)
         self.node_canvas.unbranch_requested.connect(self._remove_branch_chain)
         self.node_canvas.help_requested.connect(self._open_help_dialog)
+        self.node_canvas.node_add_at_requested.connect(self._add_step_at_position)
+        self.node_canvas.group_flow_changed.connect(self._graph_group_flow_changed)
 
         list_page = QtWidgets.QWidget()
         list_layout = QtWidgets.QVBoxLayout(list_page)
@@ -2420,6 +2422,14 @@ class BuilderPage(QtWidgets.QWidget):
             self.current_macro.pop("graph_comments", None)
         self._graph_save_timer.start()
 
+    @QtCore.Slot()
+    def _graph_group_flow_changed(self) -> None:
+        if self.current_macro is None:
+            return
+        self.current_macro["steps"] = self.node_canvas.steps
+        self._persist("노드 그룹의 다음 작업 흐름을 저장했습니다.")
+        self._refresh_steps(max(0, self.steps_table.currentRow()))
+
     def _save_graph_positions(self) -> None:
         if not self.current_name or self.current_macro is None:
             return
@@ -3131,7 +3141,21 @@ class BuilderPage(QtWidgets.QWidget):
         self._persist(f"{row + 1}번 단계를 저장했습니다.")
         self._refresh_steps(row)
 
-    def _add_step(self, action_override: Any = None) -> None:
+    def _arm_step_placement(self, action_override: Any = None) -> None:
+        if not self.current_macro:
+            self.status.emit("먼저 매크로를 선택하세요.")
+            return
+        action = action_override if isinstance(action_override, str) and action_override else self._selected_action(self.action_combo)
+        self.node_canvas.begin_node_placement(action)
+        self.status.emit(f"{ACTION_LABELS.get(action, action)} 노드를 놓을 캔버스 위치를 클릭하세요. Esc로 취소할 수 있습니다.")
+
+    @QtCore.Slot(str, object)
+    def _add_step_at_position(self, action_override: str, scene_position: object) -> None:
+        action = action_override if action_override else self._selected_action(self.action_combo)
+        position = scene_position if isinstance(scene_position, QtCore.QPointF) else self.node_canvas.preferred_add_position()
+        self._add_step(action, position)
+
+    def _add_step(self, action_override: Any = None, scene_position: QtCore.QPointF | None = None) -> None:
         if not self.current_macro:
             self.status.emit("먼저 매크로를 선택하세요.")
             return
@@ -3187,41 +3211,14 @@ class BuilderPage(QtWidgets.QWidget):
                         click["click_image"] = True
                     break
 
-        source = self.node_canvas.selected_index()
-        if not source:
-            row = self.steps_table.currentRow()
-            source = row + 1 if 0 <= row < len(steps) else len(steps)
-        source = source if 0 < source <= len(steps) else 0
         new_index = len(steps) + 1
-        previous_target = 0
-        if source and steps[source - 1].get("action") != "flow_control":
-            previous_target = int(steps[source - 1].get("on_success") or 0)
-            steps[source - 1]["on_success"] = new_index
-            if previous_target and previous_target != new_index:
-                step["on_success"] = previous_target
         steps.append(step)
         positions = self.current_macro.setdefault("graph_positions", {})
-        if source and isinstance(positions, dict):
-            source_position = positions.get(str(source))
-            target_position = positions.get(str(previous_target)) if previous_target else None
-            if isinstance(source_position, (list, tuple)) and len(source_position) >= 2:
-                source_x, source_y = float(source_position[0]), float(source_position[1])
-                if isinstance(target_position, (list, tuple)) and len(target_position) >= 2:
-                    new_x = (source_x + float(target_position[0])) / 2.0
-                    new_y = (source_y + float(target_position[1])) / 2.0
-                else:
-                    if new_index > 1 and (new_index - 1) % 10 == 0:
-                        new_x = 0.0
-                        new_y = source_y + 220.0
-                    else:
-                        new_x, new_y = source_x + 240.0, source_y
-                positions[str(new_index)] = [round(new_x, 2), round(new_y, 2)]
+        position = scene_position if isinstance(scene_position, QtCore.QPointF) else self.node_canvas.preferred_add_position()
+        if isinstance(positions, dict):
+            positions[str(new_index)] = [round(position.x() - 98.0, 2), round(position.y() - 58.0, 2)]
         action_name = ACTION_LABELS.get(action, action)
-        if source:
-            relation = "삽입" if previous_target else "연결"
-            message = f"{new_index}번 {action_name} 노드를 {source}번 성공 흐름에 자동 {relation}했습니다."
-        else:
-            message = f"{action_name} 단계를 추가했습니다."
+        message = f"{action_name} 노드를 지정한 위치에 연결 없이 추가했습니다."
         self.action_editor.refresh_sources()
         self._persist(message)
         self._refresh_steps(len(steps) - 1)

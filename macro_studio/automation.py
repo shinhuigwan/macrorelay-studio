@@ -1507,7 +1507,7 @@ class IconNodeToolbar(QtWidgets.QFrame):
         layout.setSpacing(4)
 
         header_layout = QtWidgets.QHBoxLayout()
-        header_title = QtWidgets.QLabel("노드 빠른 추가 | 클릭=끝에 추가 · 캔버스 선 위로 드래그=사이에 삽입 · 우클릭=즐겨찾기")
+        header_title = QtWidgets.QLabel("노드 빠른 추가 | 클릭=끝에 추가 · 캔버스로 드래그=해당 위치에 미연결 추가 · 우클릭=즐겨찾기")
         header_title.setStyleSheet("font-size: 8.5pt; font-weight: 700; color: #8A98B0;")
         header_layout.addWidget(header_title)
         header_layout.addStretch(1)
@@ -1786,7 +1786,7 @@ class RecordingBar(QtWidgets.QDialog):
         *,
         rebuild: bool = True,
     ) -> None:
-        """Place a new live node and splice it into the edge selected at drop time."""
+        """Place a new independent live node at the requested canvas position."""
         if not event_id:
             return
         drop_x = float(payload.get("x") or 0.0)
@@ -1842,25 +1842,25 @@ class RecordingBar(QtWidgets.QDialog):
                         if node_id:
                             self._event_positions[node_id] = [round(moved.x(), 2), round(moved.y(), 2)]
 
-        # The dragged node is appended to the recording timeline, even though
-        # it is visually inserted in an older edge. Without this guard the old
-        # terminal node receives an automatic sequential edge back to the new
-        # node, producing an unintended long return line.
-        source_workflow = str(source_step.get("workflow_id") or "")
-        workflow_terminal: dict[str, Any] | None = None
-        for step in self.live_canvas.steps:
-            workflow = str(step.get("workflow_id") or "")
-            if source_workflow and workflow != source_workflow:
-                continue
-            workflow_terminal = step
-        if workflow_terminal is not None:
-            terminal_id = str(workflow_terminal.get("_event_id") or "")
-            terminal_targets = workflow_terminal.get("success_candidates")
-            has_explicit_target = bool(
-                isinstance(terminal_targets, list) and terminal_targets
-            ) or int(workflow_terminal.get("on_success") or 0) > 0
-            if terminal_id and terminal_id != source_id and not has_explicit_target:
-                self._live_link_overrides[(terminal_id, "success")] = None
+        # Legacy edge-splice payloads still need the old terminal guard.  A
+        # normal quick-add now carries no source/target and must not modify any
+        # existing route: it is intentionally created as a disconnected node.
+        if source_id and target_id:
+            source_workflow = str(source_step.get("workflow_id") or "")
+            workflow_terminal: dict[str, Any] | None = None
+            for step in self.live_canvas.steps:
+                workflow = str(step.get("workflow_id") or "")
+                if source_workflow and workflow != source_workflow:
+                    continue
+                workflow_terminal = step
+            if workflow_terminal is not None:
+                terminal_id = str(workflow_terminal.get("_event_id") or "")
+                terminal_targets = workflow_terminal.get("success_candidates")
+                has_explicit_target = bool(
+                    isinstance(terminal_targets, list) and terminal_targets
+                ) or int(workflow_terminal.get("on_success") or 0) > 0
+                if terminal_id and terminal_id != source_id and not has_explicit_target:
+                    self._live_link_overrides[(terminal_id, "success")] = None
 
         self._event_positions[event_id] = desired_position
         for index, step in enumerate(self.live_canvas.steps, start=1):

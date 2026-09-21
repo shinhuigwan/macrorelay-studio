@@ -120,6 +120,23 @@ class QuickSlotDeckTests(unittest.TestCase):
         self.assertEqual(1, run_spy.count())
         button.close()
 
+    def test_slot_double_click_also_opens_sticky_preset_radial(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": [{"macro": "테스트", "hotkey": "", "mode": "hybrid"}]})
+            window = QuickSlotDeckWindow(repository)
+            window.show()
+            with mock.patch.object(window, "_show_preset_radial") as show_radial:
+                QtTest.QTest.mouseDClick(window.buttons[0], QtCore.Qt.LeftButton)
+
+            self.assertEqual(1, show_radial.call_count)
+            self.assertTrue(show_radial.call_args.kwargs["sticky"])
+            window.close()
+
     def test_single_click_runs_immediately(self) -> None:
         from PySide6 import QtCore, QtTest
         from macro_studio.quickslot_deck import StreamDeckButton
@@ -167,6 +184,22 @@ class QuickSlotDeckTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(menu.isVisible())
         host.close()
+
+    def test_radial_hides_before_dispatching_modal_action(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import RadialPieMenuWidget
+
+        menu = RadialPieMenuWidget()
+        visible_when_dispatched = []
+        menu.action_triggered.connect(lambda _key: visible_when_dispatched.append(menu.isVisible()))
+        menu.popup_at(QtCore.QPoint(300, 300), sticky=False)
+        self.app.processEvents()
+        item_center = menu._get_item_center(0).toPoint()
+        QtTest.QTest.mouseRelease(menu, QtCore.Qt.LeftButton, pos=item_center)
+        self.app.processEvents()
+
+        self.assertEqual([False], visible_when_dispatched)
+        menu.close()
 
     def test_radial_settings_uses_drag_canvas_without_slot_combos(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow

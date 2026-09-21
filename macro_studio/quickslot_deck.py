@@ -1211,12 +1211,14 @@ class StreamDeckButton(QtWidgets.QFrame):
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
-            # A primary action already ran on the first release. Suppress the
-            # second release so a double-click never starts the macro twice.
+            # The first release keeps the primary action feeling immediate.
+            # Suppress only the second release and open the sticky deck picker.
             self._suppress_next_release = True
             win = self.window()
             if hasattr(win, "_cancel_mouse_hold_check"):
                 win._cancel_mouse_hold_check()
+            if hasattr(win, "_show_preset_radial"):
+                win._show_preset_radial(event.globalPosition().toPoint(), sticky=True)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -1460,15 +1462,21 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
 
         if 0 <= self.hovered_idx < len(self.items):
             item = self.items[self.hovered_idx]
-            self.action_triggered.emit(item.key)
-            if item.callback:
-                item.callback()
             self.hide()
+            # Release the popup and its mouse grab before opening modal
+            # actions such as Settings. Dispatching on the next event-loop
+            # turn also avoids nesting a dialog inside this release handler.
+            QtCore.QTimer.singleShot(0, lambda selected=item: self._trigger_item(selected))
         elif self.hovered_idx == -2:
             self.hide()
         elif not self.sticky:
             self.hide()
         super().mouseReleaseEvent(event)
+
+    def _trigger_item(self, item: RadialPieMenuItem) -> None:
+        self.action_triggered.emit(item.key)
+        if item.callback:
+            item.callback()
 
     def eventFilter(self, watched: object, event: QtCore.QEvent) -> bool:
         if self.sticky and event.type() == QtCore.QEvent.MouseButtonPress and isinstance(event, QtGui.QMouseEvent):
@@ -1521,7 +1529,10 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         )
 
         for index, item in enumerate(self.items):
-            start = 90.0 - (index * step) - (step / 2.0)
+            # Qt painter angles start at 3 o'clock and increase counter-
+            # clockwise. Begin half a sector to the left of the item's
+            # centre so the painted wedge matches cursor hit-testing.
+            start = 90.0 - (index * step) + (step / 2.0)
             path = QtGui.QPainterPath()
             path.arcMoveTo(outer_rect, start)
             path.arcTo(outer_rect, start, -step)

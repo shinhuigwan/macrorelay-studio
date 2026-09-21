@@ -576,6 +576,7 @@ class StreamDeckButton(QtWidgets.QFrame):
     slot_triggered = QtCore.Signal(int, str)  # index, macro_name
     slot_stopped = QtCore.Signal(int, str)    # index, macro_name
     edit_icon_requested = QtCore.Signal(int)  # index
+    remove_slot_requested = QtCore.Signal(int)  # index
     text_position_changed = QtCore.Signal(float, float)  # x_pct, y_pct
 
     def __init__(self, slot_index: int, parent: Optional[QtWidgets.QWidget] = None):
@@ -1027,6 +1028,11 @@ class StreamDeckButton(QtWidgets.QFrame):
         self._show_options_menu(pos=event.globalPos())
 
     def _show_options_menu(self, pos: Optional[QtCore.QPoint] = None) -> None:
+        menu = self._build_options_menu()
+        popup_pos = pos or self.opt_btn.mapToGlobal(QtCore.QPoint(0, self.opt_btn.height()))
+        menu.exec_(popup_pos)
+
+    def _build_options_menu(self) -> QtWidgets.QMenu:
         menu = QtWidgets.QMenu(self)
         if self.macro_name:
             if self.is_running:
@@ -1039,6 +1045,11 @@ class StreamDeckButton(QtWidgets.QFrame):
 
         edit_icon_act = menu.addAction("🖼️ 아이콘 불러오기 / 편집")
         edit_icon_act.triggered.connect(lambda: self.edit_icon_requested.emit(self.slot_index))
+        if self.macro_name:
+            menu.addSeparator()
+            remove_act = menu.addAction("🗑 슬롯 제거")
+            remove_act.triggered.connect(lambda: self.remove_slot_requested.emit(self.slot_index))
+        return menu
 
 RADIAL_ACTION_PRESETS: Dict[str, tuple[str, str, str]] = {
     "prev_page": ("◀ 이전 페이지", "◀", "#3B82F6"),
@@ -2506,6 +2517,21 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self._save_config()
             self.refresh_slots()
 
+    def _remove_slot(self, slot_idx: int) -> None:
+        payload = self.repository.load_hotkeys()
+        slots = list(payload.get("slots") or [])
+        if not (0 <= slot_idx < len(slots)):
+            return
+        macro_name = str(slots[slot_idx].get("macro") or "").strip()
+        if macro_name and self._is_macro_running(macro_name):
+            self._stop_slot_macro(slot_idx, macro_name)
+        slots[slot_idx] = {"macro": "", "hotkey": "", "mode": "hybrid"}
+        payload["slots"] = slots
+        self.repository.save_hotkeys(payload)
+        self.custom_icons.pop(str(slot_idx), None)
+        self._save_config()
+        self.refresh_slots()
+
     def refresh_slots(self) -> None:
         gap = int(self.config.get("tile_gap", 10))
         self.grid_layout.setSpacing(gap)
@@ -2576,6 +2602,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             btn.slot_triggered.connect(self._run_slot_macro)
             btn.slot_stopped.connect(self._stop_slot_macro)
             btn.edit_icon_requested.connect(self._edit_slot_icon)
+            btn.remove_slot_requested.connect(self._remove_slot)
 
             row = i // visible_cols
             col = i % visible_cols

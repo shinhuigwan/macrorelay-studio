@@ -146,6 +146,42 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertTrue(window._handle_window_drag_release(release))
             window.close()
 
+    def test_slot_options_menu_contains_remove_action(self) -> None:
+        from PySide6 import QtTest
+        from macro_studio.quickslot_deck import StreamDeckButton
+
+        button = StreamDeckButton(3)
+        button.set_slot_data("테스트", "", "hybrid", False)
+        remove_spy = QtTest.QSignalSpy(button.remove_slot_requested)
+        menu = button._build_options_menu()
+        actions = {action.text(): action for action in menu.actions() if action.text()}
+
+        self.assertIn("🖼️ 아이콘 불러오기 / 편집", actions)
+        self.assertIn("🗑 슬롯 제거", actions)
+        actions["🗑 슬롯 제거"].trigger()
+        self.assertEqual(1, remove_spy.count())
+
+    def test_remove_slot_persists_and_shrinks_grid(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({
+                "slots": [
+                    {"macro": "첫 번째", "hotkey": "Alt+1", "mode": "hybrid"},
+                    {"macro": "두 번째", "hotkey": "Alt+2", "mode": "hybrid"},
+                ]
+            })
+            window = QuickSlotDeckWindow(repository)
+            window.custom_icons["1"] = {"emoji": "★"}
+            window._remove_slot(1)
+
+            self.assertEqual("", repository.load_hotkeys()["slots"][1]["macro"])
+            self.assertNotIn("1", window.custom_icons)
+            self.assertEqual(["첫 번째"], [button.macro_name for button in window.buttons])
+            window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

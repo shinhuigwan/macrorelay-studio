@@ -10,15 +10,14 @@ if (-not $sysPythonw -and $sysPython) {
     $sysPythonw = $sysPython
 }
 
-$runtimeCandidates = @()
+$runtimeCandidates = @(
+    @((Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"), (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\pythonw.exe"), $true),
+    @((Join-Path $studioRoot ".venv\Scripts\python.exe"), (Join-Path $studioRoot ".venv\Scripts\pythonw.exe"), $true),
+    @((Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"), (Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\pythonw.exe"), $false)
+)
 if ($sysPython -and $sysPythonw) {
     $runtimeCandidates += ,@($sysPython, $sysPythonw, $false)
 }
-$runtimeCandidates += @(
-    @((Join-Path $studioRoot ".venv\Scripts\python.exe"), (Join-Path $studioRoot ".venv\Scripts\pythonw.exe"), $true),
-    @((Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"), (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\pythonw.exe"), $true),
-    @((Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"), (Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\pythonw.exe"), $false)
-)
 
 foreach ($candidate in $runtimeCandidates) {
     $python = $candidate[0]
@@ -40,7 +39,7 @@ foreach ($candidate in $runtimeCandidates) {
     else {
         Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
     }
-    & $python -c "from PySide6 import QtWidgets" 2>$null
+    & $python -c "from PySide6 import QtWidgets; from macro_studio.quickslot_deck import QuickSlotDeckWindow" 2>$null
     if ($LASTEXITCODE -eq 0) {
         Remove-Item -LiteralPath (Join-Path $studioRoot "quickslot-launch-error.txt") -ErrorAction SilentlyContinue
         Start-Process -FilePath $pythonw -ArgumentList @($quickslotScript) -WorkingDirectory $studioRoot -WindowStyle Hidden

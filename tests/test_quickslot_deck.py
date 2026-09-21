@@ -43,6 +43,52 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual(1, window.grid_layout.count())
             window.close()
 
+    def test_tile_scale_presets_include_half_and_quarter(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": [{"macro": "첫 번째", "hotkey": "", "mode": "hybrid"}]})
+            window = QuickSlotDeckWindow(repository)
+            dialog = QuickSlotDeckSettingsDialog(window)
+
+            scales = [float(dialog.tile_scale_combo.itemData(index)) for index in range(dialog.tile_scale_combo.count())]
+            self.assertEqual([1.0, 0.5, 0.25], scales)
+
+            window.config["tile_scale"] = 0.25
+            window.refresh_slots()
+            self.assertEqual((64, 64), (window.width(), window.height()))
+            dialog.close()
+            window.close()
+
+    def test_border_resize_keeps_grid_cells_square(self) -> None:
+        from PySide6 import QtCore
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow, WINDOW_PADDING
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({
+                "slots": [
+                    {"macro": "첫 번째", "hotkey": "", "mode": "hybrid"},
+                    {"macro": "두 번째", "hotkey": "", "mode": "hybrid"},
+                ]
+            })
+            window = QuickSlotDeckWindow(repository)
+            original = window.geometry()
+            window._resize_edge = "right"
+            window._resize_start_geom = original
+            window._resize_start_pos = QtCore.QPoint(original.right(), original.center().y())
+            window._handle_border_resize(QtCore.QPoint(original.right() - 140, original.center().y()))
+
+            gap = int(window.config["tile_gap"])
+            cell_width = (window.width() - WINDOW_PADDING - gap) / 2
+            cell_height = window.height() - WINDOW_PADDING
+            self.assertAlmostEqual(cell_width, cell_height, delta=1.0)
+            self.assertGreaterEqual(cell_width, 48)
+            window.close()
+
     def test_radial_add_uses_first_empty_slot(self) -> None:
         from PySide6 import QtWidgets
         from macro_studio.quickslot_deck import QuickSlotDeckWindow

@@ -37,6 +37,9 @@ from macro_studio.theme import stylesheet
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "MacroRelayQuickSlot"
 PRESET_ICON_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ico"}
+BASE_TILE_SIDE = 190
+MIN_TILE_SIDE = 48
+WINDOW_PADDING = 16
 
 
 def quickslot_preset_icon_paths(root: Path) -> List[Path]:
@@ -765,7 +768,7 @@ class StreamDeckButton(QtWidgets.QFrame):
         self._single_click_timer.timeout.connect(self._emit_primary_action)
 
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.setMinimumSize(110, 95)
+        self.setMinimumSize(42, 42)
 
         self._init_ui()
         self._update_appearance()
@@ -854,6 +857,9 @@ class StreamDeckButton(QtWidgets.QFrame):
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
+        tiny = min(self.width(), self.height()) < 70
+        self.slot_number_label.setVisible(not tiny)
+        self.glow_bar.setVisible(not tiny)
         self._reposition_title_label()
         self.update()
 
@@ -874,7 +880,7 @@ class StreamDeckButton(QtWidgets.QFrame):
         text_show = bool(self.custom_icon_config.get("text_show", True))
         text_pos = str(self.custom_icon_config.get("text_position", "bottom"))
 
-        if not self.macro_name or not text_show or text_pos == "hidden":
+        if min(self.width(), self.height()) < 70 or not self.macro_name or not text_show or text_pos == "hidden":
             self.title_label.setVisible(False)
             return
 
@@ -1780,6 +1786,12 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         ])
         self.grid_preset_combo.currentIndexChanged.connect(self._on_grid_live_changed)
 
+        self.tile_scale_combo = QtWidgets.QComboBox()
+        self.tile_scale_combo.addItem("기본 크기 (100%)", 1.0)
+        self.tile_scale_combo.addItem("절반 크기 (1/2)", 0.5)
+        self.tile_scale_combo.addItem("초소형 (1/4)", 0.25)
+        self.tile_scale_combo.currentIndexChanged.connect(self._on_tile_scale_changed)
+
         # Border radius
         radius_box = QtWidgets.QHBoxLayout()
         self.radius_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -1820,22 +1832,22 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         # Window Size (Width x Height) controls
         win_size_box = QtWidgets.QHBoxLayout()
         self.win_w_spin = QtWidgets.QSpinBox()
-        self.win_w_spin.setRange(280, 3840)
+        self.win_w_spin.setRange(60, 3840)
         self.win_w_spin.setSuffix(" px")
 
         self.win_h_spin = QtWidgets.QSpinBox()
-        self.win_h_spin.setRange(160, 2160)
+        self.win_h_spin.setRange(60, 2160)
         self.win_h_spin.setSuffix(" px")
 
         self.win_w_spin.valueChanged.connect(self._on_win_size_changed)
         self.win_h_spin.valueChanged.connect(self._on_win_size_changed)
 
-        btn_size_sm = QtWidgets.QPushButton("작게 (860x520)")
-        btn_size_sm.clicked.connect(lambda: self._set_win_size(860, 520))
-        btn_size_md = QtWidgets.QPushButton("기본 (1060x620)")
-        btn_size_md.clicked.connect(lambda: self._set_win_size(1060, 620))
-        btn_size_lg = QtWidgets.QPushButton("크게 (1280x760)")
-        btn_size_lg.clicked.connect(lambda: self._set_win_size(1280, 760))
+        btn_size_sm = QtWidgets.QPushButton("1/4")
+        btn_size_sm.clicked.connect(lambda: self._set_tile_scale(0.25))
+        btn_size_md = QtWidgets.QPushButton("1/2")
+        btn_size_md.clicked.connect(lambda: self._set_tile_scale(0.5))
+        btn_size_lg = QtWidgets.QPushButton("기본")
+        btn_size_lg.clicked.connect(lambda: self._set_tile_scale(1.0))
 
         win_size_box.addWidget(QtWidgets.QLabel("가로:"))
         win_size_box.addWidget(self.win_w_spin)
@@ -1861,6 +1873,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         empty_opac_box.addWidget(self.empty_opac_spin)
 
         form.addRow("슬롯 창 자동 축소:", self.compact_fit_check)
+        form.addRow("슬롯 크기 프리셋:", self.tile_scale_combo)
         form.addRow("창 수동 크기:", win_size_box)
         form.addRow("그리드 레이아웃:", self.grid_preset_combo)
         hidden_slots = QtWidgets.QLabel("항상 숨김 · 슬롯을 추가하면 창과 그리드가 자동 확장됩니다.")
@@ -1873,7 +1886,13 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
     def _set_win_size(self, w: int, h: int) -> None:
         self.win_w_spin.setValue(w)
         self.win_h_spin.setValue(h)
-        self.main_window.resize(w, h)
+        self.main_window.resize_grid_from_width(w)
+
+    def _set_tile_scale(self, scale: float) -> None:
+        for index in range(self.tile_scale_combo.count()):
+            if abs(float(self.tile_scale_combo.itemData(index)) - scale) < 0.001:
+                self.tile_scale_combo.setCurrentIndex(index)
+                return
 
     def _on_compact_fit_toggled(self, checked: bool) -> None:
         if getattr(self, "_loading_settings", False):
@@ -1884,9 +1903,20 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
     def _on_win_size_changed(self) -> None:
         if getattr(self, "_loading_settings", False):
             return
-        w = self.win_w_spin.value()
-        h = self.win_h_spin.value()
-        self.main_window.resize(w, h)
+        if self.sender() is self.win_h_spin:
+            self.main_window.resize_grid_from_height(self.win_h_spin.value())
+        else:
+            self.main_window.resize_grid_from_width(self.win_w_spin.value())
+
+    def _on_tile_scale_changed(self, _index: int) -> None:
+        if getattr(self, "_loading_settings", False):
+            return
+        self.main_window.config["tile_scale"] = float(self.tile_scale_combo.currentData())
+        self.main_window.refresh_slots()
+        with QtCore.QSignalBlocker(self.win_w_spin), QtCore.QSignalBlocker(self.win_h_spin):
+            self.win_w_spin.setValue(self.main_window.width())
+            self.win_h_spin.setValue(self.main_window.height())
+        self.main_window._save_config()
 
     def _on_empty_opacity_live_changed(self, val: int) -> None:
         if getattr(self, "_loading_settings", False):
@@ -2027,6 +2057,12 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
 
             grid_map = {(3, 5): 0, (4, 4): 1, (3, 3): 2, (2, 4): 3, (4, 5): 4, (2, 6): 5}
             self.grid_preset_combo.setCurrentIndex(grid_map.get((self.main_window.rows, self.main_window.cols), 0))
+            tile_scale = float(self.main_window.config.get("tile_scale", 1.0))
+            scale_index = min(
+                range(self.tile_scale_combo.count()),
+                key=lambda idx: abs(float(self.tile_scale_combo.itemData(idx)) - tile_scale),
+            )
+            self.tile_scale_combo.setCurrentIndex(scale_index)
 
             self.compact_fit_check.setChecked(True)
             self.empty_opac_spin.setValue(int(self.main_window.config.get("empty_slot_opacity", 0)))
@@ -2061,6 +2097,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.main_window.config["empty_slot_opacity"] = self.empty_opac_spin.value()
         self.main_window.config["tile_radius"] = self.radius_spin.value()
         self.main_window.config["tile_gap"] = self.gap_spin.value()
+        self.main_window.config["tile_scale"] = float(self.tile_scale_combo.currentData())
         self.main_window.config["hover_glow"] = self.hover_glow_check.isChecked()
         self.main_window.config["theme_index"] = self.theme_combo.currentIndex()
         self.main_window.config["auto_stretch_default"] = self.auto_stretch_default.isChecked()
@@ -2213,6 +2250,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "start_minimized": False,
             "tile_radius": 14,
             "tile_gap": 10,
+            "tile_scale": 1.0,
             "hover_glow": True,
             "theme_index": 0,
             "auto_stretch_default": True,
@@ -2231,6 +2269,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._hold_start_pos: Optional[QtCore.QPoint] = None
         self._hold_popup_pos: Optional[QtCore.QPoint] = None
         self._hold_triggered = False
+        self._visible_cols = 1
+        self._visible_rows = 1
 
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
@@ -2319,7 +2359,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             pass
 
     def _init_ui(self) -> None:
-        self.setMinimumSize(220, 150)
+        self.setMinimumSize(64, 64)
         if not self.geometry().isValid():
             self.resize(1060, 620)
 
@@ -2431,27 +2471,53 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         dx = global_pos.x() - self._resize_start_pos.x()
         dy = global_pos.y() - self._resize_start_pos.y()
 
-        new_x, new_y, new_w, new_h = orig.x(), orig.y(), orig.width(), orig.height()
-        min_w, min_h = self.minimumWidth(), self.minimumHeight()
-
         edge = getattr(self, "_resize_edge", "")
-        if "right" in edge:
-            new_w = max(min_w, orig.width() + dx)
-        elif "left" in edge:
-            w_candidate = orig.width() - dx
-            if w_candidate >= min_w:
-                new_w = w_candidate
-                new_x = orig.x() + dx
+        proposed_w = orig.width() + dx if "right" in edge else orig.width() - dx
+        proposed_h = orig.height() + dy if "bottom" in edge else orig.height() - dy
+        side_w = self._tile_side_from_width(proposed_w)
+        side_h = self._tile_side_from_height(proposed_h)
 
-        if "bottom" in edge:
-            new_h = max(min_h, orig.height() + dy)
-        elif "top" in edge:
-            h_candidate = orig.height() - dy
-            if h_candidate >= min_h:
-                new_h = h_candidate
-                new_y = orig.y() + dy
+        if ("left" in edge or "right" in edge) and ("top" in edge or "bottom" in edge):
+            horizontal_change = abs(dx) / max(1, orig.width())
+            vertical_change = abs(dy) / max(1, orig.height())
+            tile_side = side_w if horizontal_change >= vertical_change else side_h
+        elif "left" in edge or "right" in edge:
+            tile_side = side_w
+        else:
+            tile_side = side_h
 
-        self.setGeometry(new_x, new_y, new_w, new_h)
+        target = self._size_for_tile_side(max(MIN_TILE_SIDE, tile_side))
+        new_x = orig.right() - target.width() + 1 if "left" in edge else orig.x()
+        new_y = orig.bottom() - target.height() + 1 if "top" in edge else orig.y()
+        self.setGeometry(new_x, new_y, target.width(), target.height())
+
+    def _grid_extras(self) -> tuple[int, int]:
+        gap = int(self.config.get("tile_gap", 10))
+        return (
+            WINDOW_PADDING + max(0, self._visible_cols - 1) * gap,
+            WINDOW_PADDING + max(0, self._visible_rows - 1) * gap,
+        )
+
+    def _size_for_tile_side(self, tile_side: float) -> QtCore.QSize:
+        extra_w, extra_h = self._grid_extras()
+        return QtCore.QSize(
+            max(1, round(self._visible_cols * tile_side + extra_w)),
+            max(1, round(self._visible_rows * tile_side + extra_h)),
+        )
+
+    def _tile_side_from_width(self, width: int) -> float:
+        extra_w, _ = self._grid_extras()
+        return max(MIN_TILE_SIDE, (width - extra_w) / max(1, self._visible_cols))
+
+    def _tile_side_from_height(self, height: int) -> float:
+        _, extra_h = self._grid_extras()
+        return max(MIN_TILE_SIDE, (height - extra_h) / max(1, self._visible_rows))
+
+    def resize_grid_from_width(self, width: int) -> None:
+        self.resize(self._size_for_tile_side(self._tile_side_from_width(width)))
+
+    def resize_grid_from_height(self, height: int) -> None:
+        self.resize(self._size_for_tile_side(self._tile_side_from_height(height)))
 
     def _start_mouse_hold_check(self, global_pos: QtCore.QPoint) -> None:
         self._hold_start_pos = global_pos
@@ -2756,6 +2822,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
         visible_cols = min(self.cols, max(1, len(page_slots)))
         visible_rows = max(1, math.ceil(len(page_slots) / visible_cols))
+        self._visible_cols = visible_cols
+        self._visible_rows = visible_rows
+        self.setMinimumSize(self._size_for_tile_side(MIN_TILE_SIDE))
         for r in range(20):
             self.grid_layout.setRowStretch(r, 1 if r < visible_rows else 0)
         for c in range(20):
@@ -2763,6 +2832,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
         for i, (slot_idx, slot_info) in enumerate(page_slots):
             btn = StreamDeckButton(slot_idx, self.swipe_container)
+            btn.setMinimumSize(MIN_TILE_SIDE, MIN_TILE_SIDE)
             btn.set_display_number(start_idx + i + 1)
 
             # Apply custom icon config if present
@@ -2792,15 +2862,18 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             if active_count > 0:
                 fit_cols = min(self.cols, active_count)
                 fit_rows = math.ceil(active_count / fit_cols)
-                gap = int(self.config.get("tile_gap", 10))
 
-                card_w = 190
-                card_h = 138
-                needed_w = max(280, fit_cols * card_w + (fit_cols - 1) * gap + 24)
-                needed_h = max(160, fit_rows * card_h + (fit_rows - 1) * gap + 24)
-                self.resize(needed_w, needed_h)
+                self._visible_cols = fit_cols
+                self._visible_rows = fit_rows
+                tile_scale = float(self.config.get("tile_scale", 1.0))
+                tile_side = max(MIN_TILE_SIDE, BASE_TILE_SIDE * tile_scale)
+                self.setMinimumSize(self._size_for_tile_side(MIN_TILE_SIDE))
+                self.resize(self._size_for_tile_side(tile_side))
             else:
-                self.resize(280, 160)
+                self._visible_cols = 1
+                self._visible_rows = 1
+                self.setMinimumSize(self._size_for_tile_side(MIN_TILE_SIDE))
+                self.resize(self._size_for_tile_side(BASE_TILE_SIDE * float(self.config.get("tile_scale", 1.0))))
 
     def _prev_page(self) -> None:
         if self.current_page > 0:

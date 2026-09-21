@@ -199,6 +199,28 @@ class QuickSlotDeckTests(unittest.TestCase):
         self.assertTrue(config["full_stretch"])
         dialog.close()
 
+    def test_multiple_user_icons_are_saved_and_reloaded(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.quickslot_deck import quickslot_user_icon_paths, save_quickslot_user_icons
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_dir = root / "sources"
+            source_dir.mkdir()
+            first = source_dir / "first.png"
+            second = source_dir / "second.png"
+            first_pixmap = QtGui.QPixmap(24, 24)
+            first_pixmap.fill(QtGui.QColor("#38BDF8"))
+            self.assertTrue(first_pixmap.save(str(first)))
+            second_pixmap = QtGui.QPixmap(24, 24)
+            second_pixmap.fill(QtGui.QColor("#A855F7"))
+            self.assertTrue(second_pixmap.save(str(second)))
+
+            saved = save_quickslot_user_icons(root, [str(first), str(second)])
+            self.assertEqual(2, len(saved))
+            self.assertEqual(saved, quickslot_user_icon_paths(root))
+            self.assertTrue(all(path.parent.name == "quickslot-user-icons" for path in saved))
+
 
 if __name__ == "__main__":
     unittest.main()

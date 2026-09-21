@@ -13,9 +13,11 @@ Features:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -45,6 +47,36 @@ def quickslot_preset_icon_paths(root: Path) -> List[Path]:
         (path for path in preset_dir.iterdir() if path.is_file() and path.suffix.lower() in PRESET_ICON_EXTENSIONS),
         key=lambda path: path.name.casefold(),
     )
+
+
+def quickslot_user_icon_paths(root: Path) -> List[Path]:
+    user_dir = root / "quickslot-user-icons"
+    if not user_dir.is_dir():
+        return []
+    return sorted(
+        (path for path in user_dir.iterdir() if path.is_file() and path.suffix.lower() in PRESET_ICON_EXTENSIONS),
+        key=lambda path: path.name.casefold(),
+    )
+
+
+def save_quickslot_user_icons(root: Path, source_paths: List[str]) -> List[Path]:
+    user_dir = root / "quickslot-user-icons"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[Path] = []
+    for source_text in source_paths:
+        source = Path(source_text)
+        if not source.is_file() or source.suffix.lower() not in PRESET_ICON_EXTENSIONS:
+            continue
+        if source.stat().st_size > 10 * 1024 * 1024:
+            continue
+        data = source.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()[:12]
+        safe_stem = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in source.stem).strip("-") or "icon"
+        destination = user_dir / f"{safe_stem[:48]}-{digest}{source.suffix.lower()}"
+        if not destination.exists():
+            shutil.copy2(source, destination)
+        saved.append(destination)
+    return saved
 
 
 def install_quickslot_desktop_shortcut(root: Path) -> Path:
@@ -279,21 +311,34 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         self.preset_buttons: Dict[str, QtWidgets.QToolButton] = {}
 
         self.setWindowTitle(f"아이콘 및 타일 상세 편집 - 슬롯 #{slot_index + 1}")
-        self.setMinimumSize(720, 880)
+        self.setMinimumSize(720, 700)
+        self.resize(760, 840)
         self.setStyleSheet(stylesheet())
 
         self._init_ui()
         self._load_current_values()
 
     def _init_ui(self) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(14)
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(20, 18, 20, 18)
+        root_layout.setSpacing(12)
 
         # Title
         header_title = QtWidgets.QLabel(f"🖼️ 슬롯 #{self.slot_index + 1} 커스텀 아이콘 & 텍스트 편집")
         header_title.setStyleSheet("font-size: 14pt; font-weight: 800; color: #FFFFFF;")
-        layout.addWidget(header_title)
+        header_title.setMinimumHeight(32)
+        root_layout.addWidget(header_title)
+
+        content_scroll = QtWidgets.QScrollArea()
+        content_scroll.setWidgetResizable(True)
+        content_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        content_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        content_host = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content_host)
+        layout.setContentsMargins(2, 2, 8, 2)
+        layout.setSpacing(14)
+        content_scroll.setWidget(content_host)
+        root_layout.addWidget(content_scroll, 1)
 
         # Form Card
         form_card = QtWidgets.QFrame()
@@ -316,7 +361,6 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         file_box.addWidget(btn_browse)
         form_layout.addRow("아이콘 이미지 파일:", file_box)
 
-        preset_paths = quickslot_preset_icon_paths(self.app_root)
         preset_section = QtWidgets.QFrame()
         preset_section.setStyleSheet(
             "QFrame { background: #101622; border: 1px solid #28344D; border-radius: 11px; }"
@@ -332,36 +376,23 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         preset_scroll.setStyleSheet(
             "QScrollArea { background: #0D121D; border: 1px solid #28344D; border-radius: 9px; }"
         )
-        preset_host = QtWidgets.QWidget()
-        preset_row = QtWidgets.QHBoxLayout(preset_host)
-        preset_row.setContentsMargins(8, 8, 8, 8)
-        preset_row.setSpacing(8)
-        for preset_path in preset_paths:
-            button = QtWidgets.QToolButton()
-            button.setCheckable(True)
-            button.setAutoExclusive(True)
-            button.setFixedSize(82, 82)
-            button.setIcon(QtGui.QIcon(str(preset_path)))
-            button.setIconSize(QtCore.QSize(68, 68))
-            button.setToolTip(preset_path.stem)
-            button.setStyleSheet(
-                "QToolButton { background: #111827; border: 1px solid #334155; border-radius: 9px; padding: 5px; }"
-                "QToolButton:hover { border: 2px solid #38BDF8; }"
-                "QToolButton:checked { border: 2px solid #7C6CFF; background: #1F193E; }"
-            )
-            button.clicked.connect(lambda _checked=False, p=preset_path: self._select_preset_icon(p))
-            self.preset_buttons[str(preset_path.resolve())] = button
-            preset_row.addWidget(button)
-        if not preset_paths:
-            empty_label = QtWidgets.QLabel("기본 아이콘이 없습니다.")
-            empty_label.setObjectName("Muted")
-            preset_row.addWidget(empty_label)
-        preset_row.addStretch(1)
-        preset_scroll.setWidget(preset_host)
-        preset_title = QtWidgets.QLabel("기본 아이콘 · 좌우로 넘겨서 선택")
+        self.preset_host = QtWidgets.QWidget()
+        self.preset_row = QtWidgets.QHBoxLayout(self.preset_host)
+        self.preset_row.setContentsMargins(8, 8, 8, 8)
+        self.preset_row.setSpacing(8)
+        preset_scroll.setWidget(self.preset_host)
+        preset_title = QtWidgets.QLabel("아이콘 보관함 · 좌우로 넘겨서 선택")
         preset_title.setStyleSheet("color: #CBD5E1; font-weight: 700; border: none;")
-        preset_section_layout.addWidget(preset_title)
+        add_icons_button = QtWidgets.QPushButton("＋ 아이콘 여러 개 저장")
+        add_icons_button.setToolTip("여러 이미지 파일을 선택해 프로그램 아이콘 보관함에 저장합니다.")
+        add_icons_button.clicked.connect(self._import_icons_to_library)
+        preset_header = QtWidgets.QHBoxLayout()
+        preset_header.addWidget(preset_title)
+        preset_header.addStretch(1)
+        preset_header.addWidget(add_icons_button)
+        preset_section_layout.addLayout(preset_header)
         preset_section_layout.addWidget(preset_scroll)
+        self._reload_icon_gallery()
 
         # Full Stretch Checkbox
         self.stretch_check = QtWidgets.QCheckBox("타일 카드 전체 가득 채우기 (Full Tile Stretch)")
@@ -512,7 +543,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         btn_box.addWidget(btn_cancel)
         btn_box.addWidget(btn_save)
 
-        layout.addLayout(btn_box)
+        root_layout.addLayout(btn_box)
 
     def _on_pos_combo_changed(self, idx: int) -> None:
         if idx == 0:  # Bottom
@@ -587,6 +618,65 @@ class SlotIconEditDialog(QtWidgets.QDialog):
             self._current_base64 = encode_image_file_to_base64(path)
             self._sync_preset_selection(path)
             self._update_preview()
+
+    def _reload_icon_gallery(self) -> None:
+        while self.preset_row.count():
+            item = self.preset_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.preset_buttons.clear()
+
+        bundled = quickslot_preset_icon_paths(self.app_root)
+        user_icons = quickslot_user_icon_paths(self.app_root)
+        icon_paths = bundled + user_icons
+        for icon_path in icon_paths:
+            button = QtWidgets.QToolButton()
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.setFixedSize(82, 82)
+            button.setIcon(QtGui.QIcon(str(icon_path)))
+            button.setIconSize(QtCore.QSize(68, 68))
+            category = "내 아이콘" if icon_path in user_icons else "기본 아이콘"
+            button.setToolTip(f"{category} · {icon_path.stem}")
+            button.setStyleSheet(
+                "QToolButton { background: #111827; border: 1px solid #334155; border-radius: 9px; padding: 5px; }"
+                "QToolButton:hover { border: 2px solid #38BDF8; }"
+                "QToolButton:checked { border: 2px solid #7C6CFF; background: #1F193E; }"
+            )
+            button.clicked.connect(lambda _checked=False, p=icon_path: self._select_preset_icon(p))
+            self.preset_buttons[str(icon_path.resolve())] = button
+            self.preset_row.addWidget(button)
+        if not icon_paths:
+            empty_label = QtWidgets.QLabel("저장된 아이콘이 없습니다.")
+            empty_label.setObjectName("Muted")
+            self.preset_row.addWidget(empty_label)
+        self.preset_row.addStretch(1)
+        current_path = self.file_edit.text().strip() if hasattr(self, "file_edit") else ""
+        self._sync_preset_selection(current_path)
+
+    def _import_icons_to_library(self) -> None:
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "아이콘 여러 개 저장",
+            "",
+            "이미지 파일 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.ico);;모든 파일 (*.*)",
+        )
+        if not paths:
+            return
+        try:
+            saved = save_quickslot_user_icons(self.app_root, list(paths))
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "아이콘 저장 실패", str(exc))
+            return
+        self._reload_icon_gallery()
+        if saved:
+            self._select_preset_icon(saved[-1])
+        skipped = len(paths) - len(saved)
+        message = f"{len(saved)}개 아이콘을 프로그램 보관함에 저장했습니다."
+        if skipped > 0:
+            message += f"\n{skipped}개 파일은 형식 또는 10MB 제한으로 제외되었습니다."
+        QtWidgets.QMessageBox.information(self, "아이콘 저장 완료", message)
 
     def _select_preset_icon(self, path: Path) -> None:
         resolved = str(path.resolve())

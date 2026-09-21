@@ -855,6 +855,17 @@ class StreamDeckButton(QtWidgets.QFrame):
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
         self._reposition_title_label()
+        self.update()
+
+    @staticmethod
+    def _scale_full_stretch_pixmap(pixmap: QtGui.QPixmap, target_size: QtCore.QSize) -> QtGui.QPixmap:
+        if pixmap.isNull() or target_size.width() <= 0 or target_size.height() <= 0:
+            return QtGui.QPixmap()
+        return pixmap.scaled(
+            target_size,
+            QtCore.Qt.IgnoreAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
 
     def _reposition_title_label(self) -> None:
         if not hasattr(self, "title_label") or not self.title_label:
@@ -917,15 +928,8 @@ class StreamDeckButton(QtWidgets.QFrame):
 
             target_size = self.size()
             if target_size.width() > 0 and target_size.height() > 0:
-                scaled_pix = pix.scaled(
-                    target_size,
-                    QtCore.Qt.KeepAspectRatioByExpanding,
-                    QtCore.Qt.SmoothTransformation,
-                )
-                x = max(0, (scaled_pix.width() - target_size.width()) // 2)
-                y = max(0, (scaled_pix.height() - target_size.height()) // 2)
-                cropped = scaled_pix.copy(x, y, target_size.width(), target_size.height())
-                painter.drawPixmap(self.rect(), cropped)
+                scaled_pix = self._scale_full_stretch_pixmap(pix, target_size)
+                painter.drawPixmap(self.rect(), scaled_pix)
             painter.end()
 
     def set_custom_icon_config(self, config: Dict[str, Any]) -> None:

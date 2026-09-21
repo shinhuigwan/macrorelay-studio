@@ -221,6 +221,24 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual(saved, quickslot_user_icon_paths(root))
             self.assertTrue(all(path.parent.name == "quickslot-user-icons" for path in saved))
 
+    def test_full_stretch_resizes_to_card_without_cropping_edges(self) -> None:
+        from PySide6 import QtCore, QtGui
+        from macro_studio.quickslot_deck import StreamDeckButton
+
+        image = QtGui.QImage(20, 60, QtGui.QImage.Format_ARGB32)
+        image.fill(QtGui.QColor("#22C55E"))
+        for y in range(10):
+            for x in range(image.width()):
+                image.setPixelColor(x, y, QtGui.QColor("#EF4444"))
+                image.setPixelColor(x, image.height() - 1 - y, QtGui.QColor("#3B82F6"))
+        pixmap = QtGui.QPixmap.fromImage(image)
+
+        scaled = StreamDeckButton._scale_full_stretch_pixmap(pixmap, QtCore.QSize(180, 40))
+        self.assertEqual(QtCore.QSize(180, 40), scaled.size())
+        scaled_image = scaled.toImage()
+        self.assertEqual(QtGui.QColor("#EF4444"), scaled_image.pixelColor(90, 0))
+        self.assertEqual(QtGui.QColor("#3B82F6"), scaled_image.pixelColor(90, 39))
+
 
 if __name__ == "__main__":
     unittest.main()

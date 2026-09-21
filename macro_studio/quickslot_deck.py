@@ -587,6 +587,9 @@ class StreamDeckButton(QtWidgets.QFrame):
         self.mode = "hybrid"
         self.is_running = False
         self.custom_icon_config: Dict[str, Any] = {}
+        self._single_click_timer = QtCore.QTimer(self)
+        self._single_click_timer.setSingleShot(True)
+        self._single_click_timer.timeout.connect(self._emit_primary_action)
 
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.setMinimumSize(110, 95)
@@ -602,6 +605,11 @@ class StreamDeckButton(QtWidgets.QFrame):
         # Top Bar (Option Menu ... on right)
         top_bar = QtWidgets.QHBoxLayout()
         top_bar.setContentsMargins(0, 0, 0, 0)
+
+        self.slot_number_label = QtWidgets.QLabel(f"#{self.slot_index + 1}")
+        self.slot_number_label.setStyleSheet(
+            "background: transparent; border: none; color: #AFC7F5; font-size: 10pt; font-weight: 800;"
+        )
 
         self.opt_btn = QtWidgets.QToolButton()
         self.opt_btn.setText("···")
@@ -619,6 +627,7 @@ class StreamDeckButton(QtWidgets.QFrame):
         """)
         self.opt_btn.clicked.connect(self._show_options_menu)
 
+        top_bar.addWidget(self.slot_number_label)
         top_bar.addStretch(1)
         top_bar.addWidget(self.opt_btn)
 
@@ -660,6 +669,9 @@ class StreamDeckButton(QtWidgets.QFrame):
         glow_layout.addStretch(1)
 
         layout.addLayout(glow_layout)
+
+    def set_display_number(self, number: int) -> None:
+        self.slot_number_label.setText(f"#{max(1, int(number))}")
 
     def _on_title_label_dragged(self, x_pct: float, y_pct: float) -> None:
         self.custom_icon_config["text_x_percent"] = x_pct
@@ -989,21 +1001,27 @@ class StreamDeckButton(QtWidgets.QFrame):
             win._cancel_mouse_hold_check()
 
         if not is_hold_triggered and event.button() == QtCore.Qt.LeftButton:
-            if self.macro_name:
-                if self.is_running:
-                    self.slot_stopped.emit(self.slot_index, self.macro_name)
-                else:
-                    self.slot_triggered.emit(self.slot_index, self.macro_name)
-            else:
-                pass
+            self._single_click_timer.start(QtWidgets.QApplication.doubleClickInterval())
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == QtCore.Qt.LeftButton and not self.macro_name:
+        if event.button() == QtCore.Qt.LeftButton:
+            self._single_click_timer.stop()
+            win = self.window()
+            if hasattr(win, "_cancel_mouse_hold_check"):
+                win._cancel_mouse_hold_check()
             self.edit_icon_requested.emit(self.slot_index)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+    def _emit_primary_action(self) -> None:
+        if not self.macro_name:
+            return
+        if self.is_running:
+            self.slot_stopped.emit(self.slot_index, self.macro_name)
+        else:
+            self.slot_triggered.emit(self.slot_index, self.macro_name)
 
     def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
         self._show_options_menu(pos=event.globalPos())
@@ -1323,11 +1341,12 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
-        self.setFixedSize(210, 210)
+        self.setFixedSize(300, 300)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.items_keys: List[str] = ["prev_page", "next_page", "settings", "emergency", "refresh", "studio", "topmost", "add_slot"]
         self.hovered_slot: int = -1
+        self.selected_slot: int = -1
 
     def set_radial_keys(self, keys: List[str]) -> None:
         if len(keys) >= 8:
@@ -1338,9 +1357,9 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
         count = 8
         angle_deg = (idx * (360.0 / count)) - 90.0
         angle_rad = math.radians(angle_deg)
-        radius = 66.0
-        cx = 105.0 + radius * math.cos(angle_rad)
-        cy = 105.0 + radius * math.sin(angle_rad)
+        radius = 92.0
+        cx = 150.0 + radius * math.cos(angle_rad)
+        cy = 150.0 + radius * math.sin(angle_rad)
         return QtCore.QPointF(cx, cy)
 
     def _get_slot_at_pos(self, pos: QtCore.QPoint) -> int:
@@ -1348,7 +1367,7 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
             c_pt = self._get_slot_center(i)
             dx = pos.x() - c_pt.x()
             dy = pos.y() - c_pt.y()
-            if math.hypot(dx, dy) <= 20.0:
+            if math.hypot(dx, dy) <= 29.0:
                 return i
         return -1
 
@@ -1363,12 +1382,7 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
         if event.button() == QtCore.Qt.LeftButton:
             slot = self._get_slot_at_pos(event.pos())
             if 0 <= slot < 8:
-                all_keys = list(RADIAL_ACTION_PRESETS.keys())
-                curr_key = self.items_keys[slot]
-                next_idx = (all_keys.index(curr_key) + 1) % len(all_keys) if curr_key in all_keys else 0
-                new_key = all_keys[next_idx]
-                self.items_keys[slot] = new_key
-                self.slot_changed.emit(slot, new_key)
+                self.selected_slot = slot
                 self.update()
         super().mousePressEvent(event)
 
@@ -1398,23 +1412,23 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
 
-        center_pt = QtCore.QPointF(105.0, 105.0)
+        center_pt = QtCore.QPointF(150.0, 150.0)
 
         # Halo ring
         painter.setBrush(QtGui.QColor(10, 14, 23, 210))
         painter.setPen(QtGui.QPen(QtGui.QColor(32, 42, 64, 180), 1.5))
-        painter.drawEllipse(center_pt, 90.0, 90.0)
+        painter.drawEllipse(center_pt, 125.0, 125.0)
 
         # Center close circle
         painter.setBrush(QtGui.QColor(130, 20, 35, 235))
         painter.setPen(QtGui.QPen(QtGui.QColor("#E85566"), 1.5))
-        painter.drawEllipse(center_pt, 15.0, 15.0)
+        painter.drawEllipse(center_pt, 22.0, 22.0)
         font = painter.font()
         font.setPointSize(9)
         font.setBold(True)
         painter.setFont(font)
         painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF")))
-        painter.drawText(QtCore.QRectF(90.0, 90.0, 30.0, 30.0), QtCore.Qt.AlignCenter, "✕")
+        painter.drawText(QtCore.QRectF(128.0, 128.0, 44.0, 44.0), QtCore.Qt.AlignCenter, "MENU")
 
         # Render 8 slots
         for i in range(8):
@@ -1422,19 +1436,20 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
             key = self.items_keys[i] if i < len(self.items_keys) else "settings"
             title, icon_text, color = RADIAL_ACTION_PRESETS.get(key, ("환경 설정", "⚙️", "#6A55FF"))
             is_hover = (i == self.hovered_slot)
+            is_selected = (i == self.selected_slot)
 
-            r_val = 18.0 + (2.5 if is_hover else 0.0)
-            if is_hover:
+            r_val = 26.0 + (3.0 if is_hover else 0.0)
+            if is_hover or is_selected:
                 glow_col = QtGui.QColor(color)
                 painter.setBrush(QtGui.QColor(glow_col.red(), glow_col.green(), glow_col.blue(), 230))
-                painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 2.0))
+                painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 2.5))
             else:
                 painter.setBrush(QtGui.QColor(30, 38, 56, 235))
                 painter.setPen(QtGui.QPen(QtGui.QColor(color), 1.5))
 
             painter.drawEllipse(c_pt, r_val, r_val)
 
-            font.setPointSize(9.5 if not is_hover else 11)
+            font.setPointSize(12 if not is_hover else 14)
             font.setBold(True)
             painter.setFont(font)
             painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF")))
@@ -1450,7 +1465,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.main_window = main_window
         self.setWindowTitle("QuickSlot Deck ⚙️ 환경 설정")
-        self.setMinimumSize(560, 520)
+        self.setMinimumSize(780, 720)
         self.setStyleSheet(stylesheet())
 
         self._init_ui()
@@ -1750,67 +1765,39 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
 
     def _init_radial_tab(self) -> None:
         layout = QtWidgets.QVBoxLayout(self.tab_radial)
-        layout.setSpacing(8)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(14)
 
-        info = QtWidgets.QLabel("🎯 아래 원형 휠의 슬롯을 클릭하거나 하단 항목을 드래그해서 위치를 변경하세요.")
-        info.setStyleSheet("color: #94A3B8; font-size: 9.5pt; font-weight: 700;")
+        info = QtWidgets.QLabel("원하는 기능을 아래 팔레트에서 원형 슬롯으로 끌어다 놓으세요.")
+        info.setAlignment(QtCore.Qt.AlignCenter)
+        info.setStyleSheet("color: #CBD5E1; font-size: 10pt; font-weight: 700;")
         layout.addWidget(info)
 
-        # Interactive Visual Editor & Dropdowns split
-        editor_box = QtWidgets.QHBoxLayout()
-        editor_box.setSpacing(16)
-
-        # Interactive Circular Wheel Canvas
         self.radial_preview = RadialWheelPreviewWidget(self)
         self.radial_preview.slot_changed.connect(self._on_preview_slot_changed)
-        editor_box.addWidget(self.radial_preview, 0, QtCore.Qt.AlignCenter)
+        layout.addWidget(self.radial_preview, 0, QtCore.Qt.AlignHCenter)
 
-        # Combo boxes on right
-        form = QtWidgets.QFormLayout()
-        form.setSpacing(6)
-
-        self.radial_combos: List[QtWidgets.QComboBox] = []
-        action_keys = list(RADIAL_ACTION_PRESETS.keys())
-
-        for i in range(8):
-            combo = QtWidgets.QComboBox()
-            for k in action_keys:
-                title, _, _ = RADIAL_ACTION_PRESETS[k]
-                combo.addItem(f"{title} ({k})", k)
-            combo.currentIndexChanged.connect(self._sync_preview_from_combos)
-            self.radial_combos.append(combo)
-            form.addRow(f"슬롯 #{i + 1}:", combo)
-
-        editor_box.addLayout(form, 1)
-        layout.addLayout(editor_box)
-
-        # Draggable Action Palette Chips below
-        palette_label = QtWidgets.QLabel("💡 드래그용 기능 칩 (원형 휠 슬롯 위로 끌어다 놓기):")
-        palette_label.setStyleSheet("color: #CBD5E1; font-size: 9pt; font-weight: 700; margin-top: 4px;")
+        palette_label = QtWidgets.QLabel("기능 팔레트")
+        palette_label.setStyleSheet("color: #FFFFFF; font-size: 10pt; font-weight: 800;")
         layout.addWidget(palette_label)
 
-        palette_flow = QtWidgets.QHBoxLayout()
-        palette_flow.setSpacing(6)
+        palette_card = QtWidgets.QFrame()
+        palette_card.setStyleSheet("QFrame { background: #0F1420; border: 1px solid #25304A; border-radius: 12px; }")
+        palette_grid = QtWidgets.QGridLayout(palette_card)
+        palette_grid.setContentsMargins(12, 12, 12, 12)
+        palette_grid.setHorizontalSpacing(8)
+        palette_grid.setVerticalSpacing(8)
 
-        for k, (title, icon_text, color) in RADIAL_ACTION_PRESETS.items():
+        for index, (k, (title, icon_text, color)) in enumerate(RADIAL_ACTION_PRESETS.items()):
             chip = DraggableActionChip(k, title, icon_text, color, self)
-            palette_flow.addWidget(chip)
+            chip.setMinimumHeight(34)
+            palette_grid.addWidget(chip, index // 4, index % 4)
 
-        layout.addLayout(palette_flow)
+        layout.addWidget(palette_card)
         layout.addStretch(1)
 
     def _on_preview_slot_changed(self, slot_idx: int, new_key: str) -> None:
-        if 0 <= slot_idx < len(self.radial_combos):
-            combo = self.radial_combos[slot_idx]
-            combo.blockSignals(True)
-            idx = combo.findData(new_key)
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-            combo.blockSignals(False)
-
-    def _sync_preview_from_combos(self) -> None:
-        keys = [c.currentData() for c in self.radial_combos]
-        self.radial_preview.set_radial_keys(keys)
+        self.radial_preview.selected_slot = slot_idx
 
     def _init_backup_tab(self) -> None:
         layout = QtWidgets.QVBoxLayout(self.tab_backup)
@@ -1863,12 +1850,6 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             self.auto_stretch_default.setChecked(bool(self.main_window.config.get("auto_stretch_default", True)))
 
             radial_keys = list(self.main_window.config.get("radial_items") or ["prev_page", "next_page", "settings", "emergency", "refresh", "studio", "topmost", "add_slot"])
-            for i, combo in enumerate(self.radial_combos):
-                key = radial_keys[i] if i < len(radial_keys) else "settings"
-                idx = combo.findData(key)
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-
             self.radial_preview.set_radial_keys(radial_keys)
         finally:
             self._loading_settings = False
@@ -1897,7 +1878,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.main_window.config["theme_index"] = self.theme_combo.currentIndex()
         self.main_window.config["auto_stretch_default"] = self.auto_stretch_default.isChecked()
 
-        radial_items = [combo.currentData() for combo in self.radial_combos]
+        radial_items = list(self.radial_preview.items_keys)
         self.main_window.config["radial_items"] = radial_items
         self.main_window.radial_menu.load_custom_items(radial_items)
 
@@ -2522,6 +2503,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         while self.grid_layout.count():
             item = self.grid_layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
+                item.widget().setParent(None)
                 item.widget().deleteLater()
         self.buttons.clear()
 
@@ -2558,13 +2541,16 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         start_idx = self.current_page * pageSize
         page_slots = filled_slots[start_idx:start_idx + pageSize]
 
-        for r in range(self.rows):
-            self.grid_layout.setRowStretch(r, 1)
-        for c in range(self.cols):
-            self.grid_layout.setColumnStretch(c, 1)
+        visible_cols = min(self.cols, max(1, len(page_slots)))
+        visible_rows = max(1, math.ceil(len(page_slots) / visible_cols))
+        for r in range(20):
+            self.grid_layout.setRowStretch(r, 1 if r < visible_rows else 0)
+        for c in range(20):
+            self.grid_layout.setColumnStretch(c, 1 if c < visible_cols else 0)
 
         for i, (slot_idx, slot_info) in enumerate(page_slots):
             btn = StreamDeckButton(slot_idx, self.swipe_container)
+            btn.set_display_number(start_idx + i + 1)
 
             # Apply custom icon config if present
             icon_cfg = self.custom_icons.get(str(slot_idx), {})
@@ -2580,8 +2566,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             btn.slot_stopped.connect(self._stop_slot_macro)
             btn.edit_icon_requested.connect(self._edit_slot_icon)
 
-            row = i // self.cols
-            col = i % self.cols
+            row = i // visible_cols
+            col = i % visible_cols
             self.grid_layout.addWidget(btn, row, col)
             self.buttons.append(btn)
         self.refresh_states()
@@ -2594,8 +2580,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 fit_rows = math.ceil(active_count / fit_cols)
                 gap = int(self.config.get("tile_gap", 10))
 
-                card_w = 180
-                card_h = 130
+                card_w = 190
+                card_h = 138
                 needed_w = max(280, fit_cols * card_w + (fit_cols - 1) * gap + 24)
                 needed_h = max(160, fit_rows * card_h + (fit_rows - 1) * gap + 24)
                 self.resize(needed_w, needed_h)

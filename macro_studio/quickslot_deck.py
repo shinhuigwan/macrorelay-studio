@@ -42,6 +42,113 @@ BASE_TILE_SIDE = 190
 MIN_TILE_SIDE = 48
 WINDOW_PADDING = 16
 PRESET_STYLE_KEYS = ("theme_index", "tile_scale", "tile_gap", "tile_radius", "hover_glow", "empty_slot_opacity")
+QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS = 240
+
+
+def glass_dialog_stylesheet() -> str:
+    """Light frosted controls matching the runtime radial wheel."""
+    return """
+        QDialog, QScrollArea, QScrollArea > QWidget > QWidget {
+            background: #F4F7FB;
+            color: #172033;
+        }
+        QLabel, QCheckBox, QRadioButton, QGroupBox {
+            color: #172033;
+            background: transparent;
+        }
+        QGroupBox {
+            border: 1px solid #CBD5E1;
+            border-radius: 12px;
+            margin-top: 10px;
+            padding-top: 10px;
+            font-weight: 700;
+        }
+        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget, QTextEdit {
+            color: #172033;
+            background: rgba(255, 255, 255, 0.96);
+            border: 1px solid #C5CEDB;
+            border-radius: 8px;
+            padding: 6px 9px;
+            selection-background-color: #B9DAFF;
+        }
+        QComboBox::drop-down { border: none; width: 24px; }
+        QComboBox QAbstractItemView {
+            color: #172033;
+            background: #FFFFFF;
+            border: 1px solid #CBD5E1;
+            selection-background-color: #DCEEFF;
+        }
+        QPushButton, QToolButton {
+            color: #263449;
+            background: rgba(255, 255, 255, 0.94);
+            border: 1px solid #BCC7D6;
+            border-radius: 9px;
+            padding: 7px 13px;
+            font-weight: 700;
+        }
+        QPushButton:hover, QToolButton:hover {
+            background: #E7F2FF;
+            border-color: #7CB7F2;
+        }
+        QPushButton:pressed, QToolButton:pressed { background: #CFE7FF; }
+        QPushButton:disabled { color: #9AA7B8; background: #E9EEF4; }
+        QSlider::groove:horizontal {
+            height: 5px; background: #D6DEE9; border-radius: 2px;
+        }
+        QSlider::handle:horizontal {
+            width: 16px; margin: -6px 0; border-radius: 8px;
+            background: #78B7F2; border: 2px solid #FFFFFF;
+        }
+        QScrollBar:vertical, QScrollBar:horizontal { background: #EDF1F6; border: none; }
+        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+            background: #B9C5D4; border-radius: 5px; min-height: 24px; min-width: 24px;
+        }
+        QTabWidget::pane {
+            border: 1px solid #C8D2DF;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.82);
+            padding: 10px;
+        }
+        QTabBar::tab {
+            color: #68768A;
+            background: #E9EEF5;
+            border: 1px solid #CDD6E2;
+            padding: 9px 15px;
+            font-weight: 700;
+            border-top-left-radius: 9px;
+            border-top-right-radius: 9px;
+            margin-right: 4px;
+        }
+        QTabBar::tab:selected {
+            color: #172033;
+            background: #FFFFFF;
+            border-bottom: 2px solid #75B8F7;
+        }
+    """
+
+
+def position_dialog_beside(parent: QtWidgets.QWidget, dialog: QtWidgets.QDialog, gap: int = 18) -> QtCore.QPoint:
+    """Place tools beside the deck, preferring its left side without leaving the screen."""
+    dialog.ensurePolished()
+    target_size = dialog.size().expandedTo(dialog.minimumSizeHint()).expandedTo(dialog.minimumSize())
+    dialog.resize(target_size)
+    parent_rect = parent.frameGeometry()
+    screen = QtGui.QGuiApplication.screenAt(parent_rect.center()) or parent.screen()
+    available = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1920, 1080)
+    left_x = parent_rect.left() - dialog.width() - gap
+    right_x = parent_rect.right() + gap + 1
+    if left_x >= available.left():
+        x = left_x
+    elif right_x + dialog.width() - 1 <= available.right():
+        x = right_x
+    else:
+        left_space = parent_rect.left() - available.left()
+        right_space = available.right() - parent_rect.right()
+        x = available.left() if left_space >= right_space else available.right() - dialog.width() + 1
+    y = max(available.top(), min(parent_rect.top(), available.bottom() - dialog.height() + 1))
+    point = QtCore.QPoint(x, y)
+    dialog.move(point)
+    return point
 
 
 def quickslot_preset_icon_paths(root: Path) -> List[Path]:
@@ -329,7 +436,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"아이콘 및 타일 상세 편집 - 슬롯 #{slot_index + 1}")
         self.setMinimumSize(720, 700)
         self.resize(760, 840)
-        self.setStyleSheet(stylesheet())
+        self.setStyleSheet(glass_dialog_stylesheet())
 
         self._init_ui()
         self._load_current_values()
@@ -341,7 +448,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
 
         # Title
         header_title = QtWidgets.QLabel(f"🖼️ 슬롯 #{self.slot_index + 1} 커스텀 아이콘 & 텍스트 편집")
-        header_title.setStyleSheet("font-size: 14pt; font-weight: 800; color: #FFFFFF;")
+        header_title.setStyleSheet("font-size: 14pt; font-weight: 800; color: #172033;")
         header_title.setMinimumHeight(32)
         root_layout.addWidget(header_title)
 
@@ -358,7 +465,8 @@ class SlotIconEditDialog(QtWidgets.QDialog):
 
         # Form Card
         form_card = QtWidgets.QFrame()
-        form_card.setStyleSheet("background-color: #131722; border: 1px solid #202738; border-radius: 12px; padding: 12px;")
+        form_card.setObjectName("IconFormCard")
+        form_card.setStyleSheet("QFrame#IconFormCard { background: rgba(255,255,255,0.88); border: 1px solid #CBD5E1; border-radius: 12px; padding: 12px; }")
         form_layout = QtWidgets.QFormLayout(form_card)
         form_layout.setSpacing(12)
         form_layout.setHorizontalSpacing(16)
@@ -370,7 +478,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         self.file_edit.textChanged.connect(self._update_preview)
 
         btn_browse = QtWidgets.QPushButton("📁 파일 선택...")
-        btn_browse.setStyleSheet("background-color: #1A2234; border: 1px solid #323F58; color: #D0D7E3; font-weight: 600; padding: 6px 12px;")
+        btn_browse.setStyleSheet("background: #FFFFFF; border: 1px solid #B9C6D6; color: #263449; font-weight: 700; padding: 6px 12px; border-radius: 8px;")
         btn_browse.clicked.connect(self._browse_image)
 
         file_box.addWidget(self.file_edit, 1)
@@ -379,7 +487,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
 
         preset_section = QtWidgets.QFrame()
         preset_section.setStyleSheet(
-            "QFrame { background: #101622; border: 1px solid #28344D; border-radius: 11px; }"
+            "QFrame { background: rgba(255,255,255,0.78); border: 1px solid #CBD5E1; border-radius: 11px; }"
         )
         preset_section_layout = QtWidgets.QVBoxLayout(preset_section)
         preset_section_layout.setContentsMargins(12, 10, 12, 10)
@@ -390,7 +498,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         preset_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         preset_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         preset_scroll.setStyleSheet(
-            "QScrollArea { background: #0D121D; border: 1px solid #28344D; border-radius: 9px; }"
+            "QScrollArea { background: #EDF3F9; border: 1px solid #CBD5E1; border-radius: 9px; }"
         )
         self.preset_host = QtWidgets.QWidget()
         self.preset_row = QtWidgets.QHBoxLayout(self.preset_host)
@@ -398,7 +506,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         self.preset_row.setSpacing(8)
         preset_scroll.setWidget(self.preset_host)
         preset_title = QtWidgets.QLabel("아이콘 보관함 · 좌우로 넘겨서 선택")
-        preset_title.setStyleSheet("color: #CBD5E1; font-weight: 700; border: none;")
+        preset_title.setStyleSheet("color: #334155; font-weight: 700; border: none;")
         add_icons_button = QtWidgets.QPushButton("＋ 아이콘 여러 개 저장")
         add_icons_button.setToolTip("여러 이미지 파일을 선택해 프로그램 아이콘 보관함에 저장합니다.")
         add_icons_button.clicked.connect(self._import_icons_to_library)
@@ -412,13 +520,13 @@ class SlotIconEditDialog(QtWidgets.QDialog):
 
         # Full Stretch Checkbox
         self.stretch_check = QtWidgets.QCheckBox("타일 카드 전체 가득 채우기 (Full Tile Stretch)")
-        self.stretch_check.setStyleSheet("font-weight: 700; color: #7C6CFF;")
+        self.stretch_check.setStyleSheet("font-weight: 700; color: #5547C8;")
         self.stretch_check.toggled.connect(self._update_preview)
         form_layout.addRow("", self.stretch_check)
 
         # Show Text Checkbox
         self.show_text_check = QtWidgets.QCheckBox("매크로 이름 텍스트 표시하기 (Show Text)")
-        self.show_text_check.setStyleSheet("font-weight: 700; color: #35C89A;")
+        self.show_text_check.setStyleSheet("font-weight: 700; color: #168566;")
         self.show_text_check.setChecked(True)
         self.show_text_check.toggled.connect(self._update_preview)
         form_layout.addRow("", self.show_text_check)
@@ -519,9 +627,9 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         # Live Preview Container
         preview_header = QtWidgets.QHBoxLayout()
         preview_label = QtWidgets.QLabel("👁️ 실시간 미리보기")
-        preview_label.setStyleSheet("font-size: 11pt; font-weight: 700; color: #808C9E;")
+        preview_label.setStyleSheet("font-size: 11pt; font-weight: 700; color: #536278;")
         drag_hint = QtWidgets.QLabel("💡 카드 내부의 텍스트를 마우스로 직접 클릭 & 드래그해보세요!")
-        drag_hint.setStyleSheet("font-size: 8.5pt; font-weight: 600; color: #35C89A;")
+        drag_hint.setStyleSheet("font-size: 8.5pt; font-weight: 600; color: #168566;")
 
         preview_header.addWidget(preview_label)
         preview_header.addStretch(1)
@@ -544,14 +652,14 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         # Action Buttons
         btn_box = QtWidgets.QHBoxLayout()
         btn_reset = QtWidgets.QPushButton("🔄 초기화")
-        btn_reset.setStyleSheet("background-color: #241B20; border: 1px solid #78323C; color: #FF9AA5; font-weight: 600; padding: 8px 16px;")
+        btn_reset.setStyleSheet("background: #FFF1F2; border: 1px solid #FDA4AF; color: #BE123C; font-weight: 700; padding: 8px 16px; border-radius: 9px;")
         btn_reset.clicked.connect(self._reset_config)
 
         btn_cancel = QtWidgets.QPushButton("취소")
         btn_cancel.clicked.connect(self.reject)
 
         btn_save = QtWidgets.QPushButton("적용 및 저장")
-        btn_save.setStyleSheet("background-color: #1F193E; border: 1.5px solid #6A55FF; color: #FFFFFF; font-weight: 700; padding: 8px 20px;")
+        btn_save.setStyleSheet("background: #DCEEFF; border: 1.5px solid #72B2EE; color: #173A5E; font-weight: 800; padding: 8px 20px; border-radius: 9px;")
         btn_save.clicked.connect(self.accept)
 
         btn_box.addWidget(btn_reset)
@@ -1601,9 +1709,9 @@ class DraggableActionChip(QtWidgets.QLabel):
         self.setToolTip(f"이 항목을 클릭하거나 라디얼 원형 메뉴 슬롯으로 끌어다 놓으세요: {title}")
         self.setStyleSheet(f"""
             QLabel {{
-                background-color: #181F30;
+                background-color: rgba(255, 255, 255, 0.92);
                 border: 1.5px solid {color};
-                color: #FFFFFF;
+                color: #263449;
                 border-radius: 8px;
                 padding: 5px 10px;
                 font-size: 9pt;
@@ -1759,7 +1867,7 @@ class SlotPresetDialog(QtWidgets.QDialog):
         self.active_id = str(main_window.config.get("active_slot_preset") or "default")
         self.setWindowTitle("QuickSlot 덱 프리셋 관리")
         self.setMinimumSize(620, 460)
-        self.setStyleSheet(stylesheet())
+        self.setStyleSheet(glass_dialog_stylesheet())
 
         root = QtWidgets.QVBoxLayout(self)
         info = QtWidgets.QLabel(
@@ -1767,7 +1875,7 @@ class SlotPresetDialog(QtWidgets.QDialog):
             "좌클릭을 1초간 유지하면 이 목록을 라디얼 메뉴에서 바로 전환할 수 있습니다."
         )
         info.setWordWrap(True)
-        info.setStyleSheet("color: #CBD5E1; font-weight: 700;")
+        info.setStyleSheet("color: #536278; font-weight: 700;")
         root.addWidget(info)
 
         self.list_widget = QtWidgets.QListWidget()
@@ -1874,7 +1982,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.main_window = main_window
         self.setWindowTitle("QuickSlot Deck ⚙️ 환경 설정")
         self.setMinimumSize(780, 720)
-        self.setStyleSheet(stylesheet())
+        self.setStyleSheet(glass_dialog_stylesheet())
 
         self._init_ui()
         self._load_settings()
@@ -1886,34 +1994,11 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
 
         # Header
         header = QtWidgets.QLabel("⚙️ QuickSlot Deck 시스템 및 환경 설정")
-        header.setStyleSheet("font-size: 14pt; font-weight: 800; color: #FFFFFF;")
+        header.setStyleSheet("font-size: 14pt; font-weight: 800; color: #172033;")
         layout.addWidget(header)
 
         # Tab Widget
         self.tabs = QtWidgets.QTabWidget()
-        self.tabs.setStyleSheet("""
-            QTabWidget::pane {
-                border: 1px solid #202738;
-                border-radius: 10px;
-                background-color: #131722;
-                padding: 10px;
-            }
-            QTabBar::tab {
-                background: #181F30;
-                border: 1px solid #2A364F;
-                color: #94A3B8;
-                padding: 8px 16px;
-                font-weight: 700;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-                margin-right: 4px;
-            }
-            QTabBar::tab:selected {
-                background: #1E293B;
-                color: #FFFFFF;
-                border-bottom: 2px solid #6A55FF;
-            }
-        """)
 
         # Tab 1: System & Autostart
         self.tab_sys = QtWidgets.QWidget()
@@ -1948,7 +2033,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         btn_cancel.clicked.connect(self.reject)
 
         btn_apply = QtWidgets.QPushButton("적용 및 저장")
-        btn_apply.setStyleSheet("background-color: #1F193E; border: 1.5px solid #6A55FF; color: #FFFFFF; font-weight: 700; padding: 8px 22px;")
+        btn_apply.setStyleSheet("background: #DCEEFF; border: 1.5px solid #72B2EE; color: #173A5E; font-weight: 800; padding: 8px 22px; border-radius: 9px;")
         btn_apply.clicked.connect(self._apply_settings)
 
         btn_box.addStretch(1)
@@ -1962,7 +2047,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         form.setSpacing(14)
 
         self.autostart_check = QtWidgets.QCheckBox("윈도우 부팅 시 QuickSlot Deck 자동 실행")
-        self.autostart_check.setStyleSheet("font-weight: 700; color: #35C89A;")
+        self.autostart_check.setStyleSheet("font-weight: 700; color: #168566;")
 
         self.start_min_check = QtWidgets.QCheckBox("시작 시 트레이(최소화) 모드로 실행")
         self.topmost_check = QtWidgets.QCheckBox("프로그램 실행 시 항상 위(TopMost) 고정")
@@ -2040,7 +2125,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.hover_glow_check.toggled.connect(self._on_hover_glow_live_changed)
 
         self.compact_fit_check = QtWidgets.QCheckBox("등록된 슬롯만 표시하고 프로그램 창 크기 자동 맞춤")
-        self.compact_fit_check.setStyleSheet("font-weight: 700; color: #38BDF8;")
+        self.compact_fit_check.setStyleSheet("font-weight: 700; color: #2879B9;")
         self.compact_fit_check.setChecked(True)
         self.compact_fit_check.setEnabled(False)
 
@@ -2206,7 +2291,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
 
         info = QtWidgets.QLabel("원하는 기능을 아래 팔레트에서 원형 슬롯으로 끌어다 놓으세요.")
         info.setAlignment(QtCore.Qt.AlignCenter)
-        info.setStyleSheet("color: #CBD5E1; font-size: 10pt; font-weight: 700;")
+        info.setStyleSheet("color: #536278; font-size: 10pt; font-weight: 700;")
         layout.addWidget(info)
 
         self.radial_preview = RadialWheelPreviewWidget(self)
@@ -2214,11 +2299,11 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         layout.addWidget(self.radial_preview, 0, QtCore.Qt.AlignHCenter)
 
         palette_label = QtWidgets.QLabel("기능 팔레트")
-        palette_label.setStyleSheet("color: #FFFFFF; font-size: 10pt; font-weight: 800;")
+        palette_label.setStyleSheet("color: #172033; font-size: 10pt; font-weight: 800;")
         layout.addWidget(palette_label)
 
         palette_card = QtWidgets.QFrame()
-        palette_card.setStyleSheet("QFrame { background: #0F1420; border: 1px solid #25304A; border-radius: 12px; }")
+        palette_card.setStyleSheet("QFrame { background: rgba(255,255,255,0.82); border: 1px solid #CBD5E1; border-radius: 12px; }")
         palette_grid = QtWidgets.QGridLayout(palette_card)
         palette_grid.setContentsMargins(12, 12, 12, 12)
         palette_grid.setHorizontalSpacing(8)
@@ -2243,19 +2328,19 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             "💾 QuickSlot Deck의 모든 매크로 슬롯 설정과 내장 커스텀 아이콘(Base64) 데이터를 백업 파일(.json)로 내보내거나 복원할 수 있습니다."
         )
         info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #94A3B8; font-size: 9.5pt;")
+        info_label.setStyleSheet("color: #637187; font-size: 9.5pt;")
         layout.addWidget(info_label)
 
         btn_export = QtWidgets.QPushButton("📤 백업 파일 내보내기 (Export .json)")
-        btn_export.setStyleSheet("background-color: #162B3D; border: 1.5px solid #2B6CB0; color: #63B3ED; font-weight: 700; padding: 10px;")
+        btn_export.setStyleSheet("background: #E8F3FF; border: 1.5px solid #7DB8EE; color: #205A8C; font-weight: 700; padding: 10px; border-radius: 9px;")
         btn_export.clicked.connect(self._export_config)
 
         btn_import = QtWidgets.QPushButton("📥 백업 파일 가져오기 (Import .json)")
-        btn_import.setStyleSheet("background-color: #173328; border: 1.5px solid #2F855A; color: #68D391; font-weight: 700; padding: 10px;")
+        btn_import.setStyleSheet("background: #EAFBF4; border: 1.5px solid #74C9A9; color: #176B50; font-weight: 700; padding: 10px; border-radius: 9px;")
         btn_import.clicked.connect(self._import_config)
 
         btn_reset_all = QtWidgets.QPushButton("⚠️ 모든 슬롯 및 설정 초기화")
-        btn_reset_all.setStyleSheet("background-color: #381A1D; border: 1.5px solid #C53030; color: #FEB2B2; font-weight: 700; padding: 10px;")
+        btn_reset_all.setStyleSheet("background: #FFF1F2; border: 1.5px solid #FDA4AF; color: #BE123C; font-weight: 700; padding: 10px; border-radius: 9px;")
         btn_reset_all.clicked.connect(self._reset_all_config)
 
         layout.addWidget(btn_export)
@@ -2463,6 +2548,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def __init__(self, repository: Optional[MacroRepository] = None, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.setDoubleClickInterval(QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS)
         self.repository = repository or MacroRepository()
         self.config_path = self.repository.root / ".quickslot_deck_config.json"
         self.active_processes: Dict[int, tuple[str, subprocess.Popen[Any]]] = {}
@@ -2876,6 +2964,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
     def _open_hold_preset_dialog(self) -> None:
         self._capture_active_slot_preset()
         dialog = SlotPresetDialog(self, self)
+        position_dialog_beside(self, dialog)
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
         target_id = dialog.selected_preset_id()
@@ -2939,6 +3028,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         dlg = QuickSlotDeckSettingsDialog(self, self)
         if 0 <= target_tab < dlg.tabs.count():
             dlg.tabs.setCurrentIndex(target_tab)
+        position_dialog_beside(self, dlg)
         dlg.exec_()
 
     # Window Drag Support for Frameless Window & Long-press / Right-click Radial Menu
@@ -3134,6 +3224,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         current_cfg = self.custom_icons.get(str(slot_idx), {})
         dlg = SlotIconEditDialog(slot_idx, macro_name, current_cfg, self)
         dlg.live_config_changed.connect(self._preview_slot_icon)
+        position_dialog_beside(self, dlg)
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             new_cfg = dlg.get_config()
             self.custom_icons[str(slot_idx)] = new_cfg

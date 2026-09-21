@@ -43,6 +43,34 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual(1, window.grid_layout.count())
             window.close()
 
+    def test_quickslot_uses_short_double_click_interval(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.quickslot_deck import QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS, QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            self.assertEqual(240, QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS)
+            self.assertEqual(QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS, QtWidgets.QApplication.doubleClickInterval())
+            window.close()
+
+    def test_tool_dialog_prefers_left_side_of_deck(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.quickslot_deck import position_dialog_beside
+
+        available = self.app.primaryScreen().availableGeometry()
+        parent = QtWidgets.QWidget()
+        parent.resize(180, 180)
+        parent.move(available.right() - 220, available.top() + 60)
+        dialog = QtWidgets.QDialog(parent)
+        dialog.setMinimumSize(300, 220)
+        point = position_dialog_beside(parent, dialog)
+
+        self.assertLess(point.x() + dialog.width(), parent.frameGeometry().left())
+        self.assertGreaterEqual(point.y(), available.top())
+        dialog.close()
+        parent.close()
+
     def test_tile_scale_presets_include_half_and_quarter(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository

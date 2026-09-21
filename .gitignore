@@ -48,6 +48,8 @@ opencv_live_check.txt
 studio-launch-error.txt
 startup.cooldown
 ocr_last.txt
+/.quickslot_deck_config.json
+/quickslot-launch-error.txt
 /바탕 화면
 
 # Generated UI captures and design drafts

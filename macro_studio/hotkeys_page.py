@@ -152,14 +152,43 @@ class HotkeysPage(QtWidgets.QWidget):
         apply_button.clicked.connect(self._apply_runner)
         stop = danger_button("Runner 중지")
         stop.clicked.connect(self._stop_runner)
+        btn_deck = primary_button("📱 퀵스트림 실행")
+        btn_deck.setToolTip("보조 터치 모니터용 퀵스트림 전용 창을 엽니다.")
+        btn_deck.clicked.connect(self._launch_deck_window)
+        btn_install_deck = QtWidgets.QPushButton("⬇ 퀵스트림 설치")
+        btn_install_deck.setToolTip("퀵스트림 실행 파일을 점검하고 바탕화면 바로가기를 만듭니다.")
+        btn_install_deck.clicked.connect(self._install_deck_shortcut)
         layout.addWidget(self.runner_status)
         layout.addWidget(self.runner_detail)
         layout.addStretch(1)
+        layout.addWidget(btn_deck)
+        layout.addWidget(btn_install_deck)
         layout.addWidget(self.startup_check)
         layout.addWidget(self.start_runner_button)
         layout.addWidget(apply_button)
         layout.addWidget(stop)
         return card
+
+    def _launch_deck_window(self) -> None:
+        from .quickslot_deck import QuickSlotDeckWindow
+        if not hasattr(self, "_deck_window") or self._deck_window is None or not self._deck_window.isVisible():
+            self._deck_window = QuickSlotDeckWindow(self.repository)
+        self._deck_window.show()
+        self._deck_window.raise_()
+        self._deck_window.activateWindow()
+
+    def _install_deck_shortcut(self) -> None:
+        from .quickslot_deck import install_quickslot_desktop_shortcut
+        try:
+            shortcut = install_quickslot_desktop_shortcut(self.repository.root)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "퀵스트림 설치 실패", str(exc))
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "퀵스트림 설치 완료",
+            f"바탕화면에 퀵스트림 바로가기를 만들었습니다.\n{shortcut}",
+        )
 
     def refresh(self) -> None:
         self.payload = self.repository.load_hotkeys()

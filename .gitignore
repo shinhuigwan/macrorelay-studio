@@ -55,6 +55,8 @@ ocr_last.txt
 # Generated UI captures and design drafts
 /*.png
 branding/*
+!branding/quickslot-icons/
+!branding/quickslot-icons/*.png
 !branding/macrorelay-studio.ico
 !branding/macrorelay-studio.png
 !branding/macrorelay-runner.ico

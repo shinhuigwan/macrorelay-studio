@@ -182,6 +182,23 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual(["첫 번째"], [button.macro_name for button in window.buttons])
             window.close()
 
+    def test_bundled_icon_gallery_selects_and_embeds_image(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.quickslot_deck import SlotIconEditDialog, quickslot_preset_icon_paths
+
+        project_root = Path(__file__).resolve().parents[1]
+        presets = quickslot_preset_icon_paths(project_root)
+        self.assertEqual(16, len(presets))
+        self.assertTrue(all(not QtGui.QPixmap(str(path)).isNull() for path in presets))
+
+        dialog = SlotIconEditDialog(0, "테스트")
+        dialog._select_preset_icon(presets[0])
+        config = dialog.get_config()
+        self.assertEqual(str(presets[0].resolve()), config["image_path"])
+        self.assertTrue(config["image_data"].startswith("data:image/png;base64,"))
+        self.assertTrue(config["full_stretch"])
+        dialog.close()
+
 
 if __name__ == "__main__":
     unittest.main()

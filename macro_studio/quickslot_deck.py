@@ -34,6 +34,17 @@ from macro_studio.theme import stylesheet
 
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "MacroRelayQuickSlot"
+PRESET_ICON_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ico"}
+
+
+def quickslot_preset_icon_paths(root: Path) -> List[Path]:
+    preset_dir = root / "branding" / "quickslot-icons"
+    if not preset_dir.is_dir():
+        return []
+    return sorted(
+        (path for path in preset_dir.iterdir() if path.is_file() and path.suffix.lower() in PRESET_ICON_EXTENSIONS),
+        key=lambda path: path.name.casefold(),
+    )
 
 
 def install_quickslot_desktop_shortcut(root: Path) -> Path:
@@ -263,9 +274,12 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         self.slot_index = slot_index
         self.macro_name = macro_name or f"슬롯 #{slot_index + 1}"
         self.icon_config = dict(icon_config or {})
+        repository = getattr(parent, "repository", None)
+        self.app_root = Path(getattr(repository, "root", Path(__file__).resolve().parents[1]))
+        self.preset_buttons: Dict[str, QtWidgets.QToolButton] = {}
 
         self.setWindowTitle(f"아이콘 및 타일 상세 편집 - 슬롯 #{slot_index + 1}")
-        self.setMinimumSize(540, 680)
+        self.setMinimumSize(720, 880)
         self.setStyleSheet(stylesheet())
 
         self._init_ui()
@@ -301,6 +315,53 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         file_box.addWidget(self.file_edit, 1)
         file_box.addWidget(btn_browse)
         form_layout.addRow("아이콘 이미지 파일:", file_box)
+
+        preset_paths = quickslot_preset_icon_paths(self.app_root)
+        preset_section = QtWidgets.QFrame()
+        preset_section.setStyleSheet(
+            "QFrame { background: #101622; border: 1px solid #28344D; border-radius: 11px; }"
+        )
+        preset_section_layout = QtWidgets.QVBoxLayout(preset_section)
+        preset_section_layout.setContentsMargins(12, 10, 12, 10)
+        preset_section_layout.setSpacing(7)
+        preset_scroll = QtWidgets.QScrollArea()
+        preset_scroll.setWidgetResizable(True)
+        preset_scroll.setFixedHeight(112)
+        preset_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        preset_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        preset_scroll.setStyleSheet(
+            "QScrollArea { background: #0D121D; border: 1px solid #28344D; border-radius: 9px; }"
+        )
+        preset_host = QtWidgets.QWidget()
+        preset_row = QtWidgets.QHBoxLayout(preset_host)
+        preset_row.setContentsMargins(8, 8, 8, 8)
+        preset_row.setSpacing(8)
+        for preset_path in preset_paths:
+            button = QtWidgets.QToolButton()
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.setFixedSize(82, 82)
+            button.setIcon(QtGui.QIcon(str(preset_path)))
+            button.setIconSize(QtCore.QSize(68, 68))
+            button.setToolTip(preset_path.stem)
+            button.setStyleSheet(
+                "QToolButton { background: #111827; border: 1px solid #334155; border-radius: 9px; padding: 5px; }"
+                "QToolButton:hover { border: 2px solid #38BDF8; }"
+                "QToolButton:checked { border: 2px solid #7C6CFF; background: #1F193E; }"
+            )
+            button.clicked.connect(lambda _checked=False, p=preset_path: self._select_preset_icon(p))
+            self.preset_buttons[str(preset_path.resolve())] = button
+            preset_row.addWidget(button)
+        if not preset_paths:
+            empty_label = QtWidgets.QLabel("기본 아이콘이 없습니다.")
+            empty_label.setObjectName("Muted")
+            preset_row.addWidget(empty_label)
+        preset_row.addStretch(1)
+        preset_scroll.setWidget(preset_host)
+        preset_title = QtWidgets.QLabel("기본 아이콘 · 좌우로 넘겨서 선택")
+        preset_title.setStyleSheet("color: #CBD5E1; font-weight: 700; border: none;")
+        preset_section_layout.addWidget(preset_title)
+        preset_section_layout.addWidget(preset_scroll)
 
         # Full Stretch Checkbox
         self.stretch_check = QtWidgets.QCheckBox("타일 카드 전체 가득 채우기 (Full Tile Stretch)")
@@ -406,6 +467,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         form_layout.addRow("아이콘-텍스트 여백 간격:", spacing_box)
 
         layout.addWidget(form_card)
+        layout.addWidget(preset_section)
 
         # Live Preview Container
         preview_header = QtWidgets.QHBoxLayout()
@@ -499,6 +561,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         pos_map = {"bottom": 0, "top": 1, "center": 2, "custom": 3, "hidden": 4}
 
         self.file_edit.setText(img_path)
+        self._sync_preset_selection(str(img_path))
         self.stretch_check.setChecked(full_stretch)
         self.show_text_check.setChecked(text_show)
         self.emoji_edit.setText(emoji)
@@ -522,11 +585,30 @@ class SlotIconEditDialog(QtWidgets.QDialog):
             self.file_edit.setText(path)
             self.stretch_check.setChecked(True)
             self._current_base64 = encode_image_file_to_base64(path)
+            self._sync_preset_selection(path)
             self._update_preview()
+
+    def _select_preset_icon(self, path: Path) -> None:
+        resolved = str(path.resolve())
+        self._current_base64 = encode_image_file_to_base64(resolved)
+        self.file_edit.setText(resolved)
+        self.stretch_check.setChecked(True)
+        self.emoji_edit.clear()
+        self._sync_preset_selection(resolved)
+        self._update_preview()
+
+    def _sync_preset_selection(self, path: str) -> None:
+        try:
+            resolved = str(Path(path).resolve()) if path else ""
+        except Exception:
+            resolved = ""
+        for preset_path, button in self.preset_buttons.items():
+            button.setChecked(preset_path == resolved)
 
     def _reset_config(self) -> None:
         self.file_edit.clear()
         self._current_base64 = ""
+        self._sync_preset_selection("")
         self.stretch_check.setChecked(False)
         self.show_text_check.setChecked(True)
         self.emoji_edit.clear()

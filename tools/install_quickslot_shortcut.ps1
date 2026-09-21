@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path
 $launcher = Join-Path $resolvedRoot "run_quickslot.ps1"
-$icon = Join-Path $resolvedRoot "branding\macrorelay-runner.ico"
+$icon = Join-Path $resolvedRoot "branding\macrorelay-quickslot.ico"
 if (-not (Test-Path -LiteralPath $launcher)) {
     throw "run_quickslot.ps1 파일을 찾을 수 없습니다."
 }

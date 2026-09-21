@@ -213,6 +213,15 @@ class TouchSwipeWidget(QtWidgets.QWidget):
                 win.radial_menu.popup_at(event.globalPos())
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            win = self.window()
+            if hasattr(win, "_show_preset_radial"):
+                win._show_preset_radial(event.globalPos(), sticky=True)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         win = self.window()
         if hasattr(win, "_handle_window_drag_move") and win._handle_window_drag_move(event):
@@ -1317,11 +1326,7 @@ class RadialPieMenuItem:
 
 
 class RadialPieMenuWidget(QtWidgets.QWidget):
-    """Futuristic Radial Pie Wheel Menu Overlay matching user screenshot.
-
-    Supports 8 circular ring slot buttons around a central close button (✕).
-    Supports mouse hover, click, and drag-release gesture selection.
-    """
+    """Glass-style radial wheel supporting hold gestures and sticky double-click mode."""
 
     action_triggered = QtCore.Signal(str)
 
@@ -1330,15 +1335,19 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.ToolTip | QtCore.Qt.WindowStaysOnTopHint)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
-        self.setFixedSize(320, 320)
+        self.setFixedSize(400, 400)
 
-        self.center_pt = QtCore.QPoint(160, 160)
-        self.radius = 95.0
-        self.item_radius = 24.0
-        self.center_radius = 19.0
+        self.center_pt = QtCore.QPoint(200, 200)
+        self.radius = 172.0
+        self.inner_radius = 72.0
+        self.center_radius = 64.0
 
         self.hovered_idx: int = -1
         self.items: List[RadialPieMenuItem] = []
+        self.sticky = False
+        self.center_title = "Quick Actions"
+        self.center_subtitle = "관리 메뉴"
+        self._sticky_timer = QtCore.QElapsedTimer()
         self._init_default_items()
 
     def _init_default_items(self) -> None:
@@ -1349,6 +1358,8 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
             self.items.append(RadialPieMenuItem(k, title, icon_text, color))
 
     def load_custom_items(self, custom_keys: Optional[List[str]]) -> None:
+        self.center_title = "Quick Actions"
+        self.center_subtitle = "관리 메뉴"
         if not custom_keys or len(custom_keys) < 8:
             self._init_default_items()
             return
@@ -1363,6 +1374,8 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
             self._init_default_items()
 
     def load_deck_presets(self, presets: List[tuple[str, str]]) -> None:
+        self.center_title = "Preset"
+        self.center_subtitle = "모드 전환"
         colors = ["#38BDF8", "#A78BFA", "#34D399", "#F59E0B", "#F472B6", "#22D3EE", "#818CF8", "#FB7185"]
         self.items = [
             RadialPieMenuItem(f"deck:{preset_id}", preset_name, str(position + 1), colors[position % len(colors)])
@@ -1373,21 +1386,29 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
             self.items = [RadialPieMenuItem("preset_settings", title, icon_text, color)]
         self.update()
 
-    def popup_at(self, global_pos: QtCore.QPoint) -> None:
-        top_left = global_pos - QtCore.QPoint(160, 160)
+    def popup_at(self, global_pos: QtCore.QPoint, sticky: bool = False) -> None:
+        top_left = global_pos - self.center_pt
         self.move(top_left)
         self.hovered_idx = -1
+        self.sticky = sticky
         self.show()
         self.raise_()
         self.activateWindow()
-        self.grabMouse()
+        if sticky:
+            self._sticky_timer.start()
+            app = QtWidgets.QApplication.instance()
+            if app:
+                app.installEventFilter(self)
+        else:
+            self.grabMouse()
 
     def _get_item_center(self, idx: int) -> QtCore.QPointF:
         count = len(self.items) or 8
         angle_deg = (idx * (360.0 / count)) - 90.0
         angle_rad = math.radians(angle_deg)
-        cx = self.center_pt.x() + self.radius * math.cos(angle_rad)
-        cy = self.center_pt.y() + self.radius * math.sin(angle_rad)
+        label_radius = (self.inner_radius + self.radius) / 2.0
+        cx = self.center_pt.x() + label_radius * math.cos(angle_rad)
+        cy = self.center_pt.y() + label_radius * math.sin(angle_rad)
         return QtCore.QPointF(cx, cy)
 
     def _update_hover_from_pos(self, pos: QtCore.QPoint) -> None:
@@ -1395,13 +1416,13 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         dy = pos.y() - self.center_pt.y()
         dist = math.hypot(dx, dy)
 
-        if dist < self.center_radius + 6:
+        if dist <= self.inner_radius:
             if self.hovered_idx != -2:
                 self.hovered_idx = -2
                 self.update()
             return
 
-        if dist < 35.0:
+        if dist > self.radius:
             if self.hovered_idx != -1:
                 self.hovered_idx = -1
                 self.update()
@@ -1424,8 +1445,16 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         self._update_hover_from_pos(event.pos())
         super().mouseMoveEvent(event)
 
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._update_hover_from_pos(event.pos())
+        event.accept()
+
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        self.releaseMouse()
+        if self.sticky and self._sticky_timer.isValid() and self._sticky_timer.elapsed() < 250:
+            event.accept()
+            return
+        if not self.sticky:
+            self.releaseMouse()
         pos = event.pos()
         self._update_hover_from_pos(pos)
 
@@ -1434,87 +1463,119 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
             self.action_triggered.emit(item.key)
             if item.callback:
                 item.callback()
+            self.hide()
         elif self.hovered_idx == -2:
-            pass
-
-        self.hide()
+            self.hide()
+        elif not self.sticky:
+            self.hide()
         super().mouseReleaseEvent(event)
+
+    def eventFilter(self, watched: object, event: QtCore.QEvent) -> bool:
+        if self.sticky and event.type() == QtCore.QEvent.MouseButtonPress and isinstance(event, QtGui.QMouseEvent):
+            global_pos = event.globalPosition().toPoint()
+            if not self.geometry().contains(global_pos):
+                self.hide()
+        elif self.sticky and event.type() == QtCore.QEvent.ApplicationDeactivate:
+            self.hide()
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key_Escape:
+            self.hide()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        app = QtWidgets.QApplication.instance()
+        if app:
+            app.removeEventFilter(self)
+        self.sticky = False
+        if QtWidgets.QWidget.mouseGrabber() is self:
+            self.releaseMouse()
+        super().hideEvent(event)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
 
-        # Background semi-transparent halo ring
-        painter.setBrush(QtGui.QColor(10, 14, 23, 210))
-        painter.setPen(QtGui.QPen(QtGui.QColor(32, 42, 64, 180), 1.5))
-        painter.drawEllipse(self.center_pt, self.radius + 34, self.radius + 34)
+        # Soft floating shadow and frosted base.
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(15, 23, 42, 42))
+        painter.drawEllipse(self.center_pt + QtCore.QPoint(0, 8), self.radius + 8, self.radius + 8)
 
-        # Outer guide circle dashed line
-        painter.setBrush(QtCore.Qt.NoBrush)
-        painter.setPen(QtGui.QPen(QtGui.QColor(60, 75, 105, 120), 1.0, QtCore.Qt.DashLine))
-        painter.drawEllipse(self.center_pt, self.radius, self.radius)
-
-        # Render 8 Ring Slots
-        for i, item in enumerate(self.items):
-            c_pt = self._get_item_center(i)
-            is_hover = (i == self.hovered_idx)
-
-            if is_hover:
-                r_val = self.item_radius + 4
-                glow_col = QtGui.QColor(item.color)
-                painter.setBrush(QtGui.QColor(glow_col.red(), glow_col.green(), glow_col.blue(), 230))
-                painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 2.0))
-            else:
-                r_val = self.item_radius
-                painter.setBrush(QtGui.QColor(30, 38, 56, 235))
-                painter.setPen(QtGui.QPen(QtGui.QColor(55, 70, 98, 210), 1.5))
-
-            painter.drawEllipse(c_pt, r_val, r_val)
-
-            font = painter.font()
-            font.setPointSize(12 if not is_hover else 14)
-            font.setBold(True)
-            painter.setFont(font)
-            painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF")))
-            painter.drawText(
-                QtCore.QRectF(c_pt.x() - r_val, c_pt.y() - r_val, r_val * 2, r_val * 2),
-                QtCore.Qt.AlignCenter,
-                item.icon_text,
-            )
-
-        # Center Close Button (✕)
-        center_is_hover = (self.hovered_idx == -2)
-        c_r = self.center_radius + (2 if center_is_hover else 0)
-        painter.setBrush(QtGui.QColor(190, 25, 45, 245) if center_is_hover else QtGui.QColor(130, 20, 35, 235))
-        painter.setPen(QtGui.QPen(QtGui.QColor("#E85566") if not center_is_hover else QtGui.QColor("#FFFFFF"), 2.0))
-        painter.drawEllipse(self.center_pt, c_r, c_r)
-
-        font = painter.font()
-        font.setPointSize(11)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF")))
-        painter.drawText(
-            QtCore.QRectF(self.center_pt.x() - c_r, self.center_pt.y() - c_r, c_r * 2, c_r * 2),
-            QtCore.Qt.AlignCenter,
-            "✕",
+        count = max(1, len(self.items))
+        step = 360.0 / count
+        outer_rect = QtCore.QRectF(
+            self.center_pt.x() - self.radius,
+            self.center_pt.y() - self.radius,
+            self.radius * 2,
+            self.radius * 2,
+        )
+        inner_rect = QtCore.QRectF(
+            self.center_pt.x() - self.inner_radius,
+            self.center_pt.y() - self.inner_radius,
+            self.inner_radius * 2,
+            self.inner_radius * 2,
         )
 
-        # Text Badge at Bottom showing active action title
-        if 0 <= self.hovered_idx < len(self.items):
-            active_item = self.items[self.hovered_idx]
-            text = active_item.title
-            painter.setBrush(QtGui.QColor(15, 22, 36, 240))
-            painter.setPen(QtGui.QPen(QtGui.QColor(active_item.color), 1.5))
-            badge_rect = QtCore.QRectF(60, 276, 200, 28)
-            painter.drawRoundedRect(badge_rect, 8, 8)
+        for index, item in enumerate(self.items):
+            start = 90.0 - (index * step) - (step / 2.0)
+            path = QtGui.QPainterPath()
+            path.arcMoveTo(outer_rect, start)
+            path.arcTo(outer_rect, start, -step)
+            inner_end = start - step
+            inner_point = QtCore.QPointF(
+                self.center_pt.x() + self.inner_radius * math.cos(math.radians(inner_end)),
+                self.center_pt.y() - self.inner_radius * math.sin(math.radians(inner_end)),
+            )
+            path.lineTo(inner_point)
+            path.arcTo(inner_rect, inner_end, step)
+            path.closeSubpath()
 
-            painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF")))
-            font.setPointSize(9.5)
+            hovered = index == self.hovered_idx
+            if hovered:
+                accent = QtGui.QColor(item.color)
+                fill = QtGui.QColor(accent.red(), accent.green(), accent.blue(), 88)
+                border = QtGui.QColor(accent.red(), accent.green(), accent.blue(), 190)
+            else:
+                fill = QtGui.QColor(247, 249, 252, 246)
+                border = QtGui.QColor(190, 198, 211, 190)
+            painter.setBrush(fill)
+            painter.setPen(QtGui.QPen(border, 1.3))
+            painter.drawPath(path)
+
+            center = self._get_item_center(index)
+            icon_rect = QtCore.QRectF(center.x() - 34, center.y() - 34, 68, 34)
+            title_rect = QtCore.QRectF(center.x() - 54, center.y() + 1, 108, 32)
+            painter.setPen(QtGui.QColor("#172033"))
+            font = painter.font()
+            font.setPointSize(14 if hovered else 13)
             font.setBold(True)
             painter.setFont(font)
-            painter.drawText(badge_rect, QtCore.Qt.AlignCenter, text)
+            painter.drawText(icon_rect, QtCore.Qt.AlignCenter, item.icon_text)
+            font.setPointSize(8 if count > 6 else 9)
+            font.setBold(False)
+            painter.setFont(font)
+            title = QtGui.QFontMetrics(font).elidedText(item.title.replace("● ", ""), QtCore.Qt.ElideRight, 104)
+            painter.drawText(title_rect, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop, title)
+
+        center_hover = self.hovered_idx == -2
+        painter.setBrush(QtGui.QColor("#FFFFFF") if not center_hover else QtGui.QColor("#EEF6FF"))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#CBD5E1"), 1.5))
+        painter.drawEllipse(self.center_pt, self.center_radius, self.center_radius)
+        font = painter.font()
+        font.setPointSize(12)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor("#172033"))
+        painter.drawText(QtCore.QRectF(130, 174, 140, 28), QtCore.Qt.AlignCenter, self.center_title)
+        font.setPointSize(8)
+        font.setBold(False)
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor("#7C879A"))
+        painter.drawText(QtCore.QRectF(130, 200, 140, 24), QtCore.Qt.AlignCenter, self.center_subtitle)
 
         painter.end()
 
@@ -2436,7 +2497,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.setObjectName("AppRoot")
         self.setStyleSheet(stylesheet())
 
-        icon_path = self.repository.root / "branding" / "macrorelay-runner.ico"
+        icon_path = self.repository.root / "branding" / "macrorelay-quickslot.ico"
         if icon_path.exists():
             self.setWindowIcon(QtGui.QIcon(str(icon_path)))
 
@@ -2774,7 +2835,12 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if self._hold_popup_pos is not None and QtWidgets.QApplication.mouseButtons() & QtCore.Qt.LeftButton:
             self._hold_triggered = True
             self._hold_start_pos = None
-            self.preset_radial_menu.popup_at(self._hold_popup_pos)
+            self._show_preset_radial(self._hold_popup_pos, sticky=False)
+
+    def _show_preset_radial(self, global_pos: QtCore.QPoint, sticky: bool) -> None:
+        self._cancel_mouse_hold_check()
+        self._refresh_preset_radial_menu()
+        self.preset_radial_menu.popup_at(global_pos, sticky=sticky)
 
     def _refresh_preset_radial_menu(self) -> None:
         self._ensure_slot_presets()
@@ -2883,6 +2949,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.radial_menu.popup_at(event.globalPos())
             event.accept()
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            self._show_preset_radial(event.globalPos(), sticky=True)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         if getattr(self, "_resize_edge", ""):

@@ -133,6 +133,41 @@ class QuickSlotDeckTests(unittest.TestCase):
         self.assertEqual(1, run_spy.count())
         button.close()
 
+    def test_background_double_click_opens_sticky_preset_radial(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            window.show()
+            with mock.patch.object(window, "_show_preset_radial") as show_radial:
+                QtTest.QTest.mouseDClick(window, QtCore.Qt.LeftButton, pos=window.rect().center())
+
+            self.assertEqual(1, show_radial.call_count)
+            self.assertTrue(show_radial.call_args.kwargs["sticky"])
+            window.close()
+
+    def test_sticky_radial_stays_open_until_outside_click(self) -> None:
+        from PySide6 import QtCore, QtTest, QtWidgets
+        from macro_studio.quickslot_deck import RadialPieMenuWidget
+
+        host = QtWidgets.QWidget()
+        host.resize(80, 80)
+        host.move(700, 500)
+        host.show()
+        menu = RadialPieMenuWidget()
+        menu.load_deck_presets([("default", "기본 모드"), ("browser", "브라우저 모드")])
+        menu.popup_at(QtCore.QPoint(300, 300), sticky=True)
+        self.app.processEvents()
+
+        QtTest.QTest.mouseRelease(menu, QtCore.Qt.LeftButton, pos=QtCore.QPoint(5, 5))
+        self.assertTrue(menu.isVisible())
+        QtTest.QTest.mouseClick(host, QtCore.Qt.LeftButton, pos=host.rect().center())
+        self.app.processEvents()
+        self.assertFalse(menu.isVisible())
+        host.close()
+
     def test_radial_settings_uses_drag_canvas_without_slot_combos(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository

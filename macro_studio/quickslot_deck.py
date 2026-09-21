@@ -298,6 +298,8 @@ class DraggableTextLabel(QtWidgets.QLabel):
 class SlotIconEditDialog(QtWidgets.QDialog):
     """Dialog for editing slot icon image, full tile stretch, drag text position, font size, and spacing."""
 
+    live_config_changed = QtCore.Signal(int, object)
+
     def __init__(
         self,
         slot_index: int,
@@ -717,6 +719,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         cfg = self.get_config()
         self.preview_card.set_custom_icon_config(cfg)
         self.preview_card.set_slot_data(self.macro_name, "Alt+1", "hybrid", False)
+        self.live_config_changed.emit(self.slot_index, cfg)
 
     def get_config(self) -> Dict[str, Any]:
         pos_keys = ["bottom", "top", "center", "custom", "hidden"]
@@ -934,6 +937,14 @@ class StreamDeckButton(QtWidgets.QFrame):
             if target_size.width() > 0 and target_size.height() > 0:
                 scaled_pix = self._scale_full_stretch_pixmap(pix, target_size)
                 painter.drawPixmap(self.rect(), scaled_pix)
+                theme_idx = int(win_cfg.get("theme_index", 0))
+                theme = THEMES.get(theme_idx, THEMES[0])
+                border_color = theme["card_border_1"] if self.slot_index % 2 == 0 else theme["card_border_2"]
+                painter.setClipping(False)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.setPen(QtGui.QPen(QtGui.QColor(border_color), 2.5))
+                border_rect = QtCore.QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+                painter.drawRoundedRect(border_rect, tile_radius, tile_radius)
             painter.end()
 
     def set_custom_icon_config(self, config: Dict[str, Any]) -> None:
@@ -1247,6 +1258,7 @@ RADIAL_ACTION_PRESETS: Dict[str, tuple[str, str, str]] = {
     "opacity": ("💧 투명도 조절", "💧", "#38BDF8"),
     "grid": ("▦ 그리드 변경", "▦", "#F59E0B"),
     "add_slot": ("＋ 슬롯 추가", "＋", "#22C55E"),
+    "preset_settings": ("★ 실행 프리셋 지정", "★", "#FBBF24"),
 }
 
 THEMES: Dict[int, Dict[str, Any]] = {
@@ -1328,7 +1340,7 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         self._init_default_items()
 
     def _init_default_items(self) -> None:
-        default_keys = ["prev_page", "next_page", "settings", "emergency", "refresh", "studio", "topmost", "add_slot"]
+        default_keys = ["prev_page", "next_page", "settings", "preset_settings", "emergency", "refresh", "studio", "topmost"]
         self.items = []
         for k in default_keys:
             title, icon_text, color = RADIAL_ACTION_PRESETS[k]
@@ -1347,6 +1359,17 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
             self.items = new_items
         else:
             self._init_default_items()
+
+    def load_macro_slots(self, slots: List[tuple[int, str]]) -> None:
+        colors = ["#38BDF8", "#A78BFA", "#34D399", "#F59E0B", "#F472B6", "#22D3EE", "#818CF8", "#FB7185"]
+        self.items = [
+            RadialPieMenuItem(f"slot:{slot_index}", macro_name, str(position + 1), colors[position % len(colors)])
+            for position, (slot_index, macro_name) in enumerate(slots[:8])
+        ]
+        if not self.items:
+            title, icon_text, color = RADIAL_ACTION_PRESETS["preset_settings"]
+            self.items = [RadialPieMenuItem("preset_settings", title, icon_text, color)]
+        self.update()
 
     def popup_at(self, global_pos: QtCore.QPoint) -> None:
         top_left = global_pos - QtCore.QPoint(160, 160)
@@ -1650,6 +1673,61 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
             painter.drawText(QtCore.QRectF(c_pt.x() - r_val, c_pt.y() - r_val, r_val * 2, r_val * 2), QtCore.Qt.AlignCenter, icon_text)
 
         painter.end()
+
+
+class HoldPresetDialog(QtWidgets.QDialog):
+    """Choose the macros exposed by the left-button hold radial menu."""
+
+    def __init__(self, main_window: "QuickSlotDeckWindow", parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setWindowTitle("좌클릭 유지 라디얼 · 실행 프리셋 지정")
+        self.setMinimumWidth(520)
+        self.setStyleSheet(stylesheet())
+
+        root = QtWidgets.QVBoxLayout(self)
+        info = QtWidgets.QLabel("좌클릭을 1초간 유지했을 때 표시할 매크로를 최대 8개까지 지정합니다.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #CBD5E1; font-weight: 700;")
+        root.addWidget(info)
+
+        hotkeys = self.main_window.repository.load_hotkeys()
+        slots = list(hotkeys.get("slots") or [])
+        self.available_slots = [
+            (index, str(slot.get("macro") or "").strip())
+            for index, slot in enumerate(slots)
+            if str(slot.get("macro") or "").strip()
+        ]
+        selected = list(self.main_window.config.get("hold_radial_slots") or [])
+        if not selected:
+            selected = [index for index, _name in self.available_slots[:8]]
+
+        form = QtWidgets.QFormLayout()
+        self.combos: List[QtWidgets.QComboBox] = []
+        for position in range(8):
+            combo = QtWidgets.QComboBox()
+            combo.addItem("사용 안 함", -1)
+            for slot_index, macro_name in self.available_slots:
+                combo.addItem(f"#{slot_index + 1} · {macro_name}", slot_index)
+            wanted = int(selected[position]) if position < len(selected) else -1
+            found = combo.findData(wanted)
+            combo.setCurrentIndex(found if found >= 0 else 0)
+            form.addRow(f"프리셋 {position + 1}:", combo)
+            self.combos.append(combo)
+        root.addLayout(form)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def selected_slots(self) -> List[int]:
+        result: List[int] = []
+        for combo in self.combos:
+            slot_index = int(combo.currentData())
+            if slot_index >= 0 and slot_index not in result:
+                result.append(slot_index)
+        return result
 
 
 class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
@@ -1960,7 +2038,10 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             return
         self.main_window.config["theme_index"] = index
         self.main_window._apply_theme()
-        self.main_window.refresh_slots()
+        for button in self.main_window.buttons:
+            button._update_appearance()
+            button.update()
+        self.main_window.update()
 
     def _init_theme_tab(self) -> None:
         form = QtWidgets.QFormLayout(self.tab_theme)
@@ -2073,7 +2154,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             self.theme_combo.setCurrentIndex(int(self.main_window.config.get("theme_index", 0)))
             self.auto_stretch_default.setChecked(bool(self.main_window.config.get("auto_stretch_default", True)))
 
-            radial_keys = list(self.main_window.config.get("radial_items") or ["prev_page", "next_page", "settings", "emergency", "refresh", "studio", "topmost", "add_slot"])
+            radial_keys = list(self.main_window.config.get("radial_items") or ["prev_page", "next_page", "settings", "preset_settings", "emergency", "refresh", "studio", "topmost"])
             self.radial_preview.set_radial_keys(radial_keys)
         finally:
             self._loading_settings = False
@@ -2108,7 +2189,10 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.main_window.radial_menu.load_custom_items(radial_items)
 
         self.main_window._save_config()
-        self.main_window.refresh_slots()
+        self.main_window._apply_theme()
+        for button in self.main_window.buttons:
+            button._update_appearance()
+            button.update()
 
         self.accept()
 
@@ -2256,7 +2340,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "theme_index": 0,
             "auto_stretch_default": True,
             "empty_slot_opacity": 0,
-            "radial_items": ["prev_page", "next_page", "settings", "emergency", "refresh", "studio", "topmost", "add_slot"],
+            "radial_items": ["prev_page", "next_page", "settings", "preset_settings", "emergency", "refresh", "studio", "topmost"],
+            "hold_radial_slots": [],
         }
         self.custom_icons: Dict[str, Dict[str, Any]] = {}
         self.buttons: List[StreamDeckButton] = []
@@ -2280,7 +2365,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.setObjectName("AppRoot")
         self.setStyleSheet(stylesheet())
 
-        icon_path = self.repository.root / "quickslot-deck.ico"
+        icon_path = self.repository.root / "branding" / "macrorelay-runner.ico"
         if icon_path.exists():
             self.setWindowIcon(QtGui.QIcon(str(icon_path)))
 
@@ -2288,6 +2373,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.radial_menu = RadialPieMenuWidget(self)
         self.radial_menu.load_custom_items(self.config.get("radial_items"))
         self.radial_menu.action_triggered.connect(self._handle_radial_action)
+        self.preset_radial_menu = RadialPieMenuWidget(self)
+        self.preset_radial_menu.action_triggered.connect(self._handle_preset_radial_action)
+        self._refresh_preset_radial_menu()
 
         self._init_ui()
         self._apply_theme()
@@ -2314,13 +2402,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                     self.config.update(data["config"])
                 self.config["compact_auto_fit"] = True
                 radial_items = list(self.config.get("radial_items") or [])
-                if "add_slot" not in radial_items:
-                    if "minimize" in radial_items:
-                        radial_items[radial_items.index("minimize")] = "add_slot"
+                if "preset_settings" not in radial_items:
+                    if "add_slot" in radial_items:
+                        radial_items[radial_items.index("add_slot")] = "preset_settings"
                     elif len(radial_items) < 8:
-                        radial_items.append("add_slot")
+                        radial_items.append("preset_settings")
                     elif radial_items:
-                        radial_items[-1] = "add_slot"
+                        radial_items[-1] = "preset_settings"
                     self.config["radial_items"] = radial_items
                 geom = data.get("geometry")
                 if geom:
@@ -2540,7 +2628,55 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if self._hold_popup_pos is not None and QtWidgets.QApplication.mouseButtons() & QtCore.Qt.LeftButton:
             self._hold_triggered = True
             self._hold_start_pos = None
-            self.radial_menu.popup_at(self._hold_popup_pos)
+            self.preset_radial_menu.popup_at(self._hold_popup_pos)
+
+    def _refresh_preset_radial_menu(self) -> None:
+        hotkeys = self.repository.load_hotkeys()
+        slots = list(hotkeys.get("slots") or [])
+        selected = list(self.config.get("hold_radial_slots") or [])
+        if not selected:
+            selected = [
+                index for index, slot in enumerate(slots)
+                if str(slot.get("macro") or "").strip()
+            ][:8]
+        items: List[tuple[int, str]] = []
+        for slot_index in selected:
+            try:
+                index = int(slot_index)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(slots):
+                macro_name = str(slots[index].get("macro") or "").strip()
+                if macro_name:
+                    items.append((index, macro_name))
+        self.preset_radial_menu.load_macro_slots(items)
+
+    def _handle_preset_radial_action(self, key: str) -> None:
+        if key == "preset_settings":
+            self._open_hold_preset_dialog()
+            return
+        if not key.startswith("slot:"):
+            return
+        try:
+            slot_index = int(key.split(":", 1)[1])
+        except (TypeError, ValueError):
+            return
+        slots = list(self.repository.load_hotkeys().get("slots") or [])
+        if 0 <= slot_index < len(slots):
+            macro_name = str(slots[slot_index].get("macro") or "").strip()
+            if macro_name:
+                if self._is_macro_running(macro_name):
+                    self._stop_slot_macro(slot_index, macro_name)
+                else:
+                    self._run_slot_macro(slot_index, macro_name)
+
+    def _open_hold_preset_dialog(self) -> None:
+        dialog = HoldPresetDialog(self, self)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        self.config["hold_radial_slots"] = dialog.selected_slots()
+        self._refresh_preset_radial_menu()
+        self._save_config()
 
     def _handle_radial_action(self, key: str) -> None:
         if key == "prev_page":
@@ -2565,6 +2701,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self._open_settings_dialog(target_tab=1)
         elif key == "add_slot":
             self._add_slot_from_radial()
+        elif key == "preset_settings":
+            self._open_hold_preset_dialog()
         elif key in ("close_app", "close", "exit"):
             self.close()
         elif key == "minimize":
@@ -2754,11 +2892,23 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
         current_cfg = self.custom_icons.get(str(slot_idx), {})
         dlg = SlotIconEditDialog(slot_idx, macro_name, current_cfg, self)
+        dlg.live_config_changed.connect(self._preview_slot_icon)
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             new_cfg = dlg.get_config()
             self.custom_icons[str(slot_idx)] = new_cfg
             self._save_config()
-            self.refresh_slots()
+            self._preview_slot_icon(slot_idx, new_cfg)
+        else:
+            self._preview_slot_icon(slot_idx, current_cfg)
+
+    def _preview_slot_icon(self, slot_idx: int, config: object) -> None:
+        if not isinstance(config, dict):
+            return
+        for button in self.buttons:
+            if button.slot_index == slot_idx:
+                button.set_custom_icon_config(config)
+                button.update()
+                break
 
     def _remove_slot(self, slot_idx: int) -> None:
         payload = self.repository.load_hotkeys()
@@ -2875,6 +3025,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 self._visible_rows = 1
                 self.setMinimumSize(self._size_for_tile_side(MIN_TILE_SIDE))
                 self.resize(self._size_for_tile_side(BASE_TILE_SIDE * float(self.config.get("tile_scale", 1.0))))
+        if hasattr(self, "preset_radial_menu"):
+            self._refresh_preset_radial_menu()
 
     def _prev_page(self) -> None:
         if self.current_page > 0:

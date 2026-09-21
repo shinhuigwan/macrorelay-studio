@@ -146,6 +146,61 @@ class QuickSlotDeckTests(unittest.TestCase):
             dialog.close()
             window.close()
 
+    def test_right_click_and_hold_radials_have_separate_content(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({
+                "slots": [
+                    {"macro": "첫 번째", "hotkey": "", "mode": "hybrid"},
+                    {"macro": "두 번째", "hotkey": "", "mode": "hybrid"},
+                ]
+            })
+            window = QuickSlotDeckWindow(repository)
+            window.config["hold_radial_slots"] = [1]
+            window._refresh_preset_radial_menu()
+
+            self.assertIn("preset_settings", [item.key for item in window.radial_menu.items])
+            self.assertEqual(["slot:1"], [item.key for item in window.preset_radial_menu.items])
+            self.assertEqual("두 번째", window.preset_radial_menu.items[0].title)
+            window.close()
+
+    def test_theme_live_change_reuses_existing_slot_widgets(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": [{"macro": "테마 테스트", "hotkey": "", "mode": "hybrid"}]})
+            window = QuickSlotDeckWindow(repository)
+            original_button = window.buttons[0]
+            dialog = QuickSlotDeckSettingsDialog(window)
+            dialog._on_theme_live_changed(2)
+
+            self.assertEqual(2, window.config["theme_index"])
+            self.assertIs(original_button, window.buttons[0])
+            dialog.close()
+            window.close()
+
+    def test_icon_editor_changes_are_previewed_on_real_slot(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow, SlotIconEditDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": [{"macro": "미리보기", "hotkey": "", "mode": "hybrid"}]})
+            window = QuickSlotDeckWindow(repository)
+            dialog = SlotIconEditDialog(0, "미리보기", {}, window)
+            dialog.live_config_changed.connect(window._preview_slot_icon)
+            dialog.emoji_edit.setText("★")
+            self.app.processEvents()
+
+            self.assertEqual("★", window.buttons[0].custom_icon_config["emoji"])
+            dialog.close()
+            window.close()
+
     def test_plain_left_drag_moves_window_and_cancels_hold(self) -> None:
         from PySide6 import QtCore, QtGui
         from macro_studio.quickslot_deck import QuickSlotDeckWindow

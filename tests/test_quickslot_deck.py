@@ -106,23 +106,7 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual(["추가할 매크로"], [button.macro_name for button in window.buttons])
             window.close()
 
-    def test_double_click_opens_editor_without_running_macro(self) -> None:
-        from PySide6 import QtCore, QtTest
-        from macro_studio.quickslot_deck import StreamDeckButton
-
-        button = StreamDeckButton(0)
-        button.set_slot_data("테스트", "", "hybrid", False)
-        edit_spy = QtTest.QSignalSpy(button.edit_icon_requested)
-        run_spy = QtTest.QSignalSpy(button.slot_triggered)
-        button.show()
-        QtTest.QTest.mouseDClick(button, QtCore.Qt.LeftButton)
-        QtTest.QTest.qWait(self.app.doubleClickInterval() + 30)
-
-        self.assertEqual(1, edit_spy.count())
-        self.assertEqual(0, run_spy.count())
-        button.close()
-
-    def test_single_click_still_runs_after_double_click_window(self) -> None:
+    def test_double_click_runs_only_once(self) -> None:
         from PySide6 import QtCore, QtTest
         from macro_studio.quickslot_deck import StreamDeckButton
 
@@ -131,7 +115,20 @@ class QuickSlotDeckTests(unittest.TestCase):
         run_spy = QtTest.QSignalSpy(button.slot_triggered)
         button.show()
         QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
-        QtTest.QTest.qWait(self.app.doubleClickInterval() + 30)
+        QtTest.QTest.mouseDClick(button, QtCore.Qt.LeftButton)
+
+        self.assertEqual(1, run_spy.count())
+        button.close()
+
+    def test_single_click_runs_immediately(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import StreamDeckButton
+
+        button = StreamDeckButton(0)
+        button.set_slot_data("테스트", "", "hybrid", False)
+        run_spy = QtTest.QSignalSpy(button.slot_triggered)
+        button.show()
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
 
         self.assertEqual(1, run_spy.count())
         button.close()

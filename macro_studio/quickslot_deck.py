@@ -763,9 +763,7 @@ class StreamDeckButton(QtWidgets.QFrame):
         self.mode = "hybrid"
         self.is_running = False
         self.custom_icon_config: Dict[str, Any] = {}
-        self._single_click_timer = QtCore.QTimer(self)
-        self._single_click_timer.setSingleShot(True)
-        self._single_click_timer.timeout.connect(self._emit_primary_action)
+        self._suppress_next_release = False
 
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.setMinimumSize(42, 42)
@@ -1183,17 +1181,20 @@ class StreamDeckButton(QtWidgets.QFrame):
         if hasattr(win, "_cancel_mouse_hold_check"):
             win._cancel_mouse_hold_check()
 
-        if not is_hold_triggered and event.button() == QtCore.Qt.LeftButton:
-            self._single_click_timer.start(QtWidgets.QApplication.doubleClickInterval())
+        if event.button() == QtCore.Qt.LeftButton and self._suppress_next_release:
+            self._suppress_next_release = False
+        elif not is_hold_triggered and event.button() == QtCore.Qt.LeftButton:
+            self._emit_primary_action()
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
-            self._single_click_timer.stop()
+            # A primary action already ran on the first release. Suppress the
+            # second release so a double-click never starts the macro twice.
+            self._suppress_next_release = True
             win = self.window()
             if hasattr(win, "_cancel_mouse_hold_check"):
                 win._cancel_mouse_hold_check()
-            self.edit_icon_requested.emit(self.slot_index)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)

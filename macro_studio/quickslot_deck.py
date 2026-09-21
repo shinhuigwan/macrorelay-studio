@@ -13,6 +13,7 @@ Features:
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -40,6 +41,7 @@ PRESET_ICON_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ic
 BASE_TILE_SIDE = 190
 MIN_TILE_SIDE = 48
 WINDOW_PADDING = 16
+PRESET_STYLE_KEYS = ("theme_index", "tile_scale", "tile_gap", "tile_radius", "hover_glow", "empty_slot_opacity")
 
 
 def quickslot_preset_icon_paths(root: Path) -> List[Path]:
@@ -1258,7 +1260,7 @@ RADIAL_ACTION_PRESETS: Dict[str, tuple[str, str, str]] = {
     "opacity": ("💧 투명도 조절", "💧", "#38BDF8"),
     "grid": ("▦ 그리드 변경", "▦", "#F59E0B"),
     "add_slot": ("＋ 슬롯 추가", "＋", "#22C55E"),
-    "preset_settings": ("★ 실행 프리셋 지정", "★", "#FBBF24"),
+    "preset_settings": ("★ 덱 프리셋 관리", "★", "#FBBF24"),
 }
 
 THEMES: Dict[int, Dict[str, Any]] = {
@@ -1360,11 +1362,11 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         else:
             self._init_default_items()
 
-    def load_macro_slots(self, slots: List[tuple[int, str]]) -> None:
+    def load_deck_presets(self, presets: List[tuple[str, str]]) -> None:
         colors = ["#38BDF8", "#A78BFA", "#34D399", "#F59E0B", "#F472B6", "#22D3EE", "#818CF8", "#FB7185"]
         self.items = [
-            RadialPieMenuItem(f"slot:{slot_index}", macro_name, str(position + 1), colors[position % len(colors)])
-            for position, (slot_index, macro_name) in enumerate(slots[:8])
+            RadialPieMenuItem(f"deck:{preset_id}", preset_name, str(position + 1), colors[position % len(colors)])
+            for position, (preset_id, preset_name) in enumerate(presets[:8])
         ]
         if not self.items:
             title, icon_text, color = RADIAL_ACTION_PRESETS["preset_settings"]
@@ -1675,59 +1677,121 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
         painter.end()
 
 
-class HoldPresetDialog(QtWidgets.QDialog):
-    """Choose the macros exposed by the left-button hold radial menu."""
+class SlotPresetDialog(QtWidgets.QDialog):
+    """Create, rename, save, delete, and select complete QuickSlot deck presets."""
 
     def __init__(self, main_window: "QuickSlotDeckWindow", parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.main_window = main_window
-        self.setWindowTitle("좌클릭 유지 라디얼 · 실행 프리셋 지정")
-        self.setMinimumWidth(520)
+        self.presets: Dict[str, Dict[str, Any]] = copy.deepcopy(main_window.config.get("slot_presets") or {})
+        self.active_id = str(main_window.config.get("active_slot_preset") or "default")
+        self.setWindowTitle("QuickSlot 덱 프리셋 관리")
+        self.setMinimumSize(620, 460)
         self.setStyleSheet(stylesheet())
 
         root = QtWidgets.QVBoxLayout(self)
-        info = QtWidgets.QLabel("좌클릭을 1초간 유지했을 때 표시할 매크로를 최대 8개까지 지정합니다.")
+        info = QtWidgets.QLabel(
+            "프리셋마다 슬롯, 연결된 매크로, 아이콘, 그리드와 테마를 통째로 저장합니다. "
+            "좌클릭을 1초간 유지하면 이 목록을 라디얼 메뉴에서 바로 전환할 수 있습니다."
+        )
         info.setWordWrap(True)
         info.setStyleSheet("color: #CBD5E1; font-weight: 700;")
         root.addWidget(info)
 
-        hotkeys = self.main_window.repository.load_hotkeys()
-        slots = list(hotkeys.get("slots") or [])
-        self.available_slots = [
-            (index, str(slot.get("macro") or "").strip())
-            for index, slot in enumerate(slots)
-            if str(slot.get("macro") or "").strip()
-        ]
-        selected = list(self.main_window.config.get("hold_radial_slots") or [])
-        if not selected:
-            selected = [index for index, _name in self.available_slots[:8]]
+        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self.accept())
+        root.addWidget(self.list_widget, 1)
 
-        form = QtWidgets.QFormLayout()
-        self.combos: List[QtWidgets.QComboBox] = []
-        for position in range(8):
-            combo = QtWidgets.QComboBox()
-            combo.addItem("사용 안 함", -1)
-            for slot_index, macro_name in self.available_slots:
-                combo.addItem(f"#{slot_index + 1} · {macro_name}", slot_index)
-            wanted = int(selected[position]) if position < len(selected) else -1
-            found = combo.findData(wanted)
-            combo.setCurrentIndex(found if found >= 0 else 0)
-            form.addRow(f"프리셋 {position + 1}:", combo)
-            self.combos.append(combo)
-        root.addLayout(form)
+        tools = QtWidgets.QHBoxLayout()
+        add_button = QtWidgets.QPushButton("＋ 빈 프리셋")
+        rename_button = QtWidgets.QPushButton("이름 변경")
+        save_button = QtWidgets.QPushButton("현재 UI로 저장")
+        delete_button = QtWidgets.QPushButton("삭제")
+        add_button.clicked.connect(self._add_preset)
+        rename_button.clicked.connect(self._rename_preset)
+        save_button.clicked.connect(self._save_current_ui)
+        delete_button.clicked.connect(self._delete_preset)
+        for button in (add_button, rename_button, save_button, delete_button):
+            tools.addWidget(button)
+        root.addLayout(tools)
 
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
+        switch_button = buttons.addButton("선택 프리셋으로 전환", QtWidgets.QDialogButtonBox.AcceptRole)
+        switch_button.clicked.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+        self._reload_list(self.active_id)
 
-    def selected_slots(self) -> List[int]:
-        result: List[int] = []
-        for combo in self.combos:
-            slot_index = int(combo.currentData())
-            if slot_index >= 0 and slot_index not in result:
-                result.append(slot_index)
-        return result
+    def _selected_id(self) -> str:
+        item = self.list_widget.currentItem()
+        return str(item.data(QtCore.Qt.UserRole)) if item else ""
+
+    def _reload_list(self, selected_id: str = "") -> None:
+        self.list_widget.clear()
+        for preset_id, preset in self.presets.items():
+            name = str(preset.get("name") or preset_id)
+            marker = "● " if preset_id == self.active_id else ""
+            item = QtWidgets.QListWidgetItem(f"{marker}{name}")
+            item.setData(QtCore.Qt.UserRole, preset_id)
+            self.list_widget.addItem(item)
+            if preset_id == selected_id:
+                self.list_widget.setCurrentItem(item)
+        if self.list_widget.currentRow() < 0 and self.list_widget.count():
+            self.list_widget.setCurrentRow(0)
+
+    def _new_id(self) -> str:
+        number = 1
+        while f"preset-{number}" in self.presets:
+            number += 1
+        return f"preset-{number}"
+
+    def _add_preset(self) -> None:
+        if len(self.presets) >= 8:
+            QtWidgets.QMessageBox.information(self, "새 프리셋", "좌클릭 라디얼에는 최대 8개 프리셋을 등록할 수 있습니다.")
+            return
+        name, accepted = QtWidgets.QInputDialog.getText(self, "새 프리셋", "프리셋 이름:")
+        name = str(name).strip()
+        if not accepted or not name:
+            return
+        preset_id = self._new_id()
+        preset = self.main_window._build_slot_preset(name)
+        preset["slots"] = []
+        preset["custom_icons"] = {}
+        self.presets[preset_id] = preset
+        self._reload_list(preset_id)
+
+    def _rename_preset(self) -> None:
+        preset_id = self._selected_id()
+        if not preset_id:
+            return
+        current = str(self.presets[preset_id].get("name") or preset_id)
+        name, accepted = QtWidgets.QInputDialog.getText(self, "프리셋 이름 변경", "새 이름:", text=current)
+        name = str(name).strip()
+        if accepted and name:
+            self.presets[preset_id]["name"] = name
+            self._reload_list(preset_id)
+
+    def _save_current_ui(self) -> None:
+        preset_id = self._selected_id()
+        if not preset_id:
+            return
+        name = str(self.presets[preset_id].get("name") or preset_id)
+        self.presets[preset_id] = self.main_window._build_slot_preset(name)
+        self._reload_list(preset_id)
+
+    def _delete_preset(self) -> None:
+        preset_id = self._selected_id()
+        if not preset_id or len(self.presets) <= 1:
+            QtWidgets.QMessageBox.information(self, "프리셋 삭제", "최소 한 개의 프리셋은 남아 있어야 합니다.")
+            return
+        self.presets.pop(preset_id, None)
+        if self.active_id == preset_id:
+            self.active_id = next(iter(self.presets))
+        self._reload_list(self.active_id)
+
+    def selected_preset_id(self) -> str:
+        return self._selected_id() or self.active_id
 
 
 class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
@@ -1995,6 +2059,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         with QtCore.QSignalBlocker(self.win_w_spin), QtCore.QSignalBlocker(self.win_h_spin):
             self.win_w_spin.setValue(self.main_window.width())
             self.win_h_spin.setValue(self.main_window.height())
+        self.main_window._capture_active_slot_preset()
         self.main_window._save_config()
 
     def _on_empty_opacity_live_changed(self, val: int) -> None:
@@ -2188,6 +2253,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.main_window.config["radial_items"] = radial_items
         self.main_window.radial_menu.load_custom_items(radial_items)
 
+        self.main_window._capture_active_slot_preset()
         self.main_window._save_config()
         self.main_window._apply_theme()
         for button in self.main_window.buttons:
@@ -2215,6 +2281,8 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
                 data = json.loads(Path(path).read_text(encoding="utf-8"))
                 self.main_window.config_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
                 self.main_window._load_config()
+                self.main_window._ensure_slot_presets()
+                self.main_window._refresh_preset_radial_menu()
                 self.main_window.refresh_slots()
                 QtWidgets.QMessageBox.information(self, "복원 완료", "성공적으로 설정을 복원했습니다!")
                 self.accept()
@@ -2230,6 +2298,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         )
         if ans == QtWidgets.QMessageBox.Yes:
             self.main_window.custom_icons.clear()
+            self.main_window._capture_active_slot_preset()
             self.main_window._save_config()
             self.main_window.refresh_slots()
             QtWidgets.QMessageBox.information(self, "초기화 완료", "모든 커스텀 아이콘 설정이 초기화되었습니다.")
@@ -2341,7 +2410,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "auto_stretch_default": True,
             "empty_slot_opacity": 0,
             "radial_items": ["prev_page", "next_page", "settings", "preset_settings", "emergency", "refresh", "studio", "topmost"],
-            "hold_radial_slots": [],
+            "slot_presets": {},
+            "active_slot_preset": "default",
         }
         self.custom_icons: Dict[str, Dict[str, Any]] = {}
         self.buttons: List[StreamDeckButton] = []
@@ -2357,6 +2427,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._hold_triggered = False
         self._visible_cols = 1
         self._visible_rows = 1
+        self._applying_slot_preset = False
 
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
@@ -2370,6 +2441,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.setWindowIcon(QtGui.QIcon(str(icon_path)))
 
         self._load_config()
+        self._ensure_slot_presets()
         self.radial_menu = RadialPieMenuWidget(self)
         self.radial_menu.load_custom_items(self.config.get("radial_items"))
         self.radial_menu.action_triggered.connect(self._handle_radial_action)
@@ -2446,6 +2518,80 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             os.replace(temp_path, self.config_path)
         except Exception:
             pass
+
+    def _build_slot_preset(self, name: str) -> Dict[str, Any]:
+        hotkeys = self.repository.load_hotkeys()
+        return {
+            "name": str(name).strip() or "이름 없는 모드",
+            "slots": copy.deepcopy(list(hotkeys.get("slots") or [])),
+            "custom_icons": copy.deepcopy(self.custom_icons),
+            "rows": int(self.rows),
+            "cols": int(self.cols),
+            "style": {key: copy.deepcopy(self.config.get(key)) for key in PRESET_STYLE_KEYS},
+        }
+
+    def _ensure_slot_presets(self) -> None:
+        presets = self.config.get("slot_presets")
+        if not isinstance(presets, dict) or not presets:
+            presets = {"default": self._build_slot_preset("기본 모드")}
+            self.config["slot_presets"] = presets
+            self.config["active_slot_preset"] = "default"
+        active_id = str(self.config.get("active_slot_preset") or "")
+        if active_id not in presets:
+            self.config["active_slot_preset"] = next(iter(presets))
+
+    def _capture_active_slot_preset(self) -> None:
+        if self._applying_slot_preset:
+            return
+        self._ensure_slot_presets()
+        presets = self.config["slot_presets"]
+        active_id = str(self.config.get("active_slot_preset"))
+        current = presets.get(active_id, {})
+        name = str(current.get("name") or active_id)
+        presets[active_id] = self._build_slot_preset(name)
+
+    def _save_preset_hotkeys(self, hotkeys: Dict[str, Any]) -> None:
+        path = str(self.repository.hotkeys_path)
+        watcher = getattr(self, "watcher", None)
+        was_watched = bool(watcher and path in watcher.files())
+        if was_watched:
+            watcher.removePath(path)
+        try:
+            self.repository.save_hotkeys(hotkeys)
+        finally:
+            if was_watched and os.path.exists(path):
+                watcher.addPath(path)
+
+    def _switch_slot_preset(self, preset_id: str) -> None:
+        self._ensure_slot_presets()
+        presets = self.config["slot_presets"]
+        if preset_id not in presets:
+            return
+        if preset_id == str(self.config.get("active_slot_preset")):
+            return
+
+        self._capture_active_slot_preset()
+        preset = copy.deepcopy(presets[preset_id])
+        self._applying_slot_preset = True
+        try:
+            self.stop_all_macros()
+            hotkeys = self.repository.load_hotkeys()
+            hotkeys["slots"] = copy.deepcopy(list(preset.get("slots") or []))
+            self._save_preset_hotkeys(hotkeys)
+            self.custom_icons = copy.deepcopy(dict(preset.get("custom_icons") or {}))
+            self.rows = max(1, int(preset.get("rows", self.rows)))
+            self.cols = max(1, int(preset.get("cols", self.cols)))
+            style = dict(preset.get("style") or {})
+            for key in PRESET_STYLE_KEYS:
+                if key in style and style[key] is not None:
+                    self.config[key] = copy.deepcopy(style[key])
+            self.config["active_slot_preset"] = preset_id
+            self.current_page = 0
+            self._apply_theme()
+            self.refresh_slots()
+        finally:
+            self._applying_slot_preset = False
+        self._save_config()
 
     def _init_ui(self) -> None:
         self.setMinimumSize(64, 64)
@@ -2631,50 +2777,54 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.preset_radial_menu.popup_at(self._hold_popup_pos)
 
     def _refresh_preset_radial_menu(self) -> None:
-        hotkeys = self.repository.load_hotkeys()
-        slots = list(hotkeys.get("slots") or [])
-        selected = list(self.config.get("hold_radial_slots") or [])
-        if not selected:
-            selected = [
-                index for index, slot in enumerate(slots)
-                if str(slot.get("macro") or "").strip()
-            ][:8]
-        items: List[tuple[int, str]] = []
-        for slot_index in selected:
-            try:
-                index = int(slot_index)
-            except (TypeError, ValueError):
-                continue
-            if 0 <= index < len(slots):
-                macro_name = str(slots[index].get("macro") or "").strip()
-                if macro_name:
-                    items.append((index, macro_name))
-        self.preset_radial_menu.load_macro_slots(items)
+        self._ensure_slot_presets()
+        items = [
+            (
+                preset_id,
+                ("● " if preset_id == str(self.config.get("active_slot_preset")) else "")
+                + str(preset.get("name") or preset_id),
+            )
+            for preset_id, preset in self.config["slot_presets"].items()
+        ]
+        self.preset_radial_menu.load_deck_presets(items)
 
     def _handle_preset_radial_action(self, key: str) -> None:
         if key == "preset_settings":
             self._open_hold_preset_dialog()
             return
-        if not key.startswith("slot:"):
+        if not key.startswith("deck:"):
             return
-        try:
-            slot_index = int(key.split(":", 1)[1])
-        except (TypeError, ValueError):
-            return
-        slots = list(self.repository.load_hotkeys().get("slots") or [])
-        if 0 <= slot_index < len(slots):
-            macro_name = str(slots[slot_index].get("macro") or "").strip()
-            if macro_name:
-                if self._is_macro_running(macro_name):
-                    self._stop_slot_macro(slot_index, macro_name)
-                else:
-                    self._run_slot_macro(slot_index, macro_name)
+        self._switch_slot_preset(key.split(":", 1)[1])
 
     def _open_hold_preset_dialog(self) -> None:
-        dialog = HoldPresetDialog(self, self)
+        self._capture_active_slot_preset()
+        dialog = SlotPresetDialog(self, self)
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
-        self.config["hold_radial_slots"] = dialog.selected_slots()
+        target_id = dialog.selected_preset_id()
+        self.config["slot_presets"] = copy.deepcopy(dialog.presets)
+        if target_id not in self.config["slot_presets"]:
+            target_id = next(iter(self.config["slot_presets"]))
+        preset = copy.deepcopy(self.config["slot_presets"][target_id])
+        self._applying_slot_preset = True
+        try:
+            self.stop_all_macros()
+            hotkeys = self.repository.load_hotkeys()
+            hotkeys["slots"] = copy.deepcopy(list(preset.get("slots") or []))
+            self._save_preset_hotkeys(hotkeys)
+            self.custom_icons = copy.deepcopy(dict(preset.get("custom_icons") or {}))
+            self.rows = max(1, int(preset.get("rows", self.rows)))
+            self.cols = max(1, int(preset.get("cols", self.cols)))
+            style = dict(preset.get("style") or {})
+            for style_key in PRESET_STYLE_KEYS:
+                if style_key in style and style[style_key] is not None:
+                    self.config[style_key] = copy.deepcopy(style[style_key])
+            self.config["active_slot_preset"] = target_id
+            self.current_page = 0
+            self._apply_theme()
+            self.refresh_slots()
+        finally:
+            self._applying_slot_preset = False
         self._refresh_preset_radial_menu()
         self._save_config()
 
@@ -2836,6 +2986,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if 0 <= index < len(presets):
             self.rows, self.cols = presets[index]
             self.current_page = 0
+            self._capture_active_slot_preset()
             self._save_config()
             self.refresh_slots()
 
@@ -2848,6 +2999,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def _on_hotkeys_file_changed(self, path: str) -> None:
         self.refresh_slots()
+        if not self._applying_slot_preset:
+            self._capture_active_slot_preset()
+            self._save_config()
         if path and path not in self.watcher.files():
             QtCore.QTimer.singleShot(150, lambda p=path: self.watcher.addPath(p) if os.path.exists(p) else None)
 
@@ -2874,12 +3028,15 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         filled_count = sum(1 for slot in slots if str(slot.get("macro") or "").strip())
         self.current_page = max(0, (filled_count - 1) // max(1, self.rows * self.cols))
         self.refresh_slots()
+        self._capture_active_slot_preset()
+        self._save_config()
 
     def _edit_slot_icon(self, slot_idx: int) -> None:
         if slot_idx < 0:
             # Reset icon request
             real_idx = -1 - slot_idx
             self.custom_icons.pop(str(real_idx), None)
+            self._capture_active_slot_preset()
             self._save_config()
             self.refresh_slots()
             return
@@ -2896,6 +3053,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             new_cfg = dlg.get_config()
             self.custom_icons[str(slot_idx)] = new_cfg
+            self._capture_active_slot_preset()
             self._save_config()
             self._preview_slot_icon(slot_idx, new_cfg)
         else:
@@ -2922,6 +3080,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         payload["slots"] = slots
         self.repository.save_hotkeys(payload)
         self.custom_icons.pop(str(slot_idx), None)
+        self._capture_active_slot_preset()
         self._save_config()
         self.refresh_slots()
 
@@ -3152,6 +3311,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.stop_all_macros()
+        self._capture_active_slot_preset()
         self._save_config()
         super().closeEvent(event)
 

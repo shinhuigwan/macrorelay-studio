@@ -159,12 +159,27 @@ class QuickSlotDeckTests(unittest.TestCase):
                 ]
             })
             window = QuickSlotDeckWindow(repository)
-            window.config["hold_radial_slots"] = [1]
+            browser = window._build_slot_preset("브라우저 모드")
+            browser["slots"] = [{"macro": "두 번째", "hotkey": "", "mode": "hybrid"}]
+            browser["custom_icons"] = {"0": {"emoji": "B"}}
+            browser["style"]["theme_index"] = 2
+            window.config["slot_presets"]["browser"] = browser
             window._refresh_preset_radial_menu()
 
             self.assertIn("preset_settings", [item.key for item in window.radial_menu.items])
-            self.assertEqual(["slot:1"], [item.key for item in window.preset_radial_menu.items])
-            self.assertEqual("두 번째", window.preset_radial_menu.items[0].title)
+            self.assertEqual(["deck:default", "deck:browser"], [item.key for item in window.preset_radial_menu.items])
+            self.assertEqual("브라우저 모드", window.preset_radial_menu.items[1].title)
+
+            window._handle_preset_radial_action("deck:browser")
+            self.assertEqual("browser", window.config["active_slot_preset"])
+            self.assertEqual(["두 번째"], [button.macro_name for button in window.buttons])
+            self.assertEqual("B", window.custom_icons["0"]["emoji"])
+            self.assertEqual(2, window.config["theme_index"])
+
+            window._handle_preset_radial_action("deck:default")
+            self.assertEqual("default", window.config["active_slot_preset"])
+            self.assertEqual(["첫 번째", "두 번째"], [button.macro_name for button in window.buttons])
+            self.assertEqual(0, window.config["theme_index"])
             window.close()
 
     def test_theme_live_change_reuses_existing_slot_widgets(self) -> None:

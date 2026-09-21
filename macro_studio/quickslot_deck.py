@@ -7,7 +7,7 @@ Features:
 - Real-time live preview inside the edit dialog.
 - Config persistence in .quickslot_deck_config.json.
 - Frameless dark titlebar with logo, status badge, top actions, and window controls.
-- Touch drag / swipe gesture navigation.
+- Touch hold radial menu and drag-to-move window controls.
 """
 
 from __future__ import annotations
@@ -151,7 +151,7 @@ class TouchSwipeWidget(QtWidgets.QWidget):
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
             win = self.window()
-            if hasattr(win, "_start_shift_drag_if_needed") and win._start_shift_drag_if_needed(event):
+            if hasattr(win, "_start_window_drag_candidate") and win._start_window_drag_candidate(event):
                 event.accept()
                 return
 
@@ -167,7 +167,7 @@ class TouchSwipeWidget(QtWidgets.QWidget):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         win = self.window()
-        if hasattr(win, "_handle_shift_drag_move") and win._handle_shift_drag_move(event):
+        if hasattr(win, "_handle_window_drag_move") and win._handle_window_drag_move(event):
             event.accept()
             return
 
@@ -181,7 +181,7 @@ class TouchSwipeWidget(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         win = self.window()
-        if hasattr(win, "_handle_shift_drag_release") and win._handle_shift_drag_release(event):
+        if hasattr(win, "_handle_window_drag_release") and win._handle_window_drag_release(event):
             event.accept()
             return
 
@@ -967,7 +967,7 @@ class StreamDeckButton(QtWidgets.QFrame):
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
             win = self.window()
-            if hasattr(win, "_start_shift_drag_if_needed") and win._start_shift_drag_if_needed(event):
+            if hasattr(win, "_start_window_drag_candidate") and win._start_window_drag_candidate(event):
                 event.accept()
                 return
 
@@ -978,7 +978,7 @@ class StreamDeckButton(QtWidgets.QFrame):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         win = self.window()
-        if hasattr(win, "_handle_shift_drag_move") and win._handle_shift_drag_move(event):
+        if hasattr(win, "_handle_window_drag_move") and win._handle_window_drag_move(event):
             event.accept()
             return
 
@@ -990,7 +990,7 @@ class StreamDeckButton(QtWidgets.QFrame):
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         win = self.window()
-        if hasattr(win, "_handle_shift_drag_release") and win._handle_shift_drag_release(event):
+        if hasattr(win, "_handle_window_drag_release") and win._handle_window_drag_release(event):
             event.accept()
             return
 
@@ -2034,9 +2034,15 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         }
         self.custom_icons: Dict[str, Dict[str, Any]] = {}
         self.buttons: List[StreamDeckButton] = []
-        self._drag_pos: Optional[QtCore.QPoint] = None
+        self._drag_press_global: Optional[QtCore.QPoint] = None
+        self._drag_window_origin: Optional[QtCore.QPoint] = None
+        self._drag_threshold = 12
+        self._is_dragging_window = False
         self._hold_timer = QtCore.QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._on_mouse_hold_timeout)
         self._hold_start_pos: Optional[QtCore.QPoint] = None
+        self._hold_popup_pos: Optional[QtCore.QPoint] = None
         self._hold_triggered = False
 
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
@@ -2164,26 +2170,38 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 }}
             """)
 
-    def _start_shift_drag_if_needed(self, event: QtGui.QMouseEvent) -> bool:
-        if (event.buttons() & QtCore.Qt.LeftButton) and (event.modifiers() & QtCore.Qt.ShiftModifier):
-            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
-            self._is_dragging_window = True
-            self.setCursor(QtCore.Qt.SizeAllCursor)
-            self._cancel_mouse_hold_check()
-            return True
-        return False
-
-    def _handle_shift_drag_move(self, event: QtGui.QMouseEvent) -> bool:
-        if getattr(self, "_is_dragging_window", False) and self._drag_pos is not None:
-            self.move(event.globalPos() - self._drag_pos)
-            return True
-        return False
-
-    def _handle_shift_drag_release(self, event: QtGui.QMouseEvent) -> bool:
-        if getattr(self, "_is_dragging_window", False):
+    def _start_window_drag_candidate(self, event: QtGui.QMouseEvent) -> bool:
+        if event.button() == QtCore.Qt.LeftButton:
+            self._drag_press_global = event.globalPosition().toPoint()
+            self._drag_window_origin = self.pos()
             self._is_dragging_window = False
+        return False
+
+    def _handle_window_drag_move(self, event: QtGui.QMouseEvent) -> bool:
+        if not (event.buttons() & QtCore.Qt.LeftButton) or self._drag_press_global is None:
+            return False
+        if self._hold_triggered:
+            return False
+
+        delta = event.globalPosition().toPoint() - self._drag_press_global
+        if not self._is_dragging_window:
+            if delta.manhattanLength() < self._drag_threshold:
+                return False
+            self._is_dragging_window = True
+            self._cancel_mouse_hold_check()
+            self.setCursor(QtCore.Qt.SizeAllCursor)
+
+        if self._drag_window_origin is not None:
+            self.move(self._drag_window_origin + delta)
+        return True
+
+    def _handle_window_drag_release(self, event: QtGui.QMouseEvent) -> bool:
+        was_dragging = self._is_dragging_window
+        self._is_dragging_window = False
+        self._drag_press_global = None
+        self._drag_window_origin = None
+        if was_dragging:
             self.unsetCursor()
-            self._drag_pos = None
             self._save_config()
             return True
         return False
@@ -2250,31 +2268,25 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def _start_mouse_hold_check(self, global_pos: QtCore.QPoint) -> None:
         self._hold_start_pos = global_pos
+        self._hold_popup_pos = global_pos
         self._hold_triggered = False
-        if not hasattr(self, "_hold_timer") or self._hold_timer is None:
-            self._hold_timer = QtCore.QTimer(self)
-            self._hold_timer.setSingleShot(True)
-        else:
-            self._hold_timer.stop()
-            try:
-                self._hold_timer.timeout.disconnect()
-            except Exception:
-                pass
-
-        self._hold_timer.timeout.connect(lambda: self._on_mouse_hold_timeout(global_pos))
+        self._hold_timer.stop()
         self._hold_timer.start(1000)
 
     def _cancel_mouse_hold_check(self) -> None:
         if hasattr(self, "_hold_timer") and self._hold_timer:
             self._hold_timer.stop()
+        self._hold_start_pos = None
+        self._hold_popup_pos = None
 
-    def _on_mouse_hold_timeout(self, global_pos: QtCore.QPoint) -> None:
+    def _on_mouse_hold_timeout(self) -> None:
         if hasattr(self, "_hold_timer") and self._hold_timer:
             self._hold_timer.stop()
 
-        if QtWidgets.QApplication.mouseButtons() & QtCore.Qt.LeftButton:
+        if self._hold_popup_pos is not None and QtWidgets.QApplication.mouseButtons() & QtCore.Qt.LeftButton:
             self._hold_triggered = True
-            self.radial_menu.popup_at(global_pos)
+            self._hold_start_pos = None
+            self.radial_menu.popup_at(self._hold_popup_pos)
 
     def _handle_radial_action(self, key: str) -> None:
         if key == "prev_page":
@@ -2313,10 +2325,6 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
     # Window Drag Support for Frameless Window & Long-press / Right-click Radial Menu
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
-            if self._start_shift_drag_if_needed(event):
-                event.accept()
-                return
-
             edge = self._get_resize_edge(event.pos())
             if edge:
                 self._resize_edge = edge
@@ -2326,6 +2334,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 event.accept()
                 return
 
+            self._start_window_drag_candidate(event)
             self._start_mouse_hold_check(event.globalPos())
             event.accept()
         elif event.button() == QtCore.Qt.RightButton:
@@ -2334,12 +2343,12 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self._handle_shift_drag_move(event):
+        if getattr(self, "_resize_edge", ""):
+            self._handle_border_resize(event.globalPos())
             event.accept()
             return
 
-        if getattr(self, "_resize_edge", ""):
-            self._handle_border_resize(event.globalPos())
+        if self._handle_window_drag_move(event):
             event.accept()
             return
 
@@ -2354,14 +2363,16 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         self._cancel_mouse_hold_check()
-        if self._handle_shift_drag_release(event):
+        if getattr(self, "_resize_edge", ""):
+            self._resize_edge = ""
+            self._drag_press_global = None
+            self._drag_window_origin = None
+            self.unsetCursor()
+            self._save_config()
             event.accept()
             return
 
-        if getattr(self, "_resize_edge", ""):
-            self._resize_edge = ""
-            self.unsetCursor()
-            self._save_config()
+        if self._handle_window_drag_release(event):
             event.accept()
             return
 

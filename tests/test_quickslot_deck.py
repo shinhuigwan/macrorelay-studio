@@ -103,6 +103,49 @@ class QuickSlotDeckTests(unittest.TestCase):
             dialog.close()
             window.close()
 
+    def test_plain_left_drag_moves_window_and_cancels_hold(self) -> None:
+        from PySide6 import QtCore, QtGui
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            window.move(100, 100)
+            press = QtGui.QMouseEvent(
+                QtCore.QEvent.MouseButtonPress,
+                QtCore.QPointF(20, 20),
+                QtCore.QPointF(120, 120),
+                QtCore.Qt.LeftButton,
+                QtCore.Qt.LeftButton,
+                QtCore.Qt.NoModifier,
+            )
+            window._start_window_drag_candidate(press)
+            window._start_mouse_hold_check(QtCore.QPoint(120, 120))
+            self.assertTrue(window._hold_timer.isActive())
+
+            move = QtGui.QMouseEvent(
+                QtCore.QEvent.MouseMove,
+                QtCore.QPointF(45, 35),
+                QtCore.QPointF(145, 135),
+                QtCore.Qt.NoButton,
+                QtCore.Qt.LeftButton,
+                QtCore.Qt.NoModifier,
+            )
+            self.assertTrue(window._handle_window_drag_move(move))
+            self.assertEqual(QtCore.QPoint(125, 115), window.pos())
+            self.assertFalse(window._hold_timer.isActive())
+
+            release = QtGui.QMouseEvent(
+                QtCore.QEvent.MouseButtonRelease,
+                QtCore.QPointF(45, 35),
+                QtCore.QPointF(145, 135),
+                QtCore.Qt.LeftButton,
+                QtCore.Qt.NoButton,
+                QtCore.Qt.NoModifier,
+            )
+            self.assertTrue(window._handle_window_drag_release(release))
+            window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

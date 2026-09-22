@@ -48,6 +48,54 @@ PRESET_STYLE_KEYS = ("theme_index", "tile_scale", "tile_gap", "tile_radius", "ho
 QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS = 240
 
 
+_ULONG_PTR = wintypes.WPARAM
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", _ULONG_PTR),
+    ]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", _ULONG_PTR),
+    ]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    # INPUT must be large enough for every documented input variant.  Defining
+    # only KEYBDINPUT shrinks this union on 64-bit Windows and makes SendInput
+    # reject cbSize with ERROR_INVALID_PARAMETER.
+    _fields_ = [
+        ("mi", _MOUSEINPUT),
+        ("ki", _KEYBDINPUT),
+        ("hi", _HARDWAREINPUT),
+    ]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("union",)
+    _fields_ = [("type", wintypes.DWORD), ("union", _INPUTUNION)]
+
+
 def glass_dialog_stylesheet() -> str:
     """Light frosted controls matching the runtime radial wheel."""
     return """
@@ -3778,31 +3826,18 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
     def _send_active_unicode_text(self, text: str, delay_ms: int = 0) -> None:
         if os.name != "nt":
             raise RuntimeError("글자별 키 입력은 Windows에서만 지원됩니다.")
-        pointer_int = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
-
-        class KEYBDINPUT(ctypes.Structure):
-            _fields_ = [
-                ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", pointer_int),
-            ]
-
-        class INPUTUNION(ctypes.Union):
-            _fields_ = [("ki", KEYBDINPUT)]
-
-        class INPUT(ctypes.Structure):
-            _anonymous_ = ("union",)
-            _fields_ = [("type", wintypes.DWORD), ("union", INPUTUNION)]
-
+        user32 = ctypes.windll.user32
         encoded = text.encode("utf-16-le")
         for offset in range(0, len(encoded), 2):
             code_unit = int.from_bytes(encoded[offset:offset + 2], "little")
-            events = (INPUT * 2)(
-                INPUT(1, INPUTUNION(ki=KEYBDINPUT(0, code_unit, 0x0004, 0, 0))),
-                INPUT(1, INPUTUNION(ki=KEYBDINPUT(0, code_unit, 0x0004 | 0x0002, 0, 0))),
+            events = (_INPUT * 2)(
+                _INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(0, code_unit, 0x0004, 0, 0))),
+                _INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(0, code_unit, 0x0004 | 0x0002, 0, 0))),
             )
-            if ctypes.windll.user32.SendInput(2, events, ctypes.sizeof(INPUT)) != 2:
-                raise RuntimeError("Windows 키 입력 전송에 실패했습니다.")
+            sent = int(user32.SendInput(2, events, ctypes.sizeof(_INPUT)))
+            if sent != 2:
+                error_code = int(ctypes.windll.kernel32.GetLastError())
+                raise RuntimeError(f"Windows 키 입력 전송에 실패했습니다. (오류 코드: {error_code})")
             if delay_ms > 0:
                 QtCore.QThread.msleep(delay_ms)
 

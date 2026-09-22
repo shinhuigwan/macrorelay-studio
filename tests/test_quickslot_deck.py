@@ -497,6 +497,24 @@ class QuickSlotDeckTests(unittest.TestCase):
                 type_text.assert_called_once_with("가나다", 25)
             window.close()
 
+    def test_windows_unicode_input_uses_native_input_structure_size(self) -> None:
+        import ctypes
+        from macro_studio.quickslot_deck import _INPUT, QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        expected_size = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28
+        self.assertEqual(expected_size, ctypes.sizeof(_INPUT))
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            sent_sizes = []
+            fake_user32 = mock.Mock()
+            fake_user32.SendInput.side_effect = lambda count, _events, size: sent_sizes.append(size) or count
+            with mock.patch.object(ctypes.windll, "user32", fake_user32):
+                window._send_active_unicode_text("가A", 0)
+            self.assertEqual([expected_size, expected_size], sent_sizes)
+            window.close()
+
     def test_system_deck_actions_dispatch_to_runtime_services(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository

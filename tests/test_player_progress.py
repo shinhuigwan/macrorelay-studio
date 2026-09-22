@@ -6,10 +6,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from macro_studio.player import MacroPlayerWindow
+from macro_studio.player import (
+    PLAYER_ICON_FILENAME,
+    PLAYER_RUN_BUTTON_MIN_HEIGHT,
+    MacroPlayerWindow,
+)
 
 
 class PlayerProgressTests(unittest.TestCase):
+    def test_player_branding_and_primary_action_size(self) -> None:
+        self.assertEqual("macrorelay-player.ico", PLAYER_ICON_FILENAME)
+        self.assertGreaterEqual(PLAYER_RUN_BUTTON_MIN_HEIGHT, 56)
+
     def test_reads_ahk_utf8_bom_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.progress.txt"

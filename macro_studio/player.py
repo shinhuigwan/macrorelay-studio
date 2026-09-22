@@ -21,6 +21,8 @@ from .repository import MacroRepository, MacroSummary
 
 
 _PLAYER_MUTEX_NAME = "Local\\MacroRelayPlayerStandalone"
+PLAYER_ICON_FILENAME = "macrorelay-player.ico"
+PLAYER_RUN_BUTTON_MIN_HEIGHT = 58
 
 
 def _acquire_player_mutex() -> int:
@@ -145,10 +147,10 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2EA043, stop:1 #238636);
                 color: #FFFFFF;
                 border: 1px solid #3FB950;
-                border-radius: 8px;
-                font-size: 14px;
+                border-radius: 10px;
+                font-size: 17px;
                 font-weight: 800;
-                padding: 10px 16px;
+                padding: 14px 22px;
             }
             QPushButton#BtnRun:hover {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3FB950, stop:1 #2EA043);
@@ -367,8 +369,9 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_run = QtWidgets.QPushButton("▶ 실 행  [F5]", self)
         self.btn_run.setObjectName("BtnRun")
         self.btn_run.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_run.setMinimumHeight(PLAYER_RUN_BUTTON_MIN_HEIGHT)
         self.btn_run.clicked.connect(self.start_macro)
-        ctrl_bar.addWidget(self.btn_run, 3)
+        ctrl_bar.addWidget(self.btn_run, 5)
 
         self.btn_pause = QtWidgets.QPushButton("⏸ 일시정지 [F7]", self)
         self.btn_pause.setObjectName("BtnPause")
@@ -808,7 +811,7 @@ def launch_player(macro_name: str = "") -> int:
     window = MacroPlayerWindow(repository=repo, default_macro=macro_name)
     app.aboutToQuit.connect(window.shutdown_runtime)
 
-    icon_path = repo.root / "branding" / "macrorelay-runner.ico"
+    icon_path = repo.root / "branding" / PLAYER_ICON_FILENAME
     if not icon_path.exists():
         icon_path = repo.root / "branding" / "macrorelay-studio.ico"
     if icon_path.exists():

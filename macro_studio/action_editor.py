@@ -43,7 +43,10 @@ class KoreanContainsProxyModel(QtCore.QSortFilterProxyModel):
 
     def set_query(self, query: str) -> None:
         self.query = query
-        self.invalidateFilter()
+        # Qt 6.13 deprecates invalidateFilter(); limit the refresh to rows and
+        # use the replacement API so large asset lists are not rebuilt twice.
+        self.beginFilterChange()
+        self.endFilterChange(QtCore.QSortFilterProxyModel.Direction.Rows)
 
     def filterAcceptsRow(self, source_row: int, source_parent: QtCore.QModelIndex) -> bool:
         index = self.sourceModel().index(source_row, 0, source_parent)

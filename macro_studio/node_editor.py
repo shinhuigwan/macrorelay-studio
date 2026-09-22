@@ -4008,11 +4008,73 @@ class NodeCanvas(QtWidgets.QWidget):
         else:
             port = target_node.in_success_port if edge.kind == "success" else target_node.in_fail_port
             end = port.mapToScene(port.rect().center())
-        bend = max(55.0, abs(end.x() - start.x()) * 0.42)
-        direction = 1.0 if end.x() >= start.x() else -1.0
+        # Keep folded-group proxy lines on the same curve used by ordinary
+        # forward edges.  The previous, proxy-only bend made these lines look
+        # unrelated to the graph and caused unnecessarily wide crossings.
+        distance = abs(end.x() - start.x())
+        vertical = end.y() - start.y()
+        bend = min(100.0, max(25.0, distance * 0.40 + abs(vertical) * 0.12))
+        candidate_offset = (
+            (edge.candidate_index - 1) * 18.0
+            if edge.is_secondary_candidate
+            else 0.0
+        )
+        lane_offset = (
+            (edge.condition_index + 1) * 28.0
+            if edge.is_condition
+            else candidate_offset
+        )
+        c1 = QtCore.QPointF(
+            start.x() + bend,
+            start.y() + vertical * 0.12 + lane_offset,
+        )
+        c2 = QtCore.QPointF(
+            end.x() - bend,
+            end.y() - vertical * 0.12,
+        )
         path = QtGui.QPainterPath(start)
-        path.cubicTo(start.x() + direction * bend, start.y(), end.x() - direction * bend, end.y(), end.x(), end.y())
+        path.cubicTo(c1, c2, end)
         return path
+
+    @staticmethod
+    def _sync_group_proxy_visual(
+        proxy: QtWidgets.QGraphicsPathItem,
+        edge: EdgeItem,
+        path: QtGui.QPainterPath,
+    ) -> None:
+        """Mirror the source edge's visuals on its folded-group proxy."""
+        proxy.setPen(QtGui.QPen(edge.pen()))
+        proxy.setOpacity(edge.opacity())
+        proxy.setZValue(edge.zValue())
+
+        arrow = getattr(proxy, "proxy_arrow", None)
+        if arrow is not None:
+            point = path.pointAtPercent(0.55)
+            angle = -path.angleAtPercent(0.55)
+            size = 8.0
+            polygon = QtGui.QPolygonF(
+                [
+                    QtCore.QPointF(0, 0),
+                    QtCore.QPointF(-size, size * 0.55),
+                    QtCore.QPointF(-size, -size * 0.55),
+                ]
+            )
+            transform = QtGui.QTransform()
+            transform.translate(point.x(), point.y())
+            transform.rotate(angle)
+            arrow.setPolygon(transform.map(polygon))
+            arrow.setBrush(edge.color)
+
+        label = getattr(proxy, "proxy_label", None)
+        if label is not None:
+            label.setText(edge.label.text())
+            label.setBrush(edge.label.brush())
+            label.setFont(edge.label.font())
+            point = path.pointAtPercent(0.55)
+            label_y = 5 if edge.route_side == "bottom" else -17
+            if not edge.route_side:
+                label_y += edge.target_offset_y * 1.15
+            label.setPos(point + QtCore.QPointF(8, label_y))
 
     def _update_group_proxy_edges(self, moved_indexes: set[int] | None = None) -> None:
         """Move existing folded-group proxy lines without recreating them."""
@@ -4033,10 +4095,7 @@ class NodeCanvas(QtWidgets.QWidget):
                 continue
             proxy.setPath(path)
             proxy.setVisible(True)
-            label = getattr(proxy, "proxy_label", None)
-            if label is not None:
-                mid = path.pointAtPercent(0.5)
-                label.setPos(mid + QtCore.QPointF(-12, -17 if edge.kind == "success" else 4))
+            self._sync_group_proxy_visual(proxy, edge, path)
 
     def _rebuild_group_proxy_edges(self) -> None:
         self._clear_group_proxy_edges()
@@ -4061,20 +4120,19 @@ class NodeCanvas(QtWidgets.QWidget):
                 continue
             proxy = QtWidgets.QGraphicsPathItem(path)
             proxy.source_edge = edge
-            color = QtGui.QColor(COLORS["success"] if edge.kind == "success" else COLORS["danger"])
-            proxy.setPen(QtGui.QPen(color, 2.4, QtCore.Qt.DashLine, QtCore.Qt.RoundCap))
-            proxy.setOpacity(0.72)
-            proxy.setZValue(3)
             proxy.setToolTip(
                 f"접힌 그룹 연결 · {'성공' if edge.kind == 'success' else '실패'} · "
                 f"실행 {self.display_number(edge.source)} → 실행 {self.display_number(edge.target)}"
             )
-            label = QtWidgets.QGraphicsSimpleTextItem("성공" if edge.kind == "success" else "실패", proxy)
+            arrow = QtWidgets.QGraphicsPolygonItem(proxy)
+            proxy.proxy_arrow = arrow
+            arrow.setPen(QtCore.Qt.NoPen)
+            arrow.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+            label = QtWidgets.QGraphicsSimpleTextItem("", proxy)
             proxy.proxy_label = label
-            label.setBrush(color.lighter(135))
-            label.setFont(QtGui.QFont("Malgun Gothic", 7, QtGui.QFont.Bold))
-            mid = path.pointAtPercent(0.5)
-            label.setPos(mid + QtCore.QPointF(-12, -17 if edge.kind == "success" else 4))
+            label.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations, True)
+            label.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+            self._sync_group_proxy_visual(proxy, edge, path)
             self.scene.addItem(proxy)
             self._group_proxy_edges.append(proxy)
 

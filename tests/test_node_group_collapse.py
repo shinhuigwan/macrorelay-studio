@@ -53,6 +53,13 @@ class NodeGroupCollapseTests(unittest.TestCase):
         self.assertGreaterEqual(len(canvas._group_proxy_edges), 1)
         external = next(edge for edge in canvas.edges if edge.source == 2 and edge.target == 3)
         self.assertFalse(external.isVisible())
+        proxy = next(item for item in canvas._group_proxy_edges if item.source_edge is external)
+        self.assertEqual(external.pen().style(), proxy.pen().style())
+        self.assertAlmostEqual(external.pen().widthF(), proxy.pen().widthF())
+        self.assertEqual(external.pen().color(), proxy.pen().color())
+        self.assertAlmostEqual(external.opacity(), proxy.opacity())
+        self.assertEqual(external.label.text(), proxy.proxy_label.text())
+        self.assertFalse(proxy.proxy_arrow.polygon().isEmpty())
         self.assertTrue(canvas.dump_comments()[0]["collapsed"])
 
         group.set_collapsed(False)

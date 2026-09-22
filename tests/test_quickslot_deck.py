@@ -300,6 +300,36 @@ class QuickSlotDeckTests(unittest.TestCase):
             dock.close()
             window.close()
 
+    def test_deck_dock_image_drop_applies_full_tile_icon(self) -> None:
+        from PySide6 import QtCore, QtGui
+        from macro_studio.deck_dock import DeckDockWindow, DeckSlotButton
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "dropped-icon.png"
+            image = QtGui.QImage(32, 32, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#FF7700"))
+            self.assertTrue(image.save(str(image_path)))
+
+            mime = QtCore.QMimeData()
+            mime.setUrls([QtCore.QUrl.fromLocalFile(str(image_path))])
+            self.assertEqual(image_path.resolve(), Path(DeckSlotButton._first_local_image(mime)).resolve())
+
+            repository = MacroRepository(root)
+            repository.save_hotkeys({"slots": []})
+            window = QuickSlotDeckWindow(repository)
+            dock = DeckDockWindow(window)
+            dock._apply_dropped_icon(0, str(image_path))
+
+            config = window.custom_icons["0"]
+            self.assertTrue(config.get("image_data"))
+            self.assertTrue(config.get("full_stretch"))
+            self.assertFalse(config.get("text_show"))
+            self.assertEqual("manual", config.get("icon_source"))
+            dock.close(); window.close()
+
     def test_deck_dock_uses_execution_label_centered_pager_and_large_grid(self) -> None:
         from macro_studio.deck_dock import ACTION_TITLES, DeckDockWindow
         from macro_studio.quickslot_deck import QuickSlotDeckWindow

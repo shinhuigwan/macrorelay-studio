@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -126,6 +127,7 @@ class ActionPaletteButton(QtWidgets.QFrame):
 class DeckSlotButton(QtWidgets.QFrame):
     action_dropped = QtCore.Signal(int, str)
     slot_dropped = QtCore.Signal(int, int)
+    image_dropped = QtCore.Signal(int, str)
     edit_requested = QtCore.Signal(int)
     clear_requested = QtCore.Signal(int)
     duplicate_requested = QtCore.Signal(int)
@@ -192,8 +194,21 @@ class DeckSlotButton(QtWidgets.QFrame):
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         mime = event.mimeData()
-        if mime.hasFormat("application/x-macrorelay-deck-action") or mime.hasFormat("application/x-macrorelay-deck-slot"):
+        if (
+            mime.hasFormat("application/x-macrorelay-deck-action")
+            or mime.hasFormat("application/x-macrorelay-deck-slot")
+            or self._first_local_image(mime)
+        ):
             event.acceptProposedAction()
+
+    @staticmethod
+    def _first_local_image(mime: QtCore.QMimeData) -> str:
+        supported = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ico"}
+        for url in mime.urls() if mime.hasUrls() else []:
+            path = url.toLocalFile()
+            if path and Path(path).suffix.lower() in supported:
+                return path
+        return ""
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
         mime = event.mimeData()
@@ -205,6 +220,11 @@ class DeckSlotButton(QtWidgets.QFrame):
             source = int(bytes(mime.data("application/x-macrorelay-deck-slot")).decode("ascii"))
             self.slot_dropped.emit(source, self.slot_index)
             event.acceptProposedAction()
+        else:
+            image_path = self._first_local_image(mime)
+            if image_path:
+                self.image_dropped.emit(self.slot_index, image_path)
+                event.acceptProposedAction()
 
     def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
         menu = QtWidgets.QMenu(self)
@@ -575,7 +595,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             index = start + local; slot = self.payload["slots"][index]
             button = DeckSlotButton(index, slot, self.main_window.custom_icons.get(str(index), {}), self.grid_host)
             button.setMinimumSize(max(48, min(92, 760 // max(1, cols))), max(44, min(82, 500 // max(1, rows))))
-            button.action_dropped.connect(self._configure_new_action); button.slot_dropped.connect(self._move_slot); button.edit_requested.connect(self._edit_slot); button.clear_requested.connect(self._clear_slot); button.duplicate_requested.connect(self._duplicate_slot)
+            button.action_dropped.connect(self._configure_new_action); button.slot_dropped.connect(self._move_slot); button.image_dropped.connect(self._apply_dropped_icon); button.edit_requested.connect(self._edit_slot); button.clear_requested.connect(self._clear_slot); button.duplicate_requested.connect(self._duplicate_slot)
             self.grid.addWidget(button, local // cols, local % cols)
         page_name = self.payload["deck_page_names"][self.current_page]
         self.deck_title.setText(page_name)
@@ -621,7 +641,10 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         return {"macro": action_title(action), "hotkey": "", "mode": "deck_action", "action": action}
 
     def _configure_new_action(self, index: int, kind: str) -> None:
-        dialog = DeckActionConfigDialog(kind, None, self.main_window, self, slot_index=index)
+        dialog = DeckActionConfigDialog(
+            kind, None, self.main_window, self, slot_index=index,
+            icon_config=self.main_window.custom_icons.get(str(index), {}),
+        )
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             action = dialog.result_action()
             self.payload["slots"][index] = self._slot_from_action(action)
@@ -635,6 +658,39 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             if icon_config: self.main_window.custom_icons[str(index)] = icon_config
             else: self.main_window.custom_icons.pop(str(index), None)
             self.save()
+
+    def _apply_dropped_icon(self, index: int, image_path: str) -> None:
+        from macro_studio.quickslot_deck import encode_image_file_to_base64
+
+        path = Path(str(image_path or ""))
+        pixmap = QtGui.QPixmap(str(path))
+        image_data = encode_image_file_to_base64(str(path))
+        if not path.is_file() or pixmap.isNull() or not image_data:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "아이콘 이미지 오류",
+                "지원되는 10MB 이하 이미지 파일을 슬롯에 놓아 주세요.",
+            )
+            return
+
+        previous = dict(self.main_window.custom_icons.get(str(index), {}) or {})
+        had_visual_layout = bool(
+            previous.get("image_data") or previous.get("image_path") or previous.get("emoji")
+        )
+        previous.update({
+            "image_path": "",
+            "image_data": image_data,
+            "emoji": "",
+            "full_stretch": bool(previous.get("full_stretch", True)),
+            "text_show": bool(previous.get("text_show", False)) if had_visual_layout else False,
+            "text_position": str(previous.get("text_position") or "hidden") if had_visual_layout else "hidden",
+            "icon_source": "manual",
+        })
+        self.main_window.custom_icons[str(index)] = previous
+        self.main_window._capture_active_slot_preset()
+        self.main_window._save_config()
+        self.main_window._preview_slot_icon(index, previous)
+        self._render_page()
 
     def _edit_slot(self, index: int) -> None:
         slot = self.payload["slots"][index]; action = dict(slot.get("action") or {})

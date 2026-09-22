@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import webbrowser
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -3508,6 +3509,141 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         user32.SetForegroundWindow(matches[0])
         QtCore.QThread.msleep(80)
 
+    def _resolve_action_window(self, action: Dict[str, Any]) -> int:
+        """Resolve a saved Deck action target without changing foreground focus."""
+        if os.name != "nt":
+            raise RuntimeError("대상 창 지정은 Windows에서만 지원됩니다.")
+        user32 = ctypes.windll.user32
+        token = str(action.get("target_window") or "").strip()
+        if token.casefold().startswith("ahk_id"):
+            try:
+                hwnd = int(token.split()[-1], 0)
+                if hwnd and user32.IsWindow(hwnd):
+                    return hwnd
+            except (TypeError, ValueError):
+                pass
+
+        title_fragment = str(action.get("target_title") or "").strip().casefold()
+        exe_name = str(action.get("target_exe") or "").strip().casefold()
+        matches: list[int] = []
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def process_name(hwnd: int) -> str:
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid.value)
+            if not handle:
+                return ""
+            try:
+                size = wintypes.DWORD(32768)
+                buffer = ctypes.create_unicode_buffer(size.value)
+                if ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                    return Path(buffer.value).name.casefold()
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            return ""
+
+        def enum_callback(hwnd: int, _param: int) -> bool:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            buffer = ctypes.create_unicode_buffer(max(1, length + 1))
+            if length:
+                user32.GetWindowTextW(hwnd, buffer, length + 1)
+            title_ok = not title_fragment or title_fragment in buffer.value.casefold()
+            exe_ok = not exe_name or process_name(hwnd) == exe_name
+            if title_ok and exe_ok:
+                matches.append(int(hwnd))
+                return False
+            return True
+
+        if title_fragment or exe_name:
+            user32.EnumWindows(callback_type(enum_callback), 0)
+        if matches:
+            return matches[0]
+        if token or title_fragment or exe_name:
+            raise ValueError(f"대상 창을 찾지 못했습니다: {action.get('target_exe') or action.get('target_title') or token}")
+        return int(user32.GetForegroundWindow() or 0)
+
+    @staticmethod
+    def _focused_child_window(hwnd: int) -> int:
+        if os.name != "nt" or not hwnd:
+            return hwnd
+
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        user32 = ctypes.windll.user32
+        thread_id = int(user32.GetWindowThreadProcessId(hwnd, None) or 0)
+        info = GUITHREADINFO(); info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        if thread_id and user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)) and info.hwndFocus:
+            return int(info.hwndFocus)
+        return hwnd
+
+    def _activate_action_window(self, action: Dict[str, Any]) -> int:
+        hwnd = self._resolve_action_window(action)
+        if hwnd:
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(hwnd, 9)
+            user32.SetForegroundWindow(hwnd)
+            QtCore.QThread.msleep(80)
+        return hwnd
+
+    def _send_inactive_hotkey(self, hwnd: int, sequence: str) -> None:
+        parts = [part.strip() for part in str(sequence).replace("-", "+").split("+") if part.strip()]
+        if not parts:
+            raise ValueError("단축키가 비어 있습니다.")
+        aliases = {
+            "ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B,
+            "enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B,
+            "space": 0x20, "backspace": 0x08, "delete": 0x2E,
+        }
+        user32 = ctypes.windll.user32
+        keys: list[int] = []
+        for token in parts:
+            lowered = token.casefold()
+            if lowered in aliases: keys.append(aliases[lowered])
+            elif lowered.startswith("f") and lowered[1:].isdigit() and 1 <= int(lowered[1:]) <= 24: keys.append(0x6F + int(lowered[1:]))
+            elif len(token) == 1: keys.append(int(user32.VkKeyScanW(ord(token))) & 0xFF)
+            else: raise ValueError(f"지원하지 않는 키: {token}")
+        target = self._focused_child_window(hwnd)
+        for vk in keys: user32.PostMessageW(target, 0x0100, vk, 0)
+        for vk in reversed(keys): user32.PostMessageW(target, 0x0101, vk, 0)
+
+    def _send_inactive_text(self, hwnd: int, text: str) -> None:
+        QtWidgets.QApplication.clipboard().setText(text)
+        self._send_inactive_hotkey(hwnd, "Ctrl+V")
+
+    def _click_action_target(self, action: Dict[str, Any], *, inactive: bool) -> None:
+        hwnd = self._resolve_action_window(action) if inactive else self._activate_action_window(action)
+        x, y = int(action.get("x") or 0), int(action.get("y") or 0)
+        button = str(action.get("button") or "left")
+        clicks = max(1, min(3, int(action.get("clicks") or 1)))
+        user32 = ctypes.windll.user32
+        if inactive:
+            message_map = {"left": (0x0201, 0x0202, 1), "right": (0x0204, 0x0205, 2), "middle": (0x0207, 0x0208, 0x10)}
+            down, up, wparam = message_map.get(button, message_map["left"])
+            lparam = (x & 0xFFFF) | ((y & 0xFFFF) << 16)
+            for _ in range(clicks):
+                user32.PostMessageW(hwnd, 0x0200, 0, lparam)
+                user32.PostMessageW(hwnd, down, wparam, lparam)
+                user32.PostMessageW(hwnd, up, 0, lparam)
+            return
+        point = wintypes.POINT(x, y)
+        if hwnd:
+            user32.ClientToScreen(hwnd, ctypes.byref(point))
+        user32.SetCursorPos(point.x, point.y)
+        flags = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010), "middle": (0x0020, 0x0040)}
+        down, up = flags.get(button, flags["left"])
+        for _ in range(clicks):
+            user32.mouse_event(down, 0, 0, 0, 0); user32.mouse_event(up, 0, 0, 0, 0)
+
     def _start_registered_macro(self, macro_name: str) -> subprocess.Popen[Any]:
         proc = self.repository.run_macro(macro_name)
         self.active_processes[int(proc.pid)] = (macro_name, proc)
@@ -3585,13 +3721,27 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             elif kind == "hotkey":
-                self._activate_window_by_title(str(action.get("target_title") or ""))
-                self._send_windows_hotkey(str(action.get("keys") or ""))
+                if str(action.get("input_mode") or "active") == "inactive":
+                    self._send_inactive_hotkey(self._resolve_action_window(action), str(action.get("keys") or ""))
+                else:
+                    if action.get("target_window") or action.get("target_exe"):
+                        self._activate_action_window(action)
+                    else:
+                        self._activate_window_by_title(str(action.get("target_title") or ""))
+                    self._send_windows_hotkey(str(action.get("keys") or ""))
             elif kind == "text":
                 text_value = str(action.get("text") or "")
-                self._activate_window_by_title(str(action.get("target_title") or ""))
-                QtWidgets.QApplication.clipboard().setText(text_value)
-                self._send_windows_hotkey("Ctrl+V")
+                if str(action.get("input_mode") or "active") == "inactive":
+                    self._send_inactive_text(self._resolve_action_window(action), text_value)
+                else:
+                    if action.get("target_window") or action.get("target_exe"):
+                        self._activate_action_window(action)
+                    else:
+                        self._activate_window_by_title(str(action.get("target_title") or ""))
+                    QtWidgets.QApplication.clipboard().setText(text_value)
+                    self._send_windows_hotkey("Ctrl+V")
+            elif kind == "mouse_click":
+                self._click_action_target(action, inactive=str(action.get("input_mode") or "inactive") == "inactive")
             elif kind == "wait":
                 wait_ms = max(10, int(action.get("ms") or 1000))
                 self._set_deck_status("대기 중", f"{wait_ms}ms")

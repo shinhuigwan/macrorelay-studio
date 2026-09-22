@@ -15,6 +15,7 @@ ACTION_LIBRARY: Dict[str, list[tuple[str, str, str]]] = {
         ("terminate_program", "프로그램 종료", "지정 프로세스 종료"),
         ("hotkey", "단축키", "키 조합 보내기"),
         ("text", "텍스트 입력", "클립보드 기반 텍스트 입력"),
+        ("mouse_click", "마우스 클릭", "대상 프로그램 좌표 클릭"),
         ("wait", "대기", "다음 동작 전 대기"),
         ("studio", "Studio 열기", "MacroRelay Studio 실행"),
         ("stop_all", "전체 중지", "실행 중 매크로 모두 중지"),
@@ -39,7 +40,7 @@ ACTION_TITLES = {
 }
 
 ACTION_ICONS = {
-    "open_target": "↗", "terminate_program": "■", "hotkey": "⌨", "text": "T",
+    "open_target": "↗", "terminate_program": "■", "hotkey": "⌨", "text": "T", "mouse_click": "🖱",
     "wait": "◷", "studio": "M", "stop_all": "⬛", "run_macro": "▶",
     "multi_macros": "≡", "switch_preset": "★", "page_prev": "◀",
     "page_next": "▶", "page_goto": "▦", "page_first": "Ⅰ",
@@ -129,7 +130,7 @@ class DeckSlotButton(QtWidgets.QFrame):
     clear_requested = QtCore.Signal(int)
     duplicate_requested = QtCore.Signal(int)
 
-    def __init__(self, slot_index: int, slot: Dict[str, Any], parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(self, slot_index: int, slot: Dict[str, Any], icon_config: Optional[Dict[str, Any]] = None, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.slot_index = slot_index
         self.slot = copy.deepcopy(slot)
@@ -143,10 +144,20 @@ class DeckSlotButton(QtWidgets.QFrame):
         layout.setSpacing(3)
         action = dict(slot.get("action") or {})
         macro = str(slot.get("macro") or "").strip()
-        icon_text = ACTION_ICONS.get(str(action.get("kind") or ""), "＋" if not macro else "M")
+        icon_config = dict(icon_config or {})
+        icon_text = str(icon_config.get("emoji") or ACTION_ICONS.get(str(action.get("kind") or ""), "＋" if not macro else "M"))
         icon = QtWidgets.QLabel(icon_text)
         icon.setAlignment(QtCore.Qt.AlignCenter)
         icon.setStyleSheet("font-size:17pt; color:#23E0C2; font-weight:900; background:transparent; border:none;")
+        try:
+            from macro_studio.quickslot_deck import load_pixmap_from_config
+
+            pixmap = load_pixmap_from_config(icon_config)
+            if not pixmap.isNull():
+                icon.setText("")
+                icon.setPixmap(pixmap.scaled(54, 54, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        except Exception:
+            pass
         title = QtWidgets.QLabel(action_title(action) if action else (macro or "빈 슬롯"))
         title.setAlignment(QtCore.Qt.AlignCenter)
         title.setWordWrap(True)
@@ -210,11 +221,23 @@ class DeckSlotButton(QtWidgets.QFrame):
 
 
 class DeckActionConfigDialog(QtWidgets.QDialog):
-    def __init__(self, kind: str, action: Optional[Dict[str, Any]], main_window: Any, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(
+        self,
+        kind: str,
+        action: Optional[Dict[str, Any]],
+        main_window: Any,
+        parent: Optional[QtWidgets.QWidget] = None,
+        *,
+        slot_index: int = -1,
+        icon_config: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(parent)
         self.kind = kind
         self.action = copy.deepcopy(action or {})
         self.main_window = main_window
+        self.repository = main_window.repository
+        self.slot_index = slot_index
+        self.icon_config = copy.deepcopy(icon_config or {})
         self.widgets: Dict[str, Any] = {}
         self.setWindowTitle(f"{ACTION_TITLES.get(kind, 'Deck 액션')} 설정")
         self.setMinimumWidth(500)
@@ -230,6 +253,16 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         form.addRow("슬롯 이름", label)
         self._build_fields(form)
         root.addLayout(form)
+        tools = QtWidgets.QHBoxLayout()
+        self.btn_edit_icon = QtWidgets.QPushButton("🖼 아이콘 불러오기 및 편집")
+        self.btn_edit_icon.clicked.connect(self._edit_icon)
+        self.btn_test = QtWidgets.QPushButton("▶ 현재 설정 테스트")
+        self.btn_test.setObjectName("TestAction")
+        self.btn_test.clicked.connect(self._test_action)
+        tools.addWidget(self.btn_edit_icon)
+        tools.addStretch(1)
+        tools.addWidget(self.btn_test)
+        root.addLayout(tools)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -250,14 +283,22 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
             self.widgets["process"] = edit; form.addRow("프로세스 이름", edit)
         elif kind == "hotkey":
             edit = QtWidgets.QKeySequenceEdit(QtGui.QKeySequence(str(self.action.get("keys") or "Ctrl+Shift+A")))
-            target = QtWidgets.QLineEdit(str(self.action.get("target_title") or "")); target.setPlaceholderText("비우면 현재 활성 창")
-            self.widgets["keys"] = edit; self.widgets["target_title"] = target
-            form.addRow("키 조합", edit); form.addRow("대상 창 제목", target)
+            self.widgets["keys"] = edit
+            form.addRow("키 조합", edit)
+            self._add_target_fields(form)
         elif kind == "text":
             edit = QtWidgets.QPlainTextEdit(str(self.action.get("text") or "")); edit.setMaximumHeight(120)
-            target = QtWidgets.QLineEdit(str(self.action.get("target_title") or "")); target.setPlaceholderText("비우면 현재 활성 창")
-            self.widgets["text"] = edit; self.widgets["target_title"] = target
-            form.addRow("입력할 텍스트", edit); form.addRow("대상 창 제목", target)
+            self.widgets["text"] = edit
+            form.addRow("입력할 텍스트", edit)
+            self._add_target_fields(form)
+        elif kind == "mouse_click":
+            button = QtWidgets.QComboBox()
+            button.addItem("좌클릭", "left"); button.addItem("우클릭", "right"); button.addItem("가운데 클릭", "middle")
+            button.setCurrentIndex(max(0, button.findData(str(self.action.get("button") or "left"))))
+            clicks = QtWidgets.QSpinBox(); clicks.setRange(1, 3); clicks.setValue(int(self.action.get("clicks") or 1))
+            self.widgets["button"] = button; self.widgets["clicks"] = clicks
+            form.addRow("마우스 버튼", button); form.addRow("클릭 횟수", clicks)
+            self._add_target_fields(form, include_point=True)
         elif kind == "wait":
             spin = QtWidgets.QSpinBox(); spin.setRange(10, 600000); spin.setSuffix(" ms"); spin.setValue(int(self.action.get("ms") or 1000))
             self.widgets["ms"] = spin; form.addRow("대기 시간", spin)
@@ -292,6 +333,74 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         elif kind == "page_goto":
             spin = QtWidgets.QSpinBox(); spin.setRange(1, 99); spin.setValue(int(self.action.get("page") or 1))
             self.widgets["page"] = spin; form.addRow("이동할 페이지", spin)
+
+    def _add_target_fields(self, form: QtWidgets.QFormLayout, *, include_point: bool = False) -> None:
+        mode = QtWidgets.QComboBox()
+        mode.addItem("비활성 · 창을 앞으로 가져오지 않음", "inactive")
+        mode.addItem("활성 · 창을 앞으로 가져온 뒤 실행", "active")
+        mode.setCurrentIndex(max(0, mode.findData(str(self.action.get("input_mode") or "inactive"))))
+        target = QtWidgets.QLineEdit(str(self.action.get("target_title") or self.action.get("target_window") or ""))
+        target.setPlaceholderText("오른쪽 버튼으로 화면에서 프로그램을 선택하세요")
+        target_window = QtWidgets.QLineEdit(str(self.action.get("target_window") or "")); target_window.setVisible(False)
+        target_exe = QtWidgets.QLineEdit(str(self.action.get("target_exe") or "")); target_exe.setReadOnly(True)
+        pick = QtWidgets.QPushButton("⌖ 화면에서 선택")
+        pick.clicked.connect(lambda: self._pick_target(include_point))
+        row = QtWidgets.QHBoxLayout(); row.addWidget(target, 1); row.addWidget(pick)
+        self.widgets.update(input_mode=mode, target_title=target, target_window=target_window, target_exe=target_exe)
+        form.addRow("실행 방식", mode); form.addRow("대상 창", row); form.addRow("대상 프로그램", target_exe)
+        if include_point:
+            x = QtWidgets.QSpinBox(); x.setRange(-100000, 100000); x.setValue(int(self.action.get("x") or 0))
+            y = QtWidgets.QSpinBox(); y.setRange(-100000, 100000); y.setValue(int(self.action.get("y") or 0))
+            coords = QtWidgets.QHBoxLayout(); coords.addWidget(QtWidgets.QLabel("X")); coords.addWidget(x); coords.addWidget(QtWidgets.QLabel("Y")); coords.addWidget(y)
+            self.widgets.update(x=x, y=y)
+            form.addRow("클라이언트 좌표", coords)
+
+    def _pick_target(self, include_point: bool) -> None:
+        from macro_studio.action_editor import WindowPickerDialog
+
+        ignored = {int(self.winId())}
+        for widget in (self.parentWidget(), self.main_window):
+            if widget is not None:
+                try:
+                    ignored.add(int(widget.winId()))
+                except Exception:
+                    pass
+        self.hide()
+        picker = WindowPickerDialog(None, ignored_hwnds=ignored, hint_text="대상 프로그램을 클릭하세요 · 클릭 기능은 위치까지 함께 저장됩니다 · Esc 취소")
+        accepted = picker.exec() == QtWidgets.QDialog.Accepted
+        self.show(); self.raise_(); self.activateWindow()
+        if not accepted:
+            return
+        title = ""
+        try:
+            length = int(__import__("ctypes").windll.user32.GetWindowTextLengthW(picker.window_hwnd))
+            buffer = __import__("ctypes").create_unicode_buffer(length + 1)
+            __import__("ctypes").windll.user32.GetWindowTextW(picker.window_hwnd, buffer, length + 1)
+            title = buffer.value
+        except Exception:
+            pass
+        self.widgets["target_title"].setText(title or picker.exe_name or picker.window_token)
+        self.widgets["target_window"].setText(picker.window_token)
+        self.widgets["target_exe"].setText(picker.exe_name)
+        if include_point:
+            point = picker.selected_client_point()
+            if point is not None:
+                self.widgets["x"].setValue(point.x()); self.widgets["y"].setValue(point.y())
+
+    def _edit_icon(self) -> None:
+        from macro_studio.quickslot_deck import SlotIconEditDialog
+
+        label = self.widgets["label"].text().strip() or ACTION_TITLES.get(self.kind, "Deck 액션")
+        dialog = SlotIconEditDialog(max(0, self.slot_index), label, self.icon_config, self)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            self.icon_config = dialog.get_config()
+            self.btn_edit_icon.setText("✓ 아이콘 편집 완료 · 다시 편집")
+
+    def _test_action(self) -> None:
+        self.main_window._execute_deck_action(self.result_action())
+
+    def result_icon_config(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.icon_config)
 
     def _browse_target(self, edit: QtWidgets.QLineEdit) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "실행할 파일 선택")
@@ -406,7 +515,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         rows, cols = int(self.main_window.rows), int(self.main_window.cols)
         for local in range(page_size):
             index = start + local; slot = self.payload["slots"][index]
-            button = DeckSlotButton(index, slot, self.grid_host)
+            button = DeckSlotButton(index, slot, self.main_window.custom_icons.get(str(index), {}), self.grid_host)
             button.action_dropped.connect(self._configure_new_action); button.slot_dropped.connect(self._move_slot); button.edit_requested.connect(self._edit_slot); button.clear_requested.connect(self._clear_slot); button.duplicate_requested.connect(self._duplicate_slot)
             self.grid.addWidget(button, local // cols, local % cols)
         page_name = self.payload["deck_page_names"][self.current_page]
@@ -418,19 +527,28 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         return {"macro": action_title(action), "hotkey": "", "mode": "deck_action", "action": action}
 
     def _configure_new_action(self, index: int, kind: str) -> None:
-        dialog = DeckActionConfigDialog(kind, None, self.main_window, self)
+        dialog = DeckActionConfigDialog(kind, None, self.main_window, self, slot_index=index)
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.payload["slots"][index] = self._slot_from_action(dialog.result_action())
-            self.main_window.custom_icons.pop(str(index), None)
+            icon_config = dialog.result_icon_config()
+            if icon_config: self.main_window.custom_icons[str(index)] = icon_config
+            else: self.main_window.custom_icons.pop(str(index), None)
             self.save()
 
     def _edit_slot(self, index: int) -> None:
         slot = self.payload["slots"][index]; action = dict(slot.get("action") or {})
         if not action:
             return
-        dialog = DeckActionConfigDialog(str(action.get("kind") or ""), action, self.main_window, self)
+        dialog = DeckActionConfigDialog(
+            str(action.get("kind") or ""), action, self.main_window, self,
+            slot_index=index, icon_config=self.main_window.custom_icons.get(str(index), {}),
+        )
         if dialog.exec() == QtWidgets.QDialog.Accepted:
-            self.payload["slots"][index] = self._slot_from_action(dialog.result_action()); self.save()
+            self.payload["slots"][index] = self._slot_from_action(dialog.result_action())
+            icon_config = dialog.result_icon_config()
+            if icon_config: self.main_window.custom_icons[str(index)] = icon_config
+            else: self.main_window.custom_icons.pop(str(index), None)
+            self.save()
 
     def _move_slot(self, source: int, target: int) -> None:
         if source == target: return

@@ -263,7 +263,7 @@ class QuickSlotDeckTests(unittest.TestCase):
             window = QuickSlotDeckWindow(repository)
             dock = DeckDockWindow(window)
             self.assertEqual(window.rows * window.cols, dock.grid.count())
-            self.assertEqual(14, len(dock.action_buttons))
+            self.assertEqual(15, len(dock.action_buttons))
 
             dock.payload["slots"][0] = dock._slot_from_action({"kind": "page_next", "label": "다음"})
             dock.add_page()
@@ -318,6 +318,43 @@ class QuickSlotDeckTests(unittest.TestCase):
                 self.assertEqual(kind, result["kind"])
                 self.assertTrue(result["label"])
                 dialog.close()
+            window.close()
+
+    def test_deck_input_actions_offer_target_mode_icon_and_test_controls(self) -> None:
+        from macro_studio.deck_dock import DeckActionConfigDialog
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            for kind in ("text", "hotkey", "mouse_click"):
+                dialog = DeckActionConfigDialog(kind, None, window, slot_index=2)
+                self.assertEqual("inactive", dialog.widgets["input_mode"].currentData())
+                self.assertIn("target_window", dialog.widgets)
+                self.assertIn("target_exe", dialog.widgets)
+                self.assertTrue(dialog.btn_edit_icon.text())
+                self.assertTrue(dialog.btn_test.text())
+                if kind == "mouse_click":
+                    self.assertIn("x", dialog.widgets)
+                    self.assertIn("y", dialog.widgets)
+                dialog.close()
+            window.close()
+
+    def test_deck_inactive_text_and_mouse_dispatch_without_activation(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            with mock.patch.object(window, "_resolve_action_window", return_value=321) as resolve, mock.patch.object(window, "_send_inactive_text") as send_text:
+                action = {"kind": "text", "label": "입력", "text": "hello", "input_mode": "inactive", "target_exe": "notepad.exe"}
+                window._execute_deck_action(action)
+                resolve.assert_called_once_with(action)
+                send_text.assert_called_once_with(321, "hello")
+            with mock.patch.object(window, "_click_action_target") as click:
+                action = {"kind": "mouse_click", "label": "클릭", "x": 40, "y": 50, "input_mode": "inactive"}
+                window._execute_deck_action(action)
+                click.assert_called_once_with(action, inactive=True)
             window.close()
 
     def test_system_deck_actions_dispatch_to_runtime_services(self) -> None:

@@ -278,6 +278,46 @@ def load_pixmap_from_config(config: Dict[str, Any]) -> QtGui.QPixmap:
     return QtGui.QPixmap()
 
 
+def icon_config_has_visual(config: Dict[str, Any]) -> bool:
+    return bool(
+        str(config.get("image_data") or "").strip()
+        or str(config.get("image_path") or "").strip()
+        or str(config.get("emoji") or "").strip()
+    )
+
+
+def extract_program_icon_config(target: str) -> Dict[str, Any]:
+    """Extract a launch target's native Windows icon into a portable config."""
+    path = str(target or "").strip().strip('"')
+    info = QtCore.QFileInfo(path)
+    if not path or not info.exists():
+        return {}
+    provider = QtWidgets.QFileIconProvider()
+    pixmap = provider.icon(info).pixmap(256, 256)
+    if pixmap.isNull():
+        return {}
+    data = QtCore.QByteArray()
+    buffer = QtCore.QBuffer(data)
+    buffer.open(QtCore.QIODevice.WriteOnly)
+    if not pixmap.save(buffer, "PNG"):
+        return {}
+    buffer.close()
+    return {
+        "image_path": "",
+        "image_data": bytes(data.toBase64()).decode("ascii"),
+        "full_stretch": True,
+        "text_show": False,
+        "emoji": "",
+        "icon_size": 64,
+        "text_position": "hidden",
+        "font_size": 12,
+        "spacing": 0,
+        "text_x_percent": 50,
+        "text_y_percent": 85,
+        "icon_source": "program_auto",
+    }
+
+
 def encode_image_file_to_base64(file_path: str) -> str:
     """Encode an image file on disk to a Base64 data URI string."""
     try:
@@ -434,6 +474,10 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         self.icon_config = dict(icon_config or {})
         repository = getattr(parent, "repository", None)
         self.app_root = Path(getattr(repository, "root", Path(__file__).resolve().parents[1]))
+        owner_config = getattr(parent, "config", None)
+        if not isinstance(owner_config, dict):
+            owner_config = getattr(getattr(parent, "main_window", None), "config", {})
+        self.default_full_stretch = bool(owner_config.get("auto_stretch_default", True)) if isinstance(owner_config, dict) else True
         self.preset_buttons: Dict[str, QtWidgets.QToolButton] = {}
 
         self.setWindowTitle(f"아이콘 및 타일 상세 편집 - 슬롯 #{slot_index + 1}")
@@ -706,7 +750,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
     def _load_current_values(self) -> None:
         img_path = self.icon_config.get("image_path", "")
         self._current_base64 = str(self.icon_config.get("image_data", "")).strip()
-        full_stretch = bool(self.icon_config.get("full_stretch", True if (img_path or self._current_base64) else False))
+        full_stretch = bool(self.icon_config.get("full_stretch", self.default_full_stretch))
         text_show = bool(self.icon_config.get("text_show", True))
         emoji = self.icon_config.get("emoji", "")
         size_val = int(self.icon_config.get("icon_size", 40))
@@ -826,7 +870,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         self.file_edit.clear()
         self._current_base64 = ""
         self._sync_preset_selection("")
-        self.stretch_check.setChecked(False)
+        self.stretch_check.setChecked(self.default_full_stretch)
         self.show_text_check.setChecked(True)
         self.emoji_edit.clear()
         self.size_spin.setValue(40)
@@ -3453,16 +3497,29 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         for c in range(20):
             self.grid_layout.setColumnStretch(c, 1 if c < visible_cols else 0)
 
+        repaired_program_icons = False
         for i, (slot_idx, slot_info) in enumerate(page_slots):
             btn = StreamDeckButton(slot_idx, self.swipe_container)
             btn.setMinimumSize(MIN_TILE_SIDE, MIN_TILE_SIDE)
 
-            # Apply custom icon config if present
-            icon_cfg = self.custom_icons.get(str(slot_idx), {})
-            btn.set_custom_icon_config(icon_cfg)
-
             macro_name = str(slot_info.get("macro") or "").strip()
             action = slot_info.get("action") if isinstance(slot_info.get("action"), dict) else None
+            icon_cfg = dict(self.custom_icons.get(str(slot_idx), {}) or {})
+            if (
+                action is not None
+                and str(action.get("kind") or "") == "open_target"
+                and str(icon_cfg.get("icon_source") or "") != "manual"
+                and not icon_config_has_visual(icon_cfg)
+            ):
+                extracted = extract_program_icon_config(str(action.get("target") or ""))
+                if extracted:
+                    icon_cfg = extracted
+                    self.custom_icons[str(slot_idx)] = extracted
+                    repaired_program_icons = True
+
+            # Apply custom icon config if present
+            btn.set_custom_icon_config(icon_cfg)
+
             display_title = str(action.get("label") or "") if action is not None else macro_name
             hotkey = str(slot_info.get("hotkey") or "").strip()
             mode = str(slot_info.get("mode") or "hybrid")
@@ -3478,6 +3535,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             col = i % visible_cols
             self.grid_layout.addWidget(btn, row, col)
             self.buttons.append(btn)
+        if repaired_program_icons:
+            self._capture_active_slot_preset()
+            self._save_config()
         self.refresh_states()
 
         # Dynamic Auto-Fit Window Size according to configured active slots

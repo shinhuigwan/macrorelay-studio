@@ -238,7 +238,9 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         self.repository = main_window.repository
         self.slot_index = slot_index
         self.icon_config = copy.deepcopy(icon_config or {})
-        self._icon_manually_edited = bool(self.icon_config)
+        icon_source = str(self.icon_config.get("icon_source") or "")
+        has_visual = self._icon_config_has_visual(self.icon_config)
+        self._icon_manually_edited = icon_source == "manual" or (has_visual and icon_source != "program_auto")
         self.widgets: Dict[str, Any] = {}
         self.setWindowTitle(f"{ACTION_TITLES.get(kind, 'Deck 액션')} 설정")
         self.setMinimumWidth(500)
@@ -408,6 +410,7 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         dialog = SlotIconEditDialog(max(0, self.slot_index), label, self.icon_config, self)
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.icon_config = dialog.get_config()
+            self.icon_config["icon_source"] = "manual"
             self._icon_manually_edited = True
             self.btn_edit_icon.setText("✓ 아이콘 편집 완료 · 다시 편집")
 
@@ -415,11 +418,19 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         self.main_window._execute_deck_action(self.result_action())
 
     def result_icon_config(self) -> Dict[str, Any]:
-        if self.kind == "open_target" and not self.icon_config:
+        if self.kind == "open_target" and not self._icon_config_has_visual(self.icon_config):
             target = self.widgets.get("target")
             if isinstance(target, QtWidgets.QLineEdit):
                 self._set_icon_from_program(target.text())
         return copy.deepcopy(self.icon_config)
+
+    @staticmethod
+    def _icon_config_has_visual(config: Dict[str, Any]) -> bool:
+        return bool(
+            str(config.get("image_data") or "").strip()
+            or str(config.get("image_path") or "").strip()
+            or str(config.get("emoji") or "").strip()
+        )
 
     def _browse_target(self, edit: QtWidgets.QLineEdit) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "실행할 파일 선택")
@@ -429,30 +440,14 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
 
     def _set_icon_from_program(self, path: str) -> None:
         target = str(path or "").strip()
-        if self._icon_manually_edited or not target or not QtCore.QFileInfo(target).exists():
+        if self._icon_manually_edited or not target:
             return
-        provider = QtWidgets.QFileIconProvider()
-        icon = provider.icon(QtCore.QFileInfo(target))
-        pixmap = icon.pixmap(256, 256)
-        if pixmap.isNull():
+        from macro_studio.quickslot_deck import extract_program_icon_config
+
+        config = extract_program_icon_config(target)
+        if not config:
             return
-        data = QtCore.QByteArray()
-        buffer = QtCore.QBuffer(data); buffer.open(QtCore.QIODevice.WriteOnly)
-        if not pixmap.save(buffer, "PNG"):
-            return
-        self.icon_config = {
-            "image_path": "",
-            "image_data": bytes(data.toBase64()).decode("ascii"),
-            "full_stretch": False,
-            "text_show": True,
-            "emoji": "",
-            "icon_size": 64,
-            "text_position": "bottom",
-            "font_size": 12,
-            "spacing": 6,
-            "text_x_percent": 50,
-            "text_y_percent": 85,
-        }
+        self.icon_config = config
         self.btn_edit_icon.setText("✓ 프로그램 아이콘 자동 적용 · 편집")
 
     def result_action(self) -> Dict[str, Any]:

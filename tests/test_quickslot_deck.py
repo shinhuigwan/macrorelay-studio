@@ -402,8 +402,45 @@ class QuickSlotDeckTests(unittest.TestCase):
             dialog.widgets["target"].setText(sys.executable)
             icon_config = dialog.result_icon_config()
             self.assertTrue(icon_config.get("image_data"))
-            self.assertFalse(icon_config.get("full_stretch"))
+            self.assertTrue(icon_config.get("full_stretch"))
+            self.assertFalse(icon_config.get("text_show"))
+            self.assertEqual("program_auto", icon_config.get("icon_source"))
             dialog.close(); window.close()
+
+    def test_program_action_repairs_layout_only_icon_config(self) -> None:
+        from macro_studio.deck_dock import DeckActionConfigDialog
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dialog = DeckActionConfigDialog(
+                "open_target", None, window, slot_index=0,
+                icon_config={"full_stretch": True, "text_show": True, "emoji": ""},
+            )
+            dialog.widgets["target"].setText(sys.executable)
+            icon_config = dialog.result_icon_config()
+            self.assertTrue(icon_config.get("image_data"))
+            self.assertEqual("program_auto", icon_config.get("icon_source"))
+            dialog.close(); window.close()
+
+    def test_quickslot_refresh_repairs_missing_program_icon(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": [{
+                "macro": "실행", "hotkey": "", "mode": "deck_action",
+                "action": {"kind": "open_target", "label": "", "target": sys.executable},
+            }]})
+            window = QuickSlotDeckWindow(repository)
+            window.custom_icons["0"] = {"full_stretch": True, "text_show": True, "emoji": ""}
+            window.refresh_slots()
+            self.assertTrue(window.custom_icons["0"].get("image_data"))
+            self.assertEqual("program_auto", window.custom_icons["0"].get("icon_source"))
+            self.assertTrue(window.buttons[0].custom_icon_config.get("full_stretch"))
+            window.close()
 
     def test_deck_inactive_text_and_mouse_dispatch_without_activation(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow

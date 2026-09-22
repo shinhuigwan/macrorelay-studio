@@ -732,6 +732,8 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
         self._rect = QtCore.QRectF()
         self._drag_origin = QtCore.QPointF()
         self._node_origins: dict[int, QtCore.QPointF] = {}
+        self._group_origins: dict[NodeGroupItem, QtCore.QPointF] = {}
+        self._rect_origin = QtCore.QRectF()
         self._dragging = False
 
         self.setZValue(-30)
@@ -840,14 +842,9 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
 
     def toggle_fold(self) -> None:
         self.folded = not self.folded
-        folded_set = set(self.indexes)
-        for index in self.indexes:
-            node = self.canvas.nodes.get(index)
-            if node is not None:
-                node.setVisible(not self.folded)
-        for edge in self.canvas.edges:
-            if edge.source in folded_set or edge.target in folded_set:
-                edge.setVisible(not self.folded)
+        # A workflow/branch is the top-level visual container. Connected node
+        # groups and every node inside them follow the branch visibility.
+        self.canvas._refresh_hierarchy_visibility()
         self.sync_rect()
         self.canvas._route_edges()
         self.canvas._sync_node_groups()
@@ -859,14 +856,7 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
             event.accept()
             return
         if event.button() == QtCore.Qt.LeftButton and self._header_rect().contains(event.pos()):
-            self.canvas.begin_node_move()
-            self._drag_origin = event.scenePos()
-            self._node_origins = {}
-            for index in self.indexes:
-                node = self.canvas.nodes.get(index)
-                if node is not None:
-                    self._node_origins[index] = QtCore.QPointF(node.pos())
-            self._dragging = True
+            self._begin_hierarchy_drag(event.scenePos())
             self.setCursor(QtCore.Qt.ClosedHandCursor)
             event.accept()
         else:
@@ -874,11 +864,7 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
 
     def mouseMoveEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
         if self._dragging:
-            delta = event.scenePos() - self._drag_origin
-            for index, origin in self._node_origins.items():
-                node = self.canvas.nodes.get(index)
-                if node is not None:
-                    node.setPos(origin + delta)
+            self._move_hierarchy_drag(event.scenePos())
             event.accept()
         else:
             super().mouseMoveEvent(event)
@@ -888,9 +874,49 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
             self._dragging = False
             self.setCursor(QtCore.Qt.OpenHandCursor)
             self.canvas.finish_node_move()
+            self.canvas.positions_changed.emit(self.canvas.positions())
+            if self._group_origins:
+                self.canvas.comments_changed.emit(self.canvas.dump_comments())
             event.accept()
         else:
             super().mouseReleaseEvent(event)
+
+    def _begin_hierarchy_drag(self, scene_pos: QtCore.QPointF) -> None:
+        """Capture the complete top-level branch hierarchy for one drag."""
+        self.canvas.begin_node_move()
+        self._drag_origin = QtCore.QPointF(scene_pos)
+        members, groups = self.canvas._workflow_fold_scope(self)
+        self._node_origins = {
+            index: QtCore.QPointF(node.pos())
+            for index in members
+            if (node := self.canvas.nodes.get(index)) is not None
+        }
+        self._group_origins = {
+            group: QtCore.QPointF(group.pos())
+            for group in groups
+        }
+        self._rect_origin = QtCore.QRectF(self._rect)
+        self._dragging = True
+
+    def _move_hierarchy_drag(self, scene_pos: QtCore.QPointF) -> None:
+        """Move nodes, child groups, lane and connecting edges in one frame."""
+        delta = QtCore.QPointF(scene_pos) - self._drag_origin
+        for index, origin in self._node_origins.items():
+            node = self.canvas.nodes.get(index)
+            if node is not None:
+                node.setPos(origin + delta)
+        for group, origin in self._group_origins.items():
+            group.setPos(origin + delta)
+            group.update()
+
+        self.prepareGeometryChange()
+        self._rect = QtCore.QRectF(self._rect_origin).translated(delta)
+        self.update()
+
+        moved = set(self._node_origins)
+        for edge in self.canvas.edges:
+            if edge.source in moved or edge.target in moved:
+                edge.update_path()
 
 
 class NodeItem(QtWidgets.QGraphicsObject):
@@ -3958,7 +3984,13 @@ class NodeCanvas(QtWidgets.QWidget):
 
     def _rebuild_group_proxy_edges(self) -> None:
         self._clear_group_proxy_edges()
+        folded_nodes, _folded_groups = self._folded_workflow_scope()
         for edge in self.edges:
+            # A folded workflow is the top-level container. Do not let the
+            # collapsed-node-group proxy pass re-enable any of its real edges.
+            if edge.source in folded_nodes or edge.target in folded_nodes:
+                edge.setVisible(False)
+                continue
             source_group = self.group_for_node(edge.source, collapsed_only=True)
             target_group = self.group_for_node(edge.target, collapsed_only=True)
             if source_group is None and target_group is None:
@@ -4744,15 +4776,77 @@ class NodeCanvas(QtWidgets.QWidget):
                 members.update(int(index) for index in getattr(group, "node_indexes", []))
         return members
 
-    def _refresh_collapsed_group_visibility(self) -> None:
-        hidden_indexes = self._collapsed_group_members()
+    def _workflow_fold_scope(self, lane: WorkflowLaneItem) -> tuple[set[int], set[NodeGroupItem]]:
+        """Return branch nodes plus connected child node-groups.
+
+        Workflow lanes are always the top-level container. Follow outgoing
+        graph edges through ordinary nodes and node-groups, but stop before a
+        node explicitly owned by another workflow lane. This keeps connected
+        legacy nodes inside the visual branch without swallowing the next
+        branch in a sequential fallback chain.
+        """
+        members = {int(index) for index in getattr(lane, "indexes", [])}
+        protected = {
+            int(index)
+            for other in self.workflow_items
+            if other is not lane
+            for index in getattr(other, "indexes", [])
+        }
+        groups: set[NodeGroupItem] = set()
+        changed = True
+        while changed:
+            changed = False
+
+            # Older macros can have nodes visually connected to a branch but
+            # without workflow_id metadata. Pull those downstream nodes into
+            # the branch hierarchy until another explicit branch begins.
+            for edge in self.edges:
+                source = int(edge.source)
+                target = int(edge.target)
+                if source in members and target not in members and target not in protected:
+                    members.add(target)
+                    changed = True
+
+            for group in list(getattr(self, "comments", [])):
+                if group in groups:
+                    continue
+                group_members = {int(index) for index in getattr(group, "node_indexes", [])}
+                if not group_members:
+                    continue
+                directly_contains = bool(members & group_members)
+                receives_from_branch = any(
+                    edge.source in members and edge.target in group_members
+                    for edge in self.edges
+                )
+                if directly_contains or receives_from_branch:
+                    groups.add(group)
+                    before = len(members)
+                    members.update(group_members - protected)
+                    changed = changed or len(members) != before
+        return members, groups
+
+    def _folded_workflow_scope(self) -> tuple[set[int], set[NodeGroupItem]]:
+        hidden_nodes: set[int] = set()
+        hidden_groups: set[NodeGroupItem] = set()
+        for lane in self.workflow_items:
+            if not bool(getattr(lane, "folded", False)):
+                continue
+            members, groups = self._workflow_fold_scope(lane)
+            hidden_nodes.update(members)
+            hidden_groups.update(groups)
+        return hidden_nodes, hidden_groups
+
+    def _refresh_hierarchy_visibility(self) -> None:
+        workflow_hidden, hidden_groups = self._folded_workflow_scope()
+        hidden_indexes = workflow_hidden | self._collapsed_group_members()
         for index, node in self.nodes.items():
             node.setVisible(index not in hidden_indexes)
+        for group in self.comments:
+            group.setVisible(group not in hidden_groups)
         for edge in self.edges:
             edge.setVisible(edge.source not in hidden_indexes and edge.target not in hidden_indexes)
         for lane in self.workflow_items:
-            indexes = [int(index) for index in getattr(lane, "indexes", [])]
-            lane.setVisible(any(index not in hidden_indexes for index in indexes))
+            lane.setVisible(True)
         if self.trigger_edge is not None:
             target_index = self.start_step if self.start_step in self.nodes else (self.start_candidates[0] if self.start_candidates else 1)
             self.trigger_edge.setVisible(target_index not in hidden_indexes)
@@ -4761,6 +4855,9 @@ class NodeCanvas(QtWidgets.QWidget):
         self._rebuild_group_proxy_edges()
         if hasattr(self, "minimap") and self.minimap and self.minimap.isVisible():
             self.minimap.preview.update()
+
+    def _refresh_collapsed_group_visibility(self) -> None:
+        self._refresh_hierarchy_visibility()
 
     def _update_scene_bounds(self) -> None:
         rect = QtCore.QRectF()

@@ -222,6 +222,83 @@ class NodeGroupCollapseTests(unittest.TestCase):
         self.assertTrue(all(not node.isVisible() for node in canvas.nodes.values()))
         canvas.close()
 
+    def test_folded_branch_hides_connected_legacy_nodes_group_and_edges(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro({
+            "steps": [
+                {"action": "wait", "workflow_id": "branch-1", "workflow_label": "1번 분기", "on_success": 2},
+                {"action": "wait", "workflow_id": "branch-1", "workflow_label": "1번 분기", "on_success": 3},
+                {"action": "wait", "on_success": 4},
+                {"action": "wait", "workflow_id": "branch-2", "workflow_label": "2번 분기"},
+            ],
+            "graph_positions": {"1": [0, 0], "2": [280, 0], "3": [560, 0], "4": [840, 0]},
+            "graph_comments": [{
+                "id": "branch-child", "title": "하위 그룹", "color": "yellow", "node_indexes": [2, 3],
+            }],
+        })
+        app.processEvents()
+
+        first_lane = next(lane for lane in canvas.workflow_items if lane.workflow_id == "branch-1")
+        first_lane.toggle_fold()
+        app.processEvents()
+
+        self.assertFalse(canvas.nodes[1].isVisible())
+        self.assertFalse(canvas.nodes[2].isVisible())
+        self.assertFalse(canvas.nodes[3].isVisible())
+        self.assertTrue(canvas.nodes[4].isVisible())
+        self.assertFalse(canvas.comments[0].isVisible())
+        self.assertTrue(all(not edge.isVisible() for edge in canvas.edges if edge.source in {1, 2, 3}))
+
+        first_lane.toggle_fold()
+        app.processEvents()
+        self.assertTrue(all(canvas.nodes[index].isVisible() for index in (1, 2, 3, 4)))
+        self.assertTrue(canvas.comments[0].isVisible())
+        canvas.close()
+
+    def test_branch_drag_moves_lane_child_group_nodes_and_edges_together(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro({
+            "steps": [
+                {"action": "wait", "workflow_id": "branch-1", "workflow_label": "1번 분기", "on_success": 2},
+                {"action": "wait", "workflow_id": "branch-1", "workflow_label": "1번 분기", "on_success": 3},
+                {"action": "wait"},
+            ],
+            "graph_positions": {"1": [0, 0], "2": [280, 0], "3": [560, 0]},
+            "graph_comments": [{
+                "id": "branch-child", "title": "하위 그룹", "color": "green", "node_indexes": [2, 3],
+            }],
+        })
+        app.processEvents()
+
+        lane = canvas.workflow_items[0]
+        group = canvas.comments[0]
+        node_origin = QtCore.QPointF(canvas.nodes[3].pos())
+        group_origin = QtCore.QPointF(group.pos())
+        lane_origin = QtCore.QRectF(lane._rect)
+        edge = next(edge for edge in canvas.edges if edge.source == 2 and edge.target == 3)
+        edge_origin = QtCore.QRectF(edge.path().boundingRect())
+        delta = QtCore.QPointF(90, 55)
+
+        lane._begin_hierarchy_drag(QtCore.QPointF(100, 100))
+        lane._move_hierarchy_drag(QtCore.QPointF(100, 100) + delta)
+
+        self.assertEqual(node_origin + delta, canvas.nodes[3].pos())
+        self.assertEqual(group_origin + delta, group.pos())
+        self.assertEqual(lane_origin.topLeft() + delta, lane._rect.topLeft())
+        self.assertEqual(edge_origin.topLeft() + delta, edge.path().boundingRect().topLeft())
+
+        lane._dragging = False
+        canvas.finish_node_move()
+        canvas.close()
+
     def test_alignment_keeps_first_selected_node_as_anchor(self) -> None:
         from PySide6 import QtWidgets
         from macro_studio.node_editor import NodeCanvas

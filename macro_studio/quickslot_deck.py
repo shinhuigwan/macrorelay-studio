@@ -1008,8 +1008,10 @@ class StreamDeckButton(QtWidgets.QFrame):
 
         text_show = bool(self.custom_icon_config.get("text_show", True))
         text_pos = str(self.custom_icon_config.get("text_position", "bottom"))
+        win_cfg = getattr(self.window(), "config", {}) if hasattr(self.window(), "config") else {}
+        theme = THEMES.get(int(win_cfg.get("theme_index", 0)), THEMES[0])
 
-        if min(self.width(), self.height()) < 70 or not self.display_title or not text_show or text_pos == "hidden":
+        if bool(theme.get("icon_only", False)) or min(self.width(), self.height()) < 70 or not self.display_title or not text_show or text_pos == "hidden":
             self.title_label.setVisible(False)
             return
 
@@ -1049,12 +1051,17 @@ class StreamDeckButton(QtWidgets.QFrame):
         theme_idx = int(win_cfg.get("theme_index", 0))
         theme = THEMES.get(theme_idx, THEMES[0])
         border_width = float(theme.get("grid_border_width", 2.0))
+        icon_only = bool(theme.get("icon_only", False))
 
         pix = load_pixmap_from_config(self.custom_icon_config)
         has_custom = not pix.isNull()
         full_stretch = bool(self.custom_icon_config.get("full_stretch", True if has_custom else False))
+        is_empty = not self.macro_name and not has_custom
 
-        if has_custom and full_stretch:
+        # Icon-grid themes always paint their own physical tile surface.
+        # Relying on QSS made transparent PNGs and empty cells appear as loose
+        # floating icons on some Windows/Qt combinations.
+        if icon_only or (has_custom and full_stretch):
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
             painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
@@ -1062,10 +1069,30 @@ class StreamDeckButton(QtWidgets.QFrame):
             rect = QtCore.QRectF(self.rect())
             path = QtGui.QPainterPath()
             path.addRoundedRect(rect, tile_radius, tile_radius)
-            painter.setClipPath(path)
+
+            if icon_only:
+                palette = list(theme.get("card_palette") or [])
+                if is_empty:
+                    fill_color = QtGui.QColor(str(theme.get("grid_empty_bg", "#181A1E")))
+                    alpha = max(0, min(100, int(win_cfg.get("empty_slot_opacity", 100)))) / 100.0
+                    fill_color.setAlphaF(alpha)
+                    border_color = QtGui.QColor(str(theme.get("grid_border", "#5B616B")))
+                    border_color.setAlphaF(max(0.55, alpha))
+                else:
+                    card_bg = palette[self.slot_index % len(palette)] if palette else (
+                        theme["card_bg_1"] if self.slot_index % 2 == 0 else theme["card_bg_2"]
+                    )
+                    fill_color = QtGui.QColor(str(card_bg))
+                    border_color = QtGui.QColor(str(theme.get("grid_border") or theme.get("palette_border") or "#5B616B"))
+                painter.fillPath(path, fill_color)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.setPen(QtGui.QPen(border_color, border_width))
+                border_rect = rect.adjusted(border_width / 2.0, border_width / 2.0, -border_width / 2.0, -border_width / 2.0)
+                painter.drawRoundedRect(border_rect, tile_radius, tile_radius)
 
             target_size = self.size()
-            if target_size.width() > 0 and target_size.height() > 0:
+            if has_custom and full_stretch and target_size.width() > 0 and target_size.height() > 0:
+                painter.setClipPath(path)
                 scaled_pix = self._scale_full_stretch_pixmap(pix, target_size)
                 painter.drawPixmap(self.rect(), scaled_pix)
                 border_color = str(theme.get("grid_border") or theme.get("palette_border") or (theme["card_border_1"] if self.slot_index % 2 == 0 else theme["card_border_2"]))

@@ -562,6 +562,7 @@ class QuickSlotDeckTests(unittest.TestCase):
             window = QuickSlotDeckWindow(repository)
             window.rows, window.cols = 2, 3
             dialog = QuickSlotDeckSettingsDialog(window)
+            dialog._on_theme_live_changed(5)
             dialog.show_empty_slots_check.setChecked(True)
             self.app.processEvents()
             self.assertTrue(window.config["show_empty_slots"])
@@ -571,6 +572,10 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertTrue(empty_button.icon_label.isHidden())
             self.assertIn(" solid ", empty_button.styleSheet())
             self.assertNotIn("dashed", empty_button.styleSheet())
+            rendered = empty_button.grab().toImage()
+            border_pixel = rendered.pixelColor(1, rendered.height() // 2)
+            center_pixel = rendered.pixelColor(rendered.width() // 2, rendered.height() // 2)
+            self.assertNotEqual(border_pixel.rgb(), center_pixel.rgb())
             dialog.show_empty_slots_check.setChecked(False)
             self.app.processEvents()
             self.assertEqual(1, len(window.buttons))

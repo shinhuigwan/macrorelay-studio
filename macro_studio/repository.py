@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import ctypes
 import os
 import shutil
 import socket
@@ -203,8 +202,6 @@ class MacroRepository:
             try:
                 payload = self._read_json(path, {})
                 if not isinstance(payload, dict):
-                    # Auxiliary/order JSON files and partially written user
-                    # files must not make the whole Studio fail to start.
                     continue
                 modified = datetime.fromtimestamp(path.stat().st_mtime)
                 raw_steps = payload.get("steps")
@@ -491,99 +488,6 @@ class MacroRepository:
         self._append_macro_order(path.stem)
         return path
 
-    def save_macro_bundle(self, name: str, macro_names: Iterable[str]) -> Path:
-        """Create or update a sequential launcher while keeping child macros independent."""
-        bundle_name = self.safe_name(name)
-        ordered: list[str] = []
-        for value in macro_names:
-            child = str(value).strip()
-            if child and child not in ordered:
-                ordered.append(child)
-        if not ordered:
-            raise ValueError("실행 묶음에는 매크로가 하나 이상 필요합니다.")
-        if bundle_name in ordered:
-            raise ValueError("실행 묶음이 자기 자신을 호출할 수 없습니다.")
-        missing = [child for child in ordered if not self.macro_path(child).is_file()]
-        if missing:
-            raise FileNotFoundError(f"매크로를 찾을 수 없습니다: {', '.join(missing)}")
-
-        path = self.macro_path(bundle_name)
-        if path.exists():
-            existing = self.load_macro(bundle_name)
-            meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
-            if not meta.get("macro_bundle"):
-                raise FileExistsError(f"'{bundle_name}' 이름은 개별 매크로가 사용 중입니다.")
-
-        steps: list[dict[str, Any]] = []
-        for index, child in enumerate(ordered, start=1):
-            next_step = index + 1
-            steps.append({
-                "action": "call_submacro",
-                "label": f"{index}. {child}",
-                "macro": child,
-                "result_var": f"bundle_{index}_success",
-                "on_success": next_step,
-                "on_fail": next_step,
-            })
-        steps.append({
-            "action": "flow_control",
-            "label": "실행 묶음 완료",
-            "jump_to": 0,
-            "repeat_count": 0,
-        })
-        payload = {
-            "name": bundle_name,
-            "description": "실행 묶음: " + " → ".join(ordered),
-            "meta": {
-                "coord_mode": "Screen",
-                "macro_bundle": True,
-                "bundle_items": ordered,
-                "bundle_continue_after_child_exit": True,
-            },
-            "steps": steps,
-            "graph_start_step": 1,
-            "graph_end_step": len(steps),
-            "graph_positions": {str(index): [(index - 1) * 280, 0] for index in range(1, len(steps) + 1)},
-        }
-        if path.exists():
-            self.save_macro(bundle_name, payload)
-        else:
-            payload["created_at"] = _utc_now_iso()
-            self._write_json(path, payload)
-            self._append_macro_order(bundle_name)
-        self.assign_macro_group([bundle_name], "실행 묶음")
-        return path
-
-    def create_macro_unique(self, base_name: str, payload: dict[str, Any]) -> tuple[str, Path]:
-        """Create a macro file with a guaranteed unique name without overwriting any existing file.
-
-        Tries base_name, base_name_1, base_name_2, ... using atomic exclusive creation ('x' mode).
-        Even corrupted or empty JSON files on disk are recognized and not overwritten.
-        Updates macro order and returns (final_name, path).
-        """
-        clean_base = self.safe_name(base_name).strip() or "새 매크로"
-        candidate_name = clean_base
-        counter = 1
-
-        payload_copy = deepcopy(payload)
-        payload_copy.setdefault("meta", {})["created_at"] = _utc_now_iso()
-        payload_copy.setdefault("steps", [])
-
-        while True:
-            target_path = self.macro_path(candidate_name)
-            if not target_path.exists():
-                payload_copy["name"] = candidate_name
-                content = json.dumps(payload_copy, ensure_ascii=False, indent=2)
-                try:
-                    with open(target_path, "x", encoding="utf-8") as f:
-                        f.write(content)
-                    self._append_macro_order(candidate_name)
-                    return candidate_name, target_path
-                except FileExistsError:
-                    pass
-            candidate_name = f"{clean_base}_{counter}"
-            counter += 1
-
     def duplicate_macro(self, source: str, target: str) -> Path:
         payload = self.load_macro(source)
         payload["name"] = target
@@ -634,8 +538,8 @@ class MacroRepository:
         payload = self._read_json(self.assets_index_path, {})
         return payload if isinstance(payload, dict) else {}
 
-    def asset_path(self, alias: str, assets: dict[str, dict[str, Any]] | None = None) -> Path | None:
-        metadata = (assets if assets is not None else self.load_assets()).get(alias)
+    def asset_path(self, alias: str) -> Path | None:
+        metadata = self.load_assets().get(alias)
         if not isinstance(metadata, dict):
             return None
         relative = Path(str(metadata.get("file") or ""))
@@ -1907,29 +1811,6 @@ internal static class Program
         process.macrorelay_checkpoint_path = checkpoint_path  # type: ignore[attr-defined]
         process.macrorelay_resume_step = int(environment.get("MACRORELAY_RESUME_STEP", "0") or 0)  # type: ignore[attr-defined]
         process.macrorelay_dry_run = bool(dry_run)  # type: ignore[attr-defined]
-        active_dir = result_dir / "active"
-        run_marker = active_dir / f"{process.pid}-{uuid.uuid4().hex}.json"
-        try:
-            active_dir.mkdir(parents=True, exist_ok=True)
-            run_marker.write_text(
-                json.dumps({"pid": int(process.pid), "script": str(script), "started": _utc_now_iso()}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except OSError:
-            # Never return an untracked automation process: if ownership cannot
-            # be recorded, terminate it immediately instead of risking an
-            # orphan that continues clicking after the UI exits.
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    capture_output=True,
-                    check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            else:
-                process.kill()
-            raise
-        process.macrorelay_run_marker = run_marker  # type: ignore[attr-defined]
         return process
 
     @staticmethod
@@ -1946,70 +1827,6 @@ internal static class Program
                 chunks.append(chunk)
         result = json.loads(b"".join(chunks).decode("utf-8", errors="replace") or "{}")
         return result if isinstance(result, dict) else {}
-
-    def _has_running_macro_process(self) -> bool:
-        """Return True while any registered MacroRelay macro process is alive."""
-        active_dir = self.exports_dir / ".run_results" / "active"
-        if not active_dir.is_dir():
-            return False
-        running = False
-        for marker in active_dir.glob("*.json"):
-            try:
-                payload = json.loads(marker.read_text(encoding="utf-8-sig"))
-                pid = int(payload.get("pid") or 0) if isinstance(payload, dict) else 0
-            except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                marker.unlink(missing_ok=True)
-                continue
-            if self._pid_is_running(pid):
-                running = True
-            else:
-                marker.unlink(missing_ok=True)
-        return running
-
-    @staticmethod
-    def _pid_is_running(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        if os.name == "nt":
-            try:
-                kernel32 = ctypes.windll.kernel32
-                kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
-                kernel32.OpenProcess.restype = ctypes.c_void_p
-                kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
-                kernel32.GetExitCodeProcess.restype = ctypes.c_bool
-                kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-                kernel32.CloseHandle.restype = ctypes.c_bool
-                handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
-                if not handle:
-                    return False
-                try:
-                    code = ctypes.c_ulong()
-                    return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and int(code.value) == 259
-                finally:
-                    kernel32.CloseHandle(handle)
-            except Exception:
-                return False
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
-
-    @staticmethod
-    def release_macro_process(process: object | None) -> None:
-        marker = getattr(process, "macrorelay_run_marker", None) if process is not None else None
-        if isinstance(marker, Path):
-            marker.unlink(missing_ok=True)
-
-    def shutdown_vision_engine_if_idle(self) -> bool:
-        """Stop the shared OpenCV server only when no macro still depends on it."""
-        if self._has_running_macro_process():
-            return False
-        try:
-            response = self._vision_request({"cmd": "shutdown"}, timeout=0.4)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return False
-        return bool(response.get("ok"))
 
     def _preload_vision_templates(self, payload: dict[str, Any], python: Path, packages: Path) -> None:
         aliases: list[str] = []

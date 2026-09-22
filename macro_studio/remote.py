@@ -3,14 +3,12 @@ from __future__ import annotations
 import ctypes
 import json
 import os
-import secrets
 import socket
 import subprocess
 import sys
 import time
 import urllib.parse
 import webbrowser
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -40,23 +38,6 @@ class RemoteController:
         for key in ("enabled", "relay_url", "prefer_cloud", "device_name", "allow_remote_run", "allow_remote_stop", "allowed_macros"):
             if key in values:
                 config[key] = values[key]
-        save_config(config, self.root)
-        return config
-
-    def reset_identity(self) -> dict[str, Any]:
-        """Rotate the device credentials and force a fresh mobile pairing.
-
-        The relay intentionally stores only a hash of the device secret.  If
-        a restored backup or a changed DPAPI vault contains another secret,
-        the old device can never be repaired remotely.  Rotating the local
-        identity creates a new, short-lived pairing code without exposing the
-        secret or requiring a database edit on the relay.
-        """
-        config = self.load()
-        self.stop_agent()
-        config["device_id"] = uuid.uuid4().hex
-        config["device_secret"] = secrets.token_urlsafe(32)
-        config["enabled"] = True
         save_config(config, self.root)
         return config
 
@@ -143,30 +124,8 @@ class RemoteController:
         pid_path.unlink(missing_ok=True)
         return not self._pid_alive(pid)
 
-    def _python_executable(self) -> str:
-        """Resolve a real Python interpreter for the detached agent.
-
-        A packaged Studio may have ``sys.executable`` pointing to the GUI
-        launcher rather than Python.  Prefer it only when it is recognizably a
-        Python executable, then fall back to the bundled runtimes.
-        """
-        current = Path(sys.executable)
-        name = current.name.lower()
-        if current.is_file() and (name.startswith("python") or name in {"py.exe", "pyw.exe"}):
-            return str(current)
-        candidates = (
-            self.root / ".venv" / "Scripts" / "pythonw.exe",
-            self.root / ".venv" / "Scripts" / "python.exe",
-            self.root / "runtime" / "python.exe",
-            self.root / "runtime" / "opencv" / "cp312" / "python" / "python.exe",
-        )
-        for candidate in candidates:
-            if candidate.is_file():
-                return str(candidate)
-        return str(current)
-
     def start_agent(self) -> bool:
-        return self._start(self.agent_pid, [self._python_executable(), str(self.root / "remote_agent.py"), "--root", str(self.root)])
+        return self._start(self.agent_pid, [sys.executable, str(self.root / "remote_agent.py"), "--root", str(self.root)])
 
     def stop_agent(self) -> bool:
         return self._stop(self.agent_pid)
@@ -175,7 +134,7 @@ class RemoteController:
         return self._start(
             self.relay_pid,
             [
-                self._python_executable(),
+                sys.executable,
                 str(self.root / "remote" / "relay_server.py"),
                 "--host",
                 "0.0.0.0",
@@ -237,19 +196,8 @@ class RemoteController:
 
     def mobile_url(self) -> str:
         relay_url = str(self.load().get("relay_url") or "http://127.0.0.1:8765")
-        try:
-            parsed = urllib.parse.urlsplit(relay_url)
-            host = (parsed.hostname or "").lower()
-            if host in {"127.0.0.1", "localhost", "::1"}:
-                host = self.lan_ip()
-                netloc = host
-                if parsed.port:
-                    netloc = f"{host}:{parsed.port}"
-                relay_url = urllib.parse.urlunsplit(
-                    (parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment)
-                )
-        except ValueError:
-            pass
+        if "127.0.0.1" in relay_url or "localhost" in relay_url:
+            relay_url = relay_url.replace("127.0.0.1", self.lan_ip()).replace("localhost", self.lan_ip())
         return relay_url.rstrip("/") + "/"
 
     def open_mobile(self) -> None:

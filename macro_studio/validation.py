@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from .repository import MacroRepository
@@ -31,26 +30,13 @@ class ProjectValidator:
             return True
         return left == right or top == bottom
 
-    def validate(
-        self,
-        macro_name: str | None = None,
-        macro_payload: dict[str, Any] | None = None,
-    ) -> list[Issue]:
+    def validate(self) -> list[Issue]:
         issues: list[Issue] = []
         assets = self.repository.load_assets()
         tables = self.repository.load_tables()
-        summaries = (
-            [SimpleNamespace(name=macro_name)]
-            if macro_name
-            else self.repository.list_macros()
-        )
-        for summary in summaries:
+        for summary in self.repository.list_macros():
             try:
-                macro = (
-                    macro_payload
-                    if macro_name and summary.name == macro_name and isinstance(macro_payload, dict)
-                    else self.repository.load_macro(summary.name)
-                )
+                macro = self.repository.load_macro(summary.name)
             except (OSError, ValueError) as exc:
                 issues.append(Issue("error", "손상된 매크로", str(exc), summary.name))
                 continue
@@ -185,38 +171,6 @@ class ProjectValidator:
                         issues.append(
                             Issue("error", "잘못된 단계 연결", f"{field}={target}", summary.name, index)
                         )
-                asset_routes = step.get("asset_routes")
-                if asset_routes and not isinstance(asset_routes, dict):
-                    issues.append(Issue("error", "잘못된 이미지별 분기", "asset_routes가 객체가 아닙니다.", summary.name, index))
-                elif isinstance(asset_routes, dict):
-                    known_assets = {
-                        str(value) for value in step.get("assets") or [] if str(value).strip()
-                    } if isinstance(step.get("assets"), list) else set()
-                    primary_asset = str(step.get("asset") or "").strip()
-                    if primary_asset:
-                        known_assets.add(primary_asset)
-                    for alias, route in asset_routes.items():
-                        if str(alias) not in known_assets:
-                            issues.append(Issue("warning", "분기 이미지 누락", f"'{alias}' 이미지가 현재 노드에 없습니다.", summary.name, index))
-                        if not isinstance(route, dict):
-                            issues.append(Issue("error", "잘못된 이미지별 분기", f"'{alias}' 분기 값이 객체가 아닙니다.", summary.name, index))
-                            continue
-                        for outcome in ("true", "fail"):
-                            try:
-                                target = int(route.get(outcome) or 0)
-                            except (TypeError, ValueError):
-                                issues.append(
-                                    Issue(
-                                        "error",
-                                        "잘못된 이미지별 분기",
-                                        f"{alias}.{outcome} 값이 노드 번호가 아닙니다.",
-                                        summary.name,
-                                        index,
-                                    )
-                                )
-                                continue
-                            if target and not 1 <= target <= len(steps):
-                                issues.append(Issue("error", "이미지별 분기 목적지 오류", f"{alias}.{outcome}={target}", summary.name, index))
                 conditions = step.get("edge_conditions") or []
                 if conditions and not isinstance(conditions, list):
                     issues.append(Issue("error", "잘못된 조건 분기", "edge_conditions가 배열이 아닙니다.", summary.name, index))
@@ -232,63 +186,6 @@ class ProjectValidator:
                             variable = str(rule.get("variable") or "")
                             if not variable or not variable.replace("_", "a").isalnum() or variable[0].isdigit():
                                 issues.append(Issue("error", "조건 분기 변수 오류", f"규칙 {rule_index}: '{variable}'", summary.name, index))
-        # 빌더에서 매크로 하나를 선택할 때는 현재 매크로와 그 매크로에서
-        # 실제로 도달할 수 있는 서브플로우만 따라가 순환을 검사합니다.
-        if macro_name:
-            call_graph: dict[str, set[str]] = {}
-            payloads: dict[str, dict[str, Any]] = {
-                macro_name: macro if isinstance(macro, dict) else {}
-            }
-            pending = [macro_name]
-            while pending:
-                current = pending.pop()
-                current_payload = payloads.get(current) or {}
-                targets = {
-                    str(step.get("macro") or "").strip()
-                    for step in current_payload.get("steps") or []
-                    if isinstance(step, dict)
-                    and step.get("action") == "call_submacro"
-                    and str(step.get("macro") or "").strip()
-                }
-                call_graph[current] = targets
-                for target in targets:
-                    if target in payloads or not self.repository.macro_path(target).is_file():
-                        continue
-                    try:
-                        child = self.repository.load_macro(target)
-                    except (OSError, ValueError):
-                        continue
-                    if isinstance(child, dict):
-                        payloads[target] = child
-                        pending.append(target)
-
-            states: dict[str, int] = {}
-            stack: list[str] = []
-            reported_cycles: set[tuple[str, ...]] = set()
-
-            def visit_reachable(current: str) -> None:
-                states[current] = 1
-                stack.append(current)
-                for target in call_graph.get(current, set()):
-                    if target not in call_graph:
-                        continue
-                    if states.get(target, 0) == 0:
-                        visit_reachable(target)
-                    elif states.get(target) == 1:
-                        cycle = tuple([*stack[stack.index(target) :], target])
-                        if len(cycle) == 2 and target == macro_name:
-                            continue
-                        if cycle not in reported_cycles:
-                            reported_cycles.add(cycle)
-                            issues.append(
-                                Issue("error", "서브플로우 간접 순환", " → ".join(cycle), macro_name)
-                            )
-                stack.pop()
-                states[current] = 2
-
-            visit_reachable(macro_name)
-            return issues
-
         call_graph: dict[str, set[str]] = {}
         for summary in self.repository.list_macros():
             try:

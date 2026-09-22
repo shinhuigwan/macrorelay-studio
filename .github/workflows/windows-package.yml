@@ -1,4 +1,4 @@
-name: Windows Studio Package
+name: Windows Install Package
 
 on:
   workflow_dispatch:
@@ -14,27 +14,17 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-
-      - name: Build clean downloadable package
+      - name: Build installer-ready source package
         shell: pwsh
         run: |
-          $name = "MacroRelay-Studio-${{ github.ref_name }}"
-          $root = Join-Path $env:RUNNER_TEMP $name
-          New-Item -ItemType Directory -Path $root | Out-Null
-          git ls-files | ForEach-Object {
-            $destination = Join-Path $root $_
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-            Copy-Item -LiteralPath $_ -Destination $destination
-          }
-          Compress-Archive -Path $root -DestinationPath "$name.zip" -CompressionLevel Optimal
-
+          git archive --format=zip --prefix=MacroRelay-Studio/ --output="MacroRelay-Studio-${{ github.ref_name }}.zip" HEAD
       - uses: actions/upload-artifact@v4
         with:
           name: MacroRelay-Studio-Windows
           path: MacroRelay-Studio-${{ github.ref_name }}.zip
-
       - name: Attach package to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: MacroRelay-Studio-${{ github.ref_name }}.zip
+

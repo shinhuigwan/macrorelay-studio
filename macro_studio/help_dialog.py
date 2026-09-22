@@ -31,7 +31,6 @@ class MacroHelpDialog(QtWidgets.QDialog):
         <li><b>빨간색 실패 포트 (Out)</b>: 이미지 탐색 실패나 조건 불일치 시 실행할 노드로 드래그하여 연결합니다.</li>
         <li><b>연결선 끊기 (제거)</b>: 노드선을 마우스로 잡고 <b>빈 공간으로 드래그</b>하면 즉시 연결이 안전하게 해제됩니다.</li>
         <li><b>연결선 설정</b>: 노드선을 <b>더블클릭</b>하거나 <b>우클릭</b>하면 '실행 딜레이(ms)' 및 '횟수/변수 조건 분기'를 추가할 수 있습니다.</li>
-        <li><b>개별 이미지 분기선</b>: 멀티 이미지의 True/Fail 전용 연결은 얇은 점선과 이미지 순번으로 표시됩니다. 선을 더블클릭하면 해당 이미지 설정으로 이동하고, 상단 <b>[개별 분기선]</b> 버튼으로 한꺼번에 숨길 수 있습니다.</li>
     </ul>
 </div>
 
@@ -83,28 +82,6 @@ class MacroHelpDialog(QtWidgets.QDialog):
         <li><b>⚡ 속도 우선 프리셋</b>: 탐색 주기를 35ms로 단축하고 불필요한 필터를 건너뛰어 초고속 연타 및 즉시 반응에 최적화됩니다.</li>
         <li><b>◐ 기본 프리셋</b>: 일치율 84%, 허용오차 16 등 대부분의 환경에서 안정적으로 동작하는 표준 설정입니다.</li>
         <li><b>🎯 정밀도 우선 프리셋</b>: 신뢰도 92%+, 허용오차 8 이하로 엄격하게 설정하여 배경 색상 변화나 유사 아이콘 오탐을 원천 차단합니다.</li>
-    </ul>
-</div>
-
-<div style='background: #171D28; border: 1px solid #2B384E; border-radius: 8px; padding: 14px; margin-bottom: 14px;'>
-    <h3 style='color: #63FFE0; margin-top: 0;'>🔍 이미지 지정·상세 편집 확대</h3>
-    <ul>
-        <li><b>휠 확대·축소</b>: 이미지 지정 화면과 상세 편집창에서 마우스 휠을 돌리면 커서가 가리키는 부분을 중심으로 확대됩니다.</li>
-        <li><b>화면 이동</b>: 최초 이미지 지정 화면은 마우스 가운데 버튼을 누른 채 드래그해 확대된 화면을 이동할 수 있습니다.</li>
-        <li><b>100% 복귀</b>: 숫자 <code>0</code> 키를 누르면 원래 보기 배율로 돌아갑니다.</li>
-        <li><b>검색 안전성</b>: 확대는 화면 표시용입니다. 실제로 저장되는 PNG와 OpenCV가 검색하는 원본 픽셀은 바뀌지 않습니다.</li>
-    </ul>
-</div>
-
-<div style='background: #171D28; border: 1px solid #2B384E; border-radius: 8px; padding: 14px; margin-bottom: 14px;'>
-    <h3 style='color: #FF6B9D; margin-top: 0;'>❖ 다중 픽셀 영역 색상 검사</h3>
-    <ul>
-        <li><b>대상 자동 지정</b>: 첫 색상을 찍은 프로그램이 자동 선택되며, 이미 지정한 프로그램은 앞에 뜬 다른 창보다 우선합니다.</li>
-        <li><b>영역 검색</b>: 고정 좌표 한 점이 아니라 지정한 검색 영역 안에서 각 저장 색상을 찾습니다.</li>
-        <li><b>실시간 미리보기</b>: 노드 우측 상단 <code>▦</code>를 눌러 영역과 색상별 일치 여부를 바로 확인합니다.</li>
-        <li><b>N-of-M 조건</b>: 모두, 하나 이상, 지정 개수 이상, 정확히 지정 개수 일치를 선택할 수 있습니다.</li>
-        <li><b>안정화</b>: 같은 프레임에서 모든 핀을 판정하고 연속 확인 횟수로 애니메이션·깜빡임 오판을 줄입니다.</li>
-        <li><b>후속 동작</b>: True/Fail 노드 분기 또는 발견 위치 비활성 클릭과 화면 클릭식 오프셋 지정을 사용할 수 있습니다.</li>
     </ul>
 </div>
 
@@ -385,3 +362,4 @@ class MacroHelpDialog(QtWidgets.QDialog):
             results_html.append(f"<p style='color: #8A98B0; padding: 20px;'>검색어 '<b>{query}</b>'와 일치하는 도움말 항목이 없습니다.<br>다른 키워드(예: <b>분기, 이미지, 클릭, 단축키, 오프셋</b>)로 검색해보세요.</p>")
 
         self.content_browser.setHtml("\n".join(results_html))
+

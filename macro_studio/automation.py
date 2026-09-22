@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-from copy import deepcopy
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -19,7 +18,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .action_editor import ActionEditor, CoordinatePickerDialog, WindowPickerDialog, action_template
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
 from .node_editor import ACTION_TITLES
-from .screen_coordinates import display_coordinate_maps, logical_point_to_native, logical_rect_to_native, native_point_to_logical, native_rect_to_logical, rect_to_exclusive_list
 from .theme import COLORS
 from .widgets import WheelSafeSpinBox
 
@@ -297,8 +295,7 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
             "table_copy", "table_paste", "table_excel_read", "table_excel_write",
             "set_var", "calc_var", "coord_mode", "call_submacro", "flow_control",
             "text_condition", "run_program", "terminate_program", "type_text",
-            "pixel_search", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio", "find_text_click",
-            "mouse_click", "inactive_click",
+            "pixel_search", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio", "find_text_click"
         }:
             window = event.get("window") if isinstance(event.get("window"), dict) else {}
             title = ACTION_TITLES.get(event_type, event_type)
@@ -312,9 +309,6 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                     "record_mode": record_mode,
                     "detail": str(event.get("detail") or title),
                     "target": _window_label(window),
-                    "step": dict(event.get("_step_payload") or {})
-                    if isinstance(event.get("_step_payload"), dict)
-                    else {},
                     **workflow,
                 }
             )
@@ -486,127 +480,7 @@ def recording_drafts(events: list[dict[str, Any]], include_waits: bool = True) -
                 }
             )
         previous_time = last_time
-    for draft in drafts:
-        event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
-        payload = event.get("_step_payload")
-        if isinstance(payload, dict) and payload:
-            draft["step"] = deepcopy(payload)
     return drafts
-
-
-def _native_pixel_color(point: QtCore.QPoint, fallback: QtGui.QColor) -> QtGui.QColor:
-    """Read the exact physical desktop pixel selected by a Qt logical cursor."""
-    try:
-        user32 = ctypes.windll.user32
-        gdi32 = ctypes.windll.gdi32
-        dc = user32.GetDC(0)
-        if dc:
-            try:
-                color_ref = int(gdi32.GetPixel(dc, int(point.x()), int(point.y())))
-                if color_ref != -1:
-                    return QtGui.QColor(
-                        color_ref & 0xFF,
-                        (color_ref >> 8) & 0xFF,
-                        (color_ref >> 16) & 0xFF,
-                    )
-            finally:
-                user32.ReleaseDC(0, dc)
-    except Exception:
-        pass
-    return QtGui.QColor(fallback)
-
-
-def _native_region_image(rect: QtCore.QRect, fallback: QtGui.QImage) -> QtGui.QImage:
-    """Capture an exact physical-pixel image for a native desktop rectangle."""
-    if not rect.isValid():
-        return fallback
-    try:
-        from opencv_search import capture_region
-
-        frame = capture_region(rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height())
-        if frame is not None and frame.size:
-            qimage = QtGui.QImage(
-                frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QtGui.QImage.Format_BGR888
-            )
-            return qimage.copy()
-    except Exception:
-        pass
-    if not fallback.isNull():
-        return fallback
-    # Some packaged Windows environments do not expose MSS/Pillow screen
-    # capture to the UI process.  Reuse Qt's proven multi-monitor capture and
-    # translate the physical selection back to its logical desktop rectangle.
-    try:
-        pixmap, geometry = capture_virtual_desktop()
-        logical_rect = native_rect_to_logical(rect)
-        local_rect = logical_rect.translated(-geometry.left(), -geometry.top()).intersected(pixmap.rect())
-        if not pixmap.isNull() and local_rect.isValid() and local_rect.width() > 1 and local_rect.height() > 1:
-            return pixmap.toImage().copy(local_rect)
-    except Exception:
-        pass
-    return QtGui.QImage()
-
-
-def build_animation_templates(
-    frames: list[QtGui.QImage],
-    stability_threshold: int = 22,
-    max_templates: int = 4,
-) -> tuple[list[QtGui.QImage], float]:
-    """Create alpha-masked representative frames for an animated UI target.
-
-    Pixels that change during the sample window are made transparent.  The
-    remaining stable icon/letter pixels are therefore matched by OpenCV while
-    a rotating effect or changing background is ignored.
-    """
-    valid = [frame.convertToFormat(QtGui.QImage.Format_RGBA8888) for frame in frames if not frame.isNull()]
-    if not valid:
-        return [], 0.0
-    width, height = valid[0].width(), valid[0].height()
-    valid = [frame for frame in valid if frame.width() == width and frame.height() == height]
-    if not valid:
-        return [], 0.0
-    max_templates = max(1, min(int(max_templates), len(valid)))
-    indexes = sorted({round(index * (len(valid) - 1) / max(1, max_templates - 1)) for index in range(max_templates)})
-    try:
-        import numpy as np
-
-        arrays = []
-        for image in valid:
-            raw = np.frombuffer(image.bits(), dtype=np.uint8, count=image.sizeInBytes())
-            rgba = raw.reshape((height, image.bytesPerLine()))[:, : width * 4].reshape((height, width, 4)).copy()
-            arrays.append(rgba)
-        stack = np.stack([array[:, :, :3] for array in arrays], axis=0).astype(np.int16)
-        spread = (stack.max(axis=0) - stack.min(axis=0)).max(axis=2)
-        mask = (spread <= max(1, int(stability_threshold))).astype(np.uint8) * 255
-        try:
-            import cv2
-
-            kernel = np.ones((3, 3), dtype=np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            mask = cv2.erode(mask, kernel, iterations=1)
-        except Exception:
-            pass
-        stable_ratio = float((mask > 0).mean())
-        # If virtually the whole target animates, keeping the originals is a
-        # safer fallback than producing an unusable fully transparent PNG.
-        use_mask = int((mask > 0).sum()) >= max(25, int(width * height * 0.01))
-        output: list[QtGui.QImage] = []
-        for index in indexes:
-            rgba = arrays[index].copy()
-            if use_mask:
-                rgba[:, :, 3] = np.minimum(rgba[:, :, 3], mask)
-            qimage = QtGui.QImage(
-                rgba.data,
-                width,
-                height,
-                int(rgba.strides[0]),
-                QtGui.QImage.Format_RGBA8888,
-            )
-            output.append(qimage.copy())
-        return output, stable_ratio if use_mask else 1.0
-    except Exception:
-        return [valid[index].copy() for index in indexes], 1.0
 
 
 class PixelColorPickerDialog(QtWidgets.QDialog):
@@ -646,17 +520,13 @@ class PixelColorPickerDialog(QtWidgets.QDialog):
             local_x = screen_pos.x() - self._geometry.left()
             local_y = screen_pos.y() - self._geometry.top()
             if 0 <= local_x < img.width() and 0 <= local_y < img.height():
-                native_pos = logical_point_to_native(screen_pos)
-                self._selected_color = _native_pixel_color(native_pos, img.pixelColor(local_x, local_y))
-                self._selected_point = native_pos
+                self._selected_color = img.pixelColor(local_x, local_y)
+                self._selected_point = screen_pos
             self.accept()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() == QtCore.Qt.Key_Escape:
-            event.accept()
             self.reject()
-            return
-        super().keyPressEvent(event)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
@@ -778,16 +648,7 @@ class PixelColorPickerDialog(QtWidgets.QDialog):
 class MultiPixelPickerDialog(QtWidgets.QDialog):
     """Fullscreen overlay with magnifier lens for extracting multiple pixel colors sequentially."""
 
-    def __init__(
-        self,
-        pixmap: QtGui.QPixmap,
-        geometry: QtCore.QRect,
-        parent=None,
-        *,
-        ignored_hwnds: set[int] | None = None,
-        preferred_window: str = "",
-        preferred_exe: str = "",
-    ) -> None:
+    def __init__(self, pixmap: QtGui.QPixmap, geometry: QtCore.QRect, parent=None) -> None:
         super().__init__(parent)
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool
@@ -800,31 +661,11 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
         self._mouse_pos = QtGui.QCursor.pos()
         self._zoom = 8
         self._lens_size = 140
-        self._ignored_hwnds = set(ignored_hwnds or ())
-        self._target: dict[str, Any] | None = None
-        self._coordinate_mode = "Screen"
-        hwnd, target_rect = _multi_pixel_target_info(preferred_window, preferred_exe)
-        if hwnd and target_rect.isValid():
-            self._target = {
-                "window": preferred_window,
-                "exe": preferred_exe,
-                "hwnd": hwnd,
-                "capture_scope": "client",
-                "client_origin": [target_rect.left(), target_rect.top()],
-                "rect": target_rect,
-            }
-            self._coordinate_mode = "Client"
         self.setMouseTracking(True)
         self.setStyleSheet("background: transparent;")
 
     def selected_points(self) -> list[dict[str, Any]]:
         return self._points
-
-    def selected_target(self) -> dict[str, Any]:
-        return dict(self._target or {})
-
-    def coordinate_mode(self) -> str:
-        return self._coordinate_mode
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         self._mouse_pos = event.globalPosition().toPoint() if hasattr(event, 'globalPosition') else event.globalPos()
@@ -837,64 +678,27 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
             local_x = screen_pos.x() - self._geometry.left()
             local_y = screen_pos.y() - self._geometry.top()
             if 0 <= local_x < img.width() and 0 <= local_y < img.height():
-                native_pos = logical_point_to_native(screen_pos)
-                color = _native_pixel_color(native_pos, img.pixelColor(local_x, local_y))
-                if self._target:
-                    target = self._target if self._target.get("rect") and self._target["rect"].contains(native_pos) else None
-                else:
-                    target = ActionEditor._window_target_at(
-                        native_pos,
-                        self._ignored_hwnds,
-                        position_is_native=True,
-                    )
-                if not self._points and not self._target and target and str(target.get("capture_scope") or "") == "client":
-                    self._target = dict(target)
-                    self._coordinate_mode = "Client"
-                elif self._target:
-                    if not target or int(target.get("hwnd") or 0) != int(self._target.get("hwnd") or 0):
-                        QtWidgets.QToolTip.showText(
-                            screen_pos,
-                            "첫 번째 핀과 같은 대상 프로그램 안에서 선택하세요.",
-                            self,
-                        )
-                        return
-
-                stored_x = native_pos.x()
-                stored_y = native_pos.y()
-                if self._target and self._coordinate_mode == "Client":
-                    origin = self._target.get("client_origin") or [0, 0]
-                    stored_x -= int(origin[0])
-                    stored_y -= int(origin[1])
+                color = img.pixelColor(local_x, local_y)
                 self._points.append({
-                    "x": stored_x,
-                    "y": stored_y,
+                    "x": screen_pos.x(),
+                    "y": screen_pos.y(),
                     "color": color.name().upper(),
                     "tolerance": 10,
-                    "custom_tolerance": False,
-                    "enabled": True,
                 })
                 self.update()
         elif event.button() == QtCore.Qt.RightButton:
             if self._points:
                 self._points.pop()
-                if not self._points and not (self._target and self._target.get("window")):
-                    self._target = None
-                    self._coordinate_mode = "Screen"
                 self.update()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-            event.accept()
             if self._points:
                 self.accept()
             else:
                 self.reject()
-            return
         elif event.key() == QtCore.Qt.Key_Escape:
-            event.accept()
             self.reject()
-            return
-        super().keyPressEvent(event)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
@@ -904,13 +708,8 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
 
         # Draw already marked pin badges
         for idx, pt in enumerate(self._points, start=1):
-            native_point = QtCore.QPoint(int(pt["x"]), int(pt["y"]))
-            if self._target and self._coordinate_mode == "Client":
-                origin = self._target.get("client_origin") or [0, 0]
-                native_point += QtCore.QPoint(int(origin[0]), int(origin[1]))
-            logical_point = native_point_to_logical(native_point)
-            px = logical_point.x() - self._geometry.left()
-            py = logical_point.y() - self._geometry.top()
+            px = pt["x"] - self._geometry.left()
+            py = pt["y"] - self._geometry.top()
             clr = QtGui.QColor(pt["color"])
             painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 2))
             painter.setBrush(clr)
@@ -1001,8 +800,7 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
                 f"{len(self._points)}개 선택됨",
             )
 
-        target_label = str((self._target or {}).get("exe") or "전체 화면")
-        hint = f"[ 다중 픽셀 선택 · {target_label} ] 좌클릭: 핀 추가 ({len(self._points)}개) · 우클릭: 취소 · Enter: 완료 · ESC: 취소"
+        hint = f"[ 다중 픽셀 선택 ] 좌클릭: 핀 추가 ({len(self._points)}개) · 우클릭: 취소 · Enter: 완료 · ESC: 취소"
         font = painter.font()
         font.setPointSize(11)
         font.setBold(True)
@@ -1023,326 +821,8 @@ class MultiPixelPickerDialog(QtWidgets.QDialog):
         painter.end()
 
 
-def _multi_pixel_target_info(window: str, window_exe: str) -> tuple[int, QtCore.QRect]:
-    """Resolve the stored target first; never substitute the foreground window."""
-    if not window and not window_exe:
-        return 0, QtCore.QRect()
-    try:
-        from .image_search_test import _find_window
-
-        hwnd = int(_find_window(window_exe, window) or 0)
-        if not hwnd:
-            return 0, QtCore.QRect()
-        user32 = ctypes.windll.user32
-        rect = wintypes.RECT()
-        origin = wintypes.POINT(0, 0)
-        if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
-            return 0, QtCore.QRect()
-        if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
-            return 0, QtCore.QRect()
-        return hwnd, QtCore.QRect(
-            int(origin.x),
-            int(origin.y),
-            int(rect.right - rect.left),
-            int(rect.bottom - rect.top),
-        )
-    except Exception:
-        return 0, QtCore.QRect()
-
-
-def _multi_pixel_target_client_rect(window: str, window_exe: str) -> QtCore.QRect:
-    return _multi_pixel_target_info(window, window_exe)[1]
-
-
-def _multi_pixel_target_image(window: str, window_exe: str) -> tuple[QtGui.QImage, QtCore.QRect]:
-    """Capture the explicitly stored target window, including when it is not foreground."""
-    hwnd, rect = _multi_pixel_target_info(window, window_exe)
-    if not hwnd or not rect.isValid():
-        return QtGui.QImage(), rect
-    screen = QtGui.QGuiApplication.screenAt(rect.center()) or QtGui.QGuiApplication.primaryScreen()
-    if screen is not None:
-        pixmap = screen.grabWindow(hwnd, 0, 0, rect.width(), rect.height())
-        if not pixmap.isNull():
-            image = pixmap.toImage()
-            if image.size() != rect.size():
-                image = image.scaled(rect.size(), QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
-            return image, rect
-    return _native_region_image(rect, QtGui.QImage()), rect
-
-
-class MultiPixelPreviewCanvas(QtWidgets.QWidget):
-    """Scaled client screenshot with numbered colour samples and search regions."""
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.image = QtGui.QImage()
-        self.points: list[dict[str, Any]] = []
-        self.capture_rect = QtCore.QRect()
-        self.relative = True
-        self.search_region: list[int] = []
-        self.setMinimumSize(640, 420)
-
-    def set_snapshot(
-        self,
-        image: QtGui.QImage,
-        capture_rect: QtCore.QRect,
-        points: list[dict[str, Any]],
-        *,
-        relative: bool,
-        search_region: list[int] | None = None,
-    ) -> None:
-        self.image = QtGui.QImage(image)
-        self.capture_rect = QtCore.QRect(capture_rect)
-        self.points = [dict(item) for item in points]
-        self.relative = bool(relative)
-        self.search_region = list(search_region or [])
-        self.update()
-
-    def _image_rect(self) -> QtCore.QRect:
-        if self.image.isNull():
-            return self.rect().adjusted(12, 12, -12, -12)
-        size = self.image.size().scaled(self.size() - QtCore.QSize(24, 24), QtCore.Qt.KeepAspectRatio)
-        return QtCore.QRect(QtCore.QPoint(), size).translated(
-            (self.width() - size.width()) // 2,
-            (self.height() - size.height()) // 2,
-        )
-
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        painter = QtGui.QPainter(self)
-        painter.fillRect(self.rect(), QtGui.QColor("#090B10"))
-        target = self._image_rect()
-        if self.image.isNull():
-            painter.setPen(QtGui.QColor("#F87171"))
-            painter.drawText(target, QtCore.Qt.AlignCenter, "대상 프로그램 화면을 캡처할 수 없습니다.")
-            return
-        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
-        painter.drawImage(target, self.image)
-        sx = target.width() / max(1, self.image.width())
-        sy = target.height() / max(1, self.image.height())
-        if len(self.search_region) >= 4:
-            left, top, right, bottom = [int(value) for value in self.search_region[:4]]
-            if not self.relative:
-                left -= self.capture_rect.x()
-                right -= self.capture_rect.x()
-                top -= self.capture_rect.y()
-                bottom -= self.capture_rect.y()
-            region_rect = QtCore.QRectF(
-                target.x() + left * sx,
-                target.y() + top * sy,
-                max(1.0, (right - left) * sx),
-                max(1.0, (bottom - top) * sy),
-            )
-            painter.setPen(QtGui.QPen(QtGui.QColor("#38BDF8"), 2, QtCore.Qt.DashLine))
-            painter.setBrush(QtGui.QColor(56, 189, 248, 28))
-            painter.drawRect(region_rect)
-            painter.setPen(QtGui.QColor("#A5E8FF"))
-            painter.drawText(region_rect.adjusted(5, 3, -5, -3), QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft, "색상 검색 영역")
-        for index, point in enumerate(self.points, start=1):
-            if not bool(point.get("enabled", True)):
-                continue
-            px = int(point.get("x") or 0)
-            py = int(point.get("y") or 0)
-            if not self.relative:
-                px -= self.capture_rect.x()
-                py -= self.capture_rect.y()
-            x = target.x() + round(px * sx)
-            y = target.y() + round(py * sy)
-            color = QtGui.QColor(str(point.get("color") or "#FFFFFF"))
-            painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 2))
-            painter.setBrush(color)
-            painter.drawEllipse(QtCore.QPoint(x, y), 10, 10)
-            painter.setPen(QtGui.QColor("#000000") if color.lightness() > 128 else QtGui.QColor("#FFFFFF"))
-            painter.drawText(QtCore.QRect(x - 10, y - 10, 20, 20), QtCore.Qt.AlignCenter, str(index))
-
-
-class MultiPixelPreviewDialog(QtWidgets.QDialog):
-    """Live same-frame preview for a multi-pixel condition."""
-
-    def __init__(self, step: dict[str, Any], parent=None) -> None:
-        super().__init__(parent)
-        self.step = dict(step)
-        raw = self.step.get("pixels") or []
-        try:
-            self.points = json.loads(raw) if isinstance(raw, str) else list(raw)
-        except Exception:
-            self.points = []
-        self.points = [dict(item) for item in self.points if isinstance(item, dict)]
-        self.relative = str(self.step.get("pixel_coords") or "screen").casefold() == "relative"
-        raw_region = self.step.get("search_region") or []
-        try:
-            self.search_region = [int(value) for value in raw_region[:4]] if isinstance(raw_region, list) and len(raw_region) >= 4 else []
-        except (TypeError, ValueError):
-            self.search_region = []
-        if len(self.search_region) == 4 and (self.search_region[2] <= self.search_region[0] or self.search_region[3] <= self.search_region[1]):
-            self.search_region = []
-        self.setWindowTitle("다중 픽셀 · 미리보기 및 실시간 검사")
-        self.resize(1180, 760)
-
-        root = QtWidgets.QHBoxLayout(self)
-        side = QtWidgets.QVBoxLayout()
-        self.target_label = QtWidgets.QLabel()
-        self.target_label.setWordWrap(True)
-        self.result_label = QtWidgets.QLabel()
-        self.result_label.setWordWrap(True)
-        self.result_label.setStyleSheet("font-size:12pt; font-weight:800; padding:10px; border-radius:8px;")
-        self.list = QtWidgets.QListWidget()
-        self.list.setMinimumWidth(390)
-        side.addWidget(self.target_label)
-        side.addWidget(self.result_label)
-        side.addWidget(self.list, 1)
-        refresh = QtWidgets.QPushButton("↻ 지금 다시 검사")
-        refresh.clicked.connect(self.refresh_preview)
-        side.addWidget(refresh)
-        close = QtWidgets.QPushButton("닫기")
-        close.clicked.connect(self.accept)
-        side.addWidget(close)
-        root.addLayout(side, 0)
-        self.canvas = MultiPixelPreviewCanvas()
-        root.addWidget(self.canvas, 1)
-        self.timer = QtCore.QTimer(self)
-        self.timer.setInterval(350)
-        self.timer.timeout.connect(self.refresh_preview)
-        self.finished.connect(lambda _result: self.timer.stop())
-        self.timer.start()
-        self.refresh_preview()
-
-    @staticmethod
-    def _matches(current: QtGui.QColor, expected: QtGui.QColor, tolerance: int) -> bool:
-        return max(
-            abs(current.red() - expected.red()),
-            abs(current.green() - expected.green()),
-            abs(current.blue() - expected.blue()),
-        ) <= max(0, min(255, int(tolerance)))
-
-    @classmethod
-    def _find_colour(cls, image: QtGui.QImage, region: QtCore.QRect, expected: QtGui.QColor, tolerance: int) -> tuple[bool, QtCore.QPoint, QtGui.QColor]:
-        region = region.intersected(image.rect())
-        if image.isNull() or not region.isValid() or region.isEmpty():
-            return False, QtCore.QPoint(), QtGui.QColor()
-        try:
-            import numpy as np
-            rgb = image.convertToFormat(QtGui.QImage.Format_RGBA8888)
-            data = np.frombuffer(rgb.bits(), dtype=np.uint8).reshape(rgb.height(), rgb.bytesPerLine())[:, : rgb.width() * 4].reshape(rgb.height(), rgb.width(), 4)
-            crop = data[region.top():region.y() + region.height(), region.left():region.x() + region.width(), :3]
-            target = np.array([expected.red(), expected.green(), expected.blue()], dtype=np.int16)
-            mask = (np.abs(crop.astype(np.int16) - target) <= max(0, min(255, int(tolerance)))).all(axis=2)
-            locations = np.argwhere(mask)
-            if locations.size:
-                y, x = locations[0]
-                point = QtCore.QPoint(region.left() + int(x), region.top() + int(y))
-                return True, point, image.pixelColor(point)
-        except Exception:
-            for y in range(region.top(), region.y() + region.height()):
-                for x in range(region.left(), region.x() + region.width()):
-                    current = image.pixelColor(x, y)
-                    if cls._matches(current, expected, tolerance):
-                        return True, QtCore.QPoint(x, y), current
-        return False, QtCore.QPoint(), QtGui.QColor()
-
-    def refresh_preview(self) -> None:
-        window = str(self.step.get("window") or "")
-        window_exe = str(self.step.get("window_exe") or "")
-        if self.relative:
-            image, capture_rect = _multi_pixel_target_image(window, window_exe)
-        else:
-            desktop_rect = QtCore.QRect()
-            for mapping in display_coordinate_maps():
-                desktop_rect = desktop_rect.united(mapping.native)
-            active_points = [item for item in self.points if bool(item.get("enabled", True))]
-            if len(self.search_region) >= 4:
-                capture_rect = QtCore.QRect(
-                    self.search_region[0],
-                    self.search_region[1],
-                    self.search_region[2] - self.search_region[0],
-                    self.search_region[3] - self.search_region[1],
-                ).intersected(desktop_rect)
-            elif active_points:
-                xs = [int(item.get("x") or 0) for item in active_points]
-                ys = [int(item.get("y") or 0) for item in active_points]
-                capture_rect = QtCore.QRect(
-                    min(xs) - 100,
-                    min(ys) - 100,
-                    max(xs) - min(xs) + 201,
-                    max(ys) - min(ys) + 201,
-                ).intersected(desktop_rect)
-            else:
-                capture_rect = desktop_rect
-            image = _native_region_image(capture_rect, QtGui.QImage()) if capture_rect.isValid() else QtGui.QImage()
-        self.canvas.set_snapshot(image, capture_rect, self.points, relative=self.relative, search_region=self.search_region)
-        self.list.clear()
-        matched = 0
-        enabled = 0
-        global_tolerance = int(self.step.get("tolerance") or 10)
-        for index, point in enumerate(self.points, start=1):
-            if not bool(point.get("enabled", True)):
-                self.list.addItem(f"{index}. 비활성")
-                continue
-            enabled += 1
-            px = int(point.get("x") or 0)
-            py = int(point.get("y") or 0)
-            expected = QtGui.QColor(str(point.get("color") or "#FFFFFF"))
-            tolerance = int(point.get("tolerance", global_tolerance)) if bool(point.get("custom_tolerance")) else global_tolerance
-            point_region = point.get("region") if isinstance(point.get("region"), list) else self.search_region
-            if isinstance(point_region, list) and len(point_region) >= 4:
-                values = [int(value) for value in point_region[:4]]
-                if not self.relative:
-                    values = [values[0] - capture_rect.x(), values[1] - capture_rect.y(), values[2] - capture_rect.x(), values[3] - capture_rect.y()]
-                region = QtCore.QRect(values[0], values[1], values[2] - values[0], values[3] - values[1])
-            else:
-                sample_x = px if self.relative else px - capture_rect.x()
-                sample_y = py if self.relative else py - capture_rect.y()
-                region = QtCore.QRect(sample_x, sample_y, 1, 1)
-            ok, found_point, current = self._find_colour(image, region, expected, tolerance)
-            matched += int(ok)
-            state = "✓ 일치" if ok else "✕ 불일치"
-            current_name = current.name().upper() if current.isValid() else "범위 밖"
-            item = QtWidgets.QListWidgetItem(
-                f"{index}. {state}  저장 {expected.name().upper()}  현재 {current_name}  허용 ±{tolerance}\n"
-                f"    {'발견 위치 ' + str((found_point.x(), found_point.y())) if ok else '영역 내 미발견'}"
-            )
-            item.setForeground(QtGui.QColor("#4ADE80" if ok else "#F87171"))
-            item.setIcon(self._color_icon(expected))
-            self.list.addItem(item)
-
-        policy = str(self.step.get("match_policy") or "all").casefold()
-        required = int(self.step.get("required_count") or 2)
-        if policy == "any":
-            success = matched >= 1
-            condition = "1개 이상"
-        elif policy == "at_least_n":
-            success = matched >= required
-            condition = f"{required}개 이상"
-        elif policy == "exact_n":
-            success = matched == required
-            condition = f"정확히 {required}개"
-        else:
-            success = enabled > 0 and matched == enabled
-            condition = "모두"
-        self.result_label.setText(f"{'참(TRUE)' if success else '거짓(FALSE)'} · {matched}/{enabled}개 일치 · 조건: {condition}")
-        self.result_label.setStyleSheet(
-            f"font-size:12pt; font-weight:800; padding:10px; border-radius:8px; "
-            f"background:{'#143528' if success else '#3A171D'}; color:{'#4ADE80' if success else '#F87171'};"
-        )
-        self.target_label.setText(
-            f"대상: {window_exe or window or '전체 화면'} · "
-            f"{'클라이언트 상대 좌표' if self.relative else '화면 절대 좌표'}\n"
-            "모든 색상은 지정 영역의 동일한 한 화면 캡처에서 동시에 판정됩니다."
-        )
-
-    @staticmethod
-    def _color_icon(color: QtGui.QColor) -> QtGui.QIcon:
-        pixmap = QtGui.QPixmap(24, 24)
-        pixmap.fill(color)
-        return QtGui.QIcon(pixmap)
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self.timer.stop()
-        super().closeEvent(event)
-
-
 class DraggableIconWrapper(QtWidgets.QWidget):
     clicked = QtCore.Signal(str)
-    favorite_toggled = QtCore.Signal(str, bool)
 
     def __init__(self, kind: str, icon_char: str, label: str, accent_color: str, parent=None):
         super().__init__(parent)
@@ -1351,7 +831,6 @@ class DraggableIconWrapper(QtWidgets.QWidget):
         self.label_text = label
         self.accent_color = accent_color
         self._press_pos = QtCore.QPoint()
-        self._favorite = False
         self.setFixedSize(74, 58)
         self.setStyleSheet("background: transparent; border: none;")
         self.setCursor(QtCore.Qt.PointingHandCursor)
@@ -1362,7 +841,6 @@ class DraggableIconWrapper(QtWidgets.QWidget):
         layout.setAlignment(QtCore.Qt.AlignCenter)
 
         self.icon_btn = QtWidgets.QLabel(icon_char)
-        self.icon_btn.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         self.icon_btn.setAlignment(QtCore.Qt.AlignCenter)
         self.icon_btn.setFixedSize(38, 38)
         self.icon_btn.setStyleSheet(f"""
@@ -1382,39 +860,12 @@ class DraggableIconWrapper(QtWidgets.QWidget):
         """)
 
         self.name_label = QtWidgets.QLabel(label)
-        self.name_label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         self.name_label.setAlignment(QtCore.Qt.AlignCenter)
         self.name_label.setStyleSheet("color: #8A98B0; font-size: 7pt; font-weight: 500; background: transparent; border: none;")
 
         layout.addWidget(self.icon_btn, 0, QtCore.Qt.AlignCenter)
         layout.addWidget(self.name_label, 0, QtCore.Qt.AlignCenter)
-        self._update_tooltip()
-
-    def set_favorite(self, favorite: bool) -> None:
-        self._favorite = bool(favorite)
-        self.name_label.setText(("★ " if self._favorite else "") + self.label_text)
-        self.name_label.setStyleSheet(
-            "color: #FFD76A; font-size: 7pt; font-weight: 700; background: transparent; border: none;"
-            if self._favorite
-            else "color: #8A98B0; font-size: 7pt; font-weight: 500; background: transparent; border: none;"
-        )
-        self._update_tooltip()
-
-    def _update_tooltip(self) -> None:
-        favorite_hint = "즐겨찾기 해제" if self._favorite else "즐겨찾기에 추가"
-        self.setToolTip(
-            f"'{self.label_text}' 노드 추가\n"
-            "캔버스 노드선 위로 드래그하면 해당 연결 사이에 자동 삽입\n"
-            f"우클릭: {favorite_hint}"
-        )
-
-    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
-        menu = QtWidgets.QMenu(self)
-        action = menu.addAction("☆ 즐겨찾기 해제" if self._favorite else "★ 즐겨찾기에 추가")
-        chosen = menu.exec(event.globalPos())
-        if chosen == action:
-            self.favorite_toggled.emit(self.kind, not self._favorite)
-        event.accept()
+        self.setToolTip(f"'{label}' 노드 추가 (마우스로 끌어서 순서 변경 가능)")
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
@@ -1507,7 +958,7 @@ class IconNodeToolbar(QtWidgets.QFrame):
         layout.setSpacing(4)
 
         header_layout = QtWidgets.QHBoxLayout()
-        header_title = QtWidgets.QLabel("노드 빠른 추가 | 클릭=끝에 추가 · 캔버스로 드래그=해당 위치에 미연결 추가 · 우클릭=즐겨찾기")
+        header_title = QtWidgets.QLabel("노드 빠른 추가 | 아이콘을 클릭하면 선택한 노드가 현재 녹화 흐름에 추가됩니다. (아이콘을 드래그해 순서를 바꿀 수 있습니다)")
         header_title.setStyleSheet("font-size: 8.5pt; font-weight: 700; color: #8A98B0;")
         header_layout.addWidget(header_title)
         header_layout.addStretch(1)
@@ -1532,10 +983,9 @@ class IconNodeToolbar(QtWidgets.QFrame):
         self.container = ReorderableIconContainer()
         self.container.setStyleSheet("background: transparent;")
         self.container.installEventFilter(self)
-        self.container.reordered.connect(self._normalize_favorite_order)
+        self.container.reordered.connect(self._save_order)
 
         specs = [
-            ("mouse_click", "⌖", "좌표 클릭", "#7C6CFF"),
             ("ocr", "OCR", "OCR 인식", "#7C6CFF"),
             ("type_text", "T", "텍스트 입력", "#C47CFF"),
             ("wait", "◷", "대기", "#F5B942"),
@@ -1553,35 +1003,19 @@ class IconNodeToolbar(QtWidgets.QFrame):
             ("multi_pixel_check", "❖", "다중 픽셀", "#FF6B9D"),
             ("wait_color", "⏳", "색상 대기", "#F5B942"),
             ("color_ratio", "📊", "색상 비율", "#FF6B9D"),
-            ("animation_search", "◉", "애니메이션 서치", "#A78BFA"),
             ("ocr_tracking", "⊕", "OCR 추적", "#4D9FFF"),
             ("find_text_click", "🎯", "텍스트 클릭", "#4D9FFF"),
         ]
 
-        settings = QtCore.QSettings("TodayNews", "MacroStudio")
-        saved_order = settings.value("icon_node_toolbar_order")
-        saved_favorites = settings.value("icon_node_toolbar_favorites")
-        if isinstance(saved_favorites, str):
-            saved_favorites = [saved_favorites] if saved_favorites else []
-        self._favorites = {
-            str(value) for value in saved_favorites
-        } if isinstance(saved_favorites, list) else set()
+        saved_order = QtCore.QSettings("TodayNews", "MacroStudio").value("icon_node_toolbar_order")
         if isinstance(saved_order, list) and saved_order:
-            saved_kinds = [str(k) for k in saved_order]
-            order_map = {str(k): idx for idx, k in enumerate(saved_kinds)}
-            if "mouse_click" not in order_map:
-                order_map = {key: index + 1 for key, index in order_map.items()}
-                order_map["mouse_click"] = 0
-            specs.sort(key=lambda s: (s[0] not in self._favorites, order_map.get(s[0], 999)))
-        else:
-            specs.sort(key=lambda s: s[0] not in self._favorites)
+            order_map = {str(k): idx for idx, k in enumerate(saved_order)}
+            specs.sort(key=lambda s: order_map.get(s[0], 999))
 
         for kind, icon_char, label, accent_color in specs:
             wrapper = DraggableIconWrapper(kind, icon_char, label, accent_color)
             wrapper.installEventFilter(self)
             wrapper.clicked.connect(self.node_clicked.emit)
-            wrapper.favorite_toggled.connect(self._toggle_favorite)
-            wrapper.set_favorite(kind in self._favorites)
             self.container.layout_box.addWidget(wrapper)
 
         self.container.layout_box.addStretch(1)
@@ -1596,31 +1030,6 @@ class IconNodeToolbar(QtWidgets.QFrame):
             if isinstance(w, DraggableIconWrapper):
                 order.append(w.kind)
         QtCore.QSettings("TodayNews", "MacroStudio").setValue("icon_node_toolbar_order", order)
-
-    def _toggle_favorite(self, kind: str, favorite: bool) -> None:
-        if favorite:
-            self._favorites.add(str(kind))
-        else:
-            self._favorites.discard(str(kind))
-        settings = QtCore.QSettings("TodayNews", "MacroStudio")
-        settings.setValue("icon_node_toolbar_favorites", sorted(self._favorites))
-
-        self._normalize_favorite_order()
-
-    def _normalize_favorite_order(self) -> None:
-        wrappers: list[DraggableIconWrapper] = []
-        for index in range(self.container.layout_box.count()):
-            item = self.container.layout_box.itemAt(index)
-            widget = item.widget() if item else None
-            if isinstance(widget, DraggableIconWrapper):
-                wrappers.append(widget)
-        for wrapper in wrappers:
-            wrapper.set_favorite(wrapper.kind in self._favorites)
-            self.container.layout_box.removeWidget(wrapper)
-        wrappers.sort(key=lambda wrapper: wrapper.kind not in self._favorites)
-        for index, wrapper in enumerate(wrappers):
-            self.container.layout_box.insertWidget(index, wrapper)
-        self._save_order()
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.Wheel and isinstance(event, QtGui.QWheelEvent):
@@ -1653,7 +1062,6 @@ class RecordingBar(QtWidgets.QDialog):
     branch_requested = QtCore.Signal()
     events_deleted = QtCore.Signal(list)
     manual_node_requested = QtCore.Signal(str)
-    manual_node_drop_requested = QtCore.Signal(str, object)
 
     def __init__(self, repository=None, parent=None) -> None:
         if isinstance(repository, QtWidgets.QWidget) and parent is None:
@@ -1693,9 +1101,6 @@ class RecordingBar(QtWidgets.QDialog):
         self.branch_button.setToolTip("현재 작업을 끝내고 독립된 새 작업 분기 녹화를 시작합니다.")
         self.branch_button.setVisible(False)
         self.branch_button.clicked.connect(self.branch_requested.emit)
-        self.delete_button = QtWidgets.QPushButton("🗑 선택 삭제  Del")
-        self.delete_button.setToolTip("스마트 녹화 캔버스에서 선택한 노드 또는 연결선을 삭제합니다.")
-        self.delete_button.clicked.connect(self._delete_selected_live_nodes)
         stop = QtWidgets.QPushButton("■ 종료  F10")
         stop.clicked.connect(self.stop_requested.emit)
         controls.addWidget(self.dot)
@@ -1704,7 +1109,6 @@ class RecordingBar(QtWidgets.QDialog):
         controls.addWidget(self.branch_button)
         controls.addWidget(self.region_capture_button)
         controls.addWidget(self.capture_button)
-        controls.addWidget(self.delete_button)
         controls.addWidget(stop)
         layout.addLayout(controls)
         shortcuts = QtWidgets.QLabel(
@@ -1717,22 +1121,13 @@ class RecordingBar(QtWidgets.QDialog):
         from .node_editor import NodeCanvas
 
         self.live_canvas = NodeCanvas(self)
-        self.live_canvas.live_edit_mode = True
         self.live_canvas.flow_label.setText("SMART RECORDING · LIVE NODE MAP")
         self.live_canvas.setMinimumHeight(280)
         self.live_canvas.link_requested.connect(self._connect_live_nodes)
         self.live_canvas.edge_delete_requested.connect(self._delete_live_edge)
-        self.live_canvas.edges_delete_requested.connect(self._delete_live_edges_batch)
-        self.live_canvas.edge_delay_requested.connect(self._set_live_edge_delay)
-        self.live_canvas.edge_condition_add_requested.connect(self._add_live_condition)
-        self.live_canvas.edge_condition_delete_requested.connect(self._delete_live_condition)
-        self.live_canvas.edge_condition_retarget_requested.connect(self._retarget_live_condition)
         self.live_canvas.node_delete_requested.connect(self._delete_live_node)
         self.live_canvas.inspector_requested.connect(self._open_live_node_editor)
-        self.live_canvas.image_edit_requested.connect(self._edit_live_node_image)
-        self.live_canvas.node_title_changed.connect(self._rename_live_node)
         self.live_canvas.multi_image_merge_requested.connect(self._merge_live_image_nodes)
-        self.live_canvas.quick_node_drop_requested.connect(self._on_quick_node_drop)
         self.live_canvas.set_macro({"steps": []})
         layout.addWidget(self.live_canvas, 1)
 
@@ -1749,7 +1144,6 @@ class RecordingBar(QtWidgets.QDialog):
         self._live_events: list[dict[str, Any]] = []
         self._live_link_overrides: dict[tuple[str, str], str | list[str] | None] = {}
         self._live_multi_groups: dict[str, str] = {}
-        self._live_step_payloads: dict[str, dict[str, Any]] = {}
         self._live_rebuild_pending = False
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(250)
@@ -1766,137 +1160,6 @@ class RecordingBar(QtWidgets.QDialog):
             self.branch_requested.emit()
         else:
             self.manual_node_requested.emit(kind)
-
-    def _on_quick_node_drop(self, kind: str, payload: object) -> None:
-        details = dict(payload) if isinstance(payload, dict) else {}
-        source = int(details.get("source") or 0)
-        target = int(details.get("target") or 0)
-        if 0 < source <= len(self.live_canvas.steps):
-            source_step = self.live_canvas.steps[source - 1]
-            details["source_event_id"] = str(source_step.get("_event_id") or "")
-            details["workflow_id"] = str(source_step.get("workflow_id") or "")
-        if 0 < target <= len(self.live_canvas.steps):
-            details["target_event_id"] = str(self.live_canvas.steps[target - 1].get("_event_id") or "")
-        self.manual_node_drop_requested.emit(str(kind), details)
-
-    def apply_quick_node_drop(
-        self,
-        event_id: str,
-        payload: dict[str, Any],
-        *,
-        rebuild: bool = True,
-    ) -> None:
-        """Place a new independent live node at the requested canvas position."""
-        if not event_id:
-            return
-        drop_x = float(payload.get("x") or 0.0)
-        drop_y = float(payload.get("y") or 0.0)
-        desired_position = [drop_x - 98.0, drop_y - 58.0]
-        source_id = str(payload.get("source_event_id") or "")
-        target_id = str(payload.get("target_event_id") or "")
-
-        source_node = None
-        target_node = None
-        source_step: dict[str, Any] = {}
-        target_step: dict[str, Any] = {}
-        for index, step in enumerate(self.live_canvas.steps, start=1):
-            current_id = str(step.get("_event_id") or "")
-            if current_id == source_id:
-                source_node = self.live_canvas.nodes.get(index)
-                source_step = step
-            if current_id == target_id:
-                target_node = self.live_canvas.nodes.get(index)
-                target_step = step
-
-        if source_node is not None and target_node is not None:
-            source_rect = source_node.sceneBoundingRect()
-            target_rect = target_node.sceneBoundingRect()
-            same_row = abs(source_rect.center().y() - target_rect.center().y()) <= 150.0
-            forward = target_rect.center().x() > source_rect.center().x()
-            if same_row and forward:
-                gap = 68.0
-                node_width = 196.0
-                min_x = source_rect.right() + gap
-                max_x = target_rect.left() - node_width - gap
-                desired_position[0] = (
-                    min(max(drop_x - node_width / 2.0, min_x), max_x)
-                    if max_x >= min_x
-                    else min_x
-                )
-                desired_position[1] = source_node.pos().y()
-                required_target_x = desired_position[0] + node_width + gap
-                shift_x = max(0.0, required_target_x - target_node.pos().x())
-                if shift_x > 0.0:
-                    target_workflow = str(target_step.get("workflow_id") or source_step.get("workflow_id") or "")
-                    target_x = target_node.pos().x()
-                    for index, node in self.live_canvas.nodes.items():
-                        step = self.live_canvas.steps[index - 1]
-                        node_id = str(step.get("_event_id") or "")
-                        if node_id in {source_id, event_id} or node.pos().x() < target_x - 1.0:
-                            continue
-                        workflow = str(step.get("workflow_id") or "")
-                        if target_workflow and workflow and workflow != target_workflow:
-                            continue
-                        moved = QtCore.QPointF(node.pos().x() + shift_x, node.pos().y())
-                        node.setPos(moved)
-                        if node_id:
-                            self._event_positions[node_id] = [round(moved.x(), 2), round(moved.y(), 2)]
-
-        # Legacy edge-splice payloads still need the old terminal guard.  A
-        # normal quick-add now carries no source/target and must not modify any
-        # existing route: it is intentionally created as a disconnected node.
-        if source_id and target_id:
-            source_workflow = str(source_step.get("workflow_id") or "")
-            workflow_terminal: dict[str, Any] | None = None
-            for step in self.live_canvas.steps:
-                workflow = str(step.get("workflow_id") or "")
-                if source_workflow and workflow != source_workflow:
-                    continue
-                workflow_terminal = step
-            if workflow_terminal is not None:
-                terminal_id = str(workflow_terminal.get("_event_id") or "")
-                terminal_targets = workflow_terminal.get("success_candidates")
-                has_explicit_target = bool(
-                    isinstance(terminal_targets, list) and terminal_targets
-                ) or int(workflow_terminal.get("on_success") or 0) > 0
-                if terminal_id and terminal_id != source_id and not has_explicit_target:
-                    self._live_link_overrides[(terminal_id, "success")] = None
-
-        self._event_positions[event_id] = desired_position
-        for index, step in enumerate(self.live_canvas.steps, start=1):
-            if str(step.get("_event_id") or "") != event_id:
-                continue
-            node = self.live_canvas.nodes.get(index)
-            if node is not None:
-                node.setPos(QtCore.QPointF(desired_position[0], desired_position[1]))
-            break
-        edge_kind = "fail" if str(payload.get("edge_kind") or "success") == "fail" else "success"
-        if not source_id or not target_id:
-            if rebuild:
-                self.update_live_events(self._live_events, force=True)
-            return
-
-        key = (source_id, edge_kind)
-        current = self._live_link_overrides.get(key)
-        if isinstance(current, list):
-            replaced = False
-            targets = []
-            for value in current:
-                if value == target_id and not replaced:
-                    targets.append(event_id)
-                    replaced = True
-                else:
-                    targets.append(value)
-            if not replaced:
-                targets.append(event_id)
-            self._live_link_overrides[key] = targets if len(targets) > 1 else targets[0]
-        else:
-            # The visible edge is authoritative even when it was produced by
-            # the automatic sequential flow and has no explicit override yet.
-            self._live_link_overrides[key] = event_id
-        self._live_link_overrides[(event_id, "success")] = target_id
-        if rebuild:
-            self.update_live_events(self._live_events, force=True)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
@@ -1926,9 +1189,6 @@ class RecordingBar(QtWidgets.QDialog):
         elif left_x >= available.left():
             x = left_x
         else:
-            # If the recorder is wider than the available desktop, the old
-            # upper clamp became smaller than the lower clamp and produced a
-            # negative/off-screen coordinate.
             max_x = max(available.left(), available.right() - width + 1)
             x = min(max(available.left(), right_x), max_x)
         max_y = max(available.top(), available.bottom() - height + 1)
@@ -1957,35 +1217,10 @@ class RecordingBar(QtWidgets.QDialog):
         if event_id and event_id not in member_ids:
             member_ids.append(event_id)
         if member_ids:
-            deleted = set(member_ids)
-            self._live_events = [
-                item for item in self._live_events
-                if str((item if isinstance(item, dict) else {}).get("event_id") or "") not in deleted
-            ]
-            for identifier in deleted:
-                self._event_positions.pop(identifier, None)
-                self._live_step_payloads.pop(identifier, None)
-                self._live_multi_groups.pop(identifier, None)
-            cleaned_links: dict[tuple[str, str], str | list[str] | None] = {}
-            for key, value in self._live_link_overrides.items():
-                if key[0] in deleted:
-                    continue
-                if isinstance(value, list):
-                    remaining = [target for target in value if target not in deleted]
-                    cleaned_links[key] = remaining if len(remaining) > 1 else (remaining[0] if remaining else None)
-                elif isinstance(value, str) and value in deleted:
-                    cleaned_links[key] = None
-                else:
-                    cleaned_links[key] = value
-            self._live_link_overrides = cleaned_links
             self.events_deleted.emit(member_ids)
-            self.update_live_events(self._live_events, force=True)
 
     def _delete_selected_live_nodes(self) -> None:
-        """선택된 노드 또는 노드선들을 일괄 삭제합니다."""
-        selected_edges = [item for item in self.live_canvas.scene.selectedItems() if type(item).__name__ == "EdgeItem"]
-        if selected_edges and hasattr(self.live_canvas, "delete_selected_edges"):
-            self.live_canvas.delete_selected_edges(selected_edges)
+        """선택된 노드들을 일괄 삭제합니다."""
         selected = self.live_canvas.selected_indexes()
         if selected:
             for idx in sorted(selected, reverse=True):
@@ -2150,9 +1385,7 @@ class RecordingBar(QtWidgets.QDialog):
             "table_copy", "table_paste", "table_excel_read", "table_excel_write",
             "set_var", "calc_var", "coord_mode", "call_submacro", "flow_control",
             "text_condition", "run_program", "terminate_program",
-            "pixel_search", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio",
-            "animation_search",
-            "mouse_click", "inactive_click",
+            "pixel_search", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio"
         }:
             return {**common, "action": kind, "label": str(draft.get("detail") or ACTION_TITLES.get(kind, kind))}
         if kind == "find_text_click":
@@ -2200,11 +1433,6 @@ class RecordingBar(QtWidgets.QDialog):
         self._live_events = list(events)
         drafts = self._group_live_drafts(recording_drafts(events, include_waits=False))
         steps = [self._live_step(draft, index) for index, draft in enumerate(drafts, start=1)]
-        for step in steps:
-            event_id = str(step.get("_event_id") or "")
-            payload = self._live_step_payloads.get(event_id)
-            if payload:
-                step.update(deepcopy(payload))
         event_ids = tuple(str(step.get("_event_id") or "") for step in steps)
         signature = tuple(
             f"{event_id}|{','.join(str(value) for value in step.get('_member_event_ids') or [])}"
@@ -2270,9 +1498,7 @@ class RecordingBar(QtWidgets.QDialog):
         previews: dict[int, Any] = {}
         for index, draft in enumerate(drafts, start=1):
             event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
-            image = _recorded_detail_image(event)
-            if image.isNull():
-                image = _recorded_sample_image(event)
+            image = _recorded_sample_image(event)
             if not image.isNull():
                 pixmap = QtGui.QPixmap.fromImage(image)
                 search_region = event.get("search_region") or event.get("_review_search_region")
@@ -2336,205 +1562,6 @@ class RecordingBar(QtWidgets.QDialog):
                 self._live_link_overrides[key] = None
             self._schedule_live_rebuild()
 
-    def _save_live_step_payload(self, source: int) -> bool:
-        if not 0 < source <= len(self.live_canvas.steps):
-            return False
-        step = self.live_canvas.steps[source - 1]
-        event_id = str(step.get("_event_id") or "")
-        if not event_id:
-            return False
-        graph_only = {
-            "on_success", "on_fail", "success_candidates", "fail_candidates",
-            "stop_on_success", "abort_on_fail",
-        }
-        self._live_step_payloads[event_id] = {
-            key: deepcopy(value)
-            for key, value in step.items()
-            if not str(key).startswith("_") and key not in graph_only
-        }
-        return True
-
-    def _set_live_edge_delay(self, source: int, target: int, kind: str) -> None:
-        if not 0 < source <= len(self.live_canvas.steps):
-            return
-        step = self.live_canvas.steps[source - 1]
-        normalized_kind = "fail" if kind == "fail" else "success"
-        field = "on_fail" if normalized_kind == "fail" else "on_success"
-        candidates_key = "fail_candidates" if normalized_kind == "fail" else "success_candidates"
-        candidates = step.get(candidates_key) if isinstance(step.get(candidates_key), list) else []
-        if int(step.get(field) or 0) != target and target not in [int(value) for value in candidates]:
-            return
-
-        from .builder import EdgeSettingsDialog
-
-        delay_field = "on_fail_delay" if normalized_kind == "fail" else "on_success_delay"
-        rules = [
-            deepcopy(rule)
-            for rule in (step.get("edge_conditions") or [])
-            if isinstance(rule, dict) and str(rule.get("kind") or "success") == normalized_kind
-        ]
-        other_rules = [
-            deepcopy(rule)
-            for rule in (step.get("edge_conditions") or [])
-            if not isinstance(rule, dict) or str(rule.get("kind") or "success") != normalized_kind
-        ]
-        dialog = EdgeSettingsDialog(
-            len(self.live_canvas.steps),
-            normalized_kind,
-            int(step.get(delay_field) or 0),
-            rules,
-            self,
-        )
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-        if dialog.delay_spin.value() > 0:
-            step[delay_field] = dialog.delay_spin.value()
-        else:
-            step.pop(delay_field, None)
-        combined = other_rules + dialog.rules
-        if combined:
-            step["edge_conditions"] = combined
-        else:
-            step.pop("edge_conditions", None)
-        if self._save_live_step_payload(source):
-            self.update_live_events(self._live_events, force=True)
-
-    def _rename_live_node(self, index: int, new_title: str) -> None:
-        """Persist a live title so rebuilding edges cannot restore the generated name."""
-        if not 0 < index <= len(self.live_canvas.steps):
-            return
-        step = self.live_canvas.steps[index - 1]
-        if new_title.strip():
-            step["label"] = new_title.strip()
-        else:
-            step.pop("label", None)
-        self._save_live_step_payload(index)
-
-    def _edit_live_node_image(self, index: int) -> None:
-        """Open the recorded image detail editor from the node preview badge."""
-        if not 0 < index <= len(self.live_canvas.steps):
-            return
-        event_id = str(self.live_canvas.steps[index - 1].get("_event_id") or "")
-        event = next(
-            (
-                item for item in self._live_events
-                if isinstance(item, dict) and str(item.get("event_id") or "") == event_id
-            ),
-            None,
-        )
-        if not isinstance(event, dict):
-            return
-        image = _recorded_detail_image(event)
-        if image.isNull():
-            image = _recorded_sample_image(event)
-        if image.isNull():
-            QtWidgets.QMessageBox.information(self, "이미지 상세 편집", "이 노드에는 편집할 녹화 이미지가 없습니다.")
-            return
-        offset_values = event.get("_review_detail_click_offset")
-        initial_offset = None
-        if isinstance(offset_values, list) and len(offset_values) >= 2:
-            initial_offset = QtCore.QPoint(int(offset_values[0] or 0), int(offset_values[1] or 0))
-        dialog = RecordedImageDetailDialog(
-            image,
-            self,
-            precise=bool(event.get("_review_detail_precise", True)),
-            initial_click_offset=initial_offset,
-        )
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-        edited = dialog.edited_image()
-        if edited.isNull():
-            return
-        event["_review_edited_image_bmp"] = _encoded_png(edited)
-        event["_review_detail_precise"] = dialog.precise_search_enabled()
-        click_offset = dialog.click_offset()
-        if click_offset is None:
-            event.pop("_review_detail_click_offset", None)
-        else:
-            event["_review_detail_click_offset"] = [click_offset.x(), click_offset.y()]
-        self.update_live_events(self._live_events, force=True)
-
-    def _delete_live_condition(self, source: int, condition_index: int) -> None:
-        if not 0 < source <= len(self.live_canvas.steps):
-            return
-        step = self.live_canvas.steps[source - 1]
-        rules = step.get("edge_conditions")
-        if not isinstance(rules, list) or not 0 <= condition_index < len(rules):
-            return
-        rules.pop(condition_index)
-        if not rules:
-            step.pop("edge_conditions", None)
-        if self._save_live_step_payload(source):
-            self.update_live_events(self._live_events, force=True)
-
-    def _add_live_condition(self, source: int, target: int, kind: str) -> None:
-        if not 0 < source <= len(self.live_canvas.steps):
-            return
-        from .builder import EdgeConditionDialog, _raise_modal_dialog
-
-        normalized_kind = "fail" if kind == "fail" else "success"
-        dialog = EdgeConditionDialog(
-            len(self.live_canvas.steps),
-            normalized_kind,
-            {"kind": normalized_kind, "target": target},
-            self,
-        )
-        QtCore.QTimer.singleShot(0, lambda: _raise_modal_dialog(dialog))
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-        step = self.live_canvas.steps[source - 1]
-        rules = [
-            deepcopy(rule)
-            for rule in (step.get("edge_conditions") or [])
-            if isinstance(rule, dict)
-        ]
-        rules.append(dialog.payload(normalized_kind))
-        step["edge_conditions"] = rules
-        if self._save_live_step_payload(source):
-            self.update_live_events(self._live_events, force=True)
-
-    def _retarget_live_condition(self, source: int, condition_index: int, target: int) -> None:
-        if not 0 < source <= len(self.live_canvas.steps) or not 0 < target <= len(self.live_canvas.steps):
-            return
-        step = self.live_canvas.steps[source - 1]
-        rules = step.get("edge_conditions")
-        if not isinstance(rules, list) or not 0 <= condition_index < len(rules):
-            return
-        rule = rules[condition_index]
-        if not isinstance(rule, dict):
-            return
-        rule["target"] = target
-        if self._save_live_step_payload(source):
-            self.update_live_events(self._live_events, force=True)
-
-    def _delete_live_edges_batch(self, edge_specs: list[dict[str, Any]]) -> None:
-        if not edge_specs:
-            return
-        modified = False
-        for spec in edge_specs:
-            source = int(spec.get("source") or 0)
-            target = int(spec.get("target") or 0)
-            kind = str(spec.get("kind") or "success")
-            if not 0 < source <= len(self.live_canvas.steps):
-                continue
-            source_id = str(self.live_canvas.steps[source - 1].get("_event_id") or "")
-            if not source_id:
-                continue
-            normalized_kind = "fail" if kind == "fail" else "success"
-            key = (source_id, normalized_kind)
-            current = self._live_link_overrides.get(key)
-            if isinstance(current, list):
-                target_id = ""
-                if 0 < target <= len(self.live_canvas.steps):
-                    target_id = str(self.live_canvas.steps[target - 1].get("_event_id") or "")
-                remaining = [value for value in current if value != target_id]
-                self._live_link_overrides[key] = remaining if len(remaining) > 1 else (remaining[0] if remaining else None)
-            else:
-                self._live_link_overrides[key] = None
-            modified = True
-        if modified:
-            self._schedule_live_rebuild()
-
     def _merge_live_image_nodes(self, indexes: list[int]) -> None:
         selected = sorted({int(index) for index in indexes if 0 < int(index) <= len(self.live_canvas.steps)})
         if len(selected) < 2:
@@ -2572,9 +1599,6 @@ class RecordingBar(QtWidgets.QDialog):
 
     def multi_groups(self) -> dict[str, str]:
         return dict(self._live_multi_groups)
-
-    def step_payloads(self) -> dict[str, dict[str, Any]]:
-        return deepcopy(self._live_step_payloads)
 
 
 def _recorded_sample_image(event: dict[str, Any]) -> QtGui.QImage:
@@ -3288,15 +2312,9 @@ class RecordedImageCropDialog(QtWidgets.QDialog):
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() in {QtCore.Qt.Key_Plus, QtCore.Qt.Key_Equal}:
             self._resize_crop(1)
-            event.accept()
             return
         if event.key() in {QtCore.Qt.Key_Minus, QtCore.Qt.Key_Underscore}:
             self._resize_crop(-1)
-            event.accept()
-            return
-        if event.key() == QtCore.Qt.Key_Escape:
-            event.accept()
-            self.reject()
             return
         super().keyPressEvent(event)
 
@@ -3418,17 +2436,13 @@ class SmartRecordingController(QtCore.QObject):
         self.bar.branch_requested.connect(self.request_workflow_branch)
         self.bar.events_deleted.connect(self._delete_recorded_events)
         self.bar.manual_node_requested.connect(self._add_manual_node)
-        self.bar.manual_node_drop_requested.connect(self._add_manual_node_at_drop)
         self.bar.show()
         self.bar.raise_()
         self.bar.activateWindow()
         self.process.start()
         self._capture_poll.start()
 
-    def _add_manual_node_at_drop(self, kind: str, payload: object) -> None:
-        self._add_manual_node(kind, dict(payload) if isinstance(payload, dict) else {})
-
-    def _add_manual_node(self, kind: str, drop_payload: dict[str, Any] | None = None) -> None:
+    def _add_manual_node(self, kind: str) -> None:
         if self._capture_in_progress:
             return
         self._capture_in_progress = True
@@ -3444,25 +2458,8 @@ class SmartRecordingController(QtCore.QObject):
                 "workflow_id": f"workflow-{self.bar.workflow_index:02d}" if self.bar else "workflow-01",
                 "window": window,
             }
-            if drop_payload and str(drop_payload.get("workflow_id") or ""):
-                event["workflow_id"] = str(drop_payload["workflow_id"])
 
-            if kind == "animation_search":
-                if self.bar is not None:
-                    self.bar._restore_position = self.bar.pos()
-                    self.bar.hide()
-                try:
-                    wizard_step = QuickActionWizard.build("animation_search", self.repository, None)
-                    if not isinstance(wizard_step, dict):
-                        return
-                    event["_wizard_step"] = wizard_step
-                    event["detail"] = str(wizard_step.get("label") or "애니메이션 서치")
-                    event["asset"] = str(wizard_step.get("asset") or "")
-                finally:
-                    if self.bar is not None:
-                        self.bar.show()
-                        self.bar.raise_()
-            elif kind == "ocr":
+            if kind == "ocr":
                 if self.bar is not None:
                     self.bar._restore_position = self.bar.pos()
                     self.bar.hide()
@@ -3471,83 +2468,37 @@ class SmartRecordingController(QtCore.QObject):
                     if not pixmap.isNull() and geometry.isValid():
                         hint_text = "[ OCR 인식 영역 지정 ] 드래그 선택 후 Enter (Esc 취소)"
                         picker = ScreenCaptureDialog(pixmap, geometry, hint_text=hint_text)
-                        try:
-                            if picker.exec() == QtWidgets.QDialog.Accepted:
-                                screen_rect = picker.selected_native_screen_rect()
-                                image = picker.captured_image()
-                                if not image.isNull() and screen_rect.isValid():
-                                    payload = QtCore.QByteArray()
-                                    buffer = QtCore.QBuffer(payload)
-                                    buffer.open(QtCore.QIODevice.WriteOnly)
-                                    image.save(buffer, "PNG")
-                                    buffer.close()
-                                    client_rect = _resolve_live_client_rect(window)
-                                    search_region = [
-                                        screen_rect.left() - client_rect.left() if client_rect.isValid() else screen_rect.left(),
-                                        screen_rect.top() - client_rect.top() if client_rect.isValid() else screen_rect.top(),
-                                        screen_rect.x() + screen_rect.width() - client_rect.left() if client_rect.isValid() else screen_rect.x() + screen_rect.width(),
-                                        screen_rect.y() + screen_rect.height() - client_rect.top() if client_rect.isValid() else screen_rect.y() + screen_rect.height(),
-                                    ]
-                                    alias = f"ocr-sample-{datetime.now():%Y%m%d-%H%M%S}"
-                                    self.repository.add_asset_image(image, alias)
-                                    event.update({
-                                        "asset": alias,
-                                        "selected_screen_rect": [screen_rect.x(), screen_rect.y(), screen_rect.width(), screen_rect.height()],
-                                        "image_sample_bmp": base64.b64encode(bytes(payload)).decode("ascii"),
-                                        "image_sample_size": [image.width(), image.height()],
-                                        "search_region": search_region,
-                                        "region": search_region,
-                                        "_review_search_region": search_region,
-                                        "detail": f"OCR 영역 인식 ({image.width()}×{image.height()})",
-                                    })
-                        finally:
-                            picker.deleteLater()
+                        if picker.exec() == QtWidgets.QDialog.Accepted:
+                            screen_rect = picker.selected_screen_rect()
+                            image = picker.captured_image()
+                            if not image.isNull() and screen_rect.isValid():
+                                payload = QtCore.QByteArray()
+                                buffer = QtCore.QBuffer(payload)
+                                buffer.open(QtCore.QIODevice.WriteOnly)
+                                image.save(buffer, "PNG")
+                                buffer.close()
+                                client_rect = _resolve_live_client_rect(window)
+                                search_region = [
+                                    screen_rect.left() - client_rect.left() if client_rect.isValid() else screen_rect.left(),
+                                    screen_rect.top() - client_rect.top() if client_rect.isValid() else screen_rect.top(),
+                                    screen_rect.right() - client_rect.left() if client_rect.isValid() else screen_rect.right(),
+                                    screen_rect.bottom() - client_rect.top() if client_rect.isValid() else screen_rect.bottom(),
+                                ]
+                                alias = f"ocr-sample-{datetime.now():%Y%m%d-%H%M%S}"
+                                self.repository.add_asset_image(image, alias)
+                                event.update({
+                                    "asset": alias,
+                                    "selected_screen_rect": [screen_rect.x(), screen_rect.y(), screen_rect.width(), screen_rect.height()],
+                                    "image_sample_bmp": base64.b64encode(bytes(payload)).decode("ascii"),
+                                    "image_sample_size": [image.width(), image.height()],
+                                    "search_region": search_region,
+                                    "region": search_region,
+                                    "_review_search_region": search_region,
+                                    "detail": f"OCR 영역 인식 ({image.width()}×{image.height()})",
+                                })
                 finally:
                     if self.bar is not None:
                         self.bar.show()
-            elif kind == "mouse_click":
-                if self.bar is not None:
-                    self.bar._restore_position = self.bar.pos()
-                    ignored = {int(self.bar.winId())}
-                    self.bar.hide()
-                else:
-                    ignored = set()
-                try:
-                    picker = WindowPickerDialog(
-                        parent=None,
-                        ignored_hwnds=ignored,
-                        hint_text="[ 좌표 클릭 지정 ] 클릭할 프로그램의 정확한 위치를 한 번 클릭하세요 · Esc 취소",
-                    )
-                    if picker.exec() == QtWidgets.QDialog.Accepted:
-                        screen_pt = picker.selected_screen_point()
-                        client_pt = picker.selected_client_point()
-                        if client_pt is None:
-                            client_pt = QtCore.QPoint(screen_pt)
-                        window_dict = {
-                            "title": picker.window_token,
-                            "exe": picker.exe_name,
-                            "hwnd": picker.window_hwnd,
-                        }
-                        event.update(
-                            {
-                                "window": window_dict,
-                                "x": int(client_pt.x()),
-                                "y": int(client_pt.y()),
-                                "screen_x": int(screen_pt.x()),
-                                "screen_y": int(screen_pt.y()),
-                                "coordinate_scope": "client" if picker.window_hwnd else "screen",
-                                "button": "Left",
-                                "count": 1,
-                                "detail": f"좌표 클릭 · {client_pt.x()}, {client_pt.y()}",
-                            }
-                        )
-                    else:
-                        return
-                finally:
-                    if self.bar is not None:
-                        self.bar.show()
-                        self.bar.raise_()
-                        self.bar.activateWindow()
             elif kind == "browser_action":
                 if self.bar is not None:
                     self.bar._restore_position = self.bar.pos()
@@ -3595,22 +2546,19 @@ class SmartRecordingController(QtCore.QObject):
                                 hint_text="[ 검색 영역 지정 ] 드래그로 검색 범위 선택 (전체 화면은 Enter, 취소는 Esc)"
                             )
                             search_region = [0, 0, 0, 0]
-                            try:
-                                if region_picker.exec() == QtWidgets.QDialog.Accepted:
-                                    s_rect = region_picker.selected_native_screen_rect()
-                                    if s_rect.isValid() and s_rect.width() > 5 and s_rect.height() > 5:
-                                        client_rect = _resolve_live_client_rect(window)
-                                        if client_rect.isValid():
-                                            search_region = [
-                                                max(0, s_rect.left() - client_rect.left()),
-                                                max(0, s_rect.top() - client_rect.top()),
-                                                s_rect.x() + s_rect.width() - client_rect.left(),
-                                                s_rect.y() + s_rect.height() - client_rect.top(),
-                                            ]
-                                        else:
-                                            search_region = rect_to_exclusive_list(s_rect)
-                            finally:
-                                region_picker.deleteLater()
+                            if region_picker.exec() == QtWidgets.QDialog.Accepted:
+                                s_rect = region_picker.selected_screen_rect()
+                                if s_rect.isValid() and s_rect.width() > 5 and s_rect.height() > 5:
+                                    client_rect = _resolve_live_client_rect(window)
+                                    if client_rect.isValid():
+                                        search_region = [
+                                            max(0, s_rect.left() - client_rect.left()),
+                                            max(0, s_rect.top() - client_rect.top()),
+                                            s_rect.right() - client_rect.left(),
+                                            s_rect.bottom() - client_rect.top(),
+                                        ]
+                                    else:
+                                        search_region = [s_rect.left(), s_rect.top(), s_rect.right(), s_rect.bottom()]
                             event.update({
                                 "color": color_hex,
                                 "search_region": search_region,
@@ -3633,38 +2581,32 @@ class SmartRecordingController(QtCore.QObject):
                             pixmap, geometry,
                             hint_text="[ OCR 추적: 1단계 ] 추적할 기준 이미지/박스 드래그 선택 후 Enter (Esc 취소)"
                         )
-                        try:
-                            if picker1.exec() == QtWidgets.QDialog.Accepted:
-                                track_rect = picker1.selected_native_screen_rect()
-                                track_img = picker1.captured_image()
-                                if not track_img.isNull() and track_rect.isValid():
-                                    alias = f"track-target-{datetime.now():%Y%m%d-%H%M%S}"
-                                    self.repository.add_asset_image(track_img, alias)
-                                    # Step 2: Capture OCR area relative to tracking target
-                                    picker2 = ScreenCaptureDialog(
-                                        pixmap, geometry,
-                                        hint_text="[ OCR 추적: 2단계 ] OCR 수행할 텍스트 영역 드래그 선택 후 Enter (Esc 취소)"
-                                    )
-                                    try:
-                                        ocr_rect = track_rect
-                                        if picker2.exec() == QtWidgets.QDialog.Accepted:
-                                            sel_ocr = picker2.selected_native_screen_rect()
-                                            if sel_ocr.isValid() and sel_ocr.width() > 2:
-                                                ocr_rect = sel_ocr
-                                        offset_x = ocr_rect.left() - track_rect.left()
-                                        offset_y = ocr_rect.top() - track_rect.top()
-                                        event.update({
-                                            "tracking_asset": alias,
-                                            "ocr_offset_x": offset_x,
-                                            "ocr_offset_y": offset_y,
-                                            "ocr_width": ocr_rect.width(),
-                                            "ocr_height": ocr_rect.height(),
-                                            "detail": f"OCR 추적 ({alias})",
-                                        })
-                                    finally:
-                                        picker2.deleteLater()
-                        finally:
-                            picker1.deleteLater()
+                        if picker1.exec() == QtWidgets.QDialog.Accepted:
+                            track_rect = picker1.selected_screen_rect()
+                            track_img = picker1.captured_image()
+                            if not track_img.isNull() and track_rect.isValid():
+                                alias = f"track-target-{datetime.now():%Y%m%d-%H%M%S}"
+                                self.repository.add_asset_image(track_img, alias)
+                                # Step 2: Capture OCR area relative to tracking target
+                                picker2 = ScreenCaptureDialog(
+                                    pixmap, geometry,
+                                    hint_text="[ OCR 추적: 2단계 ] OCR 수행할 텍스트 영역 드래그 선택 후 Enter (Esc 취소)"
+                                )
+                                ocr_rect = track_rect
+                                if picker2.exec() == QtWidgets.QDialog.Accepted:
+                                    sel_ocr = picker2.selected_screen_rect()
+                                    if sel_ocr.isValid() and sel_ocr.width() > 2:
+                                        ocr_rect = sel_ocr
+                                offset_x = ocr_rect.left() - track_rect.left()
+                                offset_y = ocr_rect.top() - track_rect.top()
+                                event.update({
+                                    "tracking_asset": alias,
+                                    "ocr_offset_x": offset_x,
+                                    "ocr_offset_y": offset_y,
+                                    "ocr_width": ocr_rect.width(),
+                                    "ocr_height": ocr_rect.height(),
+                                    "detail": f"OCR 추적 ({alias})",
+                                })
                 finally:
                     if self.bar is not None:
                         self.bar.show()
@@ -3679,16 +2621,10 @@ class SmartRecordingController(QtCore.QObject):
                         if picker.exec() == QtWidgets.QDialog.Accepted:
                             pts = picker.selected_points()
                             if pts:
-                                target = picker.selected_target()
-                                coordinate_mode = picker.coordinate_mode()
+                                import json
                                 event.update({
                                     "pixels": json.dumps(pts, ensure_ascii=False),
                                     "match_policy": "all",
-                                    "required_count": len(pts),
-                                    "coord_mode": coordinate_mode,
-                                    "pixel_coords": "relative" if coordinate_mode == "Client" else "screen",
-                                    "window": str(target.get("window") or ""),
-                                    "window_exe": str(target.get("exe") or ""),
                                     "detail": f"다중 픽셀 체크 ({len(pts)}개 점)",
                                 })
                 finally:
@@ -3733,18 +2669,18 @@ class SmartRecordingController(QtCore.QObject):
                             )
                             search_region = [0, 0, 0, 0]
                             if region_picker.exec() == QtWidgets.QDialog.Accepted:
-                                s_rect = region_picker.selected_native_screen_rect()
+                                s_rect = region_picker.selected_screen_rect()
                                 if s_rect.isValid() and s_rect.width() > 4 and s_rect.height() > 4:
                                     client_rect = _resolve_live_client_rect(window)
                                     if client_rect.isValid():
                                         search_region = [
                                             max(0, s_rect.left() - client_rect.left()),
                                             max(0, s_rect.top() - client_rect.top()),
-                                            s_rect.x() + s_rect.width() - client_rect.left(),
-                                            s_rect.y() + s_rect.height() - client_rect.top(),
+                                            s_rect.right() - client_rect.left(),
+                                            s_rect.bottom() - client_rect.top(),
                                         ]
                                     else:
-                                        search_region = rect_to_exclusive_list(s_rect)
+                                        search_region = [s_rect.left(), s_rect.top(), s_rect.right(), s_rect.bottom()]
                             event.update({
                                 "target_color": color_hex,
                                 "search_region": search_region,
@@ -3767,8 +2703,7 @@ class SmartRecordingController(QtCore.QObject):
                     })
 
             title = ACTION_TITLES.get(kind, kind)
-            wizard_step = event.pop("_wizard_step", None)
-            step_template: dict[str, Any] = deepcopy(wizard_step) if isinstance(wizard_step, dict) else {
+            step_template: dict[str, Any] = {
                 "action": "type_text" if kind in {"text", "key", "type_text"} else ("ocr" if kind == "find_text_click" else kind),
                 "label": str(event.get("detail") or title),
             }
@@ -3776,20 +2711,6 @@ class SmartRecordingController(QtCore.QObject):
                 step_template["duration"] = 1000
             elif kind in {"text", "key", "type_text"}:
                 step_template["text"] = str(event.get("text") or "")
-            elif kind == "mouse_click":
-                window_info = event.get("window") if isinstance(event.get("window"), dict) else {}
-                step_template.update(
-                    {
-                        "x": int(event.get("x") or 0),
-                        "y": int(event.get("y") or 0),
-                        "coordinate_scope": str(event.get("coordinate_scope") or "client"),
-                        "button": str(event.get("button") or "Left"),
-                        "count": int(event.get("count") or 1),
-                        "window": str(window_info.get("title") or ""),
-                        "window_exe": str(window_info.get("exe") or ""),
-                        "window_hwnd": int(window_info.get("hwnd") or 0),
-                    }
-                )
             elif kind in {"ocr", "find_text_click"}:
                 step_template["asset"] = str(event.get("asset") or "")
                 reg = event.get("region") or event.get("search_region")
@@ -3863,43 +2784,25 @@ class SmartRecordingController(QtCore.QObject):
                 step_template["lang"] = "kor+eng"
                 step_template["engine_preference"] = "auto"
 
-            # A dragged quick-add node must appear immediately. Its defaults
-            # can be adjusted by double-clicking the node afterwards. Ordinary
-            # toolbar clicks retain the existing detailed-settings dialog.
-            if isinstance(wizard_step, dict):
-                event["_step_payload"] = dict(step_template)
-            elif drop_payload:
-                event["_step_payload"] = dict(step_template)
-            else:
-                from .builder import ActionEditorDialog
-                dlg = ActionEditorDialog(self.repository, step_template, parent=self.bar)
-                if dlg.exec() == QtWidgets.QDialog.Accepted:
-                    edited_payload = dlg.payload()
-                    if isinstance(edited_payload, dict):
-                        event["_step_payload"] = edited_payload
-                        if edited_payload.get("label"):
-                            event["detail"] = str(edited_payload["label"])
+            # Popup detailed settings editor for the added node
+            from .builder import ActionEditorDialog
+            dlg = ActionEditorDialog(self.repository, step_template, parent=self.bar)
+            if dlg.exec() == QtWidgets.QDialog.Accepted:
+                edited_payload = dlg.payload()
+                if isinstance(edited_payload, dict):
+                    event["_step_payload"] = edited_payload
+                    if edited_payload.get("label"):
+                        event["detail"] = str(edited_payload["label"])
 
             self._manual_captures.append(event)
             if self.bar is not None:
-                live_events = self._current_live_events()
-                if drop_payload:
-                    self.bar.apply_quick_node_drop(event_id, drop_payload, rebuild=False)
-                self.bar.update_live_events(live_events, force=bool(drop_payload))
+                live_events = sorted(
+                    [*load_recording(self.output), *self._manual_captures],
+                    key=lambda item: int(item.get("t") or 0),
+                )
+                self.bar.update_live_events(live_events)
         finally:
             self._capture_in_progress = False
-
-    def _current_live_events(self) -> list[dict[str, Any]]:
-        """Return the live timeline without nodes explicitly deleted in the editor."""
-        return sorted(
-            [
-                event
-                for event in [*load_recording(self.output), *self._manual_captures]
-                if isinstance(event, dict)
-                and str(event.get("event_id") or "") not in self._deleted_event_ids
-            ],
-            key=lambda item: int(item.get("t") or 0),
-        )
 
     def _delete_recorded_events(self, event_ids: list[str]) -> None:
         for identifier in event_ids:
@@ -3908,8 +2811,6 @@ class SmartRecordingController(QtCore.QObject):
             e for e in self._manual_captures
             if str((e if isinstance(e, dict) else {}).get("event_id") or "") not in self._deleted_event_ids
         ]
-        if self.bar is not None:
-            self.bar.update_live_events(self._current_live_events(), force=True)
 
     def stop(self) -> None:
         self._manual_stop = True
@@ -3968,7 +2869,11 @@ class SmartRecordingController(QtCore.QObject):
         if latest_workflow_index is not None and self.bar is not None:
             self.bar.set_workflow_index(latest_workflow_index)
         if self.bar is not None:
-            self.bar.update_live_events(self._current_live_events())
+            live_events = sorted(
+                [*load_recording(self.output), *self._manual_captures],
+                key=lambda item: int(item.get("t") or 0),
+            )
+            self.bar.update_live_events(live_events)
         return requests
 
     def _poll_capture_requests(self) -> None:
@@ -4016,16 +2921,12 @@ class SmartRecordingController(QtCore.QObject):
             if prompt_search_region:
                 # F4 Instant Capture: Zero drag overlay dialogs, 100% instant 1-click snapshot at cursor position
                 point = wintypes.POINT()
-                if user32.GetCursorPos(ctypes.byref(point)):
-                    logical_cursor = native_point_to_logical(QtCore.QPoint(int(point.x), int(point.y)))
-                else:
-                    logical_cursor = geometry.center()
-                screen_rect = QtCore.QRect(
-                    logical_cursor.x() - 48, logical_cursor.y() - 32, 96, 64
-                ).intersected(geometry)
+                if not user32.GetCursorPos(ctypes.byref(point)):
+                    point.x, point.y = geometry.center().x(), geometry.center().y()
+                screen_rect = QtCore.QRect(point.x - 48, point.y - 32, 96, 64).intersected(geometry)
                 local_rect = screen_rect.translated(-geometry.left(), -geometry.top())
                 image = pixmap.copy(local_rect).toImage()
-                selected_center = QtCore.QPoint(logical_cursor)
+                selected_center = QtCore.QPoint(point.x, point.y)
             else:
                 hint1 = "[ 수동 이미지 영역 지정 ] 드래그 선택 후 Enter (Esc 취소)"
                 picker = ScreenCaptureDialog(pixmap, geometry, hint_text=hint1)
@@ -4044,11 +2945,6 @@ class SmartRecordingController(QtCore.QObject):
                     image = pixmap.copy(local_rect).toImage()
                     screen_rect = expanded
 
-            native_screen_rect = logical_rect_to_native(screen_rect)
-            native_center = native_screen_rect.center()
-            if prompt_search_region:
-                image = _native_region_image(native_screen_rect, image)
-
             ignored_hwnds: set[int] = set()
             try:
                 for widget in QtWidgets.QApplication.topLevelWidgets():
@@ -4057,7 +2953,7 @@ class SmartRecordingController(QtCore.QObject):
                         ignored_hwnds.add(root)
             except Exception:
                 ignored_hwnds.clear()
-            detected = ActionEditor._window_target_at(native_center, ignored_hwnds, position_is_native=True)
+            detected = ActionEditor._window_target_at(selected_center, ignored_hwnds)
             if detected:
                 window = {key: value for key, value in detected.items() if key != "rect"}
             elif str(window.get("exe") or "").casefold() in {"python.exe", "pythonw.exe"}:
@@ -4068,17 +2964,17 @@ class SmartRecordingController(QtCore.QObject):
                 client_rect = _resolve_live_client_rect(window)
                 if client_rect.isValid():
                     search_region = [
-                        max(0, native_center.x() - client_rect.left() - 220),
-                        max(0, native_center.y() - client_rect.top() - 160),
-                        min(client_rect.width(), native_center.x() - client_rect.left() + 220),
-                        min(client_rect.height(), native_center.y() - client_rect.top() + 160),
+                        max(0, selected_center.x() - client_rect.left() - 220),
+                        max(0, selected_center.y() - client_rect.top() - 160),
+                        min(client_rect.width(), selected_center.x() - client_rect.left() + 220),
+                        min(client_rect.height(), selected_center.y() - client_rect.top() + 160),
                     ]
                 else:
                     search_region = [
-                        max(0, native_center.x() - 220),
-                        max(0, native_center.y() - 160),
-                        native_center.x() + 220,
-                        native_center.y() + 160,
+                        max(0, selected_center.x() - 220),
+                        max(0, selected_center.y() - 160),
+                        selected_center.x() + 220,
+                        selected_center.y() + 160,
                     ]
 
             payload = QtCore.QByteArray()
@@ -4086,7 +2982,7 @@ class SmartRecordingController(QtCore.QObject):
             buffer.open(QtCore.QIODevice.WriteOnly)
             image.save(buffer, "PNG")
             buffer.close()
-            center = native_center
+            center = selected_center
             origin = window.get("capture_origin") if isinstance(window.get("capture_origin"), list) else window.get("client_origin")
             if not isinstance(origin, list):
                 origin = [0, 0]
@@ -4101,16 +2997,10 @@ class SmartRecordingController(QtCore.QObject):
                 "button": "Left",
                 "record_mode": "branch" if record_mode == "branch" else "action",
                 "window": window,
-                "selected_screen_rect": [
-                    native_screen_rect.x(), native_screen_rect.y(),
-                    native_screen_rect.width(), native_screen_rect.height(),
-                ],
+                "selected_screen_rect": [screen_rect.x(), screen_rect.y(), screen_rect.width(), screen_rect.height()],
                 "image_sample_bmp": base64.b64encode(bytes(payload)).decode("ascii"),
                 "image_sample_size": [image.width(), image.height()],
-                "image_anchor": [
-                    int(native_center.x() - native_screen_rect.left()),
-                    int(native_center.y() - native_screen_rect.top()),
-                ],
+                "image_anchor": [int(center.x() - screen_rect.left()), int(center.y() - screen_rect.top())],
             }
             if search_region:
                 capture_event["search_region"] = search_region
@@ -4119,7 +3009,11 @@ class SmartRecordingController(QtCore.QObject):
 
             if self.bar is not None:
                 self.bar.show_capture_result(image.width(), image.height(), search_region_set=bool(search_region))
-                self.bar.update_live_events(self._current_live_events())
+                live_events = sorted(
+                    [*load_recording(self.output), *self._manual_captures],
+                    key=lambda item: int(item.get("t") or 0),
+                )
+                self.bar.update_live_events(live_events)
         finally:
             self._capture_in_progress = False
             if self.bar is not None:
@@ -4135,7 +3029,6 @@ class SmartRecordingController(QtCore.QObject):
         live_positions = self.bar.event_positions() if self.bar is not None else {}
         live_links = self.bar.event_links() if self.bar is not None else {}
         live_multi_groups = self.bar.multi_groups() if self.bar is not None else {}
-        live_step_payloads = self.bar.step_payloads() if self.bar is not None else {}
         if self.bar is not None:
             self.bar.close()
             self.bar.deleteLater()
@@ -4155,8 +3048,6 @@ class SmartRecordingController(QtCore.QObject):
                 event["_live_position"] = list(live_positions[event_id])
             if event_id in live_multi_groups:
                 event["_review_multi_group"] = live_multi_groups[event_id]
-            if event_id in live_step_payloads:
-                event["_step_payload"] = deepcopy(live_step_payloads[event_id])
             event_links: dict[str, Any] = {}
             for kind in ("success", "fail"):
                 key = (event_id, kind)
@@ -4186,13 +3077,11 @@ class SmartRecordingController(QtCore.QObject):
 
 class RecordingReviewDialog(QtWidgets.QDialog):
     events_changed = QtCore.Signal(list)
-    ai_macro_ready = QtCore.Signal(dict)
 
     def __init__(self, events: list[dict[str, Any]], repository, parent=None) -> None:
         super().__init__(parent)
         self.repository = repository
         self.events = events
-        self._ai_macro_dialog = None
         self.drafts = recording_drafts(events, include_waits=False)
         self.crop_sizes: dict[int, QtCore.QSize] = {}
         self.crop_rects: dict[int, QtCore.QRect] = {}
@@ -4319,13 +3208,6 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.setSpacing(8)
 
-        self.btn_ai_macro = QtWidgets.QPushButton("🤖 녹화로 자동 매크로 만들기")
-        self.btn_ai_macro.setToolTip("녹화된 동작과 이미지를 기반으로 GPT 계획(plan.json)을 생성하고 자동 분기 매크로를 만듭니다.")
-        self.btn_ai_macro.setStyleSheet(
-            "background:#7C4DFF; color:#FFFFFF; font-weight:800; padding:6px 14px; border-radius:4px;"
-        )
-        self.btn_ai_macro.clicked.connect(self._open_ai_macro_dialog)
-
         self.btn_append = QtWidgets.QPushButton("✚ 기존 매크로에 추가")
         self.btn_append.setToolTip("현재 편집 중인 매크로 뒤에 녹화 노드를 추가합니다.")
         self.btn_append.clicked.connect(self._accept_append)
@@ -4340,81 +3222,12 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         self.btn_cancel = QtWidgets.QPushButton("취소")
         self.btn_cancel.clicked.connect(self.reject)
 
-        button_layout.addWidget(self.btn_ai_macro)
         button_layout.addStretch(1)
         button_layout.addWidget(self.btn_append)
         button_layout.addWidget(self.btn_create_new)
         button_layout.addWidget(self.btn_cancel)
         layout.addLayout(button_layout)
         self._apply_background_click_mode(True)
-
-    def _is_ai_macro_dialog_alive(self) -> bool:
-        if self._ai_macro_dialog is None:
-            return False
-        try:
-            import shiboken6
-            if not shiboken6.isValid(self._ai_macro_dialog):
-                self._ai_macro_dialog = None
-                return False
-        except (ImportError, RuntimeError):
-            self._ai_macro_dialog = None
-            return False
-        return True
-
-    def _cleanup_ai_macro_dialog(self, dialog=None) -> None:
-        if dialog is None or self._ai_macro_dialog is dialog:
-            self._ai_macro_dialog = None
-
-    def _open_ai_macro_dialog(self) -> None:
-        if self._is_ai_macro_dialog_alive():
-            dialog = self._ai_macro_dialog
-            if not dialog.isVisible():
-                dialog.show()
-            dialog.raise_()
-            dialog.activateWindow()
-            return
-        try:
-            steps = self.build_steps()
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "녹화 변환 오류", f"단계 생성 중 오류가 발생했습니다: {exc}")
-            return
-        from .ai_macro_supplement_dialog import AiMacroSupplementDialog as AiMacroDialog
-
-        dialog = AiMacroDialog(self.repository, steps, parent=self.window())
-        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
-        self._ai_macro_dialog = dialog
-        dialog.macro_ready.connect(self._on_ai_macro_ready)
-        dialog.destroyed.connect(lambda *_: self._cleanup_ai_macro_dialog(dialog))
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def _on_ai_macro_ready(self, draft: dict[str, Any]) -> None:
-        self.ai_macro_ready.emit(draft)
-
-    def _on_ai_macro_save_result(self, success: bool, message: str) -> None:
-        if success:
-            self.target_mode = "ai_plan"
-            if self._is_ai_macro_dialog_alive():
-                self._ai_macro_dialog.on_save_success()
-            self._ai_macro_dialog = None
-            self.accept()
-        else:
-            if self._is_ai_macro_dialog_alive():
-                self._ai_macro_dialog.on_save_failed(message)
-            QtWidgets.QMessageBox.warning(self, "AI 매크로 저장 실패", message)
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if self._is_ai_macro_dialog_alive():
-            self._ai_macro_dialog.close()
-        self._ai_macro_dialog = None
-        super().closeEvent(event)
-
-    def reject(self) -> None:
-        if self._is_ai_macro_dialog_alive():
-            self._ai_macro_dialog.close()
-        self._ai_macro_dialog = None
-        super().reject()
 
     def _accept_append(self) -> None:
         self.target_mode = "append"
@@ -4497,9 +3310,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 if draft.get("kind") in {"screen_condition", "screen_verification"}:
                     combo.addItem("이미지가 보이는지 확인 · 클릭 안 함", "image")
                     event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
-                    image = _recorded_detail_image(event)
-                    if image.isNull():
-                        image = _recorded_sample_image(event)
+                    image = _recorded_sample_image(event)
                     if not image.isNull() and row not in self.crop_rects:
                         self.crop_sizes[row] = QtCore.QSize(min(128, image.width()), min(88, image.height()))
                 elif draft.get("kind") == "image_capture":
@@ -4602,9 +3413,6 @@ class RecordingReviewDialog(QtWidgets.QDialog):
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
             self._remove_rows_from_shortcut()
-            event.accept()
-            return
-        if event.key() == QtCore.Qt.Key_Escape:
             event.accept()
             return
         super().keyPressEvent(event)
@@ -4860,18 +3668,14 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 "녹화한 대상 프로그램의 현재 창을 찾지 못했습니다. 대상 프로그램을 실행한 뒤 다시 눌러 주세요.",
             )
             return
-        orig_opacity = self.windowOpacity()
-        self.setWindowOpacity(0.0)
+        self.hide()
         QtWidgets.QApplication.processEvents()
         pixmap, desktop_geometry = capture_virtual_desktop()
         if pixmap.isNull() or not desktop_geometry.isValid():
-            self.setWindowOpacity(orig_opacity if orig_opacity > 0 else 1.0)
             self.show()
             return
-        logical_client_rect = native_rect_to_logical(client_rect)
-        clipped = logical_client_rect.intersected(desktop_geometry)
+        clipped = client_rect.intersected(desktop_geometry)
         if not clipped.isValid():
-            self.setWindowOpacity(orig_opacity if orig_opacity > 0 else 1.0)
             self.show()
             QtWidgets.QMessageBox.warning(self, "서치 영역 지정", "대상 프로그램의 클라이언트 화면이 현재 모니터에 보이지 않습니다.")
             return
@@ -4881,7 +3685,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
         try:
             if picker.exec() != QtWidgets.QDialog.Accepted:
                 return
-            selected = picker.selected_native_screen_rect().intersected(client_rect)
+            selected = picker.selected_screen_rect().intersected(client_rect)
             if selected.width() < 4 or selected.height() < 4:
                 return
             region = [
@@ -4907,11 +3711,7 @@ class RecordingReviewDialog(QtWidgets.QDialog):
                 )
             self.events_changed.emit(self.events)
         finally:
-            try:
-                picker.deleteLater()
-            except Exception:
-                pass
-            self.setWindowOpacity(orig_opacity if orig_opacity > 0 else 1.0)
+            picker.deleteLater()
             self.show()
             self.raise_()
             self.activateWindow()
@@ -5042,13 +3842,9 @@ class RecordingReviewDialog(QtWidgets.QDialog):
             record_mode = "branch" if str(draft.get("record_mode") or "action") == "branch" else "action"
             if draft.get("step") and isinstance(draft["step"], dict):
                 step_obj = dict(draft["step"])
-                source_event = draft.get("event") if isinstance(draft.get("event"), dict) else {}
                 step_obj["_recording_mode"] = record_mode
                 step_obj["workflow_id"] = str(draft.get("workflow_id") or "")
                 step_obj["workflow_label"] = f"스마트 작업 {int(draft.get('workflow_index') or 1)}"
-                step_obj["_live_position"] = list(source_event.get("_live_position") or [])[:2]
-                step_obj["_recording_event_ids"] = [str(source_event.get("event_id") or "")]
-                step_obj["_live_links"] = dict(source_event.get("_live_links") or {})
                 steps.append(step_obj)
                 continue
             if kind == "wait":
@@ -5899,154 +4695,6 @@ class QuickActionWizard:
                 }
             )
             return step
-        if action == "animation_search":
-            QtWidgets.QApplication.processEvents()
-            QtCore.QThread.msleep(120)
-            pixmap, geometry = capture_virtual_desktop()
-            if pixmap.isNull() or not geometry.isValid():
-                return None
-            dialog = ScreenCaptureDialog(
-                pixmap,
-                geometry,
-                parent,
-                accept_on_release=True,
-                hint_text="⬚ 애니메이션 아이콘 영역을 드래그하세요 · 이후 1.2초 동안 자동 분석합니다",
-            )
-            try:
-                if dialog.exec() != QtWidgets.QDialog.Accepted:
-                    return None
-                rect = dialog.selected_native_screen_rect()
-                first_frame = dialog.captured_image()
-            finally:
-                dialog.deleteLater()
-            if not rect.isValid() or rect.width() < 4 or rect.height() < 4:
-                return None
-
-            QtWidgets.QApplication.processEvents()
-            QtCore.QThread.msleep(100)
-            progress = QtWidgets.QProgressDialog("애니메이션 변화 영역을 분석하고 있습니다…", "취소", 0, 12, parent)
-            progress.setWindowTitle("애니메이션 서치 자동 캡처")
-            progress.setWindowModality(QtCore.Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setMinimumWidth(360)
-            progress.show()
-            progress.adjustSize()
-            logical_target = native_rect_to_logical(rect)
-            target_screen = QtGui.QGuiApplication.screenAt(logical_target.center()) or QtGui.QGuiApplication.primaryScreen()
-            if target_screen is not None:
-                available = target_screen.availableGeometry()
-                candidates = (
-                    available.topLeft() + QtCore.QPoint(12, 12),
-                    QtCore.QPoint(available.right() - progress.width() - 12, available.top() + 12),
-                    QtCore.QPoint(available.left() + 12, available.bottom() - progress.height() - 12),
-                    QtCore.QPoint(available.right() - progress.width() - 12, available.bottom() - progress.height() - 12),
-                )
-                farthest = max(
-                    candidates,
-                    key=lambda point: (point.x() + progress.width() // 2 - logical_target.center().x()) ** 2
-                    + (point.y() + progress.height() // 2 - logical_target.center().y()) ** 2,
-                )
-                progress.move(farthest)
-            frames: list[QtGui.QImage] = []
-            if not first_frame.isNull():
-                frames.append(first_frame)
-            try:
-                for frame_index in range(12):
-                    if progress.wasCanceled():
-                        return None
-                    captured = _native_region_image(rect, QtGui.QImage())
-                    if not captured.isNull():
-                        frames.append(captured)
-                    progress.setValue(frame_index + 1)
-                    QtWidgets.QApplication.processEvents()
-                    if frame_index < 11:
-                        QtCore.QThread.msleep(90)
-            finally:
-                progress.close()
-                progress.deleteLater()
-            if len(frames) < 3:
-                QtWidgets.QMessageBox.warning(
-                    parent,
-                    "애니메이션 캡처 실패",
-                    "분석에 필요한 연속 프레임을 확보하지 못했습니다. 대상 창이 보이는 상태에서 다시 시도해 주세요.",
-                )
-                return None
-            templates, stable_ratio = build_animation_templates(frames, stability_threshold=22, max_templates=4)
-            if not templates:
-                return None
-
-            aliases: list[str] = []
-            batch_id = f"{datetime.now():%m%d_%H%M%S}_{uuid.uuid4().hex[:5]}"
-            for index, image in enumerate(templates, start=1):
-                aliases.append(repository.add_asset_image(image, f"anim_{batch_id}_{index:02d}"))
-
-            target = ActionEditor._window_target_at(rect.center(), set(), position_is_native=True)
-            margin = 120
-            if target:
-                scope = str(target.get("capture_scope") or "client")
-                origin = target.get("capture_origin") or target.get("client_origin") or [0, 0]
-                size = target.get("capture_size") or target.get("client_size") or [rect.width(), rect.height()]
-                ox, oy = int(origin[0]), int(origin[1])
-                sw, sh = max(1, int(size[0])), max(1, int(size[1]))
-                search_region = [
-                    max(0, rect.left() - ox - margin),
-                    max(0, rect.top() - oy - margin),
-                    min(sw, rect.x() + rect.width() - ox + margin),
-                    min(sh, rect.y() + rect.height() - oy + margin),
-                ]
-                region_mode = scope if scope in {"client", "window"} else "client"
-                region_coords = "relative"
-                window_token = str(target.get("window") or "")
-                window_exe = str(target.get("exe") or "")
-            else:
-                search_region = [
-                    rect.left() - margin,
-                    rect.top() - margin,
-                    rect.x() + rect.width() + margin,
-                    rect.y() + rect.height() + margin,
-                ]
-                region_mode = "screen"
-                region_coords = "screen"
-                window_token = ""
-                window_exe = ""
-
-            step.update(
-                {
-                    "asset": aliases[0],
-                    "assets": aliases,
-                    "engine": "opencv",
-                    "search_profile": "balanced",
-                    "confidence": 78,
-                    "match_condition": "at_least_1",
-                    "required_count": 1,
-                    "wait_condition": "appear",
-                    "timeout": 2000,
-                    "poll_delay": 45,
-                    "click_target": "first_image",
-                    "click_enabled": True,
-                    "click": {
-                        "mode": "inactive" if target else "active",
-                        "method": "auto",
-                        "button": "left",
-                        "count": 1,
-                        "offset": [0, 0],
-                        "window": window_token,
-                        "window_exe": window_exe,
-                    },
-                    "region_mode": region_mode,
-                    "region_coords": region_coords,
-                    "region_window": window_token,
-                    "region_window_exe": window_exe,
-                    "region": search_region,
-                    "animation_capture_ms": 1200,
-                    "animation_frame_count": len(frames),
-                    "animation_stability_threshold": 22,
-                    "animation_stable_ratio": round(stable_ratio, 4),
-                    "animation_auto_mask": True,
-                    "label": f"애니메이션 서치 ({len(aliases)}프레임)",
-                }
-            )
-            return step
         if action in {"image_search", "screen_condition"}:
             QtWidgets.QApplication.processEvents()
             QtCore.QThread.msleep(150)
@@ -6066,80 +4714,21 @@ class QuickActionWizard:
                 accept_on_release=True,
                 hint_text=hint,
             )
-            try:
-                if dialog.exec() != QtWidgets.QDialog.Accepted:
-                    return None
-                image = dialog.captured_image()
-                rect = dialog.selected_native_screen_rect()
-            finally:
-                dialog.deleteLater()
+            if dialog.exec() != QtWidgets.QDialog.Accepted:
+                return None
+            image = dialog.captured_image()
+            rect = dialog.selected_screen_rect()
             if image.isNull() or not rect.isValid():
                 return None
             prefix = "cond" if is_cond else "img"
             alias = f"{prefix}_{datetime.now():%m%d_%H%M%S}"
-
-            ignored_hwnds: set[int] = set()
-            if sys.platform == "win32":
-                try:
-                    user32 = ctypes.windll.user32
-                    for widget in QtWidgets.QApplication.topLevelWidgets():
-                        root = int(user32.GetAncestor(int(widget.winId()), 2) or int(widget.winId()))
-                        if root:
-                            ignored_hwnds.add(root)
-                except Exception:
-                    ignored_hwnds.clear()
-            target = ActionEditor._window_target_at(
-                rect.center(), ignored_hwnds, position_is_native=True
-            )
-
-            region_dialog = ScreenCaptureDialog(
-                pixmap,
-                geometry,
-                parent,
-                accept_on_release=False,
-                hint_text="[ 2단계 · 검색 영역 지정 ] 실제로 검색할 범위를 드래그한 뒤 Enter · Esc 취소",
-            )
-            try:
-                if region_dialog.exec() != QtWidgets.QDialog.Accepted:
-                    return None
-                selected_region = region_dialog.selected_native_screen_rect()
-            finally:
-                region_dialog.deleteLater()
-            if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
-                return None
-
-            window_token = ""
-            window_exe = ""
-            region_mode = "screen"
-            region_coords = "screen"
-            search_region = rect_to_exclusive_list(selected_region)
-            if target:
-                scope = str(target.get("capture_scope") or "client")
-                origin = target.get("capture_origin") or target.get("client_origin") or [0, 0]
-                size = target.get("capture_size") or target.get("client_size") or [0, 0]
-                ox, oy = int(origin[0]), int(origin[1])
-                sw, sh = max(0, int(size[0])), max(0, int(size[1]))
-                target_rect = QtCore.QRect(ox, oy, sw, sh)
-                if target_rect.isValid():
-                    selected_region = selected_region.intersected(target_rect)
-                if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
-                    QtWidgets.QMessageBox.warning(
-                        parent,
-                        "검색 영역 확인",
-                        "검색 영역은 처음 이미지를 선택한 대상 프로그램 안에서 지정해 주세요.",
-                    )
-                    return None
-                search_region = [
-                    selected_region.left() - ox,
-                    selected_region.top() - oy,
-                    selected_region.left() - ox + selected_region.width(),
-                    selected_region.top() - oy + selected_region.height(),
-                ]
-                region_mode = scope if scope in {"client", "window"} else "client"
-                region_coords = "relative"
-                window_token = str(target.get("window") or "")
-                window_exe = str(target.get("exe") or "")
             alias = repository.add_asset_image(image, alias)
+            search_region = [
+                max(0, rect.left() - 100),
+                max(0, rect.top() - 100),
+                rect.right() + 100,
+                rect.bottom() + 100,
+            ]
             step.update(
                 {
                     "asset": alias,
@@ -6149,17 +4738,12 @@ class QuickActionWizard:
                     "confidence": 85,
                     "wait_condition": "appear",
                     "timeout": 3000,
-                    "region_mode": region_mode,
-                    "region_coords": region_coords,
-                    "region_window": window_token,
-                    "region_window_exe": window_exe,
+                    "region_mode": "screen",
+                    "region_coords": "screen",
                     "region": search_region,
                     "click_enabled": not is_cond,
                     "click": {
-                        "mode": "inactive" if target else "active",
-                        "method": "auto",
-                        "window": window_token,
-                        "window_exe": window_exe,
+                        "mode": "active",
                         "click_image": not is_cond,
                         "click_offset": False,
                         "count": 1,
@@ -6183,18 +4767,15 @@ class QuickActionWizard:
                 accept_on_release=True,
                 hint_text="⬚ OCR 텍스트를 인식할 영역을 드래그하세요 (마우스 놓기 / Enter 확정, Esc 취소)",
             )
-            try:
-                if dialog.exec() != QtWidgets.QDialog.Accepted:
-                    return None
-                image = dialog.captured_image()
-                rect = dialog.selected_native_screen_rect()
-            finally:
-                dialog.deleteLater()
+            if dialog.exec() != QtWidgets.QDialog.Accepted:
+                return None
+            image = dialog.captured_image()
+            rect = dialog.selected_screen_rect()
             if image.isNull() or not rect.isValid():
                 return None
             alias = f"ocr_sample_{datetime.now():%m%d_%H%M%S}"
             repository.add_asset_image(image, alias)
-            search_region = rect_to_exclusive_list(rect)
+            search_region = [rect.left(), rect.top(), rect.right(), rect.bottom()]
             step.update(
                 {
                     "asset": alias,
@@ -6235,115 +4816,30 @@ class QuickActionWizard:
             if picker.exec() != QtWidgets.QDialog.Accepted:
                 return None
             color = picker.selected_color()
-            point = picker.selected_point()
-            if not color or point is None:
+            if not color:
                 return None
-
-            ignored_hwnds: set[int] = set()
-            if sys.platform == "win32":
-                try:
-                    user32 = ctypes.windll.user32
-                    for widget in QtWidgets.QApplication.topLevelWidgets():
-                        root = int(user32.GetAncestor(int(widget.winId()), 2) or int(widget.winId()))
-                        if root:
-                            ignored_hwnds.add(root)
-                except Exception:
-                    ignored_hwnds.clear()
-            target = ActionEditor._window_target_at(
-                point, ignored_hwnds, position_is_native=True
-            )
-            region_dialog = ScreenCaptureDialog(
-                pixmap,
-                geometry,
-                parent,
-                accept_on_release=False,
-                hint_text="[ 2단계 · 색상 검색 영역 지정 ] 같은 색상을 찾을 범위를 드래그한 뒤 Enter · Esc 취소",
-            )
-            try:
-                if region_dialog.exec() != QtWidgets.QDialog.Accepted:
-                    return None
-                selected_region = region_dialog.selected_native_screen_rect()
-            finally:
-                region_dialog.deleteLater()
-            if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
-                return None
-
-            window_token = ""
-            window_exe = ""
-            region_mode = "screen"
-            region_coords = "screen"
-            search_region = rect_to_exclusive_list(selected_region)
-            stored_x, stored_y = point.x(), point.y()
-            if target:
-                scope = str(target.get("capture_scope") or "client")
-                origin = target.get("capture_origin") or target.get("client_origin") or [0, 0]
-                size = target.get("capture_size") or target.get("client_size") or [0, 0]
-                ox, oy = int(origin[0]), int(origin[1])
-                target_rect = QtCore.QRect(ox, oy, max(0, int(size[0])), max(0, int(size[1])))
-                if target_rect.isValid():
-                    selected_region = selected_region.intersected(target_rect)
-                if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
-                    QtWidgets.QMessageBox.warning(
-                        parent,
-                        "검색 영역 확인",
-                        "검색 영역은 색상을 선택한 대상 프로그램 안에서 지정해 주세요.",
-                    )
-                    return None
-                search_region = [
-                    selected_region.left() - ox,
-                    selected_region.top() - oy,
-                    selected_region.left() - ox + selected_region.width(),
-                    selected_region.top() - oy + selected_region.height(),
-                ]
-                stored_x -= ox
-                stored_y -= oy
-                region_mode = scope if scope in {"client", "window"} else "client"
-                region_coords = "relative"
-                window_token = str(target.get("window") or "")
-                window_exe = str(target.get("exe") or "")
             step.update({
                 "color": color.name().upper(),
                 "tolerance": 15,
                 "action_on_found": "click",
-                "x": stored_x,
-                "y": stored_y,
-                "region_mode": region_mode,
-                "region_coords": region_coords,
-                "region_window": window_token,
-                "region_window_exe": window_exe,
-                "search_region": search_region,
-                "click": {
-                    "mode": "inactive" if target else "active",
-                    "method": "auto",
-                    "button": "Left",
-                    "count": 1,
-                    "window": window_token,
-                    "window_exe": window_exe,
-                },
                 "label": f"색상 서치 ({color.name().upper()})",
             })
             return step
         if action == "ocr_tracking":
             pixmap, geometry = capture_virtual_desktop()
             p1 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="[ 1단계 ] 추적할 대상 이미지를 드래그 선택 후 Enter")
-            try:
-                if p1.exec() != QtWidgets.QDialog.Accepted:
-                    return None
-                img = p1.captured_image()
-                if img.isNull():
-                    return None
-                alias = f"track-{datetime.now():%Y%m%d-%H%M%S}"
-                repository.add_asset_image(img, alias)
-                ref_rect = p1.selected_native_screen_rect()
-                p2 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="[ 2단계 ] 인식할 OCR 텍스트 영역을 드래그 선택 후 Enter")
-                try:
-                    if p2.exec() != QtWidgets.QDialog.Accepted:
-                        return None
-                    ocr_rect = p2.selected_native_screen_rect()
-                finally:
-                    p2.deleteLater()
-            finally:
-                p1.deleteLater()
+            if p1.exec() != QtWidgets.QDialog.Accepted:
+                return None
+            img = p1.captured_image()
+            if img.isNull():
+                return None
+            alias = f"track-{datetime.now():%Y%m%d-%H%M%S}"
+            repository.add_asset_image(img, alias)
+            ref_rect = p1.selected_screen_rect()
+            p2 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="[ 2단계 ] 인식할 OCR 텍스트 영역을 드래그 선택 후 Enter")
+            if p2.exec() != QtWidgets.QDialog.Accepted:
+                return None
+            ocr_rect = p2.selected_screen_rect()
             step.update(
                 {
                     "tracking_asset": alias,
@@ -6363,18 +4859,8 @@ class QuickActionWizard:
             pts = picker.selected_points()
             if not pts:
                 return None
-            target = picker.selected_target()
-            coordinate_mode = picker.coordinate_mode()
-            step.update({
-                "pixels": json.dumps(pts, ensure_ascii=False),
-                "match_policy": "all",
-                "required_count": len(pts),
-                "coord_mode": coordinate_mode,
-                "pixel_coords": "relative" if coordinate_mode == "Client" else "screen",
-                "window": str(target.get("window") or ""),
-                "window_exe": str(target.get("exe") or ""),
-                "label": f"다중 픽셀 체크 ({len(pts)}개 점)",
-            })
+            import json
+            step.update({"pixels": json.dumps(pts, ensure_ascii=False), "label": f"다중 픽셀 체크 ({len(pts)}개 점)"})
             return step
         if action == "wait_color":
             pixmap, geometry = capture_virtual_desktop()
@@ -6396,16 +4882,13 @@ class QuickActionWizard:
             if not color:
                 return None
             p2 = ScreenCaptureDialog(pixmap, geometry, parent, hint_text="게이지(체력바) 영역을 드래그 선택 후 Enter")
-            try:
-                if p2.exec() != QtWidgets.QDialog.Accepted or not p2.selected_native_screen_rect().isValid():
-                    return None
-                r = p2.selected_native_screen_rect()
-            finally:
-                p2.deleteLater()
+            if p2.exec() != QtWidgets.QDialog.Accepted or not p2.selected_screen_rect().isValid():
+                return None
+            r = p2.selected_screen_rect()
             step.update(
                 {
                     "target_color": color.name().upper(),
-                    "search_region": rect_to_exclusive_list(r),
+                    "search_region": [r.left(), r.top(), r.right(), r.bottom()],
                     "label": "자동 설정 색상 비율 게이지",
                 }
             )

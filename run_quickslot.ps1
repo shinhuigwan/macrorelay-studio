@@ -1,12 +1,21 @@
 $ErrorActionPreference = "SilentlyContinue"
 $studioRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$studioScript = Join-Path $studioRoot "run_studio.py"
-$installerScript = Join-Path $studioRoot "install.ps1"
-$bootstrapMarker = Join-Path $studioRoot ".bootstrap-complete"
+$quickslotScript = Join-Path $studioRoot "quickslot_app.py"
 $runtimePackages = Join-Path $studioRoot "runtime_packages"
 $legacyPackages = Join-Path $studioRoot ".venv\Lib\site-packages"
 $bundledOpenCvPackages = Join-Path $studioRoot "runtime\opencv\cp312\packages"
-$runtimeCandidates = @(
+
+$sysPython = (Get-Command python.exe -ErrorAction SilentlyContinue).Path
+$sysPythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Path
+if (-not $sysPythonw -and $sysPython) {
+    $sysPythonw = $sysPython
+}
+
+$runtimeCandidates = @()
+if ($sysPython -and $sysPythonw) {
+    $runtimeCandidates += ,@($sysPython, $sysPythonw, $false)
+}
+$runtimeCandidates += @(
     @((Join-Path $studioRoot ".venv\Scripts\python.exe"), (Join-Path $studioRoot ".venv\Scripts\pythonw.exe"), $true),
     @((Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"), (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\pythonw.exe"), $true),
     @((Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"), (Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\pythonw.exe"), $false)
@@ -37,25 +46,12 @@ foreach ($candidate in $runtimeCandidates) {
     }
     & $python -c "from PySide6 import QtWidgets" 2>$null
     if ($LASTEXITCODE -eq 0) {
-        if (-not (Test-Path -LiteralPath $bootstrapMarker) -and (Test-Path -LiteralPath $installerScript)) {
-            Start-Process -FilePath "powershell.exe" -ArgumentList @(
-                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $installerScript, "-Launch"
-            ) -WorkingDirectory $studioRoot
-            exit 0
-        }
-        Remove-Item -LiteralPath (Join-Path $studioRoot "studio-launch-error.txt") -ErrorAction SilentlyContinue
-        Start-Process -FilePath $pythonw -ArgumentList @($studioScript) -WorkingDirectory $studioRoot -WindowStyle Hidden
+        Remove-Item -LiteralPath (Join-Path $studioRoot "quickslot-launch-error.txt") -ErrorAction SilentlyContinue
+        Start-Process -FilePath $pythonw -ArgumentList @($quickslotScript) -WorkingDirectory $studioRoot -WindowStyle Hidden
         exit 0
     }
 }
 
-if (Test-Path -LiteralPath $installerScript) {
-    Start-Process -FilePath "powershell.exe" -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $installerScript, "-Launch"
-    ) -WorkingDirectory $studioRoot
-    exit 0
-}
-
-Set-Content -LiteralPath (Join-Path $studioRoot "studio-launch-error.txt") `
-    -Value "MacroRelay Studio를 실행할 Python/PySide6 환경을 찾지 못했습니다." -Encoding utf8
+Set-Content -LiteralPath (Join-Path $studioRoot "quickslot-launch-error.txt") `
+    -Value "QuickSlot Deck을 실행할 Python/PySide6 환경을 찾지 못했습니다." -Encoding utf8
 exit 1

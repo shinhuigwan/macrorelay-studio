@@ -497,37 +497,33 @@ class MainWindow(QtWidgets.QMainWindow):
             current = self.stack.currentWidget() if hasattr(self, "stack") else None
             managed = current in (self.pages.get("builder"), self.pages.get("assets"), self.pages.get("hotkeys")) if hasattr(self, "pages") else False
             if managed and not self._is_editing_widget(QtWidgets.QApplication.focusWidget()):
-                key = event.key()
-                if key in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Z, QtCore.Qt.Key_Y):
-                    modifiers = event.modifiers()
-                    builder = self.pages.get("builder") if hasattr(self, "pages") else None
-                    macro_list = getattr(builder, "macro_list", None)
-                    is_widget = isinstance(watched, QtWidgets.QWidget)
-                    on_macro_list = bool(
-                        current is builder
-                        and macro_list is not None
-                        and is_widget
-                        and (watched is macro_list or macro_list.isAncestorOf(watched))
-                    )
-                    if on_macro_list and key == QtCore.Qt.Key_Delete and modifiers == QtCore.Qt.NoModifier:
-                        builder._delete_macro_list_selection()
-                        return True
-                    if on_macro_list and key == QtCore.Qt.Key_Z and modifiers == QtCore.Qt.ControlModifier:
+                modifiers = event.modifiers()
+                builder = self.pages.get("builder") if hasattr(self, "pages") else None
+                macro_list = getattr(builder, "macro_list", None)
+                on_macro_list = bool(
+                    current is builder
+                    and macro_list is not None
+                    and (watched is macro_list or macro_list.isAncestorOf(watched))
+                )
+                if on_macro_list and event.key() == QtCore.Qt.Key_Delete and modifiers == QtCore.Qt.NoModifier:
+                    builder._delete_macro_list_selection()
+                    return True
+                if on_macro_list and event.key() == QtCore.Qt.Key_Z and modifiers == QtCore.Qt.ControlModifier:
+                    self._restore_last_deletion()
+                    return True
+                if event.key() == QtCore.Qt.Key_Delete and modifiers == QtCore.Qt.NoModifier:
+                    self._archive_current_selection()
+                    return True
+                if event.key() == QtCore.Qt.Key_Z and modifiers == QtCore.Qt.ControlModifier:
+                    if self._undo_deletions:
                         self._restore_last_deletion()
-                        return True
-                    if key == QtCore.Qt.Key_Delete and modifiers == QtCore.Qt.NoModifier:
-                        self._archive_current_selection()
-                        return True
-                    if key == QtCore.Qt.Key_Z and modifiers == QtCore.Qt.ControlModifier:
-                        if self._undo_deletions:
-                            self._restore_last_deletion()
-                        elif current is self.pages.get("builder"):
-                            current.undo_edit()
-                        return True
-                    if key == QtCore.Qt.Key_Y and modifiers == QtCore.Qt.ControlModifier:
-                        if current is self.pages.get("builder"):
-                            current.redo_edit()
-                        return True
+                    elif current is self.pages.get("builder"):
+                        current.undo_edit()
+                    return True
+                if event.key() == QtCore.Qt.Key_Y and modifiers == QtCore.Qt.ControlModifier:
+                    if current is self.pages.get("builder"):
+                        current.redo_edit()
+                    return True
         return super().eventFilter(watched, event)
 
     @QtCore.Slot(str)
@@ -678,10 +674,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode == 0:
-                try:
-                    process.wait(timeout=1.0)
-                except Exception:
-                    pass
                 return
         try:
             process.terminate()
@@ -698,13 +690,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not running:
             self.show_status("현재 실행 중인 매크로가 없습니다.")
             self._update_macro_run_state()
-            self.repository.shutdown_vision_engine_if_idle()
             return
         stopped = 0
         for pid, (name, process, _result_path, _progress_path, _click_path) in running:
             self._append_run_log(f"사용자 정지 요청 | {name} | PID {pid}", "WARN")
             self._terminate_macro_process(pid, process)
-            self.repository.release_macro_process(process)
             self._set_running_node(name, 0)
             self._running_macro_processes.pop(pid, None)
             self._seen_click_traces.pop(pid, None)
@@ -717,7 +707,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_run_log(f"사용자 정지 완료 | {name} | PID {pid}", "WARN")
             stopped += 1
         self._run_monitor.stop()
-        self.repository.shutdown_vision_engine_if_idle()
         self._update_macro_run_state()
         self.show_status(f"실행 중인 매크로 {stopped}개를 정지했습니다.")
 
@@ -863,9 +852,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     missing()
             finished.append(pid)
         for pid in finished:
-            entry = self._running_macro_processes.get(pid)
-            if entry is not None:
-                self.repository.release_macro_process(entry[1])
             self._running_macro_processes.pop(pid, None)
             self._seen_click_traces.pop(pid, None)
             self._run_control_paths.pop(pid, None)
@@ -876,7 +862,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._failure_capture_steps = {key for key in self._failure_capture_steps if key[0] != pid}
         if not self._running_macro_processes:
             self._run_monitor.stop()
-            self.repository.shutdown_vision_engine_if_idle()
         self._update_macro_run_state()
 
     def _sample_run_resources(self, pid: int) -> None:
@@ -1080,24 +1065,17 @@ class MainWindow(QtWidgets.QMainWindow):
         pixmap = screen.grabWindow(0, left, top, width, height)
         if pixmap.isNull():
             return None
-        # QScreen returns a pixmap whose backing image may be larger than the
-        # logical capture rectangle on a scaled display.  Draw the marker in
-        # backing-pixel coordinates so the preview crosshair stays on the
-        # actual click instead of drifting at 125/150% DPI.
-        scale = max(1.0, float(pixmap.devicePixelRatio()))
-        marker_x = round((local_x - left) * scale)
-        marker_y = round((local_y - top) * scale)
+        marker_x = local_x - left
+        marker_y = local_y - top
         painter = QtGui.QPainter(pixmap)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        shadow = QtGui.QPen(QtGui.QColor(8, 12, 20, 220), max(2, round(6 * scale)))
-        accent = QtGui.QPen(QtGui.QColor("#32e6d0"), max(1, round(3 * scale)))
+        shadow = QtGui.QPen(QtGui.QColor(8, 12, 20, 220), 6)
+        accent = QtGui.QPen(QtGui.QColor("#32e6d0"), 3)
         for pen in (shadow, accent):
             painter.setPen(pen)
-            arm = round(24 * scale)
-            radius = round(13 * scale)
-            painter.drawLine(marker_x - arm, marker_y, marker_x + arm, marker_y)
-            painter.drawLine(marker_x, marker_y - arm, marker_x, marker_y + arm)
-            painter.drawEllipse(QtCore.QPoint(marker_x, marker_y), radius, radius)
+            painter.drawLine(marker_x - 24, marker_y, marker_x + 24, marker_y)
+            painter.drawLine(marker_x, marker_y - 24, marker_x, marker_y + 24)
+            painter.drawEllipse(QtCore.QPoint(marker_x, marker_y), 13, 13)
         painter.end()
         return pixmap
 
@@ -1138,18 +1116,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def show_status(self, message: str) -> None:
         self.statusBar().showMessage(message, 7000)
 
-    def shutdown_runtime(self) -> None:
-        """Idempotently stop macros and the now-unused shared vision engine."""
-        if self._running_macro_processes:
-            self.stop_running_macros()
-        else:
-            self.repository.shutdown_vision_engine_if_idle()
-
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        # Generated AutoHotkey scripts are independent child processes.  Stop
-        # this Studio session's process trees before the UI and its monitor go
-        # away, otherwise the macro keeps clicking after the window is closed.
-        self.shutdown_runtime()
         self._run_monitor.stop()
         self._event_trigger_timer.stop()
         if self._event_trigger_future is not None:
@@ -1161,8 +1128,6 @@ class MainWindow(QtWidgets.QMainWindow):
         app = QtWidgets.QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-        if hasattr(self, "_mini_hud") and self._mini_hud:
-            self._mini_hud.close()
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("sidebar_collapsed", self._sidebar_collapsed)
         super().closeEvent(event)

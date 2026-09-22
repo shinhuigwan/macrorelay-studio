@@ -13,10 +13,8 @@ from .action_editor import (
     ActionEditorDialog,
     ImageSearchConfidenceDialog,
     action_template,
-    exec_image_search_confidence_dialog,
     korean_contains,
 )
-from .ai_macro_plan import validate_compiled_draft
 from .automation import (
     AutomationAnalyzer,
     AutomationOverlay,
@@ -26,18 +24,7 @@ from .automation import (
     SmartRecordingController,
     configure_success_candidates,
 )
-from .bundle_dialog import MacroBundleDialog
 from .log_dialog import MacroLogDialog
-
-
-def _sync_multi_image_count_label(step: dict[str, Any], aliases: list[str]) -> None:
-    """Update only Studio-generated count labels; preserve user-written names."""
-    label = str(step.get("label") or "").strip()
-    prefix = "멀티 이미지 서치 "
-    suffix = "개"
-    count_text = label[len(prefix):-len(suffix)] if label.startswith(prefix) and label.endswith(suffix) else ""
-    if count_text.isdigit():
-        step["label"] = f"{prefix}{len(aliases)}{suffix}"
 from .help_dialog import MacroHelpDialog
 from .inactive_click_lab import HandlePointPicker, InactiveClickLabDialog
 from .image_editor import ImageEditorDialog
@@ -51,81 +38,6 @@ from .widgets import Card, PageHeader, WheelSafeSpinBox, danger_button, primary_
 
 
 ACTION_TEMPLATES: dict[str, dict[str, Any]] = {action: action_template(action) for action in ACTION_LABELS}
-
-
-def _branch_success_targets(steps: list[dict[str, Any]], index: int) -> list[int]:
-    """Return only the normal success-flow targets used to grow a visual branch."""
-    if not 0 < index <= len(steps):
-        return []
-    step = steps[index - 1]
-    raw_candidates = step.get("success_candidates")
-    targets: list[int] = []
-    if isinstance(raw_candidates, list) and raw_candidates:
-        targets.extend(int(value) for value in raw_candidates if str(value).lstrip("-").isdigit())
-    else:
-        target = int(step.get("on_success") or 0)
-        if target:
-            targets.append(target)
-        elif index < len(steps) and not bool(step.get("stop_on_success")):
-            targets.append(index + 1)
-    return [target for target in targets if 0 < target <= len(steps)]
-
-
-def _assign_connected_branch_workflows(steps: list[dict[str, Any]], roots: list[int]) -> dict[int, list[int]]:
-    """Assign success-connected nodes to branch roots without swallowing other roots or shared merges."""
-    ordered_roots = [int(value) for value in roots if 0 < int(value) <= len(steps)]
-    root_set = set(ordered_roots)
-    reachable: dict[int, set[int]] = {}
-    for root in ordered_roots:
-        seen = {root}
-        pending = [root]
-        while pending:
-            source = pending.pop(0)
-            for target in _branch_success_targets(steps, source):
-                if target in root_set and target != root:
-                    continue
-                if target in seen:
-                    continue
-                seen.add(target)
-                pending.append(target)
-        reachable[root] = seen
-
-    owners: dict[int, list[int]] = {}
-    for root, indexes in reachable.items():
-        for index in indexes:
-            owners.setdefault(index, []).append(root)
-
-    assigned: dict[int, list[int]] = {root: [] for root in ordered_roots}
-    for position, root in enumerate(ordered_roots, start=1):
-        root_step = steps[root - 1]
-        workflow_id = f"branch-lane-{root}"
-        existing_label = str(root_step.get("workflow_label") or "").strip()
-        label = existing_label if existing_label and str(root_step.get("workflow_id") or "") == workflow_id else f"{position}번 분기"
-        for index in sorted(reachable[root]):
-            if index != root and len(owners.get(index, [])) != 1:
-                continue
-            step = steps[index - 1]
-            step["workflow_id"] = workflow_id
-            step["workflow_label"] = label
-            assigned[root].append(index)
-
-    for index, branch_owners in owners.items():
-        if len(branch_owners) <= 1 or index in root_set:
-            continue
-        step = steps[index - 1]
-        if str(step.get("workflow_id") or "").startswith("branch-lane-"):
-            step.pop("workflow_id", None)
-            step.pop("workflow_label", None)
-    return assigned
-
-
-def _raise_modal_dialog(dialog: QtWidgets.QDialog) -> None:
-    """Keep nested dialogs visible without crashing if they close immediately."""
-    try:
-        dialog.raise_()
-        dialog.activateWindow()
-    except (AttributeError, RuntimeError):
-        return
 
 
 class MacroListWidget(QtWidgets.QListWidget):
@@ -164,8 +76,6 @@ CATEGORIZED_ACTIONS: list[tuple[str, str, list[tuple[str, str, str]]]] = [
     ]),
     ("🖼️ 화면 & 이미지", "#35C89A", [
         ("image_search", "이미지 서치", "화면에서 이미지를 찾아 중심 또는 오프셋을 클릭합니다."),
-        ("multi_image_search", "멀티 이미지 서치", "여러 이미지를 동시에 탐색하고 일치 조건(전체/일부)을 판별합니다."),
-        ("animation_search", "애니메이션 서치", "1~2초 프레임을 분석해 움직이는 배경·효과를 자동 제외하고 찾습니다."),
         ("screen_condition", "화면 조건", "이미지가 화면에 있는지 확인하여 성공/실패로 분기합니다."),
     ]),
     ("🎯 색상 & 픽셀", "#FF6B9D", [
@@ -266,11 +176,11 @@ class ActionButtonTile(QtWidgets.QPushButton):
 class CategorizedActionDialog(QtWidgets.QDialog):
     """Wide rectangular action picker organized into thematic categories with live Korean search."""
 
-    def __init__(self, current_action: str = "", parent=None, *, placement_only: bool = False) -> None:
+    def __init__(self, current_action: str = "", parent=None) -> None:
         super().__init__(parent)
         self.selected_action = current_action or "mouse_click"
         self.add_immediately = False
-        self.setWindowTitle("커서 위치에 추가할 노드 액션 선택" if placement_only else "추가할 노드 액션 선택")
+        self.setWindowTitle("추가할 노드 액션 선택")
         self.resize(920, 600)
         self.setStyleSheet("QDialog { background: #11151F; color: #E2E8F0; }")
 
@@ -383,7 +293,6 @@ class CategorizedActionDialog(QtWidgets.QDialog):
         btn_select = QtWidgets.QPushButton("선택만 하고 닫기")
         btn_select.setStyleSheet("padding: 7px 14px; border-radius: 6px; background: #1B2130; color: #DDE5F4; border: 1px solid #2C374E; font-size: 9pt;")
         btn_select.clicked.connect(self._confirm_select_only)
-        btn_select.setVisible(not placement_only)
         bottom.addWidget(btn_select)
 
         btn_cancel = QtWidgets.QPushButton("취소 (Esc)")
@@ -490,9 +399,6 @@ class MacroDialog(QtWidgets.QDialog):
 class EdgeConditionDialog(QtWidgets.QDialog):
     def __init__(self, step_count: int, kind: str, rule: dict[str, Any] | None = None, parent=None) -> None:
         super().__init__(parent)
-        if parent is not None and bool(parent.window().windowFlags() & QtCore.Qt.WindowStaysOnTopHint):
-            self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
-        self.setWindowModality(QtCore.Qt.WindowModal)
         self.setWindowTitle("조건 분기 편집")
         self.setMinimumWidth(460)
         rule = rule or {}
@@ -538,7 +444,7 @@ class EdgeConditionDialog(QtWidgets.QDialog):
         self.sentence_label = QtWidgets.QLabel()
         self.sentence_label.setWordWrap(True)
         self.sentence_label.setStyleSheet(
-            f"background:{COLORS['panel_alt']}; border:1px solid {COLORS['border']}; border-radius:8px; padding:10px; font-weight:700;"
+            f"background:{COLORS['surface_alt']}; border:1px solid {COLORS['border']}; border-radius:8px; padding:10px; font-weight:700;"
         )
         layout.addWidget(self.sentence_label)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
@@ -593,9 +499,6 @@ class EdgeConditionDialog(QtWidgets.QDialog):
 class EdgeSettingsDialog(QtWidgets.QDialog):
     def __init__(self, step_count: int, kind: str, delay: int, rules: list[dict[str, Any]], parent=None) -> None:
         super().__init__(parent)
-        if parent is not None and bool(parent.window().windowFlags() & QtCore.Qt.WindowStaysOnTopHint):
-            self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
-        self.setWindowModality(QtCore.Qt.WindowModal)
         self.step_count = step_count
         self.kind = kind
         self.rules = [deepcopy(rule) for rule in rules]
@@ -662,7 +565,6 @@ class EdgeSettingsDialog(QtWidgets.QDialog):
 
     def _add_rule(self) -> None:
         dialog = EdgeConditionDialog(self.step_count, self.kind, parent=self)
-        QtCore.QTimer.singleShot(0, lambda: _raise_modal_dialog(dialog))
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.rules.append(dialog.payload(self.kind))
             self._refresh_rules()
@@ -672,7 +574,6 @@ class EdgeSettingsDialog(QtWidgets.QDialog):
         if not 0 <= row < len(self.rules):
             return
         dialog = EdgeConditionDialog(self.step_count, self.kind, self.rules[row], self)
-        QtCore.QTimer.singleShot(0, lambda: _raise_modal_dialog(dialog))
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.rules[row] = dialog.payload(self.kind)
             self._refresh_rules()
@@ -970,7 +871,6 @@ class BuilderPage(QtWidgets.QWidget):
     stop_macros = QtCore.Signal()
     open_export = QtCore.Signal(str)
     edit_committed = QtCore.Signal()
-    ai_macro_save_result = QtCore.Signal(bool, str)
 
     def __init__(self, repository: MacroRepository, parent=None) -> None:
         super().__init__(parent)
@@ -1002,7 +902,6 @@ class BuilderPage(QtWidgets.QWidget):
         self._inactive_handle_profiles = self._load_inactive_handle_profiles()
         self._last_recording_events = self._load_last_recording()
         self._subflow_parent_stack: list[tuple[str, int]] = []
-        self._submacro_target_cache: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
         self.shortcut_buttons: dict[str, QtWidgets.QPushButton] = {}
 
         root = QtWidgets.QVBoxLayout(self)
@@ -1036,9 +935,6 @@ class BuilderPage(QtWidgets.QWidget):
         duplicate_btn = QtWidgets.QPushButton("복제")
         duplicate_btn.setToolTip("<b>현재 매크로 복제</b><br>현재 매크로의 모든 노드와 설정을 그대로 복사하여 새 이름으로 생성합니다.")
         duplicate_btn.clicked.connect(self._duplicate_macro)
-        bundle_btn = QtWidgets.QPushButton("🔗 실행 묶음")
-        bundle_btn.setToolTip("던전·성장·상점·이벤트처럼 따로 만든 매크로를 원하는 순서로 묶어 한 번에 실행합니다.")
-        bundle_btn.clicked.connect(self._create_or_edit_bundle)
         archive_btn = danger_button("보관")
         archive_btn.setToolTip("<b>현재 매크로 보관</b><br>현재 매크로를 안전하게 보관함으로 이동합니다. (언제든 복원 가능)")
         archive_btn.clicked.connect(self._archive_macro)
@@ -1158,10 +1054,10 @@ class BuilderPage(QtWidgets.QWidget):
                 background: #151A26;
             }
         """)
-        self.add_node_button.setToolTip("<b>노드 배치 추가 (+)</b><br>버튼을 누른 뒤 캔버스에서 원하는 위치를 클릭하면 스마트 설정 후 연결되지 않은 노드가 생성됩니다.<br><b>Ctrl + 빈 캔버스 더블클릭</b>으로 해당 위치에서 액션 선택창을 열 수 있습니다.<br>일반 더블클릭 드래그는 캔버스를 이동합니다.<br>💡 <i>Shift 키를 누르면 빈 템플릿으로 추가됩니다.</i>")
-        self.add_node_button.clicked.connect(self._arm_step_placement)
+        self.add_node_button.setToolTip("<b>노드 스마트 추가 (+)</b><br>선택한 액션 노드를 캔버스에 추가합니다.<br>이미지 서치나 비활성 클릭 등은 화면 캡처 및 좌표 지정이 즉시 실행됩니다.<br>💡 <i>Shift 키를 누른 채 클릭하면 빈 템플릿 노드로 추가됩니다.</i>")
+        self.add_node_button.clicked.connect(self._add_step)
         self.action_combo.currentIndexChanged.connect(self._update_add_node_label)
-        self.action_combo.node_addition_requested.connect(self._arm_step_placement)
+        self.action_combo.node_addition_requested.connect(self._add_step)
 
         wizard_btn = QtWidgets.QPushButton("⚡ 자동 설정")
         wizard_btn.setToolTip("선택한 액션을 짧은 안내에 따라 자동 구성합니다.")
@@ -1232,7 +1128,6 @@ class BuilderPage(QtWidgets.QWidget):
         help_btn.clicked.connect(self._open_help_dialog)
 
         toolbar_top.addWidget(new_btn)
-        toolbar_top.addWidget(bundle_btn)
         toolbar_top.addWidget(duplicate_btn)
         toolbar_top.addWidget(archive_btn)
         archive_box_btn = QtWidgets.QPushButton("📦 보관함")
@@ -1393,7 +1288,6 @@ class BuilderPage(QtWidgets.QWidget):
 
     def _build_steps_panel(self) -> QtWidgets.QWidget:
         card = Card()
-        card.setMinimumWidth(280)
         layout = QtWidgets.QVBoxLayout(card)
         layout.setContentsMargins(10, 10, 10, 10)
         header = QtWidgets.QHBoxLayout()
@@ -1501,29 +1395,10 @@ class BuilderPage(QtWidgets.QWidget):
         self.redo_button = QtWidgets.QPushButton("↷ 다시 실행")
         self.redo_button.setToolTip("취소한 매크로 편집 다시 실행 (Ctrl+Y)")
         self.redo_button.clicked.connect(self.redo_edit)
-        self.branch_connect_button = QtWidgets.QPushButton("🔀 선택 분기 연결")
-        self.branch_connect_button.setToolTip("선택한 노드를 실패 시 다음 분기로 순서대로 연결하고, 각 분기의 성공 흐름을 자동으로 그룹화합니다.")
-        self.branch_connect_button.clicked.connect(
-            lambda: self._configure_branch_chain(self.node_canvas.selected_indexes())
-        )
-        self.branch_manage_button = QtWidgets.QToolButton()
-        self.branch_manage_button.setText("분기 추가·해제 ▾")
-        self.branch_manage_button.setToolTip("선택 노드의 분기 소속을 생성·편입·제외하고 분기 이름을 변경합니다.")
-        self.branch_manage_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        branch_menu = QtWidgets.QMenu(self.branch_manage_button)
-        branch_menu.addAction("➕ 선택 노드로 새 분기 추가", self._create_branch_from_selection)
-        branch_menu.addAction("📥 선택 노드를 기존 분기에 추가", self._begin_add_selection_to_branch)
-        branch_menu.addAction("📤 선택 노드를 분기에서 제외", self._remove_selection_from_branch)
-        branch_menu.addSeparator()
-        branch_menu.addAction("✏️ 선택 분기 이름 변경", self._rename_selected_branch)
-        branch_menu.addAction("⛓️ 선택 노드의 분기 연결 해제", lambda: self._remove_branch_chain(self.node_canvas.selected_indexes()))
-        self.branch_manage_button.setMenu(branch_menu)
         node_actions.addWidget(self.undo_button)
         node_actions.addWidget(self.redo_button)
         node_actions.addWidget(self.duplicate_node_button)
         node_actions.addWidget(self.test_node_button)
-        node_actions.addWidget(self.branch_connect_button)
-        node_actions.addWidget(self.branch_manage_button)
         node_actions.addWidget(self.node_more_button)
         node_actions.addStretch(1)
         self._update_history_buttons()
@@ -1537,9 +1412,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.comments_changed.connect(self._graph_comments_changed)
         self.node_canvas.link_requested.connect(self._connect_graph_nodes)
         self.node_canvas.edge_delete_requested.connect(self._delete_graph_edge)
-        self.node_canvas.edges_delete_requested.connect(self._delete_graph_edges_batch)
         self.node_canvas.edge_delay_requested.connect(self._set_graph_edge_delay)
-        self.node_canvas.edge_condition_add_requested.connect(self._add_graph_condition)
         self.node_canvas.edge_condition_delete_requested.connect(self._delete_graph_condition)
         self.node_canvas.edge_condition_retarget_requested.connect(self._retarget_graph_condition)
         self.node_canvas.node_delete_requested.connect(self._delete_node_from_graph)
@@ -1549,18 +1422,9 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.start_search_group_requested.connect(self._configure_start_search_candidates)
         self.node_canvas.log_requested.connect(self._open_logs)
         self.node_canvas.image_edit_requested.connect(self._edit_node_search_image)
-        self.node_canvas.asset_route_edit_requested.connect(self._edit_asset_route)
-        self.node_canvas.color_visual_test_requested.connect(self._open_node_color_visual_test)
-        self.node_canvas.image_visual_test_requested.connect(self._open_node_image_visual_test)
-        self.node_canvas.multi_pixel_visual_test_requested.connect(self._open_node_multi_pixel_visual_test)
         self.node_canvas.multi_image_merge_requested.connect(
             lambda indexes: QtCore.QTimer.singleShot(
                 0, lambda values=list(indexes): self._merge_graph_image_nodes(values)
-            )
-        )
-        self.node_canvas.multi_color_merge_requested.connect(
-            lambda indexes: QtCore.QTimer.singleShot(
-                0, lambda values=list(indexes): self._merge_graph_color_nodes(values)
             )
         )
         self.node_canvas.node_title_changed.connect(self._graph_node_title_changed)
@@ -1569,10 +1433,6 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.single_branch_requested.connect(self._configure_single_branch)
         self.node_canvas.unbranch_requested.connect(self._remove_branch_chain)
         self.node_canvas.help_requested.connect(self._open_help_dialog)
-        self.node_canvas.node_add_at_requested.connect(self._add_step_at_position)
-        self.node_canvas.group_flow_changed.connect(self._graph_group_flow_changed)
-        self.node_canvas.workflow_membership_changed.connect(self._graph_workflow_membership_changed)
-        self.node_canvas.workflow_rename_requested.connect(self._rename_selected_branch)
 
         list_page = QtWidgets.QWidget()
         list_layout = QtWidgets.QVBoxLayout(list_page)
@@ -1615,7 +1475,6 @@ class BuilderPage(QtWidgets.QWidget):
     def _build_inspector(self) -> QtWidgets.QWidget:
         card = Card()
         card.setMinimumWidth(0)
-        self._last_inspector_width = 360
         layout = QtWidgets.QVBoxLayout(card)
         layout.setContentsMargins(14, 14, 14, 14)
         title = QtWidgets.QLabel("단계 설정")
@@ -1711,7 +1570,6 @@ class BuilderPage(QtWidgets.QWidget):
         save_btn.clicked.connect(self._save_step)
         self.inspector_action.currentIndexChanged.connect(self._change_action_template)
         content = QtWidgets.QWidget()
-        content.setMinimumWidth(330)
         content_layout = QtWidgets.QVBoxLayout(content)
         content_layout.setContentsMargins(2, 2, 6, 2)
         content_layout.setSpacing(9)
@@ -1748,20 +1606,13 @@ class BuilderPage(QtWidgets.QWidget):
         layout.addWidget(save_btn)
         return card
 
-    def _edit_asset_route(self, step_index: int, alias: str) -> None:
-        self.node_canvas.select_node(int(step_index))
-        self._edit_node_search_image(step_index, focus_alias=alias)
-
-    def _edit_node_search_image(self, step_index: int, focus_alias: str = "") -> None:
+    def _edit_node_search_image(self, step_index: int) -> None:
         steps = list((self.current_macro or {}).get("steps") or [])
         row = int(step_index) - 1
         if not 0 <= row < len(steps):
             return
         step = steps[row]
-        if str(step.get("action") or "") in {"multi_image_search", "animation_search"} and not focus_alias:
-            self._open_node_image_visual_test(step_index)
-            return
-        if str(step.get("action") or "") not in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
+        if str(step.get("action") or "") not in {"image_search", "screen_condition"}:
             return
         aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
         primary = str(step.get("asset") or "").strip()
@@ -1777,76 +1628,15 @@ class BuilderPage(QtWidgets.QWidget):
         cur_region = step.get("region") or step.get("search_region")
         if not cur_region and isinstance(step.get("regions"), list) and step["regions"]:
             cur_region = step["regions"][0]
-        if isinstance(cur_region, list) and len(cur_region) >= 4:
-            try:
-                if int(cur_region[2]) <= int(cur_region[0]) or int(cur_region[3]) <= int(cur_region[1]):
-                    cur_region = None
-            except (TypeError, ValueError):
-                cur_region = None
-        cur_asset_regions = step.get("asset_regions") if isinstance(step.get("asset_regions"), dict) else {}
-        dialog = ImageSearchConfidenceDialog(
-            self.repository,
-            aliases,
-            cur_conf,
-            cur_asset_conf,
-            cur_region,
-            self,
-            step=step,
-            asset_regions=cur_asset_regions,
-            focus_alias=focus_alias,
-        )
-        if exec_image_search_confidence_dialog(dialog) == QtWidgets.QDialog.Accepted:
-            aliases = dialog.get_aliases()
-            step["assets"] = aliases
-            if aliases:
-                step["asset"] = aliases[0]
-            else:
-                step.pop("asset", None)
-            _sync_multi_image_count_label(step, aliases)
+        dialog = ImageSearchConfidenceDialog(self.repository, aliases, cur_conf, cur_asset_conf, cur_region, self, step=step)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
             step["confidence"] = dialog.get_confidence()
             step["asset_confidences"] = dialog.get_asset_confidences()
-            asset_routes = dialog.get_asset_routes()
-            if asset_routes:
-                step["asset_routes"] = asset_routes
-            else:
-                step.pop("asset_routes", None)
-            new_asset_regs = dialog.get_asset_regions()
-            if new_asset_regs:
-                step["asset_regions"] = new_asset_regs
-                try:
-                    min_l = min(int(r[0]) for r in new_asset_regs.values())
-                    min_t = min(int(r[1]) for r in new_asset_regs.values())
-                    max_r = max(int(r[2]) for r in new_asset_regs.values())
-                    max_b = max(int(r[3]) for r in new_asset_regs.values())
-                    if max_r > min_l and max_b > min_t:
-                        step["region"] = [min_l, min_t, max_r, max_b]
-                        step["regions"] = [[min_l, min_t, max_r, max_b]]
-                        step["region_mode"] = "client"
-                        step["region_coords"] = "relative"
-                except Exception:
-                    pass
-            else:
-                step.pop("asset_regions", None)
             if dialog.search_region():
                 step["region"] = dialog.search_region()
                 step["regions"] = [dialog.search_region()]
                 step["region_mode"] = "client"
                 step["region_coords"] = "relative"
-            elif "region" in step and (step["region"] == [0, 0, 0, 0] or not isinstance(step["region"], list) or len(step["region"]) < 4 or step["region"][2] <= step["region"][0]):
-                step.pop("region", None)
-                if isinstance(step.get("regions"), list) and step["regions"] == [[0, 0, 0, 0]]:
-                    step.pop("regions", None)
-            for field in ("asset_offsets", "asset_confidences", "asset_regions", "asset_routes"):
-                mapping = step.get(field)
-                if isinstance(mapping, dict):
-                    filtered = {alias: value for alias, value in mapping.items() if alias in aliases}
-                    if filtered:
-                        step[field] = filtered
-                    else:
-                        step.pop(field, None)
-            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
-            if automation:
-                automation["image_count"] = len(aliases)
             self._persist(f"{step_index}번 노드의 이미지 신뢰도 및 검색 영역 설정을 저장했습니다.")
             self._refresh_steps(row)
             self.status.emit(f"{step_index}번 노드 이미지 신뢰도 저장 완료 (신뢰도: {step['confidence']}%)")
@@ -1969,37 +1759,9 @@ class BuilderPage(QtWidgets.QWidget):
             details = [f"대기: {int(step.get('duration') or 0)} ms"]
         elif action == "browser_action":
             details = [f"선택자: {step.get('selector') or '미입력'}", f"동작: {step.get('browser_action') or 'click'}"]
-        elif action == "pixel_search":
-            raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
-            color_cnt = len(raw_colors) or int((step.get("_automation") or {}).get("color_count") or 1)
-            is_multi = color_cnt > 1 or bool((step.get("_automation") or {}).get("manual_multi_merge")) or "멀티" in str(step.get("label") or "")
-            rm = str(step.get("region_mode") or "screen").lower()
-            rm_lbl = {"screen": "화면", "window": "창", "client": "클라이언트"}.get(rm, rm)
-            match_cond = str(step.get("match_condition") or "all_matched")
-            cond_lbl = {"all_matched": "모두 일치", "at_least_1": "1개 이상", "exact_n": "정확히 N개", "at_least_n": "N개 이상"}.get(match_cond, match_cond)
-            details = [
-                f"색상: 멀티 {color_cnt}개" if is_multi else f"색상: {step.get('color') or '#FF0000'}",
-                f"기준: {rm_lbl}",
-                f"조건: {cond_lbl}",
-            ]
         else:
             details = [self._step_summary(step)]
-        raw_colors = step.get("colors") if isinstance(step.get("colors"), list) else []
-        is_multi_pixel = (
-            action == "pixel_search"
-            and (
-                len(raw_colors) > 1
-                or bool((step.get("_automation") or {}).get("manual_multi_merge"))
-                or "멀티" in str(step.get("label") or "")
-            )
-        )
-        if action == "image_search" and len(step.get("assets") or []) > 1:
-            action_name = "멀티 이미지 서치"
-        elif is_multi_pixel:
-            cnt = len(raw_colors) or int((step.get("_automation") or {}).get("color_count") or 1)
-            action_name = f"멀티 색상 서치 ({cnt}개)" if cnt > 1 else "멀티 색상 서치"
-        else:
-            action_name = ACTION_LABELS.get(action, action)
+        action_name = "멀티 이미지 서치" if action == "image_search" and len(step.get("assets") or []) > 1 else ACTION_LABELS.get(action, action)
         self.action_summary_label.setText(action_name + "\n" + "  ·  ".join(str(item) for item in details))
 
     def capture_current_action_coordinates(self) -> None:
@@ -2094,12 +1856,14 @@ class BuilderPage(QtWidgets.QWidget):
         if previous:
             match = self._find_macro_item(previous)
             if match is not None:
-                self._activate_macro_item(match)
+                self.macro_list.setCurrentItem(match)
+                self._select_macro(match, None)
                 QtCore.QTimer.singleShot(0, lambda value=scroll_value: self.macro_list.verticalScrollBar().setValue(value))
                 return
         first = next((self.macro_list.item(index) for index in range(self.macro_list.count()) if self.macro_list.item(index).data(QtCore.Qt.UserRole)), None)
         if first is not None:
-            self._activate_macro_item(first)
+            self.macro_list.setCurrentItem(first)
+            self._select_macro(first, None)
         else:
             self._clear_editor()
         QtCore.QTimer.singleShot(0, lambda value=scroll_value: self.macro_list.verticalScrollBar().setValue(value))
@@ -2110,23 +1874,6 @@ class BuilderPage(QtWidgets.QWidget):
             if str(item.data(QtCore.Qt.UserRole) or "") == name:
                 return item
         return None
-
-    def _activate_macro_item(self, item: QtWidgets.QListWidgetItem) -> None:
-        signals_were_blocked = self.macro_list.blockSignals(True)
-        try:
-            self.macro_list.setCurrentItem(item)
-        finally:
-            self.macro_list.blockSignals(signals_were_blocked)
-        self._select_macro(item, None)
-
-    def _navigate_to_macro(self, name: str) -> None:
-        item = self._find_macro_item(name)
-        if item is None:
-            self.refresh(name)
-            return
-        self._activate_macro_item(item)
-        if not item.isHidden():
-            self.macro_list.scrollToItem(item, QtWidgets.QAbstractItemView.PositionAtCenter)
 
     def _selected_macro_names(self) -> list[str]:
         names = [str(item.data(QtCore.Qt.UserRole) or "") for item in self.macro_list.selectedItems()]
@@ -2256,83 +2003,12 @@ class BuilderPage(QtWidgets.QWidget):
         else:
             self.json_edit.clear()
         previews: dict[str, str] = {}
-        asset_index = self.repository.load_assets()
-        used_aliases: set[str] = set()
-        for step in steps:
-            if not isinstance(step, dict):
-                continue
-            primary = str(step.get("asset") or "").strip()
-            if primary:
-                used_aliases.add(primary)
-            aliases = step.get("assets")
-            if isinstance(aliases, list):
-                used_aliases.update(str(alias).strip() for alias in aliases if str(alias).strip())
-        for alias in used_aliases:
-            path = self.repository.asset_path(alias, asset_index)
+        for alias in self.repository.load_assets():
+            path = self.repository.asset_path(alias)
             if path is not None:
                 previews[str(alias)] = str(path)
         self.node_canvas.set_asset_previews(previews)
-        self.node_canvas.set_submacro_links(self._submacro_link_details(steps))
         self.node_canvas.set_macro(self.current_macro, selected + 1 if steps else 0)
-
-    def _submacro_link_details(self, steps: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-        links: dict[int, dict[str, Any]] = {}
-        for index, step in enumerate(steps, start=1):
-            if not isinstance(step, dict) or str(step.get("action") or "") != "call_submacro":
-                continue
-            target = str(step.get("macro") or "").strip()
-            info: dict[str, Any] = {"macro": target, "exists": False, "entries": []}
-            if not target:
-                links[index] = info
-                continue
-            path = self.repository.macro_path(target)
-            try:
-                stat = path.stat()
-                stamp = (int(stat.st_mtime_ns), int(stat.st_size))
-            except OSError:
-                links[index] = info
-                continue
-            cached = self._submacro_target_cache.get(target)
-            if cached is not None and cached[0] == stamp:
-                links[index] = deepcopy(cached[1])
-                continue
-            try:
-                payload = self.repository.load_macro(target)
-            except (OSError, ValueError):
-                links[index] = info
-                continue
-            target_steps = list(payload.get("steps") or [])
-            entries: list[int] = []
-            raw_candidates = payload.get("start_search_candidates")
-            if isinstance(raw_candidates, list):
-                for value in raw_candidates:
-                    try:
-                        candidate = int(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if 0 < candidate <= len(target_steps) and candidate not in entries:
-                        entries.append(candidate)
-            if not entries and target_steps:
-                try:
-                    start = int(payload.get("graph_start_step") or 1)
-                except (TypeError, ValueError):
-                    start = 1
-                entries.append(start if 0 < start <= len(target_steps) else 1)
-            info = {
-                "macro": target,
-                "exists": True,
-                "entries": [
-                    {
-                        "index": entry,
-                        "label": str(target_steps[entry - 1].get("label") or NodeCanvas.step_summary(target_steps[entry - 1])),
-                    }
-                    for entry in entries
-                    if isinstance(target_steps[entry - 1], dict)
-                ],
-            }
-            self._submacro_target_cache[target] = (stamp, deepcopy(info))
-            links[index] = info
-        return links
 
     @staticmethod
     def _step_summary(step: dict[str, Any]) -> str:
@@ -2346,22 +2022,6 @@ class BuilderPage(QtWidgets.QWidget):
                 time_text += f"~{step.get('time_end') or '23:59'}"
             wait_text = " · 조건까지 대기" if step.get("wait_until") else ""
             return f"{time_text} · 날짜·시간 조건{wait_text}"
-        if action == "multi_pixel_check":
-            raw = step.get("pixels") or []
-            try:
-                points = json.loads(raw) if isinstance(raw, str) else list(raw)
-            except Exception:
-                points = []
-            count = sum(1 for item in points if isinstance(item, dict) and bool(item.get("enabled", True)))
-            policy = str(step.get("match_policy") or "all")
-            condition = {
-                "all": "모두",
-                "any": "1개 이상",
-                "at_least_n": f"{int(step.get('required_count') or 1)}개 이상",
-                "exact_n": f"정확히 {int(step.get('required_count') or 1)}개",
-            }.get(policy, policy)
-            target = str(step.get("window_exe") or "전체 화면")
-            return f"픽셀 {count}개 · {condition} · {target}"
         if action == "type_text":
             text = str(step.get("text") or "")
             return text[:30] or "텍스트 입력"
@@ -2408,8 +2068,7 @@ class BuilderPage(QtWidgets.QWidget):
 
     @QtCore.Slot(int)
     def _focus_inspector(self, index: int) -> None:
-        if self.steps_table.currentRow() != index - 1:
-            self._select_graph_node(index)
+        self._select_graph_node(index)
         steps = list((self.current_macro or {}).get("steps") or [])
         if 1 <= index <= len(steps) and str(steps[index - 1].get("action") or "") == "call_submacro":
             target = str(steps[index - 1].get("macro") or "").strip()
@@ -2418,7 +2077,7 @@ class BuilderPage(QtWidgets.QWidget):
                 return
             if self.current_name:
                 self._subflow_parent_stack.append((self.current_name, index))
-            self._navigate_to_macro(target)
+            self.refresh(target)
             self.subflow_back_button.setVisible(True)
             self.status.emit(f"'{target}' 서브플로우 내부를 열었습니다. 상위 흐름 버튼으로 돌아갈 수 있습니다.")
             return
@@ -2433,34 +2092,17 @@ class BuilderPage(QtWidgets.QWidget):
         button = self.macro_panel_toggle if is_macro else self.inspector_panel_toggle
         visible = panel.isVisibleTo(self) and panel.width() > 0
         if force_open or not visible:
-            if not is_macro:
-                panel.setMinimumWidth(360)
-                preferred = max(360, getattr(self, "_last_inspector_width", 360))
-            else:
-                panel.setMinimumWidth(190)
-                preferred = 230
             panel.show()
             sizes = self.builder_splitter.sizes()
+            preferred = 230 if is_macro else 360
             index = 0 if is_macro else 2
             if len(sizes) == 3:
                 sizes[index] = preferred
-                sizes[1] = max(280, sizes[1] - preferred)
+                sizes[1] = max(480, sizes[1] - preferred)
                 self.builder_splitter.setSizes(sizes)
             button.setText("◀ 목록" if is_macro else "설정 ▶")
             return
-        if not is_macro:
-            if panel.width() >= 360:
-                self._last_inspector_width = panel.width()
-            panel.setMinimumWidth(0)
-        else:
-            panel.setMinimumWidth(0)
         panel.hide()
-        sizes = self.builder_splitter.sizes()
-        index = 0 if is_macro else 2
-        if len(sizes) == 3:
-            sizes[1] += sizes[index]
-            sizes[index] = 0
-            self.builder_splitter.setSizes(sizes)
         button.setText("목록 ▶" if is_macro else "◀ 설정")
 
     def _leave_subflow(self) -> None:
@@ -2468,7 +2110,7 @@ class BuilderPage(QtWidgets.QWidget):
             self.subflow_back_button.setVisible(False)
             return
         parent_name, node_index = self._subflow_parent_stack.pop()
-        self._navigate_to_macro(parent_name)
+        self.refresh(parent_name)
         self._select_graph_node(node_index)
         self.subflow_back_button.setVisible(bool(self._subflow_parent_stack))
         self.status.emit(f"'{parent_name}' 상위 흐름으로 돌아왔습니다.")
@@ -2509,21 +2151,6 @@ class BuilderPage(QtWidgets.QWidget):
         else:
             self.current_macro.pop("graph_comments", None)
         self._graph_save_timer.start()
-
-    @QtCore.Slot()
-    def _graph_group_flow_changed(self) -> None:
-        if self.current_macro is None:
-            return
-        self.current_macro["steps"] = self.node_canvas.steps
-        self._persist("노드 그룹의 다음 작업 흐름을 저장했습니다.")
-        self._refresh_steps(max(0, self.steps_table.currentRow()))
-
-    @QtCore.Slot()
-    def _graph_workflow_membership_changed(self) -> None:
-        if self.current_macro is None:
-            return
-        self.current_macro["steps"] = self.node_canvas.steps
-        self._persist("스마트 작업 그룹 소속을 저장했습니다.")
 
     def _save_graph_positions(self) -> None:
         if not self.current_name or self.current_macro is None:
@@ -2627,265 +2254,6 @@ class BuilderPage(QtWidgets.QWidget):
         self._persist(f"이미지 서치 {len(selected)}개를 멀티 이미지 서치 {len(aliases)}개로 묶었습니다.")
         self._refresh_steps(primary_index - 1)
 
-    def _merge_graph_color_nodes(self, indexes: list[int]) -> None:
-        if self.current_macro is None:
-            return
-        steps = self.current_macro.get("steps") or []
-        selected = sorted({int(index) for index in indexes if 0 < int(index) <= len(steps)})
-        if len(selected) < 2 or any(str(steps[index - 1].get("action") or "") != "pixel_search" for index in selected):
-            self.status.emit("색상 서치 노드를 2개 이상 선택해 주세요.")
-            return
-        selected_set = set(selected)
-        primary_index = selected[0]
-        primary = steps[primary_index - 1]
-        colors: list[str] = []
-        tolerances: dict[str, int] = {}
-        regions: dict[str, list[int]] = {}
-        for index in selected:
-            member = steps[index - 1]
-            member_colors = [
-                str(c).strip() for c in member.get("colors") or [] if str(c).strip()
-            ] if isinstance(member.get("colors"), list) else []
-            member_primary = str(member.get("color") or "").strip()
-            if member_primary and member_primary not in member_colors:
-                member_colors.insert(0, member_primary)
-            member_tols = member.get("color_tolerances") if isinstance(member.get("color_tolerances"), dict) else {}
-            fallback_tol = int(member.get("tolerance") or 10)
-            member_regs = member.get("color_regions") if isinstance(member.get("color_regions"), dict) else {}
-            fallback_reg = member.get("search_region") or member.get("region")
-            if not isinstance(fallback_reg, list) or len(fallback_reg) < 4:
-                fallback_reg = [0, 0, 0, 0]
-            for c in member_colors:
-                if c not in colors:
-                    colors.append(c)
-                tolerances[c] = int(member_tols.get(c, fallback_tol))
-                if c in member_regs and isinstance(member_regs[c], list) and len(member_regs[c]) >= 4:
-                    regions[c] = list(member_regs[c][:4])
-                else:
-                    regions[c] = list(fallback_reg[:4])
-
-        if len(colors) < 2:
-            self.status.emit("선택한 노드에서 서로 다른 검색 색상을 2개 이상 찾지 못했습니다.")
-            return
-
-        def external_target(field: str) -> int:
-            for index in reversed(selected):
-                target = int(steps[index - 1].get(field) or 0)
-                if target and target not in selected_set:
-                    return target
-            if field == "on_success" and selected[-1] < len(steps):
-                return selected[-1] + 1
-            return 0
-
-        success_target = external_target("on_success")
-        fail_target = external_target("on_fail")
-        primary["color"] = colors[0]
-        primary["colors"] = colors
-        primary["color_tolerances"] = tolerances
-        primary["color_regions"] = regions
-        primary["tolerance"] = tolerances.get(colors[0], 10)
-        primary["label"] = f"멀티 색상 서치 {len(colors)}개"
-        primary["match_condition"] = "all_matched"
-        primary["required_count"] = len(colors)
-        primary.pop("stop_on_success", None)
-        if success_target:
-            primary["on_success"] = success_target
-        else:
-            primary.pop("on_success", None)
-        if fail_target:
-            primary["on_fail"] = fail_target
-        else:
-            primary.pop("on_fail", None)
-
-        valid_regs = [r for r in regions.values() if isinstance(r, (list, tuple)) and len(r) >= 4 and (r[0] or r[1] or r[2] or r[3])]
-        if valid_regs:
-            min_l = min(int(r[0]) for r in valid_regs)
-            min_t = min(int(r[1]) for r in valid_regs)
-            max_r = max(int(r[2]) for r in valid_regs)
-            max_b = max(int(r[3]) for r in valid_regs)
-            primary["search_region"] = [min_l, min_t, max_r, max_b]
-            primary["region"] = [min_l, min_t, max_r, max_b]
-
-        automation = primary.get("_automation") if isinstance(primary.get("_automation"), dict) else {}
-        automation.update({"manual_multi_merge": True, "color_count": len(colors)})
-        primary["_automation"] = automation
-        if not primary.get("region_window_exe"):
-            for s in steps:
-                c_exe = str(s.get("window_exe") or s.get("region_window_exe") or (s.get("click") or {}).get("window_exe") or "")
-                c_win = str(s.get("window") or s.get("region_window") or (s.get("click") or {}).get("window") or "")
-                if c_exe:
-                    primary["region_mode"] = "client"
-                    primary["region_coords"] = "relative"
-                    primary["region_window_exe"] = c_exe
-                    primary["region_window"] = c_win
-                    break
-        for index in reversed(selected[1:]):
-            removed = steps.pop(index - 1)
-            self.current_macro.setdefault("meta", {}).setdefault("archived_steps", []).append(removed)
-            self._normalize_edges_after_delete(index)
-        self._persist(f"색상 서치 {len(selected)}개를 멀티 색상 서치 {len(colors)}개로 묶었습니다.")
-        self._refresh_steps(primary_index - 1)
-
-    def _open_node_color_visual_test(self, step_index: int) -> None:
-        steps = list((self.current_macro or {}).get("steps") or [])
-        row = int(step_index) - 1
-        if not 0 <= row < len(steps):
-            return
-        step = steps[row]
-        if str(step.get("action") or "") != "pixel_search":
-            return
-        # Auto-inherit target window from macro if not set
-        if not step.get("region_window_exe"):
-            for candidate in reversed(steps):
-                c_exe = str(candidate.get("window_exe") or candidate.get("region_window_exe") or (candidate.get("click") or {}).get("window_exe") or "")
-                c_win = str(candidate.get("window") or candidate.get("region_window") or (candidate.get("click") or {}).get("window") or "")
-                if c_exe:
-                    step["region_mode"] = "client"
-                    step["region_coords"] = "relative"
-                    step["region_window_exe"] = c_exe
-                    step["region_window"] = c_win
-                    break
-        from .region_visual_test import RegionVisualTestDialog
-        dlg = RegionVisualTestDialog(step, self.repository, parent=self.window())
-        try:
-            if dlg.exec() == QtWidgets.QDialog.Accepted:
-                if dlg.step.get("region_window_exe"):
-                    step["region_window_exe"] = dlg.step["region_window_exe"]
-                    step["region_window"] = dlg.step.get("region_window", "")
-                    step["region_mode"] = dlg.step.get("region_mode", "client")
-                    step["region_coords"] = dlg.step.get("region_coords", "relative")
-                updated_color_regs = dlg.get_color_regions()
-                if updated_color_regs:
-                    step["color_regions"] = updated_color_regs
-                updated_tols = dlg.get_color_tolerances()
-                if updated_tols:
-                    step["color_tolerances"] = updated_tols
-                    if step.get("color") in updated_tols:
-                        step["tolerance"] = updated_tols[step["color"]]
-                    elif updated_tols:
-                        step["tolerance"] = next(iter(updated_tols.values()))
-                bounding = dlg.get_bounding_region()
-                if bounding:
-                    step["search_region"] = bounding
-                    step["region"] = bounding
-                self._persist(f"{step_index}번 노드의 색상 및 검색 영역을 보정했습니다.")
-                self._refresh_steps(row)
-        finally:
-            dlg.deleteLater()
-            win = self.window()
-            if win is not None and hasattr(win, "setEnabled"):
-                win.setEnabled(True)
-                if hasattr(win, "activateWindow"):
-                    win.activateWindow()
-
-    def _open_node_multi_pixel_visual_test(self, step_index: int) -> None:
-        steps = list((self.current_macro or {}).get("steps") or [])
-        row = int(step_index) - 1
-        if not 0 <= row < len(steps):
-            return
-        step = steps[row]
-        if str(step.get("action") or "") != "multi_pixel_check":
-            return
-        from .automation import MultiPixelPreviewDialog
-        dialog = MultiPixelPreviewDialog(step, self.window())
-        try:
-            dialog.exec()
-        finally:
-            dialog.deleteLater()
-
-    def _open_node_image_visual_test(self, step_index: int) -> None:
-        steps = list((self.current_macro or {}).get("steps") or [])
-        row = int(step_index) - 1
-        if not 0 <= row < len(steps):
-            return
-        step = steps[row]
-        if str(step.get("action") or "") not in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
-            return
-        # Auto-inherit target window from macro if not set
-        if not step.get("region_window_exe"):
-            for candidate in reversed(steps):
-                c_exe = str(candidate.get("window_exe") or candidate.get("region_window_exe") or (candidate.get("click") or {}).get("window_exe") or "")
-                c_win = str(candidate.get("window") or candidate.get("region_window") or (candidate.get("click") or {}).get("window") or "")
-                if c_exe:
-                    step["region_mode"] = "client"
-                    step["region_coords"] = "relative"
-                    step["region_window_exe"] = c_exe
-                    step["region_window"] = c_win
-                    break
-        from .region_visual_test import RegionVisualTestDialog
-        dlg = RegionVisualTestDialog(step, self.repository, parent=self.window())
-        try:
-            if dlg.exec() == QtWidgets.QDialog.Accepted:
-                if dlg.step.get("region_window_exe"):
-                    step["region_window_exe"] = dlg.step["region_window_exe"]
-                    step["region_window"] = dlg.step.get("region_window", "")
-                    step["region_mode"] = dlg.step.get("region_mode", "client")
-                    step["region_coords"] = dlg.step.get("region_coords", "relative")
-                aliases = dlg.get_aliases()
-                step["assets"] = aliases
-                if aliases:
-                    step["asset"] = aliases[0]
-                else:
-                    step.pop("asset", None)
-                _sync_multi_image_count_label(step, aliases)
-                updated_regs = dlg.get_asset_regions()
-                if updated_regs:
-                    step["asset_regions"] = updated_regs
-                else:
-                    step.pop("asset_regions", None)
-                offsets = dlg.get_asset_offsets()
-                if offsets:
-                    step["asset_offsets"] = offsets
-                else:
-                    step.pop("asset_offsets", None)
-                click_target = dlg.get_click_target()
-                if click_target:
-                    step["click_target"] = click_target
-                    if click_target == "custom_coord":
-                        cx, cy = dlg.get_custom_click_coords()
-                        step["custom_click_x"] = cx
-                        step["custom_click_y"] = cy
-                        step["click_enabled"] = True
-                    elif click_target in {"each_image", "first_image"}:
-                        step["click_enabled"] = True
-                    elif click_target == "none":
-                        step["click_enabled"] = False
-                cond = dlg.get_match_condition()
-                if cond:
-                    step["match_condition"] = cond
-                req_cnt = dlg.get_required_count()
-                if req_cnt >= 0:
-                    step["required_count"] = req_cnt
-                bounding = dlg.get_bounding_region()
-                if bounding:
-                    step["search_region"] = bounding
-                    step["region"] = bounding
-                    step["regions"] = [bounding]
-                elif not aliases:
-                    step.pop("search_region", None)
-                    step.pop("region", None)
-                    step.pop("regions", None)
-                for field in ("asset_confidences", "asset_routes"):
-                    mapping = step.get(field)
-                    if isinstance(mapping, dict):
-                        filtered = {alias: value for alias, value in mapping.items() if alias in aliases}
-                        if filtered:
-                            step[field] = filtered
-                        else:
-                            step.pop(field, None)
-                automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
-                if automation:
-                    automation["image_count"] = len(aliases)
-                self._persist(f"{step_index}번 노드의 멀티 이미지 및 검색 영역을 보정했습니다.")
-                self._refresh_steps(row)
-        finally:
-            dlg.deleteLater()
-            win = self.window()
-            if win is not None and hasattr(win, "setEnabled"):
-                win.setEnabled(True)
-                if hasattr(win, "activateWindow"):
-                    win.activateWindow()
-
     @QtCore.Slot(int, int, str)
     def _delete_graph_edge(self, source: int, target: int, kind: str) -> None:
         steps = (self.current_macro or {}).get("steps") or []
@@ -2904,83 +2272,6 @@ class BuilderPage(QtWidgets.QWidget):
             steps[source - 1].pop(delay_field, None)
         self._persist(f"{source}번 노드의 연결을 끊었습니다.")
         QtCore.QTimer.singleShot(0, lambda: self._refresh_steps(source - 1))
-
-    @QtCore.Slot(list)
-    def _delete_graph_edges_batch(self, edge_specs: list[dict[str, Any]]) -> None:
-        if not edge_specs:
-            return
-        steps = (self.current_macro or {}).get("steps") or []
-        if not steps:
-            return
-
-        # 1. Condition edges: group by source and pop in descending index order
-        cond_specs = [spec for spec in edge_specs if spec.get("is_condition")]
-        cond_by_source: dict[int, list[int]] = {}
-        for spec in cond_specs:
-            src = int(spec.get("source") or 0)
-            idx = int(spec.get("condition_index", -1))
-            if 0 < src <= len(steps) and idx >= 0:
-                cond_by_source.setdefault(src, []).append(idx)
-
-        for src, idxs in cond_by_source.items():
-            rules = steps[src - 1].get("edge_conditions") or []
-            if isinstance(rules, list):
-                for idx in sorted(set(idxs), reverse=True):
-                    if 0 <= idx < len(rules):
-                        rules.pop(idx)
-                if not rules:
-                    steps[src - 1].pop("edge_conditions", None)
-
-        # 2. Non-condition edges
-        non_cond_specs = [spec for spec in edge_specs if not spec.get("is_condition")]
-        affected_sources = set(cond_by_source.keys())
-
-        for spec in non_cond_specs:
-            src = int(spec.get("source") or 0)
-            target = int(spec.get("target") or 0)
-            kind = str(spec.get("kind") or "success")
-            if not (0 < src <= len(steps)):
-                continue
-
-            step = steps[src - 1]
-            field = "on_fail" if kind == "fail" else "on_success"
-            delay_field = "on_fail_delay" if kind == "fail" else "on_success_delay"
-
-            # Check success_candidates
-            candidates = step.get("success_candidates") or []
-            if kind == "success" and isinstance(candidates, list) and target in [int(value) for value in candidates]:
-                new_cands = [int(value) for value in candidates if int(value) != target]
-                configure_success_candidates(steps, src, new_cands)
-                if not step.get("success_candidates"):
-                    step.pop(delay_field, None)
-                affected_sources.add(src)
-                continue
-
-            # Check fail_candidates
-            fail_cands = step.get("fail_candidates") or []
-            if kind == "fail" and isinstance(fail_cands, list) and target in [int(value) for value in fail_cands]:
-                new_fail_cands = [int(value) for value in fail_cands if int(value) != target]
-                if new_fail_cands:
-                    step["fail_candidates"] = new_fail_cands
-                else:
-                    step.pop("fail_candidates", None)
-                    step.pop(delay_field, None)
-                affected_sources.add(src)
-                continue
-
-            # Normal on_success or on_fail
-            if int(step.get(field) or 0) == target:
-                step.pop(field, None)
-                if kind != "success" or not step.get("success_candidates"):
-                    step.pop(delay_field, None)
-                affected_sources.add(src)
-
-        if affected_sources:
-            total_count = len(edge_specs)
-            self._persist(f"{total_count}개의 노드 연결선을 삭제했습니다.")
-            self.node_canvas.rebuild_edges()
-            refresh_row = min(affected_sources) - 1
-            QtCore.QTimer.singleShot(0, lambda: self._refresh_steps(refresh_row))
 
     @QtCore.Slot(int, int, str)
     def _set_graph_edge_delay(self, source: int, target: int, kind: str) -> None:
@@ -3026,28 +2317,6 @@ class BuilderPage(QtWidgets.QWidget):
             steps[source - 1].pop("edge_conditions", None)
         self._persist("조건 분기 노드라인을 제거했습니다.")
         self.node_canvas.rebuild_edges()
-
-    @QtCore.Slot(int, int, str)
-    def _add_graph_condition(self, source: int, target: int, kind: str) -> None:
-        steps = (self.current_macro or {}).get("steps") or []
-        if not 0 < source <= len(steps):
-            return
-        normalized_kind = "fail" if kind == "fail" else "success"
-        dialog = EdgeConditionDialog(
-            len(steps),
-            normalized_kind,
-            {"kind": normalized_kind, "target": target},
-            self,
-        )
-        QtCore.QTimer.singleShot(0, lambda: _raise_modal_dialog(dialog))
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-        step = steps[source - 1]
-        rules = [rule for rule in (step.get("edge_conditions") or []) if isinstance(rule, dict)]
-        rules.append(dialog.payload(normalized_kind))
-        step["edge_conditions"] = rules
-        self._persist("조건 분기 노드라인을 추가했습니다.")
-        QtCore.QTimer.singleShot(0, lambda: self._refresh_steps(source - 1))
 
     @QtCore.Slot(int, int, int)
     def _retarget_graph_condition(self, source: int, condition_index: int, target: int) -> None:
@@ -3236,31 +2505,7 @@ class BuilderPage(QtWidgets.QWidget):
         self._persist(f"{row + 1}번 단계를 저장했습니다.")
         self._refresh_steps(row)
 
-    def _arm_step_placement(self, action_override: Any = None) -> None:
-        if not self.current_macro:
-            self.status.emit("먼저 매크로를 선택하세요.")
-            return
-        action = action_override if isinstance(action_override, str) and action_override else self._selected_action(self.action_combo)
-        self.node_canvas.begin_node_placement(action)
-        self.status.emit(f"{ACTION_LABELS.get(action, action)} 노드를 놓을 캔버스 위치를 클릭하세요. Esc로 취소할 수 있습니다.")
-
-    @QtCore.Slot(str, object)
-    def _add_step_at_position(self, action_override: str, scene_position: object) -> None:
-        position = scene_position if isinstance(scene_position, QtCore.QPointF) else self.node_canvas.preferred_add_position()
-        action = str(action_override or "")
-        if not action:
-            current = self._selected_action(self.action_combo)
-            dialog = CategorizedActionDialog(current, self.window(), placement_only=True)
-            if dialog.exec() != QtWidgets.QDialog.Accepted or not dialog.selected_action:
-                self.status.emit("노드 추가를 취소했습니다.")
-                return
-            action = str(dialog.selected_action)
-            combo_index = self.action_combo.findData(action)
-            if combo_index >= 0:
-                self.action_combo.setCurrentIndex(combo_index)
-        self._add_step(action, position)
-
-    def _add_step(self, action_override: Any = None, scene_position: QtCore.QPointF | None = None) -> None:
+    def _add_step(self, action_override: Any = None) -> None:
         if not self.current_macro:
             self.status.emit("먼저 매크로를 선택하세요.")
             return
@@ -3273,7 +2518,6 @@ class BuilderPage(QtWidgets.QWidget):
         interactive_actions = {
             "image_search", "screen_condition", "inactive_click", "mouse_click",
             "pixel_search", "ocr", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio",
-            "animation_search",
         }
 
         step = None
@@ -3291,15 +2535,11 @@ class BuilderPage(QtWidgets.QWidget):
             step = deepcopy(ACTION_TEMPLATES.get(action, {}))
             step["action"] = action
 
-        if action in {"image_search", "screen_condition", "pixel_search", "ocr", "ocr_tracking", "multi_image_search", "animation_search"} and not step.get("region_window_exe"):
-            if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
-                step.setdefault("engine", "opencv")
-                step.setdefault("search_profile", "fast")
-                step.setdefault("confidence", 85)
-                step.setdefault("wait_condition", "appear")
-                if action in {"multi_image_search", "animation_search"}:
-                    step.setdefault("match_condition", "all_matched")
-                    step.setdefault("assets", [])
+        if action in {"image_search", "screen_condition"} and not step.get("region_window_exe"):
+            step.setdefault("engine", "opencv")
+            step.setdefault("search_profile", "precise")
+            step.setdefault("confidence", 85)
+            step.setdefault("wait_condition", "appear")
             for candidate in reversed(steps):
                 c_exe = str(candidate.get("window_exe") or candidate.get("region_window_exe") or (candidate.get("click") or {}).get("window_exe") or "")
                 c_win = str(candidate.get("window") or candidate.get("region_window") or (candidate.get("click") or {}).get("window") or "")
@@ -3308,22 +2548,48 @@ class BuilderPage(QtWidgets.QWidget):
                     step["region_coords"] = "relative"
                     step["region_window_exe"] = c_exe
                     step["region_window"] = c_win
-                    if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
-                        click = step.setdefault("click", {})
-                        click["mode"] = "inactive"
-                        click["window_exe"] = c_exe
-                        click["window"] = c_win
-                        click["click_image"] = True
+                    click = step.setdefault("click", {})
+                    click["mode"] = "inactive"
+                    click["window_exe"] = c_exe
+                    click["window"] = c_win
+                    click["click_image"] = True
                     break
 
+        source = self.node_canvas.selected_index()
+        if not source:
+            row = self.steps_table.currentRow()
+            source = row + 1 if 0 <= row < len(steps) else len(steps)
+        source = source if 0 < source <= len(steps) else 0
         new_index = len(steps) + 1
+        previous_target = 0
+        if source and steps[source - 1].get("action") != "flow_control":
+            previous_target = int(steps[source - 1].get("on_success") or 0)
+            steps[source - 1]["on_success"] = new_index
+            if previous_target and previous_target != new_index:
+                step["on_success"] = previous_target
         steps.append(step)
         positions = self.current_macro.setdefault("graph_positions", {})
-        position = scene_position if isinstance(scene_position, QtCore.QPointF) else self.node_canvas.preferred_add_position()
-        if isinstance(positions, dict):
-            positions[str(new_index)] = [round(position.x() - 98.0, 2), round(position.y() - 58.0, 2)]
+        if source and isinstance(positions, dict):
+            source_position = positions.get(str(source))
+            target_position = positions.get(str(previous_target)) if previous_target else None
+            if isinstance(source_position, (list, tuple)) and len(source_position) >= 2:
+                source_x, source_y = float(source_position[0]), float(source_position[1])
+                if isinstance(target_position, (list, tuple)) and len(target_position) >= 2:
+                    new_x = (source_x + float(target_position[0])) / 2.0
+                    new_y = (source_y + float(target_position[1])) / 2.0
+                else:
+                    if new_index > 1 and (new_index - 1) % 10 == 0:
+                        new_x = 0.0
+                        new_y = source_y + 220.0
+                    else:
+                        new_x, new_y = source_x + 240.0, source_y
+                positions[str(new_index)] = [round(new_x, 2), round(new_y, 2)]
         action_name = ACTION_LABELS.get(action, action)
-        message = f"{action_name} 노드를 지정한 위치에 연결 없이 추가했습니다."
+        if source:
+            relation = "삽입" if previous_target else "연결"
+            message = f"{new_index}번 {action_name} 노드를 {source}번 성공 흐름에 자동 {relation}했습니다."
+        else:
+            message = f"{action_name} 단계를 추가했습니다."
         self.action_editor.refresh_sources()
         self._persist(message)
         self._refresh_steps(len(steps) - 1)
@@ -3393,146 +2659,6 @@ class BuilderPage(QtWidgets.QWidget):
             f"검색·인식 {', '.join(map(str, candidates))}번을 분기 후보 그룹으로 묶었습니다. 성공 흐름은 각각 독립 실행됩니다."
         )
         self._refresh_steps(candidates[0] - 1)
-
-    @QtCore.Slot()
-    def _create_branch_from_selection(self) -> None:
-        if not self.current_macro:
-            return
-        steps = self.current_macro.get("steps") or []
-        selected = sorted({int(value) for value in self.node_canvas.selected_indexes() if 0 < int(value) <= len(steps)})
-        if not selected:
-            self.status.emit("새 분기에 넣을 노드를 먼저 선택하세요.")
-            return
-        existing_ids = {
-            str(step.get("workflow_id") or "").strip()
-            for step in steps
-            if str(step.get("workflow_id") or "").strip()
-        }
-        branch_number = 1 + sum(identifier.startswith("branch-lane-") for identifier in existing_ids)
-        default_label = f"{branch_number}번 분기"
-        label, accepted = QtWidgets.QInputDialog.getText(self, "새 분기 추가", "분기 이름", text=default_label)
-        if not accepted or not label.strip():
-            return
-        root = selected[0]
-        workflow_id = f"branch-lane-{root}"
-        root_step = steps[root - 1]
-        root_step["workflow_id"] = workflow_id
-        root_step["workflow_label"] = label.strip()
-        automation = root_step.get("_automation") if isinstance(root_step.get("_automation"), dict) else {}
-        automation["branch_root"] = True
-        root_step["_automation"] = automation
-        _assign_connected_branch_workflows(steps, [root])
-        for index in selected:
-            steps[index - 1]["workflow_id"] = workflow_id
-            steps[index - 1]["workflow_label"] = label.strip()
-        self._persist(f"'{label.strip()}' 분기를 추가했습니다.")
-        self._refresh_steps(root - 1)
-
-    def _begin_add_selection_to_branch(self) -> None:
-        if not self.current_macro:
-            return
-        steps = self.current_macro.get("steps") or []
-        selected = sorted({int(value) for value in self.node_canvas.selected_indexes() if 0 < int(value) <= len(steps)})
-        if not selected:
-            self.status.emit("기존 분기에 넣을 노드를 먼저 선택하세요.")
-            return
-        if any(bool((steps[index - 1].get("_automation") or {}).get("branch_root")) for index in selected):
-            self.status.emit("분기 시작 노드는 먼저 '분기 연결 해제' 후 이동하세요.")
-            return
-        eligible = {
-            index for index, step in enumerate(steps, start=1)
-            if index not in selected and str(step.get("workflow_id") or "").strip()
-        }
-        if not eligible:
-            self.status.emit("추가할 대상 분기가 없습니다. 먼저 분기를 생성하세요.")
-            return
-
-        self.node_canvas.cancel_node_target_pick()
-
-        def finish(target: int) -> None:
-            try:
-                self.node_canvas.node_target_picked.disconnect(finish)
-            except (RuntimeError, TypeError):
-                pass
-            if not target or not (0 < target <= len(steps)):
-                self.status.emit("분기 추가를 취소했습니다.")
-                return
-            target_step = steps[target - 1]
-            workflow_id = str(target_step.get("workflow_id") or "").strip()
-            label = str(target_step.get("workflow_label") or workflow_id).strip()
-            if not workflow_id:
-                return
-            for index in selected:
-                steps[index - 1]["workflow_id"] = workflow_id
-                steps[index - 1]["workflow_label"] = label
-            self._persist(f"선택 노드 {len(selected)}개를 '{label}'에 추가했습니다.")
-            self._refresh_steps(selected[0] - 1)
-
-        self.node_canvas.node_target_picked.connect(finish)
-        self.node_canvas.begin_node_target_pick(
-            eligible_indexes=eligible,
-            prompt="🎯 추가할 분기의 영역 안 노드를 클릭하세요 · Esc 취소",
-        )
-        self.status.emit("강조된 노드 중 하나를 클릭하면 해당 분기에 추가됩니다.")
-
-    def _remove_selection_from_branch(self) -> None:
-        if not self.current_macro:
-            return
-        steps = self.current_macro.get("steps") or []
-        selected = self.node_canvas.selected_indexes()
-        changed = 0
-        for index in selected:
-            if not 0 < int(index) <= len(steps):
-                continue
-            step = steps[int(index) - 1]
-            if not str(step.get("workflow_id") or "").strip():
-                continue
-            step.pop("workflow_id", None)
-            step.pop("workflow_label", None)
-            changed += 1
-        if not changed:
-            self.status.emit("분기에서 제외할 노드를 선택하세요.")
-            return
-        self._persist(f"선택 노드 {changed}개를 분기에서 제외했습니다.")
-        self._refresh_steps(max(0, int(selected[0]) - 1))
-
-    def _rename_selected_branch(self, workflow_id: str = "") -> None:
-        if not self.current_macro:
-            return
-        steps = self.current_macro.get("steps") or []
-        available: dict[str, str] = {}
-        for step in steps:
-            identifier = str(step.get("workflow_id") or "").strip()
-            if identifier:
-                available.setdefault(identifier, str(step.get("workflow_label") or identifier).strip())
-        if not workflow_id:
-            selected_ids = {
-                str(steps[index - 1].get("workflow_id") or "").strip()
-                for index in self.node_canvas.selected_indexes()
-                if 0 < index <= len(steps) and str(steps[index - 1].get("workflow_id") or "").strip()
-            }
-            if len(selected_ids) == 1:
-                workflow_id = next(iter(selected_ids))
-            elif available:
-                labels = [f"{label}  ({identifier})" for identifier, label in available.items()]
-                choice, accepted = QtWidgets.QInputDialog.getItem(self, "분기 이름 변경", "변경할 분기", labels, 0, False)
-                if not accepted:
-                    return
-                workflow_id = list(available)[labels.index(choice)]
-        if workflow_id not in available:
-            self.status.emit("이름을 변경할 분기를 선택하세요.")
-            return
-        label, accepted = QtWidgets.QInputDialog.getText(
-            self, "분기 이름 변경", "새 분기 이름", text=available[workflow_id]
-        )
-        label = label.strip()
-        if not accepted or not label:
-            return
-        for step in steps:
-            if str(step.get("workflow_id") or "").strip() == workflow_id:
-                step["workflow_label"] = label
-        self._persist(f"분기 이름을 '{label}'(으)로 변경했습니다.")
-        self._refresh_steps(max(0, self.steps_table.currentRow()))
 
     @QtCore.Slot(list)
     def _configure_branch_chain(self, selected_indexes: list[int]) -> None:
@@ -3609,22 +2735,16 @@ class BuilderPage(QtWidgets.QWidget):
             automation["candidate_position"] = position + 1
             automation["candidate_count"] = len(candidates)
             automation["hide_candidate_fail_edge"] = True
-            automation["branch_root"] = True
             step["_automation"] = automation
 
             # Assign workflow lane so colored bounding area border renders around each branch (like Smart Recording F7)
-            workflow_id = f"branch-lane-{index}"
-            if str(step.get("workflow_id") or "").strip() != workflow_id:
-                step["workflow_label"] = f"{position + 1}번 분기"
-            step["workflow_id"] = workflow_id
-
-        assigned = _assign_connected_branch_workflows(steps, candidates)
+            step["workflow_id"] = f"branch-lane-{index}"
+            step["workflow_label"] = f"{position + 1}번 분기"
 
         chain_desc = " ➔ ".join(f"#{i}" for i in candidates)
         self._persist(f"순차 분기 체인 생성 ({chain_desc})")
         self._refresh_steps(candidates[0] - 1)
-        member_count = sum(len(indexes) for indexes in assigned.values())
-        self.status.emit(f"🔀 순차 분기 연결 완료: {chain_desc} · 성공 흐름 {member_count}개 노드 자동 포함")
+        self.status.emit(f"🔀 순차 분기 연결 완료: {chain_desc} (실패 시 다음 분기 순차 실행)")
 
     @QtCore.Slot(int)
     def _configure_single_branch(self, source_index: int) -> None:
@@ -3696,61 +2816,23 @@ class BuilderPage(QtWidgets.QWidget):
         if not self.current_macro:
             return
         steps = self.current_macro.get("steps") or []
-        selected = {int(value) for value in selected_indexes if 0 < int(value) <= len(steps)}
-        if not selected:
-            self.status.emit("연결을 해제할 분기 노드를 선택하세요.")
-            return
-        workflow_ids = {
-            str(steps[index - 1].get("workflow_id") or "").strip()
-            for index in selected
-            if str(steps[index - 1].get("workflow_id") or "").strip()
-        }
-        roots_to_remove = {
-            index for index, step in enumerate(steps, start=1)
-            if (
-                index in selected
-                or str(step.get("workflow_id") or "").strip() in workflow_ids
-            )
-            and bool((step.get("_automation") or {}).get("branch_root") or (step.get("_automation") or {}).get("branch_chain"))
-        }
-        roots_to_remove.update(selected if not roots_to_remove else set())
-
-        for step in steps:
-            if str(step.get("workflow_id") or "").strip() in workflow_ids:
-                step.pop("workflow_id", None)
-                step.pop("workflow_label", None)
-
-        for index in roots_to_remove:
-            step = steps[index - 1]
-            step.pop("on_fail", None)
-            step.pop("abort_on_fail", None)
-            automation = step.get("_automation")
-            if isinstance(automation, dict):
-                for key in ("branch_chain", "branch_root", "candidate_position", "candidate_count", "hide_candidate_fail_edge"):
-                    automation.pop(key, None)
-                if not automation:
-                    step.pop("_automation", None)
-
-        remaining_roots = []
-        for index, step in enumerate(steps, start=1):
-            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
-            if automation.get("branch_chain") and automation.get("branch_root"):
-                remaining_roots.append((int(automation.get("candidate_position") or index), index))
-        remaining = [index for _position, index in sorted(remaining_roots)]
-        for position, index in enumerate(remaining):
-            step = steps[index - 1]
-            automation = step.get("_automation")
-            automation["candidate_position"] = position + 1
-            automation["candidate_count"] = len(remaining)
-            if position + 1 < len(remaining):
-                step["on_fail"] = remaining[position + 1]
-                step["abort_on_fail"] = False
-            else:
-                step.pop("on_fail", None)
-                step["abort_on_fail"] = True
-        count = len(roots_to_remove)
+        count = 0
+        for idx in selected_indexes:
+            if 0 < idx <= len(steps):
+                steps[idx - 1].pop("on_fail", None)
+                automation = steps[idx - 1].get("_automation")
+                if isinstance(automation, dict):
+                    automation.pop("branch_chain", None)
+                    automation.pop("candidate_position", None)
+                    automation.pop("candidate_count", None)
+                    if not automation:
+                        steps[idx - 1].pop("_automation", None)
+                if str(steps[idx - 1].get("workflow_id") or "").startswith("branch-lane-"):
+                    steps[idx - 1].pop("workflow_id", None)
+                    steps[idx - 1].pop("workflow_label", None)
+                count += 1
         self._persist(f"선택한 {count}개 노드의 분기 연결을 해제했습니다.")
-        self._refresh_steps(min(selected) - 1)
+        self._refresh_steps(selected_indexes[0] - 1 if selected_indexes else 0)
         self.status.emit("선택 노드 분기 해제 완료")
 
     def _append_automation_steps(self, new_steps: list[dict[str, Any]], message: str) -> None:
@@ -3784,15 +2866,6 @@ class BuilderPage(QtWidgets.QWidget):
                 for rule in conditions:
                     if isinstance(rule, dict) and int(rule.get("target") or 0):
                         rule["target"] = int(rule["target"]) + base
-            asset_routes = step.get("asset_routes")
-            if isinstance(asset_routes, dict):
-                for route in asset_routes.values():
-                    if not isinstance(route, dict):
-                        continue
-                    for outcome in ("true", "fail"):
-                        target = int(route.get(outcome) or 0)
-                        if target:
-                            route[outcome] = target + base
         for step in prepared:
             step.pop("_live_position", None)
             if not str(step.get("workflow_id") or "").strip():
@@ -3943,8 +3016,6 @@ class BuilderPage(QtWidgets.QWidget):
         dialog.events_changed.connect(self._remember_last_recording)
         dialog.accepted.connect(lambda: QtCore.QTimer.singleShot(0, lambda: self._finish_smart_recording_review(dialog)))
         dialog.rejected.connect(lambda: self._close_smart_recording_review(dialog))
-        dialog.ai_macro_ready.connect(self._create_macro_from_ai_plan)
-        self.ai_macro_save_result.connect(dialog._on_ai_macro_save_result)
         dialog.show()
 
     def _close_smart_recording_review(self, dialog: RecordingReviewDialog) -> None:
@@ -3953,50 +3024,14 @@ class BuilderPage(QtWidgets.QWidget):
         dialog.deleteLater()
         self.status.emit("검토창을 닫았습니다. '녹화 상세편집'에서 다시 열 수 있습니다.")
 
-    def _create_macro_from_ai_plan(self, draft: dict[str, Any]) -> None:
-        try:
-            validate_compiled_draft(draft)
-            base_name = str(draft.get("name") or "AI자동매크로").strip()
-            payload = {
-                "name": base_name,
-                "description": f"스마트 녹화 기반 AI 생성 매크로 ({draft.get('meta', {}).get('recording_id', '')})",
-                "steps": draft.get("steps", []),
-                "graph_start_step": draft.get("graph_start_step", 1),
-                "graph_positions": draft.get("graph_positions", {}),
-                "meta": draft.get("meta", {}),
-            }
-            name, path = self.repository.create_macro_unique(base_name, payload)
-        except Exception as exc:
-            msg = str(exc)
-            self.ai_macro_save_result.emit(False, msg)
-            return
-
-        self.ai_macro_save_result.emit(True, f"'{name}' 매크로가 성공적으로 생성되었습니다.")
-        self.refresh(name)
-        self.data_changed.emit()
-        self.status.emit(f"AI 매크로 '{name}' 생성 완료 (노드 {len(payload['steps'])}개). 상단 '🛡️ 드라이런'으로 먼저 안전하게 테스트하세요.")
-        QtWidgets.QMessageBox.information(
-            self,
-            "AI 매크로 생성 완료",
-            f"'{name}' 매크로가 성공적으로 생성되어 캔버스에 로드되었습니다.\n\n"
-            f"• 총 {len(payload['steps'])}개의 노드와 분기선(성공/실패)이 자동 연결되었습니다.\n"
-            f"• 안전을 위해 매크로가 자동으로 실행되지 않습니다.\n"
-            f"• 상단 툴바의 '🛡️ 드라이런' 또는 단계별 디버깅을 사용하여 안전하게 동작을 검증하세요.",
-        )
-
     def _finish_smart_recording_review(self, dialog: RecordingReviewDialog) -> None:
-        target_mode = getattr(dialog, "target_mode", "append")
-        if target_mode == "ai_plan":
-            if self._recording_review_dialog is dialog:
-                self._recording_review_dialog = None
-            dialog.deleteLater()
-            return
         try:
             steps = dialog.build_steps()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "녹화 변환 실패", str(exc))
+            self._close_smart_recording_review(dialog)
             return
-
+        target_mode = getattr(dialog, "target_mode", "append")
         if self._recording_review_dialog is dialog:
             self._recording_review_dialog = None
         dialog.deleteLater()
@@ -4387,23 +3422,6 @@ class BuilderPage(QtWidgets.QWidget):
                     step["edge_conditions"] = normalized
                 else:
                     step.pop("edge_conditions", None)
-            asset_routes = step.get("asset_routes")
-            if isinstance(asset_routes, dict):
-                normalized_routes: dict[str, dict[str, int]] = {}
-                for alias, route in asset_routes.items():
-                    if not isinstance(route, dict):
-                        continue
-                    normalized_route = {
-                        outcome: mapping[int(route[outcome])]
-                        for outcome in ("true", "fail")
-                        if int(route.get(outcome) or 0) in mapping
-                    }
-                    if normalized_route:
-                        normalized_routes[str(alias)] = normalized_route
-                if normalized_routes:
-                    step["asset_routes"] = normalized_routes
-                else:
-                    step.pop("asset_routes", None)
             block_steps.append(step)
         self.repository.save_automation_block(name, block_steps, description)
         self.status.emit(f"'{name}' 자동화 블록을 저장했습니다. 노드 {len(block_steps)}개")
@@ -4564,27 +3582,6 @@ class BuilderPage(QtWidgets.QWidget):
                     step["edge_conditions"] = normalized_rules
                 else:
                     step.pop("edge_conditions", None)
-            asset_routes = step.get("asset_routes")
-            if isinstance(asset_routes, dict):
-                normalized_asset_routes: dict[str, dict[str, int]] = {}
-                for alias, route in asset_routes.items():
-                    if not isinstance(route, dict):
-                        continue
-                    normalized_route: dict[str, int] = {}
-                    for outcome in ("true", "fail"):
-                        route_target = int(route.get(outcome) or 0)
-                        if route_target == deleted:
-                            continue
-                        if route_target > deleted:
-                            route_target -= 1
-                        if route_target > 0:
-                            normalized_route[outcome] = route_target
-                    if normalized_route:
-                        normalized_asset_routes[str(alias)] = normalized_route
-                if normalized_asset_routes:
-                    step["asset_routes"] = normalized_asset_routes
-                else:
-                    step.pop("asset_routes", None)
         if self.current_macro is None:
             return
         positions = self.current_macro.get("graph_positions") or {}
@@ -4673,15 +3670,6 @@ class BuilderPage(QtWidgets.QWidget):
                         value = int(rule.get("target") or 0)
                         if value in mapping:
                             rule["target"] = mapping[value]
-            asset_routes = step.get("asset_routes")
-            if isinstance(asset_routes, dict):
-                for route in asset_routes.values():
-                    if not isinstance(route, dict):
-                        continue
-                    for outcome in ("true", "fail"):
-                        value = int(route.get(outcome) or 0)
-                        if value in mapping:
-                            route[outcome] = mapping[value]
         positions = self.current_macro.get("graph_positions") or {}
         if isinstance(positions, dict):
             first = positions.pop(str(old_a), None)
@@ -4730,7 +3718,6 @@ class BuilderPage(QtWidgets.QWidget):
                 del history[:-50]
             self._redo_history.setdefault(self.current_name, []).clear()
         self.repository.save_macro(self.current_name, self.current_macro)
-        self._submacro_target_cache.pop(self.current_name, None)
         self._last_persisted_macro = current
         self.macro_title.setText(f"{self.current_name}  ·  {len(self.current_macro.get('steps') or [])}단계")
         regressions = [item for item in run_test_cases(self.current_macro) if not item.passed]
@@ -4799,24 +3786,6 @@ class BuilderPage(QtWidgets.QWidget):
         self.data_changed.emit()
         self.status.emit(f"'{path.stem}' 매크로를 만들었습니다.")
 
-    def _create_or_edit_bundle(self) -> None:
-        bundle_name = ""
-        if self.current_macro:
-            meta = self.current_macro.get("meta") if isinstance(self.current_macro.get("meta"), dict) else {}
-            if meta.get("macro_bundle"):
-                bundle_name = self.current_name
-        dialog = MacroBundleDialog(self.repository, bundle_name, self.window())
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-        try:
-            path = self.repository.save_macro_bundle(dialog.name_edit.text(), dialog.selected_macros())
-        except (OSError, ValueError) as exc:
-            QtWidgets.QMessageBox.warning(self, "실행 묶음 저장 실패", str(exc))
-            return
-        self.refresh(path.stem)
-        self.data_changed.emit()
-        self.status.emit(f"'{path.stem}' 실행 묶음을 저장했습니다. 실행 버튼으로 순서대로 시작할 수 있습니다.")
-
     def _duplicate_macro(self) -> None:
         if not self.current_name:
             return
@@ -4865,7 +3834,7 @@ class BuilderPage(QtWidgets.QWidget):
 
     def delete_selected(self) -> dict[str, Any] | None:
         focus = QtWidgets.QApplication.focusWidget()
-        if focus is self.macro_list or (isinstance(focus, QtWidgets.QWidget) and self.macro_list.isAncestorOf(focus)):
+        if focus is self.macro_list or (focus is not None and self.macro_list.isAncestorOf(focus)):
             names = self._selected_macro_names() or ([self.current_name] if self.current_name else [])
             return self._archive_macros(names, confirm=False)
         # 1. First priority: Check if any NodeGroupItem is selected on the canvas
@@ -4882,7 +3851,7 @@ class BuilderPage(QtWidgets.QWidget):
 
         indexes = self.node_canvas.selected_indexes()
         if not indexes:
-            if isinstance(focus, QtWidgets.QWidget) and (focus is self.node_canvas or self.node_canvas.isAncestorOf(focus)):
+            if focus is not None and (focus is self.node_canvas or self.node_canvas.isAncestorOf(focus)):
                 return None
             indexes = sorted({model_index.row() + 1 for model_index in self.steps_table.selectionModel().selectedRows()})
         if not indexes or self.current_macro is None:
@@ -5143,7 +4112,7 @@ class BuilderPage(QtWidgets.QWidget):
         warnings: list[str] = []
         validator = ProjectValidator(self.repository)
         try:
-            validation_issues = validator.validate(self.current_name, self.current_macro)
+            validation_issues = [item for item in validator.validate() if item.macro == self.current_name]
         except Exception as exc:
             validation_issues = []
             warnings.append(f"프로젝트 검사 일부를 완료하지 못했습니다: {exc}")
@@ -5155,19 +4124,12 @@ class BuilderPage(QtWidgets.QWidget):
                 issues.append(message)
             else:
                 warnings.append(message)
-        opencv_checked = False
         ocr_checked = False
-        window_checks: dict[tuple[str, str], bool] = {}
         for index, step in enumerate((self.current_macro or {}).get("steps") or [], start=1):
             if not isinstance(step, dict):
                 continue
             action = str(step.get("action") or "")
-            if (
-                action in {"image_search", "screen_condition"}
-                and str(step.get("engine") or "ahk").lower() == "opencv"
-                and not opencv_checked
-            ):
-                opencv_checked = True
+            if action in {"image_search", "screen_condition"} and str(step.get("engine") or "ahk").lower() == "opencv":
                 try:
                     self.repository._ensure_opencv_runtime()
                 except Exception as exc:
@@ -5188,12 +4150,8 @@ class BuilderPage(QtWidgets.QWidget):
                 target_title, target_exe = str(step.get("region_window") or ""), str(step.get("region_window_exe") or "")
             elif action == "ocr" and str(step.get("capture_mode") or "screen") in {"window", "client"}:
                 target_title = str(step.get("window_title") or "")
-            if target_title or target_exe:
-                target = (target_title, target_exe)
-                if target not in window_checks:
-                    window_checks[target] = self._target_window_exists(target_title, target_exe)
-                if not window_checks[target]:
-                    warnings.append(f"{index}번 대상 창을 현재 찾지 못했습니다 · {target_exe or target_title}")
+            if (target_title or target_exe) and not self._target_window_exists(target_title, target_exe):
+                warnings.append(f"{index}번 대상 창을 현재 찾지 못했습니다 · {target_exe or target_title}")
         self._last_execution_warnings = list(dict.fromkeys(warnings))
         return list(dict.fromkeys(issues))
 

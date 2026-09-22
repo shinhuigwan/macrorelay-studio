@@ -71,7 +71,6 @@ def create_app(root=None, *, start_remote_runtime: bool = True) -> tuple[QtWidge
         icon = QtGui.QIcon(str(icon_path))
         app.setWindowIcon(icon)
     window = MainWindow(repository)
-    app.aboutToQuit.connect(window.shutdown_runtime)
     if not icon.isNull():
         window.setWindowIcon(icon)
     return app, window

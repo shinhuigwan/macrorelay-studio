@@ -289,10 +289,6 @@ class VisionState:
         capture_before: int = 0,
         reuse_before: int = 0,
         thresholds: list[float] | None = None,
-        image_regions: list[list[tuple[int, int, int, int]]] | None = None,
-        min_count: int = 1,
-        match_condition: str = "at_least_1",
-        all_action: str = "",
     ) -> dict[str, Any]:
         prepared_items: list[tuple[dict[str, Any], bool]] = [
             self._template(path, profile) for path in image_paths
@@ -300,47 +296,17 @@ class VisionState:
         self._modules()
         deadline = time.perf_counter() + timeout_ms / 1000.0
         best_score = 0.0
-
-        total_images = len(prepared_items)
-        if match_condition == "all_matched":
-            target_count = total_images
-        elif match_condition == "exact_n":
-            target_count = max(1, min_count)
-        elif match_condition == "at_least_n" or min_count > 1:
-            target_count = max(1, min_count)
-        else:
-            target_count = 1
-
-        best_match_count = 0
-
-        def _target_regions_for(idx: int) -> list[tuple[int, int, int, int]]:
-            if image_regions and idx < len(image_regions) and image_regions[idx]:
-                return image_regions[idx]
-            return regions
-
-        all_unique_regions: list[tuple[int, int, int, int]] = []
-        seen_regions: set[tuple[int, int, int, int]] = set()
-        for idx in range(len(image_paths)):
-            for r in _target_regions_for(idx):
-                if r not in seen_regions:
-                    seen_regions.add(r)
-                    all_unique_regions.append(r)
-
         while True:
             cycle_started = time.perf_counter()
             hits: list[tuple[float, int, int, int, int, int, dict[str, Any]]] = []
-            cycle_frames: dict[tuple[int, int, int, int], Any] = {}
-            for reg in all_unique_regions:
-                frame, _reused = self._capture(reg, context, cache_ms)
-                if frame is not None:
-                    cycle_frames[reg] = frame
-
-            for index, (prepared, _cache_hit) in enumerate(prepared_items):
-                item_thresh = thresholds[index] if (thresholds and index < len(thresholds)) else threshold
-                for left, top, right, bottom in _target_regions_for(index):
-                    frame = cycle_frames.get((left, top, right, bottom))
-                    if frame is None:
-                        continue
+            for left, top, right, bottom in regions:
+                # Capture each region once, then compare every registered
+                # template against that immutable frame.
+                frame, _reused = self._capture((left, top, right, bottom), context, cache_ms)
+                if frame is None:
+                    continue
+                for index, (prepared, _cache_hit) in enumerate(prepared_items):
+                    item_thresh = thresholds[index] if (thresholds and index < len(thresholds)) else threshold
                     match, score = self._match(frame, prepared, item_thresh, profile)
                     best_score = max(best_score, float(score))
                     if match is None:
@@ -358,68 +324,34 @@ class VisionState:
                         )
                     )
             if hits:
-                cycle_matched_templates: dict[int, tuple] = {}
-                for hit in hits:
-                    idx = hit[1]
-                    if idx not in cycle_matched_templates or hit[0] > cycle_matched_templates[idx][0]:
-                        cycle_matched_templates[idx] = hit
-
-                cycle_count = len(cycle_matched_templates)
-                if cycle_count > best_match_count:
-                    best_match_count = cycle_count
-
-                if match_condition == "exact_n":
-                    satisfied = (cycle_count == target_count)
-                else:
-                    satisfied = (cycle_count >= target_count)
-
-                if satisfied:
-                    # Highest confidence wins for primary hit coords
-                    confidence, index, center_x, center_y, width, height, prepared = max(
-                        hits, key=lambda item: (item[0], -item[1])
-                    )
-                    image_key = str(prepared["path"]).casefold()
-                    self.last_hits[image_key] = (center_x, center_y, width, height)
-                    canvas_width, canvas_height = prepared.get("canvas_size") or (width, height)
-                    matches_list = []
-                    csv_parts = []
-                    for t_idx in sorted(cycle_matched_templates.keys()):
-                        m_conf, m_idx, m_cx, m_cy, m_w, m_h, m_prep = cycle_matched_templates[t_idx]
-                        matches_list.append({
-                            "index": m_idx + 1,
-                            "x": m_cx,
-                            "y": m_cy,
-                            "width": m_w,
-                            "height": m_h,
-                            "confidence": round(m_conf, 4),
-                            "path": str(m_prep.get("path") or ""),
-                        })
-                        csv_parts.append(f"{m_idx + 1},{m_cx},{m_cy},{m_w},{m_h}")
-                    matches_csv = "|".join(csv_parts)
-                    return {
-                        "ok": True,
-                        "found": True,
-                        "x": center_x,
-                        "y": center_y,
-                        "confidence": round(confidence, 6),
-                        "best_score": round(max(best_score, confidence), 6),
-                        "width": width,
-                        "height": height,
-                        "source_width": int(canvas_width),
-                        "source_height": int(canvas_height),
-                        "match_index": index + 1,
-                        "matched_image": str(prepared["path"]),
-                        "matches": matches_list,
-                        "matches_csv": matches_csv,
-                        "match_count": cycle_count,
-                        "required_count": target_count,
-                        "image_count": len(prepared_items),
-                        "profile": profile,
-                        "cache_hit": all(hit for _prepared, hit in prepared_items),
-                        "capture_count": self.capture_count - capture_before,
-                        "capture_reuse_count": self.capture_reuse_count - reuse_before,
-                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-                    }
+                # Highest confidence wins. Stable index ordering supplies the
+                # user's checklist priority when scores are equal.
+                confidence, index, center_x, center_y, width, height, prepared = max(
+                    hits, key=lambda item: (item[0], -item[1])
+                )
+                image_key = str(prepared["path"]).casefold()
+                self.last_hits[image_key] = (center_x, center_y, width, height)
+                canvas_width, canvas_height = prepared.get("canvas_size") or (width, height)
+                return {
+                    "ok": True,
+                    "found": True,
+                    "x": center_x,
+                    "y": center_y,
+                    "confidence": round(confidence, 6),
+                    "best_score": round(max(best_score, confidence), 6),
+                    "width": width,
+                    "height": height,
+                    "source_width": int(canvas_width),
+                    "source_height": int(canvas_height),
+                    "match_index": index + 1,
+                    "matched_image": str(prepared["path"]),
+                    "image_count": len(prepared_items),
+                    "profile": profile,
+                    "cache_hit": all(hit for _prepared, hit in prepared_items),
+                    "capture_count": self.capture_count - capture_before,
+                    "capture_reuse_count": self.capture_reuse_count - reuse_before,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                }
             if timeout_ms <= 0 or time.perf_counter() >= deadline:
                 break
             adaptive_poll, cpu = self._adaptive_poll(poll_ms)
@@ -430,8 +362,6 @@ class VisionState:
             "ok": True,
             "found": False,
             "best_score": round(best_score, 6),
-            "match_count": best_match_count,
-            "required_count": target_count,
             "image_count": len(prepared_items),
             "profile": profile,
             "cache_hit": all(hit for _prepared, hit in prepared_items),
@@ -485,38 +415,12 @@ class VisionState:
                 raise ValueError("at least one search image is required")
             prepared_items = [self._template(path, profile) for path in image_paths]
             self._modules()
-            raw_image_regions = request.get("image_regions")
-            parsed_image_regions: list[list[tuple[int, int, int, int]]] | None = None
-            if isinstance(raw_image_regions, list):
-                parsed_image_regions = []
-                for item in raw_image_regions:
-                    if isinstance(item, list) and item:
-                        try:
-                            parsed_image_regions.append(self._regions(item))
-                        except Exception:
-                            parsed_image_regions.append([])
-                    else:
-                        parsed_image_regions.append([])
-
-            def _bench_regions_for(idx: int) -> list[tuple[int, int, int, int]]:
-                if parsed_image_regions and idx < len(parsed_image_regions) and parsed_image_regions[idx]:
-                    return parsed_image_regions[idx]
-                return regions
-
-            all_bench_regions: list[tuple[int, int, int, int]] = []
-            seen_bench: set[tuple[int, int, int, int]] = set()
-            for idx in range(len(prepared_items)):
-                for r in _bench_regions_for(idx):
-                    if r not in seen_bench:
-                        seen_bench.add(r)
-                        all_bench_regions.append(r)
-
-            frames: dict[tuple[int, int, int, int], Any] = {}
-            for region in all_bench_regions:
+            frames: list[tuple[tuple[int, int, int, int], Any]] = []
+            for region in regions:
                 left, top, right, bottom = region
                 frame = search.capture_region(left, top, right, bottom, self._grabber or None)
                 if frame is not None:
-                    frames[region] = frame
+                    frames.append((region, frame))
             if not frames:
                 raise RuntimeError("screen capture failed for every search region")
             results: list[dict[str, Any]] = []
@@ -524,10 +428,7 @@ class VisionState:
                 item_started = time.perf_counter()
                 best_score = 0.0
                 best_hit: tuple[float, int, int, int, int] | None = None
-                for (left, top, right, bottom) in _bench_regions_for(image_index - 1):
-                    frame = frames.get((left, top, right, bottom))
-                    if frame is None:
-                        continue
+                for (left, top, _right, _bottom), frame in frames:
                     match, score = self._match(frame, prepared, threshold, profile)
                     best_score = max(best_score, float(score))
                     if match is None:
@@ -607,25 +508,9 @@ class VisionState:
                     for value in raw_images if str(value).strip()
                 )
             ) if isinstance(raw_images, list) else []
-            min_count = max(0, int(request.get("min_count") or 0))
-            match_condition = str(request.get("match_condition") or "at_least_1")
-            all_action = str(request.get("all_action") or "")
-
             if len(image_paths) > 1:
                 raw_thresholds = request.get("thresholds")
                 thresholds_list = [float(v) for v in raw_thresholds] if isinstance(raw_thresholds, list) else None
-                raw_image_regions = request.get("image_regions")
-                parsed_image_regions: list[list[tuple[int, int, int, int]]] | None = None
-                if isinstance(raw_image_regions, list):
-                    parsed_image_regions = []
-                    for item in raw_image_regions:
-                        if isinstance(item, list) and item:
-                            try:
-                                parsed_image_regions.append(self._regions(item))
-                            except Exception:
-                                parsed_image_regions.append([])
-                        else:
-                            parsed_image_regions.append([])
                 return self._search_multi(
                     image_paths,
                     regions,
@@ -639,16 +524,9 @@ class VisionState:
                     capture_before,
                     reuse_before,
                     thresholds=thresholds_list,
-                    image_regions=parsed_image_regions,
-                    min_count=min_count,
-                    match_condition=match_condition,
-                    all_action=all_action,
                 )
             prepared, cache_hit = self._template(image_path, profile)
             self._modules()
-
-            target_count = max(1, min_count) if (min_count > 1 or match_condition in {"at_least_n", "exact_n"}) else 1
-            best_match_count = 0
 
             deadline = time.perf_counter() + timeout_ms / 1000.0
             best_score = 0.0
@@ -657,7 +535,7 @@ class VisionState:
             while True:
                 cycle_started = time.perf_counter()
                 candidates = list(regions)
-                if last_hit and target_count <= 1:
+                if last_hit:
                     center_x, center_y, width, height = last_hit
                     for left, top, right, bottom in regions:
                         if left <= center_x < right and top <= center_y < bottom:
@@ -673,7 +551,6 @@ class VisionState:
                                 candidates.insert(0, recent)
                             break
                 seen: set[tuple[int, int, int, int]] = set()
-                cycle_hits: list[tuple[float, int, int, int, int]] = []
                 for region in candidates:
                     if region in seen:
                         continue
@@ -682,39 +559,22 @@ class VisionState:
                     best_score = max(best_score, score)
                     if match is not None:
                         confidence, center_x, center_y, width, height = match
-                        cycle_hits.append((confidence, center_x, center_y, width, height))
-                        if target_count <= 1 and match_condition != "exact_n":
-                            break
-
-                cycle_count = len(cycle_hits)
-                if cycle_count > best_match_count:
-                    best_match_count = cycle_count
-
-                if match_condition == "exact_n":
-                    satisfied = (cycle_count == target_count)
-                else:
-                    satisfied = (cycle_count >= target_count)
-
-                if satisfied and cycle_hits:
-                    confidence, center_x, center_y, width, height = max(cycle_hits, key=lambda item: item[0])
-                    self.last_hits[image_key] = (center_x, center_y, width, height)
-                    return {
-                        "ok": True,
-                        "found": True,
-                        "x": center_x,
-                        "y": center_y,
-                        "confidence": round(confidence, 6),
-                        "best_score": round(max(best_score, confidence), 6),
-                        "width": width,
-                        "height": height,
-                        "match_count": cycle_count,
-                        "required_count": target_count,
-                        "profile": profile,
-                        "cache_hit": cache_hit,
-                        "capture_count": self.capture_count - capture_before,
-                        "capture_reuse_count": self.capture_reuse_count - reuse_before,
-                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-                    }
+                        self.last_hits[image_key] = (center_x, center_y, width, height)
+                        return {
+                            "ok": True,
+                            "found": True,
+                            "x": center_x,
+                            "y": center_y,
+                            "confidence": round(confidence, 6),
+                            "best_score": round(max(best_score, confidence), 6),
+                            "width": width,
+                            "height": height,
+                            "profile": profile,
+                            "cache_hit": cache_hit,
+                            "capture_count": self.capture_count - capture_before,
+                            "capture_reuse_count": self.capture_reuse_count - reuse_before,
+                            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                        }
                 if timeout_ms <= 0 or time.perf_counter() >= deadline:
                     break
                 adaptive_poll, cpu = self._adaptive_poll(poll_ms)
@@ -725,153 +585,12 @@ class VisionState:
                 "ok": True,
                 "found": False,
                 "best_score": round(best_score, 6),
-                "match_count": best_match_count,
-                "required_count": target_count,
                 "profile": profile,
                 "cache_hit": cache_hit,
                 "capture_count": self.capture_count - capture_before,
                 "capture_reuse_count": self.capture_reuse_count - reuse_before,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
                 "adaptive_poll_ms": self._adaptive_poll(poll_ms)[0],
-            }
-
-    def multi_pixel(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Find each configured colour inside its region from one frame per poll."""
-        started = time.perf_counter()
-        with self._lock:
-            self.last_activity = time.time()
-            self.request_count += 1
-            raw_points = request.get("points")
-            points: list[dict[str, Any]] = []
-            for item in raw_points if isinstance(raw_points, list) else []:
-                if not isinstance(item, dict) or not bool(item.get("enabled", True)):
-                    continue
-                try:
-                    x = int(item.get("x"))
-                    y = int(item.get("y"))
-                    color = str(item.get("color") or "#FFFFFF").strip().lstrip("#")
-                    expected = int(color, 16)
-                except (TypeError, ValueError):
-                    continue
-                raw_region = item.get("region")
-                try:
-                    region = [int(value) for value in raw_region[:4]] if isinstance(raw_region, list) and len(raw_region) >= 4 else [x, y, x + 1, y + 1]
-                except (TypeError, ValueError):
-                    region = [x, y, x + 1, y + 1]
-                if region[2] <= region[0] or region[3] <= region[1]:
-                    region = [x, y, x + 1, y + 1]
-                points.append(
-                    {
-                        "x": x,
-                        "y": y,
-                        "r": (expected >> 16) & 0xFF,
-                        "g": (expected >> 8) & 0xFF,
-                        "b": expected & 0xFF,
-                        "tolerance": max(0, min(255, int(item.get("tolerance") or 0))),
-                        "source_index": int(item.get("index") or len(points) + 1),
-                        "region": region,
-                    }
-                )
-            if not points:
-                return {"ok": False, "found": False, "error": "NO_PIXELS", "detail": "no enabled pixels"}
-
-            left = min(item["region"][0] for item in points)
-            top = min(item["region"][1] for item in points)
-            right = max(item["region"][2] for item in points)
-            bottom = max(item["region"][3] for item in points)
-            policy = str(request.get("match_policy") or "all").casefold()
-            required = max(1, int(request.get("required_count") or 1))
-            if policy == "all":
-                required = len(points)
-            elif policy == "any":
-                required = 1
-            required = min(required, len(points))
-            stable_required = max(1, min(100, int(request.get("stable_hits") or 1)))
-            timeout_ms = max(0, int(request.get("timeout") or 0))
-            poll_ms = max(10, int(request.get("poll") or 30))
-            click_index = max(0, int(request.get("click_index") or 0))
-            deadline = time.perf_counter() + timeout_ms / 1000.0
-            stable_count = 0
-            best_count = 0
-            last_matches: list[dict[str, Any]] = []
-            captures = 0
-
-            while True:
-                cycle_started = time.perf_counter()
-                frame, _reused = self._capture(
-                    (left, top, right, bottom),
-                    str(request.get("capture_context") or "multi_pixel"),
-                    0,
-                )
-                captures += 1
-                matches: list[dict[str, Any]] = []
-                if frame is not None and getattr(frame, "size", 0):
-                    for item in points:
-                        region = item["region"]
-                        x1 = max(0, region[0] - left)
-                        y1 = max(0, region[1] - top)
-                        x2 = min(frame.shape[1], region[2] - left)
-                        y2 = min(frame.shape[0], region[3] - top)
-                        if x2 <= x1 or y2 <= y1:
-                            continue
-                        crop = frame[y1:y2, x1:x2, :3]
-                        tolerance = item["tolerance"]
-                        delta = abs(crop.astype("int16") - [item["b"], item["g"], item["r"]])
-                        mask = (delta <= tolerance).all(axis=2)
-                        locations = mask.nonzero()
-                        if locations[0].size:
-                            matched = dict(item)
-                            matched["x"] = int(left + x1 + locations[1][0])
-                            matched["y"] = int(top + y1 + locations[0][0])
-                            matches.append(matched)
-                match_count = len(matches)
-                best_count = max(best_count, match_count)
-                if policy == "exact_n":
-                    satisfied = match_count == required
-                else:
-                    satisfied = match_count >= required
-                if satisfied:
-                    stable_count += 1
-                    last_matches = matches
-                else:
-                    stable_count = 0
-                    last_matches = matches
-                if stable_count >= stable_required:
-                    selected = next(
-                        (item for item in matches if item["source_index"] == click_index),
-                        matches[0] if matches else points[0],
-                    )
-                    return {
-                        "ok": True,
-                        "found": True,
-                        "match_count": match_count,
-                        "required_count": required,
-                        "stable_hits": stable_count,
-                        "matched_indexes_csv": ",".join(str(item["source_index"]) for item in matches),
-                        "x": int(matches[0]["x"] if matches else selected["x"]),
-                        "y": int(matches[0]["y"] if matches else selected["y"]),
-                        "click_x": int(selected["x"]),
-                        "click_y": int(selected["y"]),
-                        "capture_count": captures,
-                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-                    }
-                if timeout_ms <= 0 or time.perf_counter() >= deadline:
-                    break
-                adaptive_poll, _cpu = self._adaptive_poll(poll_ms)
-                remaining = max(0.0, adaptive_poll / 1000.0 - (time.perf_counter() - cycle_started))
-                if remaining:
-                    time.sleep(remaining)
-
-            return {
-                "ok": True,
-                "found": False,
-                "match_count": len(last_matches),
-                "best_match_count": best_count,
-                "required_count": required,
-                "stable_hits": stable_count,
-                "matched_indexes_csv": ",".join(str(item["source_index"]) for item in last_matches),
-                "capture_count": captures,
-                "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
             }
 
     def status(self) -> dict[str, Any]:
@@ -921,8 +640,6 @@ class VisionHandler(socketserver.StreamRequestHandler):
                 response = self.server.state.status()
             elif command == "search":
                 response = self.server.state.search(request)
-            elif command == "multi_pixel":
-                response = self.server.state.multi_pixel(request)
             elif command == "preload":
                 response = self.server.state.preload(request)
             elif command == "benchmark":

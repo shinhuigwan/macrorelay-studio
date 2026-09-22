@@ -152,14 +152,26 @@ class HotkeysPage(QtWidgets.QWidget):
         apply_button.clicked.connect(self._apply_runner)
         stop = danger_button("Runner 중지")
         stop.clicked.connect(self._stop_runner)
+        btn_deck = primary_button("📱 스트림덱 뷰어")
+        btn_deck.setToolTip("보조 터치 모니터용 퀵슬롯 스트림덱 전용 창을 엽니다.")
+        btn_deck.clicked.connect(self._launch_deck_window)
         layout.addWidget(self.runner_status)
         layout.addWidget(self.runner_detail)
         layout.addStretch(1)
+        layout.addWidget(btn_deck)
         layout.addWidget(self.startup_check)
         layout.addWidget(self.start_runner_button)
         layout.addWidget(apply_button)
         layout.addWidget(stop)
         return card
+
+    def _launch_deck_window(self) -> None:
+        from .quickslot_deck import QuickSlotDeckWindow
+        if not hasattr(self, "_deck_window") or self._deck_window is None or not self._deck_window.isVisible():
+            self._deck_window = QuickSlotDeckWindow(self.repository)
+        self._deck_window.show()
+        self._deck_window.raise_()
+        self._deck_window.activateWindow()
 
     def refresh(self) -> None:
         self.payload = self.repository.load_hotkeys()

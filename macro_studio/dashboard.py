@@ -96,10 +96,16 @@ class DashboardPage(QtWidgets.QWidget):
         self.slots_list.itemDoubleClicked.connect(self._run_slot)
         manage_slots = QtWidgets.QPushButton("슬롯과 단축키 관리")
         manage_slots.clicked.connect(lambda: self.open_page.emit("hotkeys"))
+        open_deck = QtWidgets.QPushButton("📱 스트림덱 뷰어")
+        open_deck.setToolTip("보조 터치 모니터용 스트림덱 독립 실행 창을 엽니다.")
+        open_deck.clicked.connect(self._launch_deck_window)
+        slot_btns_layout = QtWidgets.QHBoxLayout()
+        slot_btns_layout.addWidget(manage_slots, 1)
+        slot_btns_layout.addWidget(open_deck, 1)
         slots_layout.addWidget(slots_title)
         slots_layout.addWidget(slots_hint)
         slots_layout.addWidget(self.slots_list, 1)
-        slots_layout.addWidget(manage_slots)
+        slots_layout.addLayout(slot_btns_layout)
         content.addWidget(slots_card, 2)
         root.addLayout(content, 1)
 
@@ -144,6 +150,14 @@ class DashboardPage(QtWidgets.QWidget):
         name = str(item.data(QtCore.Qt.UserRole) or "")
         if name:
             self.run_macro.emit(name)
+
+    def _launch_deck_window(self) -> None:
+        from .quickslot_deck import QuickSlotDeckWindow
+        if not hasattr(self, "_deck_window") or self._deck_window is None or not self._deck_window.isVisible():
+            self._deck_window = QuickSlotDeckWindow(self.repository)
+        self._deck_window.show()
+        self._deck_window.raise_()
+        self._deck_window.activateWindow()
 
     def _sync_selection(self, item, _previous) -> None:
         if item:

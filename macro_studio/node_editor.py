@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import json
 import math
 from pathlib import Path
 from typing import Any
@@ -41,8 +40,6 @@ ACTION_STYLES: dict[str, tuple[str, str]] = {
     "multi_pixel_check": ("PIXELS", "#FF6B9D"),
     "wait_color": ("WAITCLR", "#F5B942"),
     "color_ratio": ("GAUGE", "#FF6B9D"),
-    "multi_image_search": ("MULTI-IMG", "#38BDF8"),
-    "animation_search": ("ANIM", "#A78BFA"),
 }
 
 ACTION_TITLES = {
@@ -55,8 +52,6 @@ ACTION_TITLES = {
     "call_submacro": "서브매크로", "vault_get": "보안 값", "run_program": "프로그램 실행", "terminate_program": "프로그램 종료",
     "pixel_search": "색상 서치", "ocr_tracking": "OCR 추적",
     "multi_pixel_check": "다중 픽셀 체크", "wait_color": "색상 변화 대기", "color_ratio": "색상 비율 게이지",
-    "multi_image_search": "멀티 이미지 서치",
-    "animation_search": "애니메이션 서치",
 }
 
 
@@ -96,37 +91,19 @@ class NodeGraphScene(QtWidgets.QGraphicsScene):
                 event.accept()
                 return
 
-            selected_edges = [
-                item for item in self.selectedItems()
-                if isinstance(item, EdgeItem)
-            ]
-            selected_nodes = sorted(
+            selected = sorted(
                 item.index for item in self.selectedItems() if isinstance(item, NodeItem)
             )
-
-            handled = False
             canvas = None
-
-            if selected_edges:
-                canvas = getattr(selected_edges[0], "canvas", None)
-                if canvas is not None and hasattr(canvas, "delete_selected_edges"):
-                    canvas.delete_selected_edges(selected_edges)
-                    handled = True
-
-            if selected_nodes:
-                if canvas is None:
-                    for item in self.selectedItems():
-                        if isinstance(item, NodeItem):
-                            canvas = item.canvas
-                            break
-                if canvas is not None:
-                    for index in reversed(selected_nodes):
-                        canvas.node_delete_requested.emit(index)
-                    handled = True
-
-            if handled:
-                event.accept()
-                return
+            for item in self.selectedItems():
+                if isinstance(item, NodeItem):
+                    canvas = item.canvas
+                    break
+            if canvas is not None:
+                for index in reversed(selected):
+                    canvas.node_delete_requested.emit(index)
+            event.accept()
+            return
         super().keyPressEvent(event)
 
 
@@ -135,8 +112,6 @@ class NodeGraphView(QtWidgets.QGraphicsView):
 
     def __init__(self, scene: QtWidgets.QGraphicsScene, parent=None) -> None:
         super().__init__(scene, parent)
-        self.setAcceptDrops(True)
-        self.viewport().setAcceptDrops(True)
         self.setRenderHints(
             QtGui.QPainter.Antialiasing
             | QtGui.QPainter.TextAntialiasing
@@ -146,7 +121,6 @@ class NodeGraphView(QtWidgets.QGraphicsView):
         self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
         self.setDragMode(QtWidgets.QGraphicsView.RubberBandDrag)
-        self.setRubberBandSelectionMode(QtCore.Qt.IntersectsItemShape)
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
@@ -165,46 +139,6 @@ class NodeGraphView(QtWidgets.QGraphicsView):
         self._double_click_pan = False
         self._pan_start = QtCore.QPoint()
         self._zoom = 100
-
-    @staticmethod
-    def _quick_node_kind(event: QtCore.QEvent) -> str:
-        mime = getattr(event, "mimeData", lambda: None)()
-        if mime is None or not mime.hasFormat("application/x-macrostudio-nodeicon"):
-            return ""
-        try:
-            return bytes(mime.data("application/x-macrostudio-nodeicon")).decode("utf-8").strip()
-        except (TypeError, ValueError, UnicodeDecodeError):
-            return ""
-
-    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
-        if self._quick_node_kind(event):
-            event.acceptProposedAction()
-            return
-        super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
-        kind = self._quick_node_kind(event)
-        canvas = self.parent()
-        if kind and isinstance(canvas, NodeCanvas):
-            canvas.preview_quick_node_drop(kind, self.mapToScene(event.position().toPoint()))
-            event.acceptProposedAction()
-            return
-        super().dragMoveEvent(event)
-
-    def dragLeaveEvent(self, event: QtGui.QDragLeaveEvent) -> None:
-        canvas = self.parent()
-        if isinstance(canvas, NodeCanvas):
-            canvas.clear_quick_node_preview()
-        super().dragLeaveEvent(event)
-
-    def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        kind = self._quick_node_kind(event)
-        canvas = self.parent()
-        if kind and isinstance(canvas, NodeCanvas):
-            canvas.commit_quick_node_drop(kind, self.mapToScene(event.position().toPoint()))
-            event.acceptProposedAction()
-            return
-        super().dropEvent(event)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -229,33 +163,17 @@ class NodeGraphView(QtWidgets.QGraphicsView):
             event.accept()
             return
         if event.button() == QtCore.Qt.LeftButton and not self.itemAt(event.position().toPoint()):
-            if event.modifiers() & QtCore.Qt.ControlModifier:
-                # Reserve Ctrl + double-click for the contextual node picker.
-                # Consuming the first press prevents rubber selection or a
-                # pending toolbar placement from firing before the double-click.
-                event.accept()
-                return
             canvas = self.parent()
             if isinstance(canvas, NodeCanvas):
-                if canvas.commit_pending_node_placement(self.mapToScene(event.position().toPoint())):
-                    event.accept()
-                    return
                 canvas.begin_rubber_selection()
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton and not self.itemAt(event.position().toPoint()):
-            canvas = self.parent()
-            if event.modifiers() & QtCore.Qt.ControlModifier:
-                if isinstance(canvas, NodeCanvas):
-                    canvas.request_node_add_at(self.mapToScene(event.position().toPoint()))
-            else:
-                # Preserve the original canvas navigation gesture: keep the
-                # second left press held and drag to pan the view.
-                self._panning = True
-                self._double_click_pan = True
-                self._pan_start = event.position().toPoint()
-                self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
+            self._panning = True
+            self._double_click_pan = True
+            self._pan_start = event.position().toPoint()
+            self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -311,10 +229,6 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                     act_align_dh = align_sub.addAction("↔ 가로 간격 균등 분배")
                     act_align_dv = align_sub.addAction("↕ 세로 간격 균등 분배")
                     menu.addSeparator()
-                act_collapse_nodes = menu.addAction(f"⊟ 선택 노드 {len(selected_nodes)}개 접기") if selected_nodes else None
-                act_expand_nodes = menu.addAction(f"⊞ 선택 노드 {len(selected_nodes)}개 펼치기") if selected_nodes else None
-                if selected_nodes:
-                    menu.addSeparator()
                 act_group = menu.addAction("🗂️ 여기에 새 노드 그룹 추가...")
                 act_archive = menu.addAction("📦 노드 보관함 열기...")
                 act_auto = menu.addAction("자동 정렬")
@@ -323,11 +237,7 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                 if not chosen:
                     event.accept()
                     return
-                if act_collapse_nodes is not None and chosen == act_collapse_nodes:
-                    canvas.set_nodes_collapsed(selected_nodes, True)
-                elif act_expand_nodes is not None and chosen == act_expand_nodes:
-                    canvas.set_nodes_collapsed(selected_nodes, False)
-                elif act_branch is not None and chosen == act_branch:
+                if act_branch is not None and chosen == act_branch:
                     canvas.branch_chain_requested.emit(selected_nodes)
                 elif chosen == act_align_top:
                     canvas.align_selected_nodes("top")
@@ -359,12 +269,7 @@ class NodeGraphView(QtWidgets.QGraphicsView):
         self.zoom_changed.emit(self._zoom)
 
     def fit_all(self) -> None:
-        rect = QtCore.QRectF()
-        for item in self.scene().items():
-            if not item.isVisible():
-                continue
-            item_rect = item.sceneBoundingRect()
-            rect = rect.united(item_rect) if not rect.isNull() else QtCore.QRectF(item_rect)
+        rect = self.scene().itemsBoundingRect()
         if rect.isEmpty():
             return
         self.fitInView(rect.adjusted(-70, -70, 70, 70), QtCore.Qt.KeepAspectRatio)
@@ -591,51 +496,9 @@ class NodeImagePreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
         super().hoverLeaveEvent(event)
 
     def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
-        if event.button() == QtCore.Qt.LeftButton and self.step_index is not None:
+        if event.button() == QtCore.Qt.LeftButton and self.step_index is not None and (self.entries or self._pixmap):
             self.canvas.hide_image_preview()
             self.canvas.image_edit_requested.emit(self.step_index)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-
-class NodeColorPreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
-    """Interactive color preview badge on node cards."""
-
-    def __init__(
-        self,
-        canvas: "NodeCanvas",
-        colors: list[str],
-        step_index: int | None = None,
-        parent=None,
-    ) -> None:
-        super().__init__("🎨" if len(colors) > 1 else "◈", parent)
-        self.canvas = canvas
-        self.colors = colors
-        self.step_index = step_index
-        self.setAcceptHoverEvents(True)
-
-    def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
-        if event.button() == QtCore.Qt.LeftButton and self.step_index is not None:
-            self.canvas.color_visual_test_requested.emit(self.step_index)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-
-class NodeMultiPixelPreviewBadge(QtWidgets.QGraphicsSimpleTextItem):
-    """Top-right shortcut for the multi-pixel live region preview."""
-
-    def __init__(self, canvas: "NodeCanvas", colors: list[str], step_index: int, parent=None) -> None:
-        super().__init__("▦", parent)
-        self.canvas = canvas
-        self.colors = colors
-        self.step_index = step_index
-        self.setAcceptHoverEvents(True)
-
-    def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
-        if event.button() == QtCore.Qt.LeftButton:
-            self.canvas.multi_pixel_visual_test_requested.emit(self.step_index)
             event.accept()
             return
         super().mousePressEvent(event)
@@ -739,14 +602,12 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
         return self._rect.adjusted(-4, -4, 4, 4)
 
     def path(self) -> QtGui.QPainterPath:
-        """Return the visible lane outline for tests and accessibility tools."""
         path = QtGui.QPainterPath()
         if not self._rect.isNull():
             path.addRoundedRect(self._rect, 14, 14)
         return path
 
     def __iter__(self):
-        """Preserve the former (item, label, indexes) inspection contract."""
         return iter((self, self.label_text, self.indexes))
 
     def sync_rect(self) -> None:
@@ -819,12 +680,7 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
 
     def mouseDoubleClickEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
         if self._header_rect().contains(event.pos()):
-            if event.pos().x() <= self._rect.x() + 26:
-                self.toggle_fold()
-            else:
-                self._dragging = False
-                self.setCursor(QtCore.Qt.OpenHandCursor)
-                self.canvas.workflow_rename_requested.emit(self.workflow_id)
+            self.toggle_fold()
             event.accept()
 
     def toggle_fold(self) -> None:
@@ -891,26 +747,17 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self.index = index
         self.step = step
         self.canvas = canvas
-        self._workflow_drag_bounds: QtCore.QRectF | None = None
         self.collapsed = index in canvas.collapsed_nodes
         self.is_multi = (
-            str(step.get("action") or "") in {"multi_image_search", "animation_search"}
-            or (str(step.get("action") or "") == "image_search" and len(step.get("assets") or []) > 1)
-        )
-        self.is_multi_color = (
-            str(step.get("action") or "") == "pixel_search"
-            and len(step.get("colors") or []) > 1
+            str(step.get("action") or "") == "image_search"
+            and len(step.get("assets") or []) > 1
         )
         custom_label = str(step.get("label") or step.get("name") or "").strip()
         self.display_title = (
             custom_label
             if custom_label
-            else "애니메이션 서치"
-            if str(step.get("action") or "") == "animation_search"
             else "멀티 이미지 서치"
             if self.is_multi
-            else f"멀티 색상 서치 · {len(step.get('colors') or [])}개"
-            if self.is_multi_color
             else "서브플로우"
             if str(step.get("action") or "") == "call_submacro"
             else ACTION_TITLES.get(str(step.get("action") or "step"), str(step.get("action") or "step"))
@@ -934,8 +781,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
 
         self._sync_compact_geometry()
 
-        self.preview_badge: QtWidgets.QGraphicsSimpleTextItem | None = None
-        if str(step.get("action") or "") in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
+        self.preview_badge: NodeImagePreviewBadge | None = None
+        if str(step.get("action") or "") in {"image_search", "screen_condition"}:
             aliases = [str(value) for value in step.get("assets") or [] if str(value).strip()] if isinstance(step.get("assets"), list) else []
             primary = str(step.get("asset") or "").strip()
             if primary and primary not in aliases:
@@ -961,45 +808,9 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 )
             elif live_pixmap is not None:
                 region_hint = f"<br>서치 영역: {live_region[2]-live_region[0]}×{live_region[3]-live_region[1]}" if live_region and len(live_region) >= 4 else ""
-                badge.setToolTip(f"<b>캡처 이미지</b><br>{live_pixmap.width()}×{live_pixmap.height()}{region_hint}<br>커서를 올리면 미리보기 · 클릭하면 상세 편집")
+                badge.setToolTip(f"<b>캡처 이미지</b><br>{live_pixmap.width()}×{live_pixmap.height()}{region_hint}<br>커서를 올리면 미리보기")
             else:
                 badge.setToolTip("이미지 미선택")
-            self.preview_badge = badge
-            badge.setVisible(not self.collapsed)
-        elif str(step.get("action") or "") == "multi_pixel_check":
-            raw = step.get("pixels") or []
-            try:
-                samples = json.loads(raw) if isinstance(raw, str) else list(raw)
-            except Exception:
-                samples = []
-            colors = [str(item.get("color") or "#FFFFFF") for item in samples if isinstance(item, dict) and bool(item.get("enabled", True))]
-            badge = NodeMultiPixelPreviewBadge(canvas, colors, index, self)
-            font = QtGui.QFont("Segoe UI Symbol", 9)
-            font.setBold(True)
-            badge.setFont(font)
-            badge.setBrush(QtGui.QColor(colors[0]) if colors and QtGui.QColor(colors[0]).isValid() else QtGui.QColor("#FF6B9D"))
-            badge.setPos(self.current_width() - 22, 6)
-            badge.setZValue(8)
-            badge.setCursor(QtCore.Qt.PointingHandCursor)
-            badge.setToolTip(f"<b>다중 픽셀 체크 ({len(colors)}색)</b><br>클릭하면 지정 영역의 실시간 색상 검사를 엽니다.")
-            self.preview_badge = badge
-            badge.setVisible(not self.collapsed)
-        elif str(step.get("action") or "") == "pixel_search":
-            colors = [str(value).strip() for value in (step.get("colors") or []) if str(value).strip()]
-            primary = str(step.get("color") or "#FF0000").strip()
-            if primary and primary not in colors:
-                colors.insert(0, primary)
-            badge = NodeColorPreviewBadge(canvas, colors, index, self)
-            font = QtGui.QFont("Segoe UI Symbol", 9)
-            font.setBold(True)
-            badge.setFont(font)
-            first_c = colors[0] if colors else "#FF6B9D"
-            badge.setBrush(QtGui.QColor(first_c) if QtGui.QColor(first_c).isValid() else QtGui.QColor("#FF6B9D"))
-            badge.setPos(self.current_width() - 22, 6)
-            badge.setZValue(8)
-            badge.setCursor(QtCore.Qt.PointingHandCursor)
-            title = f"멀티 색상 서치 ({len(colors)}개)" if len(colors) > 1 else "색상 서치"
-            badge.setToolTip(f"<b>{title}</b><br>색상: {', '.join(colors)}<br>클릭하면 실시간 영역 검증 및 미세조정")
             self.preview_badge = badge
             badge.setVisible(not self.collapsed)
 
@@ -1044,7 +855,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
     def hoverEnterEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
         super().hoverEnterEvent(event)
         summary = self.canvas.step_summary(self.step)
-        detail_lines = self.canvas.node_connection_details(self.index, self.step)
+        detail_lines = []
         if self.step.get("window"):
             detail_lines.append(f"<b>대상:</b> {html.escape(str(self.step['window']))}")
         if self.step.get("text"):
@@ -1338,9 +1149,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
         action = str(self.step.get("action") or "step")
         action_title = self.display_title
         badge, accent = ("MULTI", "#38E7FF") if getattr(self, "is_multi", False) else ACTION_STYLES.get(action, ("STEP", COLORS["muted"]))
-        group_theme = self.canvas.node_group_theme(self.index)
-        if group_theme is not None:
-            accent = str(group_theme["header"])
         selected = self.isSelected()
         running = self.index == self.canvas.active_step
         execution = self.canvas.execution_states.get(self.index, {})
@@ -1372,8 +1180,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
             if selected
             else COLORS["warning"]
             if candidate_position
-            else str(group_theme["border"])
-            if group_theme is not None
             else "#363E54"
         )
         border_width = 3.8 if running else (2.5 if needs_setup else 2.2 if selected else max(1.6, 1.2 * line_boost ** 0.5))
@@ -1396,11 +1202,11 @@ class NodeItem(QtWidgets.QGraphicsObject):
         num_font_size = max(8, int(8.5 * font_boost))
         num_font = QtGui.QFont("Segoe UI", num_font_size, QtGui.QFont.Bold)
         painter.setPen(QtCore.Qt.NoPen)
-        painter.setBrush(QtGui.QColor(str(group_theme["border"])) if group_theme is not None else QtGui.QColor("#6F62D9"))
+        painter.setBrush(QtGui.QColor("#6F62D9"))
         painter.drawRoundedRect(QtCore.QRectF(5, 4, 22, 20), 5, 5)
         painter.setPen(QtGui.QColor("#FFFFFF"))
         painter.setFont(num_font)
-        painter.drawText(QtCore.QRectF(5, 4, 22, 20), QtCore.Qt.AlignCenter, str(self.canvas.display_number(self.index)))
+        painter.drawText(QtCore.QRectF(5, 4, 22, 20), QtCore.Qt.AlignCenter, str(self.index))
 
         # Action Title (Crisp white bold title)
         title_font_size = max(9, int(9.5 * font_boost))
@@ -1568,9 +1374,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
 
     def mouseReleaseEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
         super().mouseReleaseEvent(event)
-        if not self.canvas.suspended and self._workflow_drag_bounds is not None:
-            self.canvas.check_node_workflow_membership(self, self._workflow_drag_bounds)
-        self._workflow_drag_bounds = None
         if not self.canvas.suspended and hasattr(self.canvas, "check_node_group_membership"):
             self.canvas.check_node_group_membership(self)
 
@@ -1634,13 +1437,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
         event.accept()
 
     def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
-        if getattr(self.canvas, "_node_target_pick_active", False):
-            if event.button() == QtCore.Qt.LeftButton:
-                self.canvas.complete_node_target_pick(self.index)
-            elif event.button() == QtCore.Qt.RightButton:
-                self.canvas.cancel_node_target_pick()
-            event.accept()
-            return
         point = event.pos()
         w = self.current_width()
         if event.button() == QtCore.Qt.LeftButton and 0 <= point.y() <= 28:
@@ -1663,9 +1459,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 self.canvas.set_nodes_collapsed(indexes, not self.collapsed)
                 event.accept()
                 return
-        if event.button() == QtCore.Qt.LeftButton:
-            lane = self.canvas.workflow_lane_for_node(self.index)
-            self._workflow_drag_bounds = QtCore.QRectF(lane._rect) if lane is not None else None
         super().mousePressEvent(event)
 
     def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:
@@ -1702,17 +1495,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
         if current_group is not None:
             act_leave_group = menu.addAction(f"📤 노드 그룹 '{current_group.title}'에서 제외")
             act_split_to_new = menu.addAction(f"📤 현재 그룹에서 분리 (새 그룹으로 독립)")
-
-        workflow_steps = [
-            idx for idx in selected_indexes
-            if 0 < idx <= len(self.canvas.steps)
-            and str(self.canvas.steps[idx - 1].get("workflow_id") or "").strip()
-        ]
-        act_leave_workflow = None
-        if workflow_steps:
-            first = self.canvas.steps[workflow_steps[0] - 1]
-            workflow_label = str(first.get("workflow_label") or first.get("workflow_id") or "스마트 작업").strip()
-            act_leave_workflow = menu.addAction(f"📤 '{workflow_label}'에서 제외")
 
         add_group_menu = None
         group_actions = {}
@@ -1751,24 +1533,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
         ]
         merge_multi = menu.addAction("▦ 선택 이미지 서치를 멀티 서치로 묶기")
         merge_multi.setEnabled(len(selected_image_nodes) >= 2 and len(selected_image_nodes) == len(selected_indexes))
-        selected_color_nodes = [
-            index
-            for index in selected_indexes
-            if index in self.canvas.nodes
-            and str(self.canvas.steps[index - 1].get("action") or "") == "pixel_search"
-        ]
-        merge_color_multi = menu.addAction("🎨 선택 색상 서치를 멀티 색상 서치로 묶기")
-        merge_color_multi.setEnabled(len(selected_color_nodes) >= 2 and len(selected_color_nodes) == len(selected_indexes))
-        act_color_test = None
-        if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") == "pixel_search":
-            act_color_test = menu.addAction("🔍 색상 검색 영역 검증 및 실시간 검사...")
-        act_multi_pixel_test = None
-        if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") == "multi_pixel_check":
-            act_multi_pixel_test = menu.addAction("🔍 다중 픽셀 검색 영역 미리보기 및 실시간 검사...")
-        act_image_visual_test = None
-        if len(selected_indexes) == 1 and 0 < self.index <= len(self.canvas.steps) and str(self.canvas.steps[self.index - 1].get("action") or "") in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
-            is_mis = str(self.canvas.steps[self.index - 1].get("action") or "") in {"multi_image_search", "animation_search"}
-            act_image_visual_test = menu.addAction("🔍 멀티 이미지 시각화 및 실시간 검사 (미리보기)..." if is_mis else "🔍 이미지 검색 영역 검증 및 실시간 검사...")
         menu.addSeparator()
         if len(selected_indexes) >= 2:
             act_branch = menu.addAction(f"🔀 선택 노드 {len(selected_indexes)}개를 순차 분기로 연결 (실패 시 다음 분기)")
@@ -1784,7 +1548,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
         act_unbranch = menu.addAction(f"⛓️ 선택 노드 {len(selected_indexes)}개 분기 해제 (실패선 제거)") if has_branch else None
         menu.addSeparator()
         duplicate = menu.addAction("노드 복제")
-        archive = menu.addAction("🗑 선택 노드 삭제" if getattr(self.canvas, "live_edit_mode", False) else "노드 보관")
+        archive = menu.addAction("노드 보관")
         open_archive = menu.addAction("📦 노드 보관함 열기...")
         chosen = menu.exec(event.screenPos())
         if not chosen:
@@ -1812,8 +1576,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 other_colors = [c for c in NODE_GROUP_THEMES.keys() if c != getattr(current_group, "color_name", "yellow")]
                 new_color = other_colors[0] if other_colors else "blue"
                 self.canvas.add_comment_box_for_selection(title=new_title, color=new_color)
-        elif act_leave_workflow and chosen == act_leave_workflow:
-            self.canvas.detach_nodes_from_workflow(workflow_steps)
         elif add_group_menu and chosen in group_actions:
             target_group = group_actions[chosen]
             for idx in selected_indexes:
@@ -1843,14 +1605,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
             self.canvas.all_wait_duration_requested.emit()
         elif chosen == merge_multi:
             self.canvas.multi_image_merge_requested.emit(selected_image_nodes)
-        elif chosen == merge_color_multi:
-            self.canvas.multi_color_merge_requested.emit(selected_color_nodes)
-        elif act_color_test is not None and chosen == act_color_test:
-            self.canvas.color_visual_test_requested.emit(self.index)
-        elif act_multi_pixel_test is not None and chosen == act_multi_pixel_test:
-            self.canvas.multi_pixel_visual_test_requested.emit(self.index)
-        elif act_image_visual_test is not None and chosen == act_image_visual_test:
-            self.canvas.image_visual_test_requested.emit(self.index)
         elif chosen == duplicate:
             self.canvas.node_duplicate_requested.emit(self.index)
         elif chosen == archive:
@@ -1899,8 +1653,6 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         condition_index: int = -1,
         rule: dict[str, Any] | None = None,
         candidate_index: int = 0,
-        asset_entries: list[tuple[int, str]] | None = None,
-        asset_outcome: str = "",
     ) -> None:
         super().__init__()
         self.canvas = canvas
@@ -1912,21 +1664,10 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self.is_secondary_candidate = candidate_index > 0
         self.rule = rule or {}
         self.is_condition = condition_index >= 0
-        self.asset_entries = list(asset_entries or [])
-        self.asset_outcome = str(asset_outcome or "")
-        self.is_asset_route = bool(self.asset_entries) and self.asset_outcome in {"true", "fail"}
         is_return_flow = self.is_return_link()
-        self.edge_type = (
-            "asset_route" if self.is_asset_route
-            else ("return" if is_return_flow else ("condition" if self.is_condition else "normal"))
-        )
+        self.edge_type = "return" if is_return_flow else ("condition" if self.is_condition else "normal")
 
-        if self.edge_type == "asset_route":
-            self.color = QtGui.QColor("#45CBB0" if self.asset_outcome == "true" else "#DE718B")
-            line_style = QtCore.Qt.DashLine
-            pen_width = 1.45
-            self.setOpacity(0.58)
-        elif self.edge_type == "return":
+        if self.edge_type == "return":
             self.color = QtGui.QColor("#2CDBB8" if kind == "success" else "#F06292")
             line_style = QtCore.Qt.DashLine
             pen_width = 2.4
@@ -1948,23 +1689,16 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self.arrow = QtWidgets.QGraphicsPolygonItem(self)
         self.arrow.setBrush(self.color)
         self.arrow.setPen(QtCore.Qt.NoPen)
-        self.arrow.setAcceptedMouseButtons(QtCore.Qt.NoButton)
         self.target_arrow = QtWidgets.QGraphicsPolygonItem(self)
         self.target_arrow.setBrush(self.color)
         self.target_arrow.setPen(QtCore.Qt.NoPen)
-        self.target_arrow.setAcceptedMouseButtons(QtCore.Qt.NoButton)
         self.target_arrow.setVisible(False)
         self.label = QtWidgets.QGraphicsSimpleTextItem("", self)
         self.label.setBrush(self.color.lighter(130))
         self.label.setFont(QtGui.QFont("Malgun Gothic", 7))
         self.label.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations, True)
-        self.label.setAcceptedMouseButtons(QtCore.Qt.NoButton)
         self.setCursor(QtCore.Qt.OpenHandCursor)
-        self.setToolTip(
-            "개별 이미지 분기선입니다. 더블클릭하면 해당 이미지 설정을 엽니다."
-            if self.is_asset_route
-            else "선을 빈 공간으로 드래그해 즉시 끊거나, 다른 노드로 드래그해 다시 연결합니다."
-        )
+        self.setToolTip("선을 빈 공간으로 드래그해 즉시 끊거나, 다른 노드로 드래그해 다시 연결합니다.")
         self._drag_origin = QtCore.QPointF()
         self._dragging = False
         self.route_side = ""
@@ -1977,8 +1711,6 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         self.update_path()
 
     def is_return_link(self) -> bool:
-        if getattr(self, "is_asset_route", False):
-            return False
         if getattr(self, "is_condition", False):
             return False
         source_node = self.canvas.nodes.get(self.source)
@@ -2028,56 +1760,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
     def itemChange(self, change: QtWidgets.QGraphicsItem.GraphicsItemChange, value: Any) -> Any:
         result = super().itemChange(change, value)
         if change == QtWidgets.QGraphicsItem.ItemSelectedHasChanged and not self._disposed:
-            self._sync_selected_visual()
             QtCore.QTimer.singleShot(0, self._sync_waypoint_handles)
         return result
-
-    def _sync_selected_visual(self) -> None:
-        if self._disposed:
-            return
-        try:
-            selected = self.isSelected()
-        except RuntimeError:
-            return
-        if selected:
-            highlight = QtGui.QColor(
-                ("#63FFE0" if self.asset_outcome == "true" else "#FF8BA5") if self.is_asset_route
-                else "#38E7FF" if self.kind == "success" and not self.is_condition
-                else ("#FF4B72" if self.kind == "fail" and not self.is_condition else "#FFE600")
-            )
-            style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") in {"return", "asset_route"} or self.is_condition else QtCore.Qt.SolidLine
-            self.setPen(QtGui.QPen(highlight, 3.0 if self.is_asset_route else 4.2, style, QtCore.Qt.RoundCap))
-            self.setOpacity(1.0)
-            self.setZValue(30)
-            self.arrow.setBrush(highlight)
-            if hasattr(self, "target_arrow"):
-                self.target_arrow.setBrush(highlight)
-            self.label.setBrush(highlight)
-        else:
-            node_selected = self.canvas.selected_indexes() if hasattr(self, "canvas") else []
-            if not node_selected:
-                base_opacity = (
-                    0.58 if self.is_asset_route
-                    else 0.38 if getattr(self, "edge_type", "") == "return" and self.kind == "success"
-                    else (0.35 if getattr(self, "edge_type", "") == "return"
-                    else (0.50 if self.is_condition else 0.45))
-                )
-                self.setZValue(-1)
-            elif self.source in node_selected or self.target in node_selected:
-                base_opacity = 1.0
-                self.setZValue(15)
-            else:
-                base_opacity = 0.18
-                self.setZValue(-2)
-            self.setOpacity(base_opacity)
-            style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") in {"return", "asset_route"} or self.is_condition else QtCore.Qt.SolidLine
-            pen_width = 1.45 if self.is_asset_route else (2.4 if getattr(self, "edge_type", "") == "return" else (3.0 if self.is_condition else 2.6))
-            self.setPen(QtGui.QPen(self.color, pen_width, style, QtCore.Qt.RoundCap))
-            self.arrow.setBrush(self.color)
-            if hasattr(self, "target_arrow"):
-                self.target_arrow.setBrush(self.color)
-            self.label.setBrush(self.color.lighter(130))
-        self.update()
 
     def dispose(self) -> None:
         """Invalidate queued Qt callbacks before the C++ graphics item dies."""
@@ -2160,7 +1844,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
 
     def shape(self) -> QtGui.QPainterPath:
         stroker = QtGui.QPainterPathStroker()
-        stroker.setWidth(16)
+        stroker.setWidth(14)
         return stroker.createStroke(self.path())
 
     def update_path(self) -> None:
@@ -2230,9 +1914,9 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 delay = int(step.get("on_success_delay") or 0)
                 success_candidates = step.get("success_candidates") or []
                 if isinstance(success_candidates, list) and self.target in success_candidates:
-                    text = f"성공 후보 {success_candidates.index(self.target) + 1}/{len(success_candidates)} (실행 {self.canvas.display_number(self.target)}로 복귀)"
+                    text = f"성공 후보 {success_candidates.index(self.target) + 1}/{len(success_candidates)} ({self.target}번 복귀)"
                 else:
-                    text = f"성공 시 실행 {self.canvas.display_number(self.target)}로 복귀"
+                    text = f"성공 시 {self.target}번으로 복귀"
                 if delay:
                     text += f" · {delay}ms"
                 self.label.setText(text)
@@ -2289,9 +1973,9 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 delay = int(step.get("on_fail_delay") or 0)
                 fail_candidates = step.get("fail_candidates") or []
                 if isinstance(fail_candidates, list) and self.target in fail_candidates:
-                    text = f"실패 후보 {fail_candidates.index(self.target) + 1}/{len(fail_candidates)} (실행 {self.canvas.display_number(self.target)}로 복귀)"
+                    text = f"실패 후보 {fail_candidates.index(self.target) + 1}/{len(fail_candidates)} ({self.target}번 복귀)"
                 else:
-                    text = f"실패 시 실행 {self.canvas.display_number(self.target)}로 복귀"
+                    text = f"실패 시 {self.target}번으로 복귀"
                 if delay:
                     text += f" · {delay}ms"
                 self.label.setText(text)
@@ -2392,11 +2076,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 path.lineTo(control)
             path.lineTo(end)
         elif self.route_side:
-            # Outer-lane routing for return, long and conditional branches.
-            # Conditional branches deliberately consider every node in the
-            # horizontal span, not only nodes near the direct source/target
-            # corridor.  This keeps their vertical detour outside stacked
-            # nodes instead of cutting through a different row.
+            # Backward routing for other non-return links
             source_rect = source_node.sceneBoundingRect()
             target_rect = target_node.sceneBoundingRect()
             span_left = min(start.x(), end.x())
@@ -2408,19 +2088,12 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
                 for node in self.canvas.nodes.values()
                 if node.sceneBoundingRect().right() >= span_left
                 and node.sceneBoundingRect().left() <= span_right
-                and (
-                    self.is_condition or self.is_asset_route
-                    or (
-                        node.sceneBoundingRect().bottom() >= corridor_top
-                        and node.sceneBoundingRect().top() <= corridor_bottom
-                    )
-                )
+                and node.sceneBoundingRect().bottom() >= corridor_top
+                and node.sceneBoundingRect().top() <= corridor_bottom
             ]
             if not route_rects:
                 route_rects = [source_rect, target_rect]
-            base_margin = 68.0 if self.is_condition else (60.0 if self.is_asset_route else 52.0)
-            lane_spacing = 30.0 if self.is_condition else (22.0 if self.is_asset_route else 26.0)
-            margin = base_margin + self.route_lane * lane_spacing
+            margin = 52.0 + self.route_lane * 26.0
             if self.route_side == "top":
                 lane_y = min(rect.top() for rect in route_rects) - margin
             else:
@@ -2458,19 +2131,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         transform.rotate(angle)
         self.arrow.setPolygon(transform.map(polygon))
 
-        if self.is_asset_route:
-            numbers = "".join(
-                chr(0x2460 + number - 1) if 1 <= number <= 20 else f"[{number}]"
-                for number, _alias in self.asset_entries
-            )
-            outcome = "True" if self.asset_outcome == "true" else "Fail"
-            if len(self.asset_entries) == 1:
-                _number, alias = self.asset_entries[0]
-                short_alias = QtGui.QFontMetrics(self.label.font()).elidedText(alias, QtCore.Qt.ElideMiddle, 118)
-                text = f"{numbers} {short_alias} · {outcome} → {self.target}번"
-            else:
-                text = f"{numbers} 이미지 · {outcome} → {self.target}번"
-        elif self.is_condition:
+        if self.is_condition:
             source_name = "횟수" if self.rule.get("source", "edge_count") == "edge_count" else str(self.rule.get("variable") or "변수")
             operator = str(self.rule.get("operator") or ">=")
             value = self.rule.get("value", 1)
@@ -2513,34 +2174,16 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         target_node = self.canvas.nodes.get(self.target)
         src_name = source_node.step.get("label") or getattr(source_node, "display_title", "노드") if source_node else f"{self.source}번"
         tgt_name = target_node.step.get("label") or getattr(target_node, "display_title", "노드") if target_node else f"{self.target}번"
-        if self.is_asset_route:
-            outcome = "True(발견)" if self.asset_outcome == "true" else "Fail(미탐지)"
-            aliases = "<br>".join(f"{number}번 · {alias}" for number, alias in self.asset_entries)
-            self.setToolTip(
-                f"<b>개별 이미지 {outcome} 분기</b><br>{aliases}<br>"
-                f"→ <b>{self.target}번 [{tgt_name}]</b><br>💡 더블클릭: 해당 이미지 설정 열기"
-            )
-            entries = [
-                (alias, self.canvas._asset_preview_paths[alias])
-                for _number, alias in self.asset_entries
-                if alias in self.canvas._asset_preview_paths
-            ]
-            if entries:
-                self.canvas.show_image_preview(entries, event.screenPos())
-        else:
-            kind_str = "성공" if self.kind == "success" else "실패"
-            self.setToolTip(
-                f"<b>{self.source}번 [{src_name}] {kind_str}</b> → <b>{self.target}번 [{tgt_name}]</b><br>"
-                "💡 <b>더블클릭 / 우클릭</b>: 딜레이 시간 및 분기 조건 추가<br>"
-                "💡 <b>빈 곳으로 드래그</b>: 연결선 즉시 삭제"
-            )
-
-        highlight = QtGui.QColor(
-            ("#63FFE0" if self.asset_outcome == "true" else "#FF8BA5") if self.is_asset_route
-            else "#38E7FF" if self.kind == "success" else "#FF5252" if self.kind == "fail" else COLORS["warning"]
+        kind_str = "성공" if self.kind == "success" else "실패"
+        self.setToolTip(
+            f"<b>{self.source}번 [{src_name}] {kind_str}</b> → <b>{self.target}번 [{tgt_name}]</b><br>"
+            "💡 <b>더블클릭 / 우클릭</b>: 딜레이 시간 및 분기 조건 추가<br>"
+            "💡 <b>빈 곳으로 드래그</b>: 연결선 즉시 삭제"
         )
-        style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") in {"return", "asset_route"} or self.is_condition else QtCore.Qt.SolidLine
-        self.setPen(QtGui.QPen(highlight, 3.0 if self.is_asset_route else 4.2, style, QtCore.Qt.RoundCap))
+
+        highlight = QtGui.QColor("#38E7FF" if self.kind == "success" else "#FF5252" if self.kind == "fail" else COLORS["warning"])
+        style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") == "return" or self.is_condition else QtCore.Qt.SolidLine
+        self.setPen(QtGui.QPen(highlight, 4.2, style, QtCore.Qt.RoundCap))
         self.arrow.setBrush(highlight)
         if hasattr(self, "target_arrow"):
             self.target_arrow.setBrush(highlight)
@@ -2552,12 +2195,9 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
-        if self.isSelected():
-            super().hoverLeaveEvent(event)
-            return
         selected = self.canvas.selected_indexes()
         if not selected:
-            base_opacity = 0.58 if self.is_asset_route else (0.38 if getattr(self, "edge_type", "") == "return" and self.kind == "success" else (0.35 if getattr(self, "edge_type", "") == "return" else (0.50 if self.is_condition else 0.45)))
+            base_opacity = 0.38 if getattr(self, "edge_type", "") == "return" and self.kind == "success" else (0.35 if getattr(self, "edge_type", "") == "return" else (0.50 if self.is_condition else 0.45))
             self.setZValue(-1)
         elif self.source in selected or self.target in selected:
             base_opacity = 1.0
@@ -2566,8 +2206,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             base_opacity = 0.18
             self.setZValue(-2)
         self.setOpacity(base_opacity)
-        style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") in {"return", "asset_route"} or self.is_condition else QtCore.Qt.SolidLine
-        pen_width = 1.45 if self.is_asset_route else (2.4 if getattr(self, "edge_type", "") == "return" else (3.0 if self.is_condition else 2.6))
+        style = QtCore.Qt.DashLine if getattr(self, "edge_type", "") == "return" or self.is_condition else QtCore.Qt.SolidLine
+        pen_width = 2.4 if getattr(self, "edge_type", "") == "return" else (3.0 if self.is_condition else 2.6)
         self.setPen(QtGui.QPen(self.color, pen_width, style, QtCore.Qt.RoundCap))
         self.arrow.setBrush(self.color)
         if hasattr(self, "target_arrow"):
@@ -2579,36 +2219,21 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             source_node.update()
         if target_node:
             target_node.update()
-        if self.is_asset_route:
-            self.canvas.hide_image_preview()
         super().hoverLeaveEvent(event)
 
     def mouseDoubleClickEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
-        if self.is_asset_route:
-            alias = self.asset_entries[0][1] if self.asset_entries else ""
-            self.canvas.asset_route_edit_requested.emit(self.source, alias)
-        else:
-            self.canvas.edge_delay_requested.emit(self.source, self.target, self.kind)
+        self.canvas.edge_delay_requested.emit(self.source, self.target, self.kind)
         event.accept()
 
     def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
-            if event.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
-                event.accept()
-                return
             self._drag_origin = event.scenePos()
             self._dragging = False
             self.setCursor(QtCore.Qt.ClosedHandCursor)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
-        if self.is_asset_route:
-            event.accept()
-            return
         if event.buttons() & QtCore.Qt.LeftButton:
-            if event.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
-                event.accept()
-                return
             distance = (event.scenePos() - self._drag_origin).manhattanLength()
             if not self._dragging and distance >= 8:
                 self._dragging = True
@@ -2621,11 +2246,6 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
 
     def mouseReleaseEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
         self.setCursor(QtCore.Qt.OpenHandCursor)
-        if event.button() == QtCore.Qt.LeftButton:
-            if event.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
-                self.setSelected(not self.isSelected())
-                event.accept()
-                return
         if self._dragging and event.button() == QtCore.Qt.LeftButton:
             self._dragging = False
             scene_pos = QtCore.QPointF(event.scenePos())
@@ -2637,22 +2257,8 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:
-        if self.is_asset_route:
-            menu = QtWidgets.QMenu()
-            edit = menu.addAction("이 이미지의 분기 설정 열기")
-            hide = menu.addAction("개별 이미지 분기선 숨기기")
-            chosen = menu.exec(event.screenPos())
-            if chosen == edit:
-                alias = self.asset_entries[0][1] if self.asset_entries else ""
-                QtCore.QTimer.singleShot(0, lambda: self.canvas.asset_route_edit_requested.emit(self.source, alias))
-            elif chosen == hide:
-                self.canvas.set_asset_route_edges_visible(False)
-            event.accept()
-            return
         menu = QtWidgets.QMenu()
         delay = menu.addAction("연결 설정 · 딜레이와 조건 분기")
-        add_condition = menu.addAction("＋ 조건 분기 바로 추가")
-        menu.addSeparator()
         add_point = menu.addAction("＋ 이 위치에 경유점 추가")
         reset_route = menu.addAction("수동 경로 초기화")
         reset_route.setEnabled(bool(self.manual_points))
@@ -2662,17 +2268,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             event.accept()
             return
         if chosen == delay:
-            source, target, kind = self.source, self.target, self.kind
-            QtCore.QTimer.singleShot(
-                0,
-                lambda: self.canvas.edge_delay_requested.emit(source, target, kind),
-            )
-        elif chosen == add_condition:
-            source, target, kind = self.source, self.target, self.kind
-            QtCore.QTimer.singleShot(
-                0,
-                lambda: self.canvas.edge_condition_add_requested.emit(source, target, kind),
-            )
+            self.canvas.edge_delay_requested.emit(self.source, self.target, self.kind)
         elif chosen == add_point:
             self.add_manual_point(event.scenePos())
         elif chosen == reset_route:
@@ -3031,8 +2627,6 @@ COMMENT_THEMES = NODE_GROUP_THEMES
 
 class NodeGroupItem(QtWidgets.QGraphicsItem):
     HEADER_HEIGHT = 30.0
-    COLLAPSED_HEIGHT = 38.0
-    COLLAPSED_WIDTH = 280.0
     MIN_WIDTH = 220.0
     MIN_HEIGHT = 140.0
     RESIZE_HANDLE_SIZE = 16.0
@@ -3045,21 +2639,14 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         rect: QtCore.QRectF,
         canvas: "NodeCanvas",
         node_indexes: list[int] | None = None,
-        next_group_id: str = "",
-        unconnected_success: str = "next",
-        unconnected_fail: str = "next",
     ) -> None:
         super().__init__()
         self.comment_id = comment_id or uuid.uuid4().hex[:8]
         self.title = title or "노드 그룹"
         self.color_name = color if color in NODE_GROUP_THEMES else "yellow"
         self.node_indexes: list[int] = [int(i) for i in (node_indexes or [])]
-        self.next_group_id = str(next_group_id or "")
-        self.unconnected_success = str(unconnected_success or "next")
-        self.unconnected_fail = str(unconnected_fail or "next")
         self.box_rect = QtCore.QRectF(0, 0, max(self.MIN_WIDTH, rect.width()), max(self.MIN_HEIGHT, rect.height()))
         self.canvas = canvas
-        self.collapsed = False
 
         self.setPos(rect.topLeft())
         self.setZValue(-40)  # Behind workflow lanes (-30), edges (-10) & nodes (0)
@@ -3077,8 +2664,6 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         self._node_origins: dict[int, QtCore.QPointF] = {}
         self._hover_close = False
         self._hover_color = False
-        self._hover_collapse = False
-        self._group_origin = QtCore.QPointF()
 
     def boundingRect(self) -> QtCore.QRectF:
         return self.box_rect.adjusted(-3, -3, 3, 3)
@@ -3091,18 +2676,11 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         r = self.box_rect
         return QtCore.QRectF(r.right() - 50, r.top() + 4, 20, 22)
 
-    def _collapse_btn_rect(self) -> QtCore.QRectF:
-        r = self.box_rect
-        return QtCore.QRectF(r.left() + 5, r.top() + 4, 20, 22)
-
     def _is_in_close_btn(self, pos: QtCore.QPointF) -> bool:
         return self._close_btn_rect().contains(pos)
 
     def _is_in_color_btn(self, pos: QtCore.QPointF) -> bool:
         return self._color_btn_rect().contains(pos)
-
-    def _is_in_collapse_btn(self, pos: QtCore.QPointF) -> bool:
-        return self._collapse_btn_rect().contains(pos)
 
     def _is_in_resize_handle(self, pos: QtCore.QPointF) -> bool:
         if self.node_indexes:
@@ -3116,7 +2694,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
 
     def sync_rect(self) -> None:
         """Dynamically expand/contract box bounding rect to fit all member nodes and their workflow lanes."""
-        if self.collapsed or not self.node_indexes:
+        if not self.node_indexes:
             return
         node_union = QtCore.QRectF()
         valid_nodes = []
@@ -3167,47 +2745,18 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         if node_index not in self.node_indexes:
             self.node_indexes.append(node_index)
             self.sync_rect()
-            self.canvas._refresh_collapsed_group_visibility()
-            self.canvas._refresh_group_node_styles()
             self.canvas.comments_changed.emit(self.canvas.dump_comments())
 
     def remove_node(self, node_index: int) -> None:
         if node_index in self.node_indexes:
             self.node_indexes.remove(node_index)
             self.sync_rect()
-            self.canvas._refresh_collapsed_group_visibility()
-            self.canvas._refresh_group_node_styles()
             self.canvas.comments_changed.emit(self.canvas.dump_comments())
-
-    def set_collapsed(self, collapsed: bool, notify: bool = True) -> None:
-        normalized = bool(collapsed)
-        if normalized == self.collapsed:
-            return
-        if normalized:
-            self.sync_rect()
-        self.prepareGeometryChange()
-        self.collapsed = normalized
-        if normalized:
-            width = max(self.MIN_WIDTH, min(self.COLLAPSED_WIDTH, self.box_rect.width()))
-            self.box_rect = QtCore.QRectF(0, 0, width, self.COLLAPSED_HEIGHT)
-            self.setZValue(5)
-        else:
-            self.setZValue(-40)
-        self.canvas._refresh_collapsed_group_visibility()
-        if not normalized:
-            self.sync_rect()
-        self.canvas._route_edges()
-        self.canvas._sync_workflow_lanes()
-        self.update()
-        if notify:
-            self.canvas.comments_changed.emit(self.canvas.dump_comments())
-            self.canvas._update_scene_bounds()
 
     def set_color(self, color_name: str) -> None:
         if color_name in NODE_GROUP_THEMES:
             self.color_name = color_name
             self.update()
-            self.canvas._refresh_group_node_styles()
             self.canvas.comments_changed.emit(self.canvas.dump_comments())
 
     def _show_color_popup(self, screen_pos: QtCore.QPointF | QtCore.QPoint) -> None:
@@ -3243,24 +2792,14 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         painter.setPen(QtGui.QColor(theme["text"]))
         font = QtGui.QFont("Pretendard", 10, QtGui.QFont.Bold)
         painter.setFont(font)
-        text_rect = header_rect.adjusted(30, 0, -58, 0)
+        text_rect = header_rect.adjusted(10, 0, -60, 0)
         metrics = QtGui.QFontMetrics(font)
         title_str = f"🗂️ {self.title}"
         if self.node_indexes:
             title_str += f" ({len(self.node_indexes)}개)"
         painter.drawText(text_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, metrics.elidedText(title_str, QtCore.Qt.ElideRight, int(text_rect.width())))
 
-        # 4. Collapse button [ ▸ / ▾ ]
-        collapse_btn_r = self._collapse_btn_rect()
-        if self._hover_collapse:
-            painter.setPen(QtCore.Qt.NoPen)
-            painter.setBrush(QtGui.QColor(255, 255, 255, 50))
-            painter.drawRoundedRect(collapse_btn_r, 4, 4)
-        painter.setFont(QtGui.QFont("Segoe UI Symbol", 10, QtGui.QFont.Bold))
-        painter.setPen(QtGui.QColor("#FFFFFF"))
-        painter.drawText(collapse_btn_r, QtCore.Qt.AlignCenter, "▸" if self.collapsed else "▾")
-
-        # 5. Color button [ 🎨 ]
+        # 4. Color button [ 🎨 ]
         col_btn_r = self._color_btn_rect()
         if self._hover_color:
             painter.setPen(QtCore.Qt.NoPen)
@@ -3271,7 +2810,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         painter.setPen(QtGui.QColor("#FFFFFF"))
         painter.drawText(col_btn_r, QtCore.Qt.AlignCenter, "🎨")
 
-        # 6. Close button [ ✕ ]
+        # 5. Close button [ ✕ ]
         close_btn_r = self._close_btn_rect()
         if self._hover_close:
             painter.setPen(QtCore.Qt.NoPen)
@@ -3282,8 +2821,8 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         painter.setPen(QtGui.QColor("#FFFFFF"))
         painter.drawText(close_btn_r, QtCore.Qt.AlignCenter, "✕")
 
-        # 7. Resize handle (only when manual / no member nodes)
-        if not self.node_indexes and not self.collapsed:
+        # 6. Resize handle (only when manual / no member nodes)
+        if not self.node_indexes:
             hr = QtCore.QRectF(r.right() - self.RESIZE_HANDLE_SIZE, r.bottom() - self.RESIZE_HANDLE_SIZE, self.RESIZE_HANDLE_SIZE, self.RESIZE_HANDLE_SIZE)
             painter.setPen(QtGui.QPen(QtGui.QColor(theme["border"]), 1.5))
             painter.drawLine(QtCore.QPointF(hr.right() - 4, hr.bottom() - 11), QtCore.QPointF(hr.right() - 11, hr.bottom() - 4))
@@ -3293,16 +2832,14 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         pos = event.pos()
         in_close = self._is_in_close_btn(pos)
         in_color = self._is_in_color_btn(pos)
-        in_collapse = self._is_in_collapse_btn(pos)
         in_resize = self._is_in_resize_handle(pos)
 
-        if in_close != self._hover_close or in_color != self._hover_color or in_collapse != self._hover_collapse:
+        if in_close != self._hover_close or in_color != self._hover_color:
             self._hover_close = in_close
             self._hover_color = in_color
-            self._hover_collapse = in_collapse
             self.update()
 
-        if in_close or in_color or in_collapse:
+        if in_close or in_color:
             self.setCursor(QtCore.Qt.PointingHandCursor)
         elif in_resize:
             self.setCursor(QtCore.Qt.SizeFDiagCursor)
@@ -3313,10 +2850,9 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         super().hoverMoveEvent(event)
 
     def hoverLeaveEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:
-        if self._hover_close or self._hover_color or self._hover_collapse:
+        if self._hover_close or self._hover_color:
             self._hover_close = False
             self._hover_color = False
-            self._hover_collapse = False
             self.update()
         super().hoverLeaveEvent(event)
 
@@ -3340,23 +2876,17 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
                 self._show_color_popup(event.screenPos())
                 event.accept()
                 return
-            # 3. Collapse / expand button
-            if self._is_in_collapse_btn(pos):
-                self.set_collapsed(not self.collapsed)
-                event.accept()
-                return
-            # 4. Resize handle
+            # 3. Resize handle
             if self._is_in_resize_handle(pos):
                 self._resizing = True
                 self._resize_start = event.scenePos()
                 self._rect_start = QtCore.QRectF(self.box_rect)
                 event.accept()
                 return
-            # 5. Header dragged -> Move all member nodes together
+            # 4. Header dragged -> Move all member nodes together
             if pos.y() <= self.HEADER_HEIGHT:
                 self._dragging_group = True
                 self._drag_start_scene = event.scenePos()
-                self._group_origin = QtCore.QPointF(self.pos())
                 self._node_origins = {}
                 for idx in self.node_indexes:
                     n = self.canvas.nodes.get(idx)
@@ -3365,7 +2895,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
                 self.setCursor(QtCore.Qt.ClosedHandCursor)
                 event.accept()
                 return
-            # 6. Body clicked -> Just select group without moving contained nodes
+            # 5. Body clicked -> Just select group without moving contained nodes
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
@@ -3385,12 +2915,9 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
                 node = self.canvas.nodes.get(idx)
                 if node:
                     node.setPos(origin + delta)
-            if self.collapsed:
-                self.setPos(self._group_origin + delta)
-            else:
-                self.canvas._route_edges()
-                self.canvas._sync_workflow_lanes()
-                self.sync_rect()
+            self.canvas._route_edges()
+            self.canvas._sync_workflow_lanes()
+            self.sync_rect()
             event.accept()
             return
 
@@ -3416,22 +2943,20 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         self.canvas.comments_changed.emit(self.canvas.dump_comments())
 
     def mouseDoubleClickEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:
-        if (
-            event.pos().y() <= self.HEADER_HEIGHT
-            and not self._is_in_close_btn(event.pos())
-            and not self._is_in_color_btn(event.pos())
-            and not self._is_in_collapse_btn(event.pos())
-        ):
-            self.set_collapsed(not self.collapsed)
+        if event.pos().y() <= self.HEADER_HEIGHT and not self._is_in_close_btn(event.pos()) and not self._is_in_color_btn(event.pos()):
+            new_title, ok = QtWidgets.QInputDialog.getText(
+                None, "노드 그룹 이름 수정", "새 노드 그룹 이름을 입력하세요:", text=self.title
+            )
+            if ok and new_title.strip():
+                self.title = new_title.strip()
+                self.update()
+                self.canvas.comments_changed.emit(self.canvas.dump_comments())
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:
         menu = QtWidgets.QMenu()
-        act_toggle = menu.addAction("▾ 그룹 펼치기" if self.collapsed else "▸ 그룹 접기")
-        act_flow = menu.addAction("🔗 그룹 흐름 설정...")
-        menu.addSeparator()
         act_edit = menu.addAction("✏️ 그룹 이름 수정...")
         color_menu = menu.addMenu("🎨 색상 변경")
         color_actions = {}
@@ -3464,46 +2989,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
         if not chosen:
             event.accept()
             return
-        if chosen == act_toggle:
-            self.set_collapsed(not self.collapsed)
-        elif chosen == act_flow:
-            dialog = QtWidgets.QDialog(self.canvas.window())
-            dialog.setWindowTitle(f"그룹 흐름 설정 · {self.title}")
-            form = QtWidgets.QFormLayout(dialog)
-            next_combo = QtWidgets.QComboBox(dialog)
-            next_combo.addItem("다음 그룹 없음 · 종료", "")
-            for group in self.canvas.comments:
-                if group is not self:
-                    next_combo.addItem(group.title, group.comment_id)
-            selected_next = next_combo.findData(self.next_group_id)
-            next_combo.setCurrentIndex(max(0, selected_next))
-            policy_items = (("다음 그룹으로 계속", "next"), ("현재 그룹 다시 시도", "retry"), ("매크로 종료", "stop"))
-            success_combo = QtWidgets.QComboBox(dialog)
-            fail_combo = QtWidgets.QComboBox(dialog)
-            for label, value in policy_items:
-                success_combo.addItem(label, value)
-                fail_combo.addItem(label, value)
-            success_combo.setCurrentIndex(max(0, success_combo.findData(self.unconnected_success)))
-            fail_combo.setCurrentIndex(max(0, fail_combo.findData(self.unconnected_fail)))
-            form.addRow("다음 그룹", next_combo)
-            form.addRow("연결 없는 성공", success_combo)
-            form.addRow("연결 없는 실패", fail_combo)
-            info = QtWidgets.QLabel("노드에 직접 연결된 성공·실패선이 있으면 해당 연결이 항상 우선합니다.")
-            info.setWordWrap(True)
-            form.addRow(info)
-            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
-            buttons.button(QtWidgets.QDialogButtonBox.Save).setText("저장")
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            form.addRow(buttons)
-            if dialog.exec() == QtWidgets.QDialog.Accepted:
-                self.next_group_id = str(next_combo.currentData() or "")
-                self.unconnected_success = str(success_combo.currentData() or "next")
-                self.unconnected_fail = str(fail_combo.currentData() or "next")
-                self.canvas.apply_group_flow_routes()
-                self.canvas.comments_changed.emit(self.canvas.dump_comments())
-                self.canvas.group_flow_changed.emit()
-        elif chosen == act_edit:
+        if chosen == act_edit:
             new_title, ok = QtWidgets.QInputDialog.getText(
                 None, "노드 그룹 이름 수정", "새 노드 그룹 이름을 입력하세요:", text=self.title
             )
@@ -3533,23 +3019,17 @@ class NodeCanvas(QtWidgets.QWidget):
     routes_changed = QtCore.Signal(dict)
     link_requested = QtCore.Signal(int, int, str)
     edge_delete_requested = QtCore.Signal(int, int, str)
-    edges_delete_requested = QtCore.Signal(list)
     edge_delay_requested = QtCore.Signal(int, int, str)
     edge_condition_delete_requested = QtCore.Signal(int, int)
     edge_condition_retarget_requested = QtCore.Signal(int, int, int)
-    edge_condition_add_requested = QtCore.Signal(int, int, str)
     node_delete_requested = QtCore.Signal(int)
     node_duplicate_requested = QtCore.Signal(int)
     wait_duration_requested = QtCore.Signal(list)
     all_wait_duration_requested = QtCore.Signal()
     start_search_group_requested = QtCore.Signal(list)
     image_edit_requested = QtCore.Signal(int)
-    color_visual_test_requested = QtCore.Signal(int)
-    image_visual_test_requested = QtCore.Signal(int)
-    multi_pixel_visual_test_requested = QtCore.Signal(int)
     collapsed_changed = QtCore.Signal(list)
     multi_image_merge_requested = QtCore.Signal(list)
-    multi_color_merge_requested = QtCore.Signal(list)
     log_requested = QtCore.Signal()
     node_title_changed = QtCore.Signal(int, str)
     archive_requested = QtCore.Signal()
@@ -3558,13 +3038,6 @@ class NodeCanvas(QtWidgets.QWidget):
     unbranch_requested = QtCore.Signal(list)
     help_requested = QtCore.Signal()
     comments_changed = QtCore.Signal(list)
-    quick_node_drop_requested = QtCore.Signal(str, object)
-    node_add_at_requested = QtCore.Signal(str, object)
-    group_flow_changed = QtCore.Signal()
-    workflow_membership_changed = QtCore.Signal()
-    workflow_rename_requested = QtCore.Signal(str)
-    node_target_picked = QtCore.Signal(int)
-    asset_route_edit_requested = QtCore.Signal(int, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -3584,21 +3057,9 @@ class NodeCanvas(QtWidgets.QWidget):
         self.active_step = 0
         self.execution_states: dict[int, dict[str, Any]] = {}
         self.collapsed_nodes: set[int] = set()
-        self._submacro_links: dict[int, dict[str, Any]] = {}
         self._temp_edge: QtWidgets.QGraphicsPathItem | None = None
         self._temp_start = QtCore.QPointF()
         self._retargeting_edge: tuple[int, int, str] | None = None
-        self._quick_drop_preview_items: list[QtWidgets.QGraphicsItem] = []
-        self._quick_drop_candidate: EdgeItem | None = None
-        self._quick_drop_kind = ""
-        self._pending_node_kind = ""
-        self._group_proxy_edges: list[QtWidgets.QGraphicsItem] = []
-        self._display_numbers: dict[int, int] = {}
-        self._node_target_pick_active = False
-        self._node_target_pick_excluded = 0
-        self._node_target_pick_eligible: set[int] | None = None
-        self._node_target_pick_previous_label = ""
-        self._asset_route_edges_visible = True
         self.rubber_selecting = False
         self._asset_preview_paths: dict[str, Path] = {}
         self._preview_popup = ImagePreviewPopup(self)
@@ -3607,9 +3068,6 @@ class NodeCanvas(QtWidgets.QWidget):
         self._positions_timer.setSingleShot(True)
         self._positions_timer.setInterval(350)
         self._positions_timer.timeout.connect(lambda: self.positions_changed.emit(self.positions()))
-        self._target_pick_escape = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Escape), self)
-        self._target_pick_escape.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
-        self._target_pick_escape.activated.connect(self.cancel_node_target_pick)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -3635,13 +3093,6 @@ class NodeCanvas(QtWidgets.QWidget):
         reset.clicked.connect(self.view_reset_zoom)
         self.zoom_label = QtWidgets.QLabel("100%")
         self.zoom_label.setObjectName("Muted")
-        self.asset_route_toggle = QtWidgets.QPushButton("개별 분기선")
-        self.asset_route_toggle.setCheckable(True)
-        self.asset_route_toggle.setChecked(True)
-        self.asset_route_toggle.setToolTip(
-            "멀티 이미지 서치에서 특정 이미지에 지정한 True/Fail 보조 분기선을 표시하거나 숨깁니다."
-        )
-        self.asset_route_toggle.toggled.connect(self.set_asset_route_edges_visible)
         canvas_log_btn = QtWidgets.QPushButton("📋 성공·실패 로그")
         canvas_log_btn.setToolTip("<b>성공·실패 실행 로그</b><br>각 노드의 성공/실패 여부, 실패 시 쉬운 원인 분석과 개선 가이드를 실시간 확인합니다.")
         canvas_log_btn.clicked.connect(self.log_requested.emit)
@@ -3652,11 +3103,9 @@ class NodeCanvas(QtWidgets.QWidget):
         legend = QtWidgets.QLabel(
             f"<span style='color:{COLORS['success']}'>● 성공</span>  "
             f"<span style='color:{COLORS['danger']}'>● 실패</span>  "
-            "<span style='color:#9DA7BA'>· 빈 바닥 더블클릭 드래그=이동 · Ctrl+더블클릭=노드 선택 추가 · 가운데 버튼 드래그=이동 · 선 바깥 드롭=제거</span>"
+            "<span style='color:#9DA7BA'>· 선 선택→손잡이 드래그=경로 · 선 바깥 드롭=제거 · 바닥 더블클릭 유지=이동</span>"
         )
         legend.setObjectName("Muted")
-        legend.setMinimumWidth(0)
-        legend.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         toolbar_layout.addWidget(self.flow_label)
         toolbar_layout.addWidget(legend)
         toolbar_layout.addStretch(1)
@@ -3664,7 +3113,6 @@ class NodeCanvas(QtWidgets.QWidget):
         self.archive_btn.setToolTip("<b>노드 보관함 (📦)</b><br>삭제하거나 보관 처리한 노드 목록을 확인하고, 캔버스로 즉시 복원합니다.")
         self.archive_btn.clicked.connect(self.archive_requested.emit)
         toolbar_layout.addWidget(self.archive_btn)
-        toolbar_layout.addWidget(self.asset_route_toggle)
         toolbar_layout.addWidget(canvas_log_btn)
         toolbar_layout.addWidget(canvas_help_btn)
         self.branch_btn = QtWidgets.QPushButton("🔀 순차 분기 묶기")
@@ -3707,15 +3155,6 @@ class NodeCanvas(QtWidgets.QWidget):
         act_split_by_branch.setToolTip("캔버스의 분기(Workflow Lane)들을 각각 독립된 노드 그룹으로 깔끔하게 분리 생성합니다.")
         act_split_by_branch.triggered.connect(self.auto_group_by_branches)
         group_menu.addSeparator()
-        act_collapse_grp = group_menu.addAction("▸ 선택 그룹 접기")
-        act_collapse_grp.triggered.connect(lambda: self.set_selected_groups_collapsed(True))
-        act_expand_grp = group_menu.addAction("▾ 선택 그룹 펼치기")
-        act_expand_grp.triggered.connect(lambda: self.set_selected_groups_collapsed(False))
-        act_collapse_all = group_menu.addAction("▸ 모든 그룹 접기")
-        act_collapse_all.triggered.connect(lambda: self.set_all_groups_collapsed(True))
-        act_expand_all = group_menu.addAction("▾ 모든 그룹 펼치기")
-        act_expand_all.triggered.connect(lambda: self.set_all_groups_collapsed(False))
-        group_menu.addSeparator()
         act_del_grp = group_menu.addAction("🗑️ 선택한 노드 그룹 삭제 (Delete)")
         act_del_grp.triggered.connect(self._delete_selected_group)
         self.node_group_btn.setMenu(group_menu)
@@ -3749,313 +3188,6 @@ class NodeCanvas(QtWidgets.QWidget):
         self.view.horizontalScrollBar().valueChanged.connect(self._update_minimap_preview)
         self.view.verticalScrollBar().valueChanged.connect(self._update_minimap_preview)
         self.view.zoom_changed.connect(self._update_minimap_preview)
-
-    def begin_node_placement(self, kind: str) -> None:
-        self._pending_node_kind = str(kind or "")
-        if self._pending_node_kind:
-            self.flow_label.setText("캔버스에서 생성 위치를 클릭하세요 · Esc 취소")
-            self.view.viewport().setCursor(QtCore.Qt.CrossCursor)
-
-    def cancel_node_placement(self) -> None:
-        self._pending_node_kind = ""
-        self.flow_label.setText("FLOW CANVAS")
-        self.view.viewport().unsetCursor()
-
-    def commit_pending_node_placement(self, scene_pos: QtCore.QPointF) -> bool:
-        if not self._pending_node_kind:
-            return False
-        kind = self._pending_node_kind
-        self.cancel_node_placement()
-        self.node_add_at_requested.emit(kind, QtCore.QPointF(scene_pos))
-        return True
-
-    def request_node_add_at(self, scene_pos: QtCore.QPointF) -> None:
-        self.cancel_node_placement()
-        self.node_add_at_requested.emit("", QtCore.QPointF(scene_pos))
-
-    def preferred_add_position(self) -> QtCore.QPointF:
-        return self.view.mapToScene(self.view.viewport().rect().center())
-
-    def group_for_node(self, index: int, *, collapsed_only: bool = False) -> NodeGroupItem | None:
-        for group in self.comments:
-            if int(index) in getattr(group, "node_indexes", []):
-                if not collapsed_only or bool(getattr(group, "collapsed", False)):
-                    return group
-        return None
-
-    def node_group_theme(self, index: int) -> dict[str, Any] | None:
-        group = self.group_for_node(index)
-        if group is None:
-            return None
-        return NODE_GROUP_THEMES.get(group.color_name)
-
-    def _refresh_group_node_styles(self) -> None:
-        for node in self.nodes.values():
-            node.update()
-        self._sync_node_groups()
-
-    def _execution_targets(self, index: int) -> list[int]:
-        if not 0 < index <= len(self.steps):
-            return []
-        step = self.steps[index - 1]
-        targets: list[int] = []
-        success_candidates = step.get("success_candidates")
-        if isinstance(success_candidates, list) and success_candidates:
-            targets.extend(int(value) for value in success_candidates if str(value).lstrip("-").isdigit())
-        else:
-            success = int(step.get("on_success") or 0)
-            if success:
-                targets.append(success)
-            elif index < len(self.steps) and not bool(step.get("stop_on_success")):
-                targets.append(index + 1)
-        failure = int(step.get("on_fail") or 0)
-        if failure:
-            targets.append(failure)
-        for rule in step.get("edge_conditions") or []:
-            if isinstance(rule, dict) and int(rule.get("target") or 0):
-                targets.append(int(rule["target"]))
-        result: list[int] = []
-        for target in targets:
-            if 0 < target <= len(self.steps) and target not in result:
-                result.append(target)
-        return result
-
-    def _refresh_display_numbers(self) -> None:
-        total = len(self.steps)
-        if not total:
-            self._display_numbers = {}
-            return
-        start = self.start_step if 0 < self.start_step <= total else 1
-        order: list[int] = []
-        pending = [start]
-        while pending:
-            index = pending.pop(0)
-            if index in order:
-                continue
-            order.append(index)
-            for target in self._execution_targets(index):
-                if target not in order and target not in pending:
-                    pending.append(target)
-        remaining = sorted(
-            (index for index in range(1, total + 1) if index not in order),
-            key=lambda index: (self.nodes.get(index).pos().x() if index in self.nodes else 0.0,
-                               self.nodes.get(index).pos().y() if index in self.nodes else 0.0),
-        )
-        order.extend(remaining)
-        self._display_numbers = {index: position for position, index in enumerate(order, start=1)}
-        for node in self.nodes.values():
-            node.update()
-
-    def display_number(self, index: int) -> int:
-        return int(self._display_numbers.get(int(index), int(index)))
-
-    def _group_entry_index(self, group: NodeGroupItem) -> int:
-        members = [int(index) for index in group.node_indexes if int(index) in self.nodes]
-        if not members:
-            return 0
-        member_set = set(members)
-        incoming = {
-            target
-            for source in range(1, len(self.steps) + 1)
-            for target in self._execution_targets(source)
-            if source not in member_set and target in member_set
-        }
-        candidates = list(incoming) or members
-        return min(candidates, key=lambda value: (self.display_number(value), value))
-
-    def apply_group_flow_routes(self) -> None:
-        # Remove only routes previously generated by this feature. User-made
-        # node connections are never replaced.
-        for step in self.steps:
-            automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
-            generated = automation.pop("group_flow_generated", None)
-            if isinstance(generated, dict):
-                for kind in ("success", "fail"):
-                    if kind not in generated:
-                        continue
-                    if kind == "success":
-                        step.pop("on_success", None)
-                        step.pop("stop_on_success", None)
-                    else:
-                        step.pop("on_fail", None)
-                        step.pop("abort_on_fail", None)
-            if automation:
-                step["_automation"] = automation
-            else:
-                step.pop("_automation", None)
-
-        groups = {group.comment_id: group for group in self.comments}
-        for group in self.comments:
-            members = {int(index) for index in group.node_indexes if 0 < int(index) <= len(self.steps)}
-            if not members:
-                continue
-            own_entry = self._group_entry_index(group)
-            next_group = groups.get(group.next_group_id)
-            next_entry = self._group_entry_index(next_group) if next_group is not None else 0
-            for index in sorted(members):
-                step = self.steps[index - 1]
-                generated: dict[str, Any] = {}
-                success_explicit = bool(step.get("on_success") or step.get("success_candidates") or step.get("stop_on_success"))
-                implicit_next_inside = index < len(self.steps) and index + 1 in members
-                if not success_explicit and not implicit_next_inside:
-                    policy = group.unconnected_success
-                    target = next_entry if policy == "next" else own_entry if policy == "retry" else 0
-                    if target:
-                        step["on_success"] = target
-                    else:
-                        step["stop_on_success"] = True
-                    generated["success"] = {"group": group.comment_id, "policy": policy, "target": target}
-
-                fail_explicit = bool(step.get("on_fail") or step.get("fail_candidates"))
-                if not fail_explicit:
-                    policy = group.unconnected_fail
-                    target = next_entry if policy == "next" else own_entry if policy == "retry" else 0
-                    if target:
-                        step["on_fail"] = target
-                        step["abort_on_fail"] = False
-                    else:
-                        step["abort_on_fail"] = True
-                    generated["fail"] = {"group": group.comment_id, "policy": policy, "target": target}
-                if generated:
-                    automation = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
-                    automation["group_flow_generated"] = generated
-                    step["_automation"] = automation
-        self.rebuild_edges()
-        self._refresh_display_numbers()
-
-    def _clear_group_proxy_edges(self) -> None:
-        for item in self._group_proxy_edges:
-            try:
-                if item.scene() is self.scene:
-                    self.scene.removeItem(item)
-            except RuntimeError:
-                pass
-        self._group_proxy_edges = []
-
-    def _rebuild_group_proxy_edges(self) -> None:
-        self._clear_group_proxy_edges()
-        for edge in self.edges:
-            source_group = self.group_for_node(edge.source, collapsed_only=True)
-            target_group = self.group_for_node(edge.target, collapsed_only=True)
-            if source_group is None and target_group is None:
-                edge.setVisible(True)
-                continue
-            if source_group is not None and source_group is target_group:
-                edge.setVisible(False)
-                continue
-            edge.setVisible(False)
-            source_node = self.nodes.get(edge.source)
-            target_node = self.nodes.get(edge.target)
-            if source_node is None or target_node is None:
-                continue
-            if source_group is not None:
-                rect = source_group.sceneBoundingRect()
-                start = QtCore.QPointF(rect.right(), rect.center().y() + (-7 if edge.kind == "success" else 7))
-            else:
-                port = source_node.out_success_port if edge.kind == "success" else source_node.out_fail_port
-                start = port.mapToScene(port.rect().center())
-            if target_group is not None:
-                rect = target_group.sceneBoundingRect()
-                end = QtCore.QPointF(rect.left(), rect.center().y() + (-7 if edge.kind == "success" else 7))
-            else:
-                port = target_node.in_success_port if edge.kind == "success" else target_node.in_fail_port
-                end = port.mapToScene(port.rect().center())
-            bend = max(55.0, abs(end.x() - start.x()) * 0.42)
-            direction = 1.0 if end.x() >= start.x() else -1.0
-            path = QtGui.QPainterPath(start)
-            path.cubicTo(start.x() + direction * bend, start.y(), end.x() - direction * bend, end.y(), end.x(), end.y())
-            proxy = QtWidgets.QGraphicsPathItem(path)
-            color = QtGui.QColor(COLORS["success"] if edge.kind == "success" else COLORS["danger"])
-            proxy.setPen(QtGui.QPen(color, 2.4, QtCore.Qt.DashLine, QtCore.Qt.RoundCap))
-            proxy.setOpacity(0.72)
-            proxy.setZValue(3)
-            proxy.setToolTip(
-                f"접힌 그룹 연결 · {'성공' if edge.kind == 'success' else '실패'} · "
-                f"실행 {self.display_number(edge.source)} → 실행 {self.display_number(edge.target)}"
-            )
-            label = QtWidgets.QGraphicsSimpleTextItem("성공" if edge.kind == "success" else "실패", proxy)
-            label.setBrush(color.lighter(135))
-            label.setFont(QtGui.QFont("Malgun Gothic", 7, QtGui.QFont.Bold))
-            mid = path.pointAtPercent(0.5)
-            label.setPos(mid + QtCore.QPointF(-12, -17 if edge.kind == "success" else 4))
-            self.scene.addItem(proxy)
-            self._group_proxy_edges.append(proxy)
-
-    def _quick_drop_edge_at(self, scene_pos: QtCore.QPointF) -> EdgeItem | None:
-        """Return the normal edge that a quick-add node would split."""
-        direct: list[EdgeItem] = []
-        nearby: list[tuple[float, EdgeItem]] = []
-        stroker = QtGui.QPainterPathStroker()
-        stroker.setWidth(84.0)
-        cached = self._quick_drop_candidate
-        if cached is not None and cached in self.edges and cached.isVisible():
-            try:
-                if stroker.createStroke(cached.path()).contains(cached.mapFromScene(scene_pos)):
-                    return cached
-            except RuntimeError:
-                self._quick_drop_candidate = None
-        for edge in self.edges:
-            if edge is cached:
-                continue
-            if edge.condition_index >= 0 or edge.is_asset_route or not edge.isVisible():
-                continue
-            local_pos = edge.mapFromScene(scene_pos)
-            if stroker.createStroke(edge.path()).contains(local_pos):
-                direct.append(edge)
-                continue
-            bounds = edge.sceneBoundingRect().adjusted(-70.0, -70.0, 70.0, 70.0)
-            if bounds.contains(scene_pos):
-                center = bounds.center()
-                nearby.append((QtCore.QLineF(scene_pos, center).length(), edge))
-        if direct:
-            return min(
-                direct,
-                key=lambda edge: QtCore.QLineF(scene_pos, edge.sceneBoundingRect().center()).length(),
-            )
-        if nearby:
-            distance, edge = min(nearby, key=lambda item: item[0])
-            if distance <= 140.0:
-                return edge
-        return None
-
-    @staticmethod
-    def _quick_preview_path(start: QtCore.QPointF, end: QtCore.QPointF) -> QtGui.QPainterPath:
-        path = QtGui.QPainterPath(start)
-        dx = max(46.0, abs(end.x() - start.x()) * 0.45)
-        direction = 1.0 if end.x() >= start.x() else -1.0
-        path.cubicTo(
-            QtCore.QPointF(start.x() + direction * dx, start.y()),
-            QtCore.QPointF(end.x() - direction * dx, end.y()),
-            end,
-        )
-        return path
-
-    def clear_quick_node_preview(self) -> None:
-        for item in self._quick_drop_preview_items:
-            try:
-                if item.scene() is self.scene:
-                    self.scene.removeItem(item)
-            except RuntimeError:
-                pass
-        self._quick_drop_preview_items = []
-        self._quick_drop_candidate = None
-        self._quick_drop_kind = ""
-
-    def preview_quick_node_drop(self, kind: str, scene_pos: QtCore.QPointF) -> None:
-        # Quick-added nodes are deliberately independent. Merely hovering over
-        # an existing edge must never imply that the graph will be rewired.
-        self.clear_quick_node_preview()
-
-    def commit_quick_node_drop(self, kind: str, scene_pos: QtCore.QPointF) -> None:
-        payload: dict[str, Any] = {
-            "x": round(scene_pos.x(), 2),
-            "y": round(scene_pos.y(), 2),
-            "source": 0,
-            "target": 0,
-            "edge_kind": "success",
-        }
-        self.clear_quick_node_preview()
-        self.quick_node_drop_requested.emit(str(kind), payload)
 
     def _update_minimap_preview(self) -> None:
         try:
@@ -4121,87 +3253,15 @@ class NodeCanvas(QtWidgets.QWidget):
             else:
                 self.archive_btn.setStyleSheet("")
 
-    def set_submacro_links(self, links: dict[int, dict[str, Any]] | None) -> None:
-        self._submacro_links = dict(links) if isinstance(links, dict) else {}
-
-    def submacro_link_info(self, index: int) -> dict[str, Any]:
-        info = self._submacro_links.get(int(index), {})
-        return dict(info) if isinstance(info, dict) else {}
-
-    def node_connection_details(self, index: int, step: dict[str, Any]) -> list[str]:
-        current_name = html.escape(str(self.macro.get("name") or "현재 빌드"))
-        details = [f"<b>현재 위치:</b> {current_name} · {index}번 노드"]
-        if str(step.get("action") or "") == "call_submacro":
-            info = self.submacro_link_info(index)
-            target = html.escape(str(info.get("macro") or step.get("macro") or "선택 필요"))
-            if info.get("exists"):
-                details.append(f"<b>호출 대상:</b> {target}")
-                entries = info.get("entries") if isinstance(info.get("entries"), list) else []
-                entry_text = ", ".join(
-                    f"{int(entry.get('index') or 0)}번 · {html.escape(str(entry.get('label') or '단계'))}"
-                    for entry in entries
-                    if isinstance(entry, dict) and int(entry.get("index") or 0) > 0
-                )
-                details.append(f"<b>진입 노드:</b> {entry_text or '지정되지 않음'}")
-            else:
-                details.append(f"<b>호출 대상:</b> {target} · 파일 없음")
-
-        success_targets: list[int] = []
-        candidates = step.get("success_candidates")
-        if isinstance(candidates, list):
-            for value in candidates:
-                try:
-                    target = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if target > 0 and target not in success_targets:
-                    success_targets.append(target)
-        if not success_targets:
-            try:
-                target = int(step.get("on_success") or 0)
-            except (TypeError, ValueError):
-                target = 0
-            if target > 0:
-                success_targets.append(target)
-        if success_targets:
-            target_text = ", ".join(f"{target}번" for target in success_targets)
-            details.append(f"<b>성공 연결:</b> {current_name} · {target_text} 노드")
-        try:
-            fail_target = int(step.get("on_fail") or 0)
-        except (TypeError, ValueError):
-            fail_target = 0
-        if fail_target > 0:
-            details.append(f"<b>실패 연결:</b> {current_name} · {fail_target}번 노드")
-        return details
-
     @staticmethod
     def step_summary(step: dict[str, Any]) -> str:
         action = str(step.get("action") or "")
         label = str(step.get("label") or "").strip()
         if label:
             return label
-        if action in {"multi_image_search", "animation_search"}:
-            assets = step.get("assets") if isinstance(step.get("assets"), list) else []
-            prefix = "애니메이션 프레임" if action == "animation_search" else "멀티 이미지"
-            return f"{prefix} {len(assets)}개" if assets else "이미지 추가 필요 (미리보기/에디터)"
         if action in {"image_search", "screen_condition"}:
             assets = step.get("assets") if isinstance(step.get("assets"), list) else []
             return f"멀티 이미지 {len(assets)}개" if len(assets) > 1 else str(step.get("asset") or "이미지 선택 필요")
-        if action == "multi_pixel_check":
-            raw = step.get("pixels") or []
-            try:
-                points = json.loads(raw) if isinstance(raw, str) else list(raw)
-            except Exception:
-                points = []
-            count = sum(1 for item in points if isinstance(item, dict) and bool(item.get("enabled", True)))
-            policy = str(step.get("match_policy") or "all")
-            condition = {
-                "all": "모두",
-                "any": "1개 이상",
-                "at_least_n": f"{int(step.get('required_count') or 1)}개 이상",
-                "exact_n": f"정확히 {int(step.get('required_count') or 1)}개",
-            }.get(policy, policy)
-            return f"픽셀 {count}개 · {condition}"
         if action == "datetime_condition":
             if "weekday_enabled" in step:
                 day_text = str(step.get("custom_days") or "요일 지정") if step.get("weekday_enabled") else "매일"
@@ -4244,7 +3304,6 @@ class NodeCanvas(QtWidgets.QWidget):
 
     def set_macro(self, macro: dict[str, Any] | None, selected: int = 0) -> None:
         self.suspended = True
-        self.clear_quick_node_preview()
         self.hide_image_preview()
         self.active_step = 0
         self.execution_states = {}
@@ -4257,7 +3316,6 @@ class NodeCanvas(QtWidgets.QWidget):
         self.nodes = {}
         self.workflow_items = []
         self.comments = []
-        self._group_proxy_edges = []
         self.trigger_node = None
         self.trigger_edge = None
         self.scene.clear()
@@ -4304,9 +3362,6 @@ class NodeCanvas(QtWidgets.QWidget):
         self.rebuild_edges()
         self._add_trigger_visual()
         self._load_comment_boxes()
-        if any(group.next_group_id for group in self.comments):
-            self.apply_group_flow_routes()
-        self._refresh_display_numbers()
         rect = self.scene.itemsBoundingRect()
         if rect.isEmpty():
             rect = QtCore.QRectF(-500, -350, 1000, 700)
@@ -4316,8 +3371,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self.suspended = False
         if selected in self.nodes:
             self.select_node(selected)
-        has_collapsed_groups = any(bool(getattr(group, "collapsed", False)) for group in self.comments)
-        if self.nodes and (not positions or has_collapsed_groups):
+        if self.nodes and not positions:
             QtCore.QTimer.singleShot(0, self.view.fit_all)
 
     def _add_trigger_visual(self) -> None:
@@ -4513,15 +3567,6 @@ class NodeCanvas(QtWidgets.QWidget):
                     target = int(rule.get("target") or 0)
                     if target:
                         targets.append(target)
-            asset_routes = step.get("asset_routes")
-            if isinstance(asset_routes, dict):
-                for route in asset_routes.values():
-                    if not isinstance(route, dict):
-                        continue
-                    for outcome in ("true", "fail"):
-                        target = int(route.get(outcome) or 0)
-                        if target:
-                            targets.append(target)
             for target in targets:
                 if 0 < target <= total and target not in outgoing[index]:
                     outgoing[index].append(target)
@@ -4588,25 +3633,19 @@ class NodeCanvas(QtWidgets.QWidget):
         """Adjust horizontal spacing between adjacent nodes in each row so gaps stay consistent."""
         if not self.nodes:
             return
-        rows: list[list[NodeItem]] = []
-        for node in sorted(self.nodes.values(), key=lambda item: (item.pos().y(), item.pos().x())):
-            row = next((candidate for candidate in rows if abs(candidate[0].pos().y() - node.pos().y()) <= 64.0), None)
-            if row is None:
-                row = []
-                rows.append(row)
-            row.append(node)
-        for row_nodes in rows:
+        rows: dict[int, list[NodeItem]] = {}
+        for node in self.nodes.values():
+            row_key = int(round(node.pos().y() / 150.0))
+            rows.setdefault(row_key, []).append(node)
+        for row_nodes in rows.values():
             if len(row_nodes) <= 1:
                 continue
             row_nodes.sort(key=lambda n: n.pos().x())
-            anchor_x = row_nodes[0].pos().x()
-            row_nodes[0].setPos(anchor_x, row_nodes[0].pos().y())
             for i in range(1, len(row_nodes)):
                 prev = row_nodes[i - 1]
                 curr = row_nodes[i]
-                desired_x = prev.pos().x() + prev.current_width() + 72.0
+                desired_x = prev.pos().x() + prev.current_width() + 100.0
                 curr.setPos(desired_x, curr.pos().y())
-        self._sync_node_groups()
 
     def set_nodes_collapsed(self, indexes: list[int], collapsed: bool) -> None:
         changed = False
@@ -4633,9 +3672,6 @@ class NodeCanvas(QtWidgets.QWidget):
 
     @staticmethod
     def edge_route_key(edge: EdgeItem) -> str:
-        if edge.is_asset_route:
-            aliases = ",".join(alias for _number, alias in edge.asset_entries)
-            return f"{edge.source}:asset_{edge.asset_outcome}:{edge.target}:{aliases}"
         return f"{edge.source}:{edge.kind}:{edge.target}:{edge.condition_index}"
 
     def route_points(self, edge: EdgeItem) -> list[QtCore.QPointF]:
@@ -4662,7 +3698,6 @@ class NodeCanvas(QtWidgets.QWidget):
         self._route_edges()
         self._sync_workflow_lanes()
         self._sync_node_groups()
-        self._refresh_display_numbers()
         self._positions_timer.start()
         if hasattr(self, "minimap") and self.minimap and self.minimap.expanded and self.minimap.isVisible():
             self.minimap.preview.update()
@@ -4674,62 +3709,6 @@ class NodeCanvas(QtWidgets.QWidget):
                     group.sync_rect()
             except Exception:
                 pass
-
-    def _collapsed_group_members(self) -> set[int]:
-        members: set[int] = set()
-        for group in list(getattr(self, "comments", [])):
-            if bool(getattr(group, "collapsed", False)):
-                members.update(int(index) for index in getattr(group, "node_indexes", []))
-        return members
-
-    def _refresh_collapsed_group_visibility(self) -> None:
-        hidden_indexes = self._collapsed_group_members()
-        for index, node in self.nodes.items():
-            node.setVisible(index not in hidden_indexes)
-        for edge in self.edges:
-            edge.setVisible(edge.source not in hidden_indexes and edge.target not in hidden_indexes)
-        for lane in self.workflow_items:
-            indexes = [int(index) for index in getattr(lane, "indexes", [])]
-            lane.setVisible(any(index not in hidden_indexes for index in indexes))
-        if self.trigger_edge is not None:
-            target_index = self.start_step if self.start_step in self.nodes else (self.start_candidates[0] if self.start_candidates else 1)
-            self.trigger_edge.setVisible(target_index not in hidden_indexes)
-        if self.trigger_node is not None:
-            self.trigger_node.setVisible(True)
-        self._rebuild_group_proxy_edges()
-        if hasattr(self, "minimap") and self.minimap and self.minimap.isVisible():
-            self.minimap.preview.update()
-
-    def _update_scene_bounds(self) -> None:
-        rect = QtCore.QRectF()
-        for item in self.scene.items():
-            if not item.isVisible():
-                continue
-            item_rect = item.sceneBoundingRect()
-            rect = rect.united(item_rect) if not rect.isNull() else QtCore.QRectF(item_rect)
-        if rect.isEmpty():
-            rect = QtCore.QRectF(-500, -350, 1000, 700)
-        self.scene.setSceneRect(rect.adjusted(-2200, -1800, 2200, 1800))
-
-    def selected_group_items(self) -> list[NodeGroupItem]:
-        return [item for item in self.scene.selectedItems() if isinstance(item, NodeGroupItem)]
-
-    def set_selected_groups_collapsed(self, collapsed: bool) -> None:
-        groups = self.selected_group_items()
-        if not groups and self.comments:
-            groups = [self.comments[-1]]
-        for group in groups:
-            group.set_collapsed(collapsed, notify=False)
-        if groups:
-            self.comments_changed.emit(self.dump_comments())
-            self._update_scene_bounds()
-
-    def set_all_groups_collapsed(self, collapsed: bool) -> None:
-        for group in list(self.comments):
-            group.set_collapsed(collapsed, notify=False)
-        if self.comments:
-            self.comments_changed.emit(self.dump_comments())
-            self._update_scene_bounds()
 
     def _add_workflow_lanes(self) -> None:
         groups: dict[str, list[int]] = {}
@@ -4751,40 +3730,6 @@ class NodeCanvas(QtWidgets.QWidget):
     def _sync_workflow_lanes(self) -> None:
         for lane in self.workflow_items:
             lane.sync_rect()
-
-    def workflow_lane_for_node(self, node_index: int) -> WorkflowLaneItem | None:
-        return next((lane for lane in self.workflow_items if node_index in lane.indexes), None)
-
-    def check_node_workflow_membership(self, node: NodeItem, original_bounds: QtCore.QRectF) -> None:
-        """Detach a node when it is deliberately dragged outside its smart-workflow lane."""
-        if not original_bounds.isValid():
-            return
-        center = node.sceneBoundingRect().center()
-        if original_bounds.adjusted(-8.0, -8.0, 8.0, 8.0).contains(center):
-            return
-        self.detach_nodes_from_workflow([node.index])
-
-    def detach_nodes_from_workflow(self, indexes: list[int]) -> None:
-        changed = False
-        for index in {int(value) for value in indexes}:
-            if not (0 < index <= len(self.steps)):
-                continue
-            step = self.steps[index - 1]
-            if not str(step.get("workflow_id") or "").strip():
-                continue
-            step.pop("workflow_id", None)
-            step.pop("workflow_label", None)
-            changed = True
-        if not changed:
-            return
-        for lane in list(self.workflow_items):
-            if lane.scene() is self.scene:
-                self.scene.removeItem(lane)
-        self.workflow_items = []
-        self._add_workflow_lanes()
-        self._route_edges()
-        self._update_scene_bounds()
-        self.workflow_membership_changed.emit()
 
     def rebuild_edges(self) -> None:
         for edge in self.edges:
@@ -4848,52 +3793,10 @@ class NodeCanvas(QtWidgets.QWidget):
                         edge = EdgeItem(self, index, target, kind, condition_index, rule)
                         self.scene.addItem(edge)
                         self.edges.append(edge)
-            if self._asset_route_edges_visible:
-                assets = step.get("assets") if isinstance(step.get("assets"), list) else []
-                primary = str(step.get("asset") or "").strip()
-                ordered_assets = [str(alias) for alias in assets if str(alias).strip()]
-                if primary and primary not in ordered_assets:
-                    ordered_assets.insert(0, primary)
-                asset_numbers = {alias: pos for pos, alias in enumerate(ordered_assets, start=1)}
-                route_groups: dict[tuple[str, int], list[tuple[int, str]]] = {}
-                asset_routes = step.get("asset_routes")
-                if isinstance(asset_routes, dict):
-                    for alias, route in asset_routes.items():
-                        alias = str(alias)
-                        if not isinstance(route, dict):
-                            continue
-                        number = int(asset_numbers.get(alias) or (len(asset_numbers) + 1))
-                        for outcome in ("true", "fail"):
-                            target = int(route.get(outcome) or 0)
-                            if target > 0:
-                                route_groups.setdefault((outcome, target), []).append((number, alias))
-                for (outcome, target), entries in route_groups.items():
-                    if index in self.nodes and target in self.nodes:
-                        kind = "success" if outcome == "true" else "fail"
-                        edge = EdgeItem(
-                            self,
-                            index,
-                            target,
-                            kind,
-                            asset_entries=sorted(entries),
-                            asset_outcome=outcome,
-                        )
-                        self.scene.addItem(edge)
-                        self.edges.append(edge)
         self._route_edges()
 
-    def set_asset_route_edges_visible(self, visible: bool) -> None:
-        visible = bool(visible)
-        if self._asset_route_edges_visible == visible:
-            return
-        self._asset_route_edges_visible = visible
-        blocker = QtCore.QSignalBlocker(self.asset_route_toggle)
-        self.asset_route_toggle.setChecked(visible)
-        del blocker
-        self.rebuild_edges()
-
     def _route_edges(self) -> None:
-        """Assign collision-free outer lanes before drawing ordinary direct curves."""
+        """Assign non-overlapping outer lanes to backward links, and route forward links via direct curves."""
         candidates: dict[str, list[tuple[float, float, EdgeItem]]] = {
             "top": [],
             "bottom": [],
@@ -4916,14 +3819,7 @@ class NodeCanvas(QtWidgets.QWidget):
             start = out_port.mapToScene(out_port.rect().center())
             in_port = target.in_success_port if edge.kind == "success" else target.in_fail_port
             end = in_port.mapToScene(in_port.rect().center())
-            if edge.is_condition or edge.is_asset_route:
-                # Condition lines carry a separate meaning and are usually
-                # longer than ordinary flow links. Always keep them outside
-                # node bodies: success above, failure below. Manual waypoints
-                # were handled above and remain untouched.
-                side = "top" if edge.kind == "success" else "bottom"
-                candidates[side].append((min(start.x(), end.x()), max(start.x(), end.x()), edge))
-            elif edge.is_return_link():
+            if edge.is_return_link():
                 side = "top" if edge.kind == "success" else "bottom"
                 candidates[side].append((min(start.x(), end.x()), max(start.x(), end.x()), edge))
             elif edge.is_row_wrap_link():
@@ -4968,16 +3864,6 @@ class NodeCanvas(QtWidgets.QWidget):
                 edge.route_side = side
                 edge.route_lane = lane
 
-        # Offset converging forward edges so their labels/paths do not overlap
-        incoming_targets: dict[tuple[int, str], list[EdgeItem]] = {}
-        for edge in self.edges:
-            if not edge.route_side and not edge.is_return_link() and not edge.is_row_wrap_link():
-                incoming_targets.setdefault((edge.target, edge.kind), []).append(edge)
-        for (tgt, kind), in_edges in incoming_targets.items():
-            if len(in_edges) > 1:
-                for idx, e in enumerate(sorted(in_edges, key=lambda x: (x.source, x.condition_index))):
-                    e.target_offset_y = (idx - (len(in_edges) - 1) / 2.0) * 16.0
-
         # 2-Pass update: Pass 1 primary edges, Pass 2 secondary candidate edges (so they branch from primary edge midpoint)
         for edge in self.edges:
             if not getattr(edge, "is_secondary_candidate", False):
@@ -4985,7 +3871,6 @@ class NodeCanvas(QtWidgets.QWidget):
         for edge in self.edges:
             if getattr(edge, "is_secondary_candidate", False):
                 edge.update_path()
-        self._rebuild_group_proxy_edges()
 
     def remove_edge(self, source: int, target: int, kind: str, condition_index: int = -1) -> None:
         for edge in list(self.edges):
@@ -5006,84 +3891,6 @@ class NodeCanvas(QtWidgets.QWidget):
                 continue
         self.scene.update()
         self.view.viewport().update()
-
-    def delete_selected_edges(self, edges: list[EdgeItem]) -> None:
-        if not edges:
-            return
-        edge_specs = []
-        for edge in edges:
-            try:
-                if edge.is_asset_route:
-                    continue
-                edge_specs.append({
-                    "source": int(edge.source),
-                    "target": int(edge.target),
-                    "kind": str(edge.kind),
-                    "is_condition": bool(getattr(edge, "is_condition", False)),
-                    "condition_index": int(getattr(edge, "condition_index", -1)),
-                    "candidate_index": int(getattr(edge, "candidate_index", 0)),
-                })
-            except Exception:
-                continue
-        if edge_specs:
-            self.edges_delete_requested.emit(edge_specs)
-
-    def begin_node_target_pick(
-        self,
-        excluded_index: int = 0,
-        eligible_indexes: set[int] | None = None,
-        prompt: str = "🎯 다음 진행 노드를 클릭하세요 · Esc 취소",
-    ) -> None:
-        self.cancel_node_target_pick(emit=False)
-        self._node_target_pick_active = True
-        self._node_target_pick_excluded = int(excluded_index or 0)
-        self._node_target_pick_eligible = {int(value) for value in eligible_indexes} if eligible_indexes is not None else None
-        self._node_target_pick_previous_label = self.flow_label.text()
-        self.flow_label.setText(prompt)
-        self.flow_label.setStyleSheet("font-weight:800; color:#38E7FF; letter-spacing:0.4px;")
-        self.view.setCursor(QtCore.Qt.PointingHandCursor)
-        self.view.setFocus(QtCore.Qt.OtherFocusReason)
-        for index, node in self.nodes.items():
-            unavailable = index == self._node_target_pick_excluded
-            if self._node_target_pick_eligible is not None:
-                unavailable = unavailable or index not in self._node_target_pick_eligible
-            node.setOpacity(0.22 if unavailable else 1.0)
-            node.update()
-
-    def complete_node_target_pick(self, target: int) -> None:
-        if not self._node_target_pick_active:
-            return
-        target = int(target or 0)
-        if (
-            target <= 0
-            or target == self._node_target_pick_excluded
-            or (self._node_target_pick_eligible is not None and target not in self._node_target_pick_eligible)
-        ):
-            QtWidgets.QApplication.beep()
-            return
-        self._finish_node_target_pick_ui()
-        self.node_target_picked.emit(target)
-
-    def cancel_node_target_pick(self, emit: bool = True) -> None:
-        if self._pending_node_kind:
-            self.cancel_node_placement()
-            return
-        if not self._node_target_pick_active:
-            return
-        self._finish_node_target_pick_ui()
-        if emit:
-            self.node_target_picked.emit(0)
-
-    def _finish_node_target_pick_ui(self) -> None:
-        self._node_target_pick_active = False
-        self._node_target_pick_excluded = 0
-        self._node_target_pick_eligible = None
-        self.flow_label.setText(self._node_target_pick_previous_label or "FLOW CANVAS")
-        self.flow_label.setStyleSheet(f"font-weight:800; color:{COLORS['accent']}; letter-spacing:1px;")
-        self.view.unsetCursor()
-        for node in self.nodes.values():
-            node.setOpacity(1.0)
-            node.update()
 
     def select_node(self, index: int) -> None:
         if index not in self.nodes:
@@ -5124,10 +3931,6 @@ class NodeCanvas(QtWidgets.QWidget):
         if not selected_index:
             for edge in self.edges:
                 try:
-                    if edge.isSelected():
-                        edge.setOpacity(1.0)
-                        edge.setZValue(30)
-                        continue
                     base_op = 0.38 if getattr(edge, "edge_type", "") == "return" and edge.kind == "success" else (0.35 if getattr(edge, "edge_type", "") == "return" else (0.50 if getattr(edge, "is_condition", False) else 0.45))
                     edge.setOpacity(base_op)
                     edge.setZValue(-1)
@@ -5137,10 +3940,6 @@ class NodeCanvas(QtWidgets.QWidget):
 
         for edge in self.edges:
             try:
-                if edge.isSelected():
-                    edge.setOpacity(1.0)
-                    edge.setZValue(30)
-                    continue
                 if edge.source == selected_index or edge.target == selected_index:
                     edge.setOpacity(1.0)
                     edge.setZValue(15)
@@ -5301,17 +4100,10 @@ class NodeCanvas(QtWidgets.QWidget):
                     QtCore.QRectF(x, y, w, h),
                     self,
                     node_indexes=[int(i) for i in loaded_indexes if str(i).isdigit()],
-                    next_group_id=str(c.get("next_group_id") or ""),
-                    unconnected_success=str(c.get("unconnected_success") or "next"),
-                    unconnected_fail=str(c.get("unconnected_fail") or "next"),
                 )
                 self.comments.append(box)
                 self.scene.addItem(box)
                 box.sync_rect()
-                if bool(c.get("collapsed", False)):
-                    box.set_collapsed(True, notify=False)
-        self._refresh_collapsed_group_visibility()
-        self._refresh_group_node_styles()
 
     def _add_default_comment_box(self, color: str = "yellow") -> None:
         if self.selected_indexes():
@@ -5474,9 +4266,6 @@ class NodeCanvas(QtWidgets.QWidget):
         width: float = 440.0,
         height: float = 260.0,
         node_indexes: list[int] | None = None,
-        next_group_id: str = "",
-        unconnected_success: str = "next",
-        unconnected_fail: str = "next",
     ) -> NodeGroupItem:
         box = NodeGroupItem(
             uuid.uuid4().hex[:8],
@@ -5485,19 +4274,14 @@ class NodeCanvas(QtWidgets.QWidget):
             QtCore.QRectF(pos.x(), pos.y(), width, height),
             self,
             node_indexes=node_indexes or [],
-            next_group_id=next_group_id,
-            unconnected_success=unconnected_success,
-            unconnected_fail=unconnected_fail,
         )
         self.comments.append(box)
         self.scene.addItem(box)
         box.sync_rect()
-        self._refresh_group_node_styles()
         self.comments_changed.emit(self.dump_comments())
         return box
 
     def remove_comment_box(self, box: NodeGroupItem) -> None:
-        was_collapsed = bool(getattr(box, "collapsed", False))
         if box in self.comments:
             self.comments.remove(box)
         try:
@@ -5505,9 +4289,6 @@ class NodeCanvas(QtWidgets.QWidget):
                 self.scene.removeItem(box)
         except (RuntimeError, AttributeError):
             pass
-        if was_collapsed:
-            self._refresh_collapsed_group_visibility()
-        self._refresh_group_node_styles()
         self.comments_changed.emit(self.dump_comments())
 
     def dump_comments(self) -> list[dict[str, Any]]:
@@ -5524,10 +4305,6 @@ class NodeCanvas(QtWidgets.QWidget):
                         "w": round(b.box_rect.width(), 1),
                         "h": round(b.box_rect.height(), 1),
                         "node_indexes": list(getattr(b, "node_indexes", [])),
-                        "collapsed": bool(getattr(b, "collapsed", False)),
-                        "next_group_id": str(getattr(b, "next_group_id", "") or ""),
-                        "unconnected_success": str(getattr(b, "unconnected_success", "next") or "next"),
-                        "unconnected_fail": str(getattr(b, "unconnected_fail", "next") or "next"),
                     })
             except (RuntimeError, AttributeError):
                 pass

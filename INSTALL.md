@@ -1,36 +1,45 @@
-# Windows 설치 및 실행
+# 설치/실행 (다른 PC)
 
-## 가장 쉬운 설치
+## 가장 쉬운 자동 설치
 
-1. GitHub Releases에서 `MacroRelay-Studio-v*.zip`을 내려받아 압축을 풉니다.
-2. `setup_windows.bat`을 더블클릭합니다.
-3. 설치가 끝나면 Studio가 자동으로 실행됩니다.
+1. GitHub의 Windows ZIP을 내려받아 압축을 풉니다.
+2. `install.bat`을 더블클릭합니다.
+3. Python 3.11, 필수 Python 패키지, OpenCV/OCR/Windows 자동화 엔진과 MacroRelay 호환 AutoHotkey v1이 자동 구성됩니다.
+4. 완료 후 Studio가 자동 실행됩니다.
 
-설치 프로그램은 다음 작업을 자동으로 처리합니다.
+`run_studio.bat`을 먼저 실행해도 필수 환경이 없으면 자동 설치 화면으로 전환됩니다. 설치 진행은 `bootstrap-install.log`, 실패 원인은 `bootstrap-install-error.txt`에 기록됩니다.
 
-- Python 3.11/3.12 검색 및 없을 경우 Windows Package Manager로 Python 3.12 설치
-- 프로젝트 전용 `.venv` 생성 또는 손상된 가상환경 복구
-- PySide6, OpenCV, MSS, NumPy 등 멀티 이미지 서치 필수 패키지 설치
-- AutoHotkey v1.1 공식 설치 파일의 SHA-256 검증 후 자동 설치·연결
-- Playwright Chromium 설치
-- 설치 결과 모듈 검사
+Tesseract OCR도 winget 사용이 가능한 PC에서는 자동 설치하고 한국어·영어 데이터를 내려받습니다. 브라우저 자동화용 Chromium은 용량이 크므로 다음 명령으로 선택 설치합니다.
 
-OCR 부가 엔진은 사용하는 기능과 용량이 다르므로 Studio의 `설정 > 구성요소 설치`에서 추가할 수 있습니다. Studio 편집, 이미지 검색과 기본 매크로 실행은 위 원클릭 설치로 구성됩니다.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -IncludeBrowser -Launch
+```
 
-## 이미 설치한 이후
+## 자동 설치 항목
 
-`run_studio.bat`을 더블클릭하면 기존 환경을 재설치하지 않고 바로 실행합니다.
+- Python 3.11 전용 `.venv`
+- PySide6, Playwright Python 패키지, Pillow, pytesseract, openpyxl
+- OpenCV, MSS, RapidOCR, ONNX Runtime
+- pywin32, pywinauto, uiautomation
+- AutoHotkey v1.1.37.02 포터블 실행기 및 Ahk2Exe 연결
+- Tesseract OCR과 `eng+kor` 언어 데이터(설치 가능한 환경)
 
 ## 수동 설치
 
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m playwright install chromium
+```bat
+cd C:\path\to\macro_tool
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install --target runtime_packages -r requirements-runtime.txt
+.venv\Scripts\python.exe run_studio.py
 ```
 
-## 문제 해결
+## 3) Playwright 브라우저 설치 (처음 1회, 브라우저 도우미 사용 시)
 
-- 설치 중 오류: 열린 창의 마지막 오류 문장을 확인합니다.
-- 실행 창이 열리지 않음: `studio-launch-error.txt`를 확인합니다.
-- OpenCV/OCR/AutoHotkey: Studio의 `설정 > 구성요소 설치`에서 상태를 확인합니다.
+```bat
+py -m playwright install
+```
+
+## 4) 창이 바로 꺼질 때
+
+`bootstrap-install-error.txt` 또는 `studio-launch-error.txt` 내용을 확인하세요.

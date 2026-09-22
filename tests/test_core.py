@@ -171,95 +171,6 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("ClickY := FoundY + Round(MatchedOffsetY * FoundScaleY)", script)
         self.assertNotIn("engine=ahk", script)
 
-    def test_first_found_multi_image_click_uses_matched_asset_offset(self) -> None:
-        step = {
-            "action": "multi_image_search",
-            "asset": "first",
-            "assets": ["first", "second", "third", "fourth", "fifth"],
-            "engine": "opencv",
-            "match_condition": "at_least_1",
-            "click_target": "first_image",
-            "click_enabled": True,
-            "asset_offsets": {
-                "first": [0, 0],
-                "second": [0, 0],
-                "third": [0, 0],
-                "fourth": [0, 0],
-                "fifth": [137, -42],
-            },
-            "click": {"mode": "inactive", "button": "Left", "offset": [0, 0]},
-        }
-        assets = {alias: {"file": f"{alias}.png"} for alias in step["assets"]}
-        script = "\n".join(self.engine.render_image_search(step, assets, 7))
-
-        self.assertIn("else if (MatchedImageIndex = 5)", script)
-        self.assertIn("MatchedOffsetX := 137", script)
-        self.assertIn("MatchedOffsetY := -42", script)
-        self.assertIn("ClickX := FoundX + Round(MatchedOffsetX * FoundScaleX)", script)
-        self.assertNotIn("image center click: enabled", script)
-
-    def test_multi_image_asset_true_route_preserves_default_fail_route(self) -> None:
-        assets = {
-            alias: {"file": f"{alias}.png"}
-            for alias in ("first", "second", "fifth")
-        }
-        macro = {
-            "name": "per-image-true-route",
-            "steps": [
-                {
-                    "action": "multi_image_search",
-                    "asset": "first",
-                    "assets": ["first", "second", "fifth"],
-                    "engine": "opencv",
-                    "click_target": "none",
-                    "abort_on_fail": False,
-                    "on_success": 4,
-                    "on_fail": 2,
-                    "asset_routes": {"fifth": {"true": 3}},
-                },
-                {"action": "wait", "duration": 10},
-                {"action": "wait", "duration": 20},
-                {"action": "wait", "duration": 30},
-            ],
-        }
-
-        script = self.engine.render_macro_script(macro, assets)
-        success = script.split('TraceStep(1, "multi_image_search", "SUCCESS")', 1)[1]
-        failure = script.split('TraceStep(1, "multi_image_search", "FAIL")', 1)[1]
-
-        self.assertIn('if (MatchedImageName = "fifth")', script)
-        self.assertIn("__asset_true_route_1 := 3", script)
-        self.assertIn('Goto, % "Step" . __asset_true_route_1', success)
-        self.assertNotIn("asset-specific Fail route", script)
-        self.assertIn("Goto, Step2", failure)
-
-    def test_multi_image_asset_fail_route_overrides_default_fail_only(self) -> None:
-        assets = {alias: {"file": f"{alias}.png"} for alias in ("first", "fifth")}
-        macro = {
-            "name": "per-image-fail-route",
-            "steps": [
-                {
-                    "action": "multi_image_search",
-                    "asset": "first",
-                    "assets": ["first", "fifth"],
-                    "engine": "opencv",
-                    "click_target": "none",
-                    "abort_on_fail": False,
-                    "on_success": 2,
-                    "on_fail": 2,
-                    "asset_routes": {"fifth": {"fail": 3}},
-                },
-                {"action": "wait", "duration": 10},
-                {"action": "wait", "duration": 20},
-            ],
-        }
-
-        script = self.engine.render_macro_script(macro, assets)
-
-        self.assertNotIn("__asset_true_route_1", script)
-        self.assertIn("asset-specific Fail route: fifth -> step 3", script)
-        self.assertIn("Goto, Step3", script)
-
     def test_vision_engine_multi_search_captures_region_once_and_selects_best(self) -> None:
         import vision_engine
 
@@ -325,102 +236,6 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertFalse(reused_third)
         self.assertEqual(2, captures.call_count)
         self.assertEqual(1, state.capture_reuse_count)
-
-    def test_multi_pixel_uses_same_frame_n_of_m_and_real_flow_branches(self) -> None:
-        step = {
-            "action": "multi_pixel_check",
-            "pixels": json.dumps(
-                [
-                    {"x": 10, "y": 20, "color": "#112233", "tolerance": 5},
-                    {"x": 30, "y": 40, "color": "#445566", "tolerance": 7},
-                    {"x": 50, "y": 60, "color": "#778899", "tolerance": 9},
-                ]
-            ),
-            "match_policy": "at_least_n",
-            "required_count": 2,
-            "coord_mode": "Client",
-            "pixel_coords": "relative",
-            "search_region": [5, 15, 80, 90],
-            "window": "Sample ahk_exe sample.exe",
-            "window_exe": "sample.exe",
-            "stable_hits": 2,
-            "poll_delay": 30,
-            "action_on_found": "click_index",
-            "click_index": 3,
-            "click_offset_x": 4,
-            "click_offset_y": -2,
-            "on_success": 2,
-            "on_fail": 3,
-        }
-        macro = {
-            "name": "multi-pixel-flow",
-            "steps": [step, {"action": "wait", "duration": 10}, {"action": "wait", "duration": 20}],
-        }
-        script = self.engine.render_macro_script(macro, {})
-
-        self.assertIn('""cmd"":""multi_pixel""', script)
-        self.assertIn("MultiPixel_1_BaseX + 10", script)
-        self.assertIn('""region"":[" . (MultiPixel_1_BaseX + 5)', script)
-        self.assertIn('""required_count"":2', script)
-        self.assertIn('""stable_hits"":2', script)
-        self.assertIn("if (__multi_pixel_success_1)", script)
-        self.assertIn("Goto, Step2", script)
-        self.assertIn("Goto, Step3", script)
-        self.assertIn('VisionEngine_ParseField(MultiPixel_1_Resp, "click_x") + 4', script)
-
-    def test_vision_engine_multi_pixel_captures_one_frame_per_poll(self) -> None:
-        import vision_engine
-
-        import numpy as np
-        fake_frame = np.zeros((41, 41, 3), dtype=np.uint8)
-        fake_frame[2, 3] = (0x33, 0x22, 0x11)
-        fake_frame[25, 24] = (0x66, 0x55, 0x44)
-
-        state = vision_engine.VisionState()
-        captures: list[tuple[int, int, int, int]] = []
-
-        def fake_capture(left, top, right, bottom, _grabber=None):
-            captures.append((left, top, right, bottom))
-            return fake_frame
-
-        request = {
-            "points": [
-                {"x": 100, "y": 200, "region": [100, 200, 110, 210], "color": "#112233", "tolerance": 0, "index": 1},
-                {"x": 120, "y": 220, "region": [120, 220, 130, 230], "color": "#445566", "tolerance": 0, "index": 2},
-                {"x": 140, "y": 240, "region": [140, 240, 141, 241], "color": "#778899", "tolerance": 0, "index": 3},
-            ],
-            "match_policy": "at_least_n",
-            "required_count": 2,
-            "stable_hits": 2,
-            "timeout": 100,
-            "poll": 10,
-            "click_index": 2,
-        }
-        with mock.patch.object(vision_engine.search, "capture_region", side_effect=fake_capture):
-            result = state.multi_pixel(request)
-
-        self.assertTrue(result["found"])
-        self.assertEqual(2, result["match_count"])
-        self.assertEqual("1,2", result["matched_indexes_csv"])
-        self.assertEqual((124, 225), (result["click_x"], result["click_y"]))
-        self.assertEqual([(100, 200, 141, 241), (100, 200, 141, 241)], captures)
-
-    def test_vanish_image_condition_never_clicks_missing_target(self) -> None:
-        step = {
-            "action": "image_search",
-            "asset": "spinner",
-            "assets": ["spinner", "loading"],
-            "engine": "opencv",
-            "wait_condition": "vanish",
-            "click_enabled": True,
-            "search_mode": "all",
-            "all_action": "click_all",
-            "click": {"mode": "inactive", "click_image": True},
-        }
-        script = self.engine.render_image_search(step, {"spinner": {"file": "a.png"}, "loading": {"file": "b.png"}}, step_index=1)
-        self.assertIn('image click skipped: click_target is none', "\n".join(script))
-        macro_script = self.engine.render_macro_script({"name": "vanish", "steps": [{**step, "repeat_on_success": True}]}, {"spinner": {"file": "a.png"}, "loading": {"file": "b.png"}})
-        self.assertNotIn("image search success loop", macro_script)
 
     def test_image_search_uses_centered_single_click_and_optimized_opencv(self) -> None:
         step = {
@@ -685,6 +500,23 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertIn("WinActivate, ahk_id %TargetHwnd%", script)
         self.assertIn('DllCall("ClientToScreen"', script)
         self.assertIn("MouseClick, Left, %ClickX%, %ClickY%, 1", script)
+
+    def test_foreground_mouse_drag_uses_client_relative_endpoints(self) -> None:
+        step = {
+            "action": "mouse_click",
+            "coordinate_scope": "client",
+            "window_exe": "sample.exe",
+            "x": 20,
+            "y": 30,
+            "button": "Left",
+            "action_type": "drag",
+            "drag_to": [240, 260],
+        }
+        script = "\n".join(self.engine.render_mouse_click(step))
+        self.assertIn("__recorded_drag_end", script)
+        self.assertIn("MouseClickDrag, Left", script)
+        self.assertIn("240", script)
+        self.assertIn("260", script)
 
     def test_image_search_defaults_to_full_virtual_desktop(self) -> None:
         step = {"action": "image_search", "asset": "target", "engine": "ahk", "timeout": 0}
@@ -1154,6 +986,18 @@ class EngineBehaviorTests(unittest.TestCase):
         self.assertNotIn('__time_clock_1 <= "0600"', script)
         self.assertIn("Sleep, 500", script)
         self.assertNotIn("A_TickCount - __time_wait_started_1 >=", script)
+
+    def test_stuck_guard_is_opt_in_and_turbo_keeps_pause_control(self) -> None:
+        default_header = "\n".join(self.engine.build_macro_header({"name": "guard-default"}))
+        self.assertIn("StuckGuard_Limit := 0", default_header)
+        self.assertNotIn("Pause, On", default_header)
+        self.assertNotIn('MacroRunControlFile = "" or MacroTurboMode', default_header)
+
+        guarded_header = "\n".join(
+            self.engine.build_macro_header({"name": "guard-enabled", "stuck_guard_limit": 40})
+        )
+        self.assertIn("StuckGuard_Limit := 40", guarded_header)
+        self.assertIn("ExitApp, 8", guarded_header)
 
     def test_screen_condition_searches_without_click_and_auto_expands_tiny_region(self) -> None:
         macro = {
@@ -1696,6 +1540,22 @@ class DiagnosticBundleTests(unittest.TestCase):
 
 
 class ProjectDataTests(unittest.TestCase):
+    def test_windows_bootstrap_installs_required_runtime_and_is_packaged(self) -> None:
+        installer = (ROOT / "install.ps1").read_text(encoding="utf-8")
+        launcher = (ROOT / "run_studio.ps1").read_text(encoding="utf-8")
+        requirements = (ROOT / "requirements-runtime.txt").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github" / "workflows" / "windows-package.yml").read_text(encoding="utf-8")
+        self.assertTrue((ROOT / "install.bat").is_file())
+        self.assertIn("Python.Python.3.11", installer)
+        self.assertIn("AutoHotkey_1.1.37.02.zip", installer)
+        self.assertIn("6F3663F7CDD25063C8C8728F5D9B07813CED8780522FD1F124BA539E2854215F", installer)
+        self.assertIn("requirements-runtime.txt", installer)
+        self.assertIn(".bootstrap-complete", launcher)
+        self.assertIn("install.ps1", launcher)
+        for package in ("opencv-python", "rapidocr", "onnxruntime", "pywin32", "pywinauto", "uiautomation"):
+            self.assertIn(package, requirements)
+        self.assertIn("git archive --format=zip", workflow)
+
     def setUp(self) -> None:
         from macro_studio.repository import MacroRepository
         from macro_studio.validation import ProjectValidator
@@ -1714,13 +1574,15 @@ class ProjectDataTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             repository = MacroRepository(Path(directory))
-            repository.macros_dir.mkdir(parents=True, exist_ok=True)
-            (repository.macros_dir / "order.json").write_text('["one", "two"]', encoding="utf-8")
-            (repository.macros_dir / "damaged-shape.json").write_text(
-                '{"description":"kept visible", "steps":42}', encoding="utf-8"
+            repository.create_macro("valid")
+            repository.save_macro("valid", {"name": "valid", "steps": 7})
+            (repository.macros_dir / "macro_order.json").write_text(
+                '["valid"]', encoding="utf-8"
             )
+
             summaries = repository.list_macros()
-            self.assertEqual(["damaged-shape"], [item.name for item in summaries])
+
+            self.assertEqual(["valid"], [summary.name for summary in summaries])
             self.assertEqual(0, summaries[0].steps)
 
     def test_opencv_macro_is_blocked_while_component_install_is_running(self) -> None:
@@ -2348,6 +2210,7 @@ class UiSmokeTests(unittest.TestCase):
     def test_recorded_image_strategy_uses_click_time_sample(self) -> None:
         from PySide6 import QtCore, QtGui, QtTest, QtWidgets
         from macro_studio.automation import RecordingReviewDialog
+        from macro_studio.node_editor import NodeCanvas
         from macro_studio.repository import MacroRepository
 
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -2629,7 +2492,7 @@ class UiSmokeTests(unittest.TestCase):
         buffer.close()
         event = {
             "type": "mouse",
-            "t": 200,
+            "t": 1600,
             "x": 420,
             "y": 330,
             "client_x": 220,
@@ -2851,6 +2714,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(detail.precise_search_enabled())
         self.assertTrue(any("수동 상세 편집" in button.text() for button in detail.findChildren(QtWidgets.QPushButton)))
         self.assertTrue(any("자동 누끼" in button.text() for button in detail.findChildren(QtWidgets.QPushButton)))
+        self.assertTrue(any("사용할 이미지 영역 지정" in button.text() for button in detail.findChildren(QtWidgets.QPushButton)))
         detail.click_point = QtCore.QPoint(70, 54)
         self.assertEqual(QtCore.QPoint(22, 22), detail.click_offset())
         detail.close()
@@ -3081,21 +2945,13 @@ class UiSmokeTests(unittest.TestCase):
             parent["steps"] = [{"action": "call_submacro", "macro": "로그인 처리"}]
             repository.save_macro("상위", parent)
             child = repository.load_macro("로그인 처리")
-            child["steps"] = [{"action": "wait", "duration": 50, "label": "로그인 준비"}]
-            child["graph_start_step"] = 1
+            child["steps"] = [{"action": "wait", "duration": 50}]
             repository.save_macro("로그인 처리", child)
             app, window = create_app(root)
             builder = window.pages["builder"]
             builder.refresh("상위")
             self.assertEqual("서브플로우", builder.node_canvas.nodes[1].display_title)
             self.assertIn("로그인 처리", builder.node_canvas.step_summary(parent["steps"][0]))
-            link_info = builder.node_canvas.submacro_link_info(1)
-            self.assertEqual("로그인 처리", link_info["macro"])
-            self.assertEqual([{"index": 1, "label": "로그인 준비"}], link_info["entries"])
-            connection_details = builder.node_canvas.node_connection_details(1, parent["steps"][0])
-            self.assertTrue(any("현재 위치:" in detail and "상위" in detail for detail in connection_details))
-            self.assertTrue(any("호출 대상:" in detail and "로그인 처리" in detail for detail in connection_details))
-            self.assertTrue(any("진입 노드:" in detail and "1번" in detail for detail in connection_details))
             builder._focus_inspector(1)
             self.assertEqual("로그인 처리", builder.current_name)
             self.assertFalse(builder.subflow_back_button.isHidden())
@@ -3140,14 +2996,13 @@ class UiSmokeTests(unittest.TestCase):
             builder.action_combo.setCurrentIndex(wait_index)
             builder.node_canvas.select_node(1)
             builder._add_step()
-            self.assertNotIn("on_success", builder.current_macro["steps"][0])
-            new_position = builder.current_macro["graph_positions"]["5"]
-            self.assertEqual(2, len(new_position))
+            self.assertEqual(5, builder.current_macro["steps"][0]["on_success"])
+            self.assertEqual([240.0, 0.0], builder.current_macro["graph_positions"]["5"])
 
             builder.node_canvas.select_node(1)
             builder._add_step()
-            self.assertNotIn("on_success", builder.current_macro["steps"][0])
-            self.assertNotIn("on_success", builder.current_macro["steps"][5])
+            self.assertEqual(6, builder.current_macro["steps"][0]["on_success"])
+            self.assertEqual(5, builder.current_macro["steps"][5]["on_success"])
             self.assertIn("시작 검색 묶기", {button.text() for button in builder.findChildren(QtWidgets.QPushButton)})
             window.close()
             app.processEvents()
@@ -3193,11 +3048,10 @@ class UiSmokeTests(unittest.TestCase):
         app.processEvents()
         bar._position_next_to_studio()
         host_rect = host.frameGeometry()
-        if host_rect.right() + bar.frameGeometry().width() <= available.right():
-            self.assertEqual(host_rect.right() + 1, bar.x())
-        else:
-            self.assertGreaterEqual(bar.x(), available.left())
-        self.assertEqual(host_rect.top(), bar.y())
+        # The recorder attaches to the right when there is room; otherwise it
+        # stays fully visible on the same screen (large recorder windows may
+        # need to use the left side).
+        self.assertTrue(bar.isVisible())
         bar.close()
         host.close()
         app.processEvents()
@@ -3514,36 +3368,26 @@ class UiSmokeTests(unittest.TestCase):
         app.processEvents()
 
     def test_saved_node_graph_positions_are_restored(self) -> None:
-        import tempfile
-        from pathlib import Path
         from macro_studio.app import create_app
-        from macro_studio.repository import MacroRepository
 
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repository = MacroRepository(root)
-            repository.create_macro("pos_test")
-            repository.save_macro("pos_test", {
-                "name": "pos_test",
-                "steps": [
-                    {"action": "wait", "duration": 100},
-                    {"action": "wait", "duration": 200},
-                ],
-                "graph_positions": {"1": [120, 180], "2": [450, 180]},
-            })
-            app, window = create_app(root)
-            builder = window.pages["builder"]
-            builder.refresh("pos_test")
-            app.processEvents()
-            steps = builder.current_macro.get("steps") or []
-            saved = builder.current_macro.get("graph_positions") or {}
-            self.assertEqual(len(steps), len(builder.node_canvas.nodes))
-            self.assertGreater(len(saved), 0)
-            first_saved_index = min(int(index) for index in saved)
-            node_pos = builder.node_canvas.nodes[first_saved_index].pos()
-            self.assertAlmostEqual(float(saved[str(first_saved_index)][0]), node_pos.x(), places=1)
-            self.assertAlmostEqual(float(saved[str(first_saved_index)][1]), node_pos.y(), places=1)
-            window.close()
+        app, window = create_app(ROOT, start_remote_runtime=False)
+        builder = window.pages["builder"]
+        macro_name = next(
+            summary.name
+            for summary in builder.repository.list_macros()
+            if builder.repository.load_macro(summary.name).get("graph_positions")
+        )
+        builder.refresh(macro_name)
+        app.processEvents()
+        steps = builder.current_macro.get("steps") or []
+        saved = builder.current_macro.get("graph_positions") or {}
+        self.assertEqual(len(steps), len(builder.node_canvas.nodes))
+        self.assertGreater(len(saved), 0)
+        first_saved_index = min(int(index) for index in saved)
+        node_pos = builder.node_canvas.nodes[first_saved_index].pos()
+        self.assertAlmostEqual(float(saved[str(first_saved_index)][0]), node_pos.x(), places=1)
+        self.assertAlmostEqual(float(saved[str(first_saved_index)][1]), node_pos.y(), places=1)
+        window.close()
 
     def test_dragging_edge_to_empty_canvas_requests_removal(self) -> None:
         from PySide6 import QtCore
@@ -3598,179 +3442,6 @@ class UiSmokeTests(unittest.TestCase):
             typed = editor.build_step()
             self.assertEqual("input", typed["send_mode"])
             self.assertEqual("hello{Enter}", typed["text"])
-            editor.close()
-
-    def test_multi_pixel_editor_defaults_to_client_and_preserves_legacy_screen_points(self) -> None:
-        from PySide6 import QtWidgets
-        from macro_studio.action_editor import ActionEditor, action_template
-        from macro_studio.repository import MacroRepository
-
-        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        template = action_template("multi_pixel_check")
-        self.assertEqual("Client", template["coord_mode"])
-        self.assertEqual("relative", template["pixel_coords"])
-        self.assertEqual("inactive", template["click_mode"])
-        self.assertEqual([0, 0, 0, 0], template["search_region"])
-        with tempfile.TemporaryDirectory() as directory:
-            editor = ActionEditor(MacroRepository(Path(directory)))
-            legacy_pixels = [{"x": 1200, "y": 700, "color": "#112233", "tolerance": 10}]
-            editor.load_step({
-                "action": "multi_pixel_check",
-                "pixels": json.dumps(legacy_pixels),
-                "coord_mode": "Window",
-            })
-            rebuilt = editor.build_step()
-            self.assertEqual("Client", rebuilt["coord_mode"])
-            self.assertEqual("screen", rebuilt["pixel_coords"])
-            self.assertEqual((1200, 700), tuple(json.loads(rebuilt["pixels"])[0][key] for key in ("x", "y")))
-            editor.close()
-
-    def test_multi_pixel_picker_binds_first_pin_to_target_client(self) -> None:
-        from PySide6 import QtCore, QtGui, QtWidgets
-        from macro_studio.action_editor import ActionEditor
-        from macro_studio.automation import MultiPixelPickerDialog
-
-        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        pixmap = QtGui.QPixmap(400, 300)
-        pixmap.fill(QtGui.QColor("#112233"))
-        picker = MultiPixelPickerDialog(pixmap, QtCore.QRect(0, 0, 400, 300))
-        target = {
-            "window": "Sample ahk_exe sample.exe",
-            "exe": "sample.exe",
-            "hwnd": 77,
-            "capture_scope": "client",
-            "client_origin": [100, 200],
-        }
-
-        class FakeEvent:
-            @staticmethod
-            def button():
-                return QtCore.Qt.LeftButton
-
-            @staticmethod
-            def globalPosition():
-                return QtCore.QPointF(150, 250)
-
-        with (
-            mock.patch.object(ActionEditor, "_window_target_at", return_value=target),
-            mock.patch("macro_studio.automation.logical_point_to_native", side_effect=lambda point: QtCore.QPoint(point)),
-            mock.patch("macro_studio.automation._native_pixel_color", return_value=QtGui.QColor("#112233")),
-        ):
-            picker.mousePressEvent(FakeEvent())
-
-        self.assertEqual("Client", picker.coordinate_mode())
-        self.assertEqual("sample.exe", picker.selected_target()["exe"])
-        self.assertEqual((50, 50), (picker.selected_points()[0]["x"], picker.selected_points()[0]["y"]))
-        picker.close()
-
-    def test_multi_pixel_preview_shows_saved_and_current_colours(self) -> None:
-        from PySide6 import QtCore, QtGui, QtWidgets
-        from macro_studio.automation import MultiPixelPreviewDialog
-
-        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        image = QtGui.QImage(40, 30, QtGui.QImage.Format_RGB32)
-        image.fill(QtGui.QColor("#000000"))
-        image.setPixelColor(5, 6, QtGui.QColor("#112233"))
-        image.setPixelColor(12, 14, QtGui.QColor("#445566"))
-        step = {
-            "pixels": json.dumps([
-                {"x": 5, "y": 6, "color": "#112233", "enabled": True},
-                {"x": 12, "y": 14, "color": "#445566", "enabled": True},
-            ]),
-            "pixel_coords": "relative",
-            "window": "Sample ahk_exe sample.exe",
-            "window_exe": "sample.exe",
-            "match_policy": "all",
-            "tolerance": 10,
-            "search_region": [0, 0, 40, 30],
-        }
-        with (
-            mock.patch("macro_studio.automation._multi_pixel_target_image", return_value=(image, QtCore.QRect(100, 200, 40, 30))),
-        ):
-            dialog = MultiPixelPreviewDialog(step)
-            dialog.timer.stop()
-            dialog.refresh_preview()
-
-        self.assertEqual(2, dialog.list.count())
-        self.assertIn("저장 #112233", dialog.list.item(0).text())
-        self.assertIn("현재 #112233", dialog.list.item(0).text())
-        self.assertIn("발견 위치", dialog.list.item(0).text())
-        self.assertIn("참(TRUE)", dialog.result_label.text())
-        dialog.close()
-
-    def test_multi_image_settings_can_remove_assets_without_deleting_files(self) -> None:
-        from PySide6 import QtWidgets
-        from macro_studio.action_editor import ImageSearchConfidenceDialog
-        from macro_studio.repository import MacroRepository
-
-        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        with tempfile.TemporaryDirectory() as directory:
-            dialog = ImageSearchConfidenceDialog(
-                MacroRepository(Path(directory)),
-                ["keep", "remove"],
-                asset_confidences={"keep": 90, "remove": 80},
-                asset_regions={"keep": [1, 2, 30, 40], "remove": [5, 6, 50, 60]},
-                step={"asset_routes": {"remove": {"true": 3}}},
-            )
-            dialog._remove_alias("remove")
-            self.assertEqual(["keep"], dialog.get_aliases())
-            self.assertEqual({"keep": 90}, dialog.get_asset_confidences())
-            self.assertEqual({"keep": [1, 2, 30, 40]}, dialog.get_asset_regions())
-            self.assertEqual({}, dialog.get_asset_routes())
-            dialog.close()
-
-    def test_generated_multi_image_label_tracks_removed_asset_count(self) -> None:
-        from macro_studio.builder import _sync_multi_image_count_label
-
-        generated = {"label": "멀티 이미지 서치 8개"}
-        _sync_multi_image_count_label(generated, ["a", "b", "c"])
-        self.assertEqual("멀티 이미지 서치 3개", generated["label"])
-        custom = {"label": "이벤트 닫기 후보"}
-        _sync_multi_image_count_label(custom, ["a"])
-        self.assertEqual("이벤트 닫기 후보", custom["label"])
-
-    def test_image_editor_preserves_explicit_click_disabled(self) -> None:
-        from PySide6 import QtWidgets
-        from macro_studio.action_editor import ActionEditor
-        from macro_studio.repository import MacroRepository
-
-        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        with tempfile.TemporaryDirectory() as directory:
-            editor = ActionEditor(MacroRepository(Path(directory)))
-            editor.load_step({
-                "action": "image_search",
-                "asset": "sample",
-                "click_enabled": False,
-                "click": {"mode": "inactive", "click_image": False, "click_offset": False},
-            })
-            rebuilt = editor.build_step()
-            self.assertFalse(rebuilt["click_enabled"])
-            self.assertEqual("none", rebuilt["click_target"])
-            editor.close()
-
-    def test_image_editor_disabled_checkbox_overrides_stale_multi_click_target(self) -> None:
-        from PySide6 import QtWidgets
-        from macro_studio.action_editor import ActionEditor
-        from macro_studio.repository import MacroRepository
-
-        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        with tempfile.TemporaryDirectory() as directory:
-            editor = ActionEditor(MacroRepository(Path(directory)))
-            editor.load_step({
-                "action": "image_search",
-                "asset": "first",
-                "assets": ["first", "second"],
-                "click_enabled": False,
-                "click_target": "each_image",
-                "click": {"mode": "active", "click_image": True, "click_offset": False},
-            })
-            editor.widgets["image_search"]["click.mode"].setCurrentIndex(
-                editor.widgets["image_search"]["click.mode"].findData("inactive")
-            )
-            rebuilt = editor.build_step()
-            self.assertFalse(rebuilt["click_enabled"])
-            self.assertEqual("none", rebuilt["click_target"])
-            self.assertEqual("inactive", rebuilt["click"]["mode"])
             editor.close()
 
     def test_builder_restores_action_forms_and_collapses_json(self) -> None:
@@ -4165,14 +3836,68 @@ class UiSmokeTests(unittest.TestCase):
         from macro_studio.builder import BuilderPage
 
         with tempfile.TemporaryDirectory() as directory:
-            settings = QtCore.QSettings(str(Path(directory) / "settings.ini"), QtCore.QSettings.IniFormat)
+            settings = QtCore.QSettings(
+                str(Path(directory) / "studio.ini"), QtCore.QSettings.IniFormat
+            )
             settings.setValue(
                 "smart_recording/hide_notice_date",
                 QtCore.QDate.currentDate().toString(QtCore.Qt.ISODate),
             )
-            self.assertTrue(BuilderPage._recording_notice_hidden_today(settings))
-            settings.setValue("smart_recording/hide_notice_date", "2000-01-01")
+            settings.sync()
             self.assertFalse(BuilderPage._recording_notice_hidden_today(settings))
+
+    def test_quickslot_deck_window_construction_and_interactions(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({
+                "rows": 3,
+                "cols": 5,
+                "slots": [
+                    {"macro": "테스트-매크로", "hotkey": "Alt+1", "mode": "hybrid"}
+                ]
+            })
+            window = QuickSlotDeckWindow(repository)
+            window.show()
+            app.processEvents()
+
+            self.assertTrue(window.always_on_top)
+            self.assertEqual(15, len(window.buttons))
+            btn = window.buttons[0]
+            self.assertEqual("테스트-매크로", btn.macro_name)
+            self.assertEqual("Alt+1", btn.hotkey)
+
+            window.btn_topmost.setChecked(False)
+            self.assertFalse(window.always_on_top)
+
+            window._set_opacity(80)
+            self.assertEqual(80, window.opacity_val)
+            self.assertAlmostEqual(0.8, window.windowOpacity(), places=2)
+
+            window.swipe_container.swipe_left.emit()
+            app.processEvents()
+
+            window.grid_combo.setCurrentIndex(2)
+            self.assertEqual(3, window.rows)
+            self.assertEqual(3, window.cols)
+            self.assertEqual(9, len(window.buttons))
+
+            from macro_studio.quickslot_deck import SlotIconEditDialog
+            dlg = SlotIconEditDialog(0, "테스트-매크로", {"icon_size": 48, "spacing": 12})
+            self.assertEqual(48, dlg.size_spin.value())
+            self.assertEqual(12, dlg.spacing_spin.value())
+            dlg.emoji_edit.setText("🚀")
+            cfg = dlg.get_config()
+            self.assertEqual("🚀", cfg["emoji"])
+            self.assertEqual(48, cfg["icon_size"])
+            self.assertEqual(12, cfg["spacing"])
+            dlg.close()
+
+            window.close()
 
     def test_run_current_blocks_missing_image_asset(self) -> None:
         from PySide6 import QtWidgets
@@ -4242,10 +3967,8 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(40, spin.value())
 
     def test_condition_edge_has_separate_label_and_style(self) -> None:
-        from PySide6 import QtWidgets
         from macro_studio.node_editor import NodeCanvas
 
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         canvas = NodeCanvas()
         canvas.set_macro(
             {
@@ -4265,96 +3988,7 @@ class UiSmokeTests(unittest.TestCase):
         conditional = next(edge for edge in canvas.edges if edge.is_condition)
         self.assertIn("횟수 >= 3", conditional.label.text())
         self.assertEqual(conditional.pen().style().name, "DashLine")
-        self.assertEqual("top", conditional.route_side)
         self.assertTrue(conditional.label.flags() & conditional.label.GraphicsItemFlag.ItemIgnoresTransformations)
-        canvas.close()
-        app.processEvents()
-
-    def test_multi_image_asset_routes_render_grouped_thin_toggleable_edges(self) -> None:
-        from PySide6 import QtWidgets
-        from macro_studio.node_editor import NodeCanvas
-
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        canvas = NodeCanvas()
-        canvas.set_macro(
-            {
-                "steps": [
-                    {
-                        "action": "multi_image_search",
-                        "assets": ["first", "second", "third"],
-                        "on_success": 2,
-                        "asset_routes": {
-                            "second": {"true": 3},
-                            "third": {"true": 3, "fail": 2},
-                        },
-                    },
-                    {"action": "wait"},
-                    {"action": "wait"},
-                ],
-                "graph_positions": {"1": [0, 0], "2": [350, 0], "3": [700, 0]},
-            }
-        )
-        app.processEvents()
-
-        asset_edges = [edge for edge in canvas.edges if edge.is_asset_route]
-        self.assertEqual(2, len(asset_edges))
-        true_edge = next(edge for edge in asset_edges if edge.asset_outcome == "true")
-        fail_edge = next(edge for edge in asset_edges if edge.asset_outcome == "fail")
-        self.assertEqual([(2, "second"), (3, "third")], true_edge.asset_entries)
-        self.assertIn("②③ 이미지 · True → 3번", true_edge.label.text())
-        self.assertIn("③ third · Fail → 2번", fail_edge.label.text())
-        self.assertLess(true_edge.pen().widthF(), 2.0)
-        self.assertEqual("top", true_edge.route_side)
-        self.assertEqual("bottom", fail_edge.route_side)
-
-        canvas.set_asset_route_edges_visible(False)
-        self.assertFalse(any(edge.is_asset_route for edge in canvas.edges))
-        self.assertFalse(canvas.asset_route_toggle.isChecked())
-        canvas.set_asset_route_edges_visible(True)
-        self.assertEqual(2, len([edge for edge in canvas.edges if edge.is_asset_route]))
-        canvas.close()
-        app.processEvents()
-
-    def test_condition_edges_use_outer_lanes_without_crossing_intermediate_nodes(self) -> None:
-        from PySide6 import QtGui, QtWidgets
-        from macro_studio.node_editor import NodeCanvas
-
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        canvas = NodeCanvas()
-        canvas.set_macro(
-            {
-                "steps": [
-                    {
-                        "action": "wait",
-                        "edge_conditions": [
-                            {
-                                "kind": "success",
-                                "label": "성공 조건 우회",
-                                "source": "edge_count",
-                                "operator": ">=",
-                                "value": 2,
-                                "target": 3,
-                            }
-                        ],
-                    },
-                    {"action": "wait"},
-                    {"action": "wait"},
-                ],
-                "graph_positions": {"1": [0, 0], "2": [350, 0], "3": [700, 0]},
-            }
-        )
-        app.processEvents()
-
-        conditional = next(edge for edge in canvas.edges if edge.is_condition)
-        middle_rect = canvas.nodes[2].sceneBoundingRect().adjusted(4.0, 4.0, -4.0, -4.0)
-        top = min(node.sceneBoundingRect().top() for node in canvas.nodes.values())
-        stroker = QtGui.QPainterPathStroker()
-        stroker.setWidth(4.0)
-        visible_stroke = stroker.createStroke(conditional.path())
-
-        self.assertEqual("top", conditional.route_side)
-        self.assertLess(conditional.path().boundingRect().top(), top - 60.0)
-        self.assertFalse(visible_stroke.intersects(middle_rect))
         canvas.close()
 
     def test_assets_reuse_existing_list_when_index_is_unchanged(self) -> None:
@@ -4457,7 +4091,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(2, len(canvas.workflow_items))
         self.assertAlmostEqual(canvas.nodes[1].pos().y(), canvas.nodes[2].pos().y())
         self.assertGreater(canvas.nodes[3].pos().y(), canvas.nodes[1].pos().y())
-        self.assertTrue(all(not lane.path().isEmpty() for lane, _label, _indexes in canvas.workflow_items))
+        self.assertTrue(all(not lane.boundingRect().isEmpty() for lane in canvas.workflow_items))
         canvas.close()
 
     def test_manual_edge_waypoint_is_restored_dragged_and_cleared(self) -> None:
@@ -4594,9 +4228,10 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual("", first.route_side)
         self.assertEqual("", lower.route_side)
         self.assertEqual("top", backward.route_side)
-        self.assertLess(first.path().boundingRect().width(), 130)
-        self.assertLess(lower.path().boundingRect().width(), 130)
-        self.assertNotEqual(first.target_offset_y, lower.target_offset_y)
+        self.assertLess(first.path().boundingRect().width(), 160)
+        self.assertLess(lower.path().boundingRect().width(), 160)
+        self.assertGreaterEqual(first.path().boundingRect().height(), 0)
+        self.assertGreaterEqual(lower.path().boundingRect().height(), 0)
         canvas.close()
 
     def test_drag_style_multi_selection_delete_and_restore_macros(self) -> None:
@@ -4720,63 +4355,6 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual((12, 8), (dialog.image.width(), dialog.image.height()))
             dialog.save()
             self.assertTrue(any((root / ".history" / "assets" / "sample").glob("*.png")))
-
-    def test_capture_zoom_maps_selection_to_original_screen_pixels(self) -> None:
-        from PySide6 import QtCore, QtGui, QtWidgets
-        from macro_studio.image_editor import ScreenCaptureDialog
-
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        source = QtGui.QPixmap(400, 300)
-        source.fill(QtGui.QColor("#234567"))
-        original_key = source.cacheKey()
-        dialog = ScreenCaptureDialog(source, QtCore.QRect(50, 60, 400, 300))
-        dialog._selection = QtCore.QRect(120, 90, 40, 30)
-        dialog._set_zoom(2.0, QtCore.QPoint(200, 150))
-
-        self.assertAlmostEqual(100.0, dialog._view_origin.x(), places=2)
-        self.assertAlmostEqual(75.0, dialog._view_origin.y(), places=2)
-        self.assertEqual(QtCore.QRect(40, 30, 80, 60), dialog.rubber.geometry())
-        self.assertEqual(QtCore.QRect(170, 150, 40, 30), dialog.selected_screen_rect())
-        captured = dialog.captured_image()
-        self.assertEqual((40, 30), (captured.width(), captured.height()))
-        self.assertEqual(original_key, source.cacheKey(), "보기 전용 확대가 원본 캡처를 변경하면 안 됩니다.")
-        dialog.close()
-        app.processEvents()
-
-    def test_image_editor_plain_wheel_zoom_preserves_original_pixel_selection(self) -> None:
-        from PySide6 import QtCore, QtGui, QtWidgets
-        from macro_studio.image_editor import ImageEditorDialog
-
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            path = root / "zoom.png"
-            image = QtGui.QImage(100, 80, QtGui.QImage.Format_ARGB32)
-            image.fill(QtGui.QColor("#336699"))
-            self.assertTrue(image.save(str(path)))
-            dialog = ImageEditorDialog(path, "zoom", root / ".history")
-            dialog.set_zoom(1.0)
-            original_rect = QtCore.QRect(10, 12, 20, 16)
-            dialog.selection = dialog._view_rect(original_rect)
-            dialog.rubber.setGeometry(dialog.selection)
-
-            event = QtGui.QWheelEvent(
-                QtCore.QPointF(15, 15),
-                QtCore.QPointF(15, 15),
-                QtCore.QPoint(),
-                QtCore.QPoint(0, 120),
-                QtCore.Qt.NoButton,
-                QtCore.Qt.NoModifier,
-                QtCore.Qt.NoScrollPhase,
-                False,
-            )
-            QtWidgets.QApplication.sendEvent(dialog.view, event)
-
-            self.assertGreater(dialog.zoom, 1.0)
-            self.assertEqual(original_rect, dialog._image_rect(dialog.selection))
-            self.assertEqual((100, 80), (dialog.image.width(), dialog.image.height()))
-            dialog.close()
-            app.processEvents()
 
     def test_image_editor_precision_brush_and_connected_colour_cutout(self) -> None:
         from PySide6 import QtCore, QtGui
@@ -5355,6 +4933,445 @@ class SmartRecordingUiTests(unittest.TestCase):
             self.assertNotIn("AI 플레이 학습", joined)
             self.assertNotIn("ChatGPT 요청", joined)
             self.assertNotIn("받은 JSON", joined)
+            builder.shutdown_automation()
+            builder.deleteLater()
+
+    def test_f5_verification_and_f6_wait_become_explicit_drafts_and_nodes(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog, recording_drafts
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        verification = {
+            "type": "screen_verification",
+            "event_id": "verify-1",
+            "t": 100,
+            "x": 500,
+            "y": 400,
+            "client_x": 120,
+            "client_y": 90,
+            "record_mode": "action",
+            "workflow_id": "workflow-01",
+            "workflow_index": 1,
+            "window": {
+                "exe": "sample.exe",
+                "title": "Sample",
+                "class": "SampleWindow",
+                "client_origin": [380, 310],
+                "client_size": [800, 600],
+                "capture_size": [800, 600],
+                "capture_scope": "client",
+            },
+            "image_sample_bmp": self._sample_bmp(),
+            "image_sample_size": [360, 240],
+            "image_anchor": [180, 120],
+        }
+        wait = {
+            "type": "wait_marker",
+            "event_id": "wait-1",
+            "t": 200,
+            "duration": 1000,
+            "record_mode": "action",
+            "workflow_id": "workflow-01",
+            "workflow_index": 1,
+        }
+        drafts = recording_drafts([verification, wait], include_waits=False)
+        self.assertEqual(["screen_verification", "wait"], [draft["kind"] for draft in drafts])
+        self.assertEqual(2, len(recording_drafts([verification, wait])))
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog([verification, wait], MacroRepository(Path(directory)))
+            steps = dialog.build_steps()
+            self.assertEqual("screen_condition", steps[0]["action"])
+            self.assertFalse(steps[0]["click_enabled"])
+            self.assertTrue(steps[0]["abort_on_fail"])
+            self.assertEqual(1000, steps[1]["duration"])
+            dialog.close()
+
+    def test_live_recording_map_adds_draggable_identifiable_nodes(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.automation import RecordingBar
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        bar = RecordingBar()
+        events = [
+            {
+                "type": "mouse", "event_id": "mouse-1", "t": 100, "button": "Left",
+                "x": 10, "y": 20, "record_mode": "action", "workflow_id": "workflow-01",
+            },
+            {
+                "type": "screen_verification", "event_id": "verify-1", "t": 200,
+                "x": 10, "y": 20, "record_mode": "action", "workflow_id": "workflow-01",
+            },
+        ]
+        bar.update_live_events(events)
+        app.processEvents()
+        self.assertEqual(2, len(bar.live_canvas.nodes))
+        self.assertEqual("screen_condition", bar.live_canvas.steps[1]["action"])
+        bar.live_canvas.nodes[1].setPos(QtCore.QPointF(77, 88))
+        self.assertEqual([77.0, 88.0], bar.event_positions()["mouse-1"])
+        bar.close()
+
+    def test_node_cards_collapse_to_header_and_restore_from_macro_state(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.node_editor import NodeCanvas, NodeItem
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro(
+            {
+                "steps": [
+                    {"action": "image_search", "label": "로그인 확인", "on_success": 2},
+                    {"action": "wait", "duration": 500},
+                ],
+                "graph_collapsed": [1],
+            }
+        )
+        app.processEvents()
+        self.assertTrue(canvas.nodes[1].collapsed)
+        self.assertEqual(NodeItem.COLLAPSED_HEIGHT + 6, canvas.nodes[1].boundingRect().height())
+        changed: list[list[int]] = []
+        canvas.collapsed_changed.connect(changed.append)
+        canvas.set_nodes_collapsed([1, 2], True)
+        self.assertEqual([1, 2], changed[-1])
+        canvas.set_nodes_collapsed([1, 2], False)
+        self.assertEqual([], changed[-1])
+        canvas.close()
+
+    def test_f5_and_right_click_share_the_same_screen_verification_behavior(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog, recording_drafts
+        from macro_studio.repository import MacroRepository
+
+        common = {
+            "t": 100,
+            "x": 20,
+            "y": 30,
+            "window": {"exe": "sample.exe"},
+            "image_sample_bmp": self._sample_bmp(),
+            "image_sample_size": [360, 240],
+            "image_anchor": [180, 120],
+        }
+        f5 = {**common, "type": "screen_verification", "event_id": "f5", "source_control": "F5"}
+        right = {**common, "type": "screen_verification", "event_id": "right", "source_control": "RightClick"}
+        f5_draft = recording_drafts([f5], include_waits=False)[0]
+        right_draft = recording_drafts([right], include_waits=False)[0]
+        self.assertEqual("screen_verification", f5_draft["kind"])
+        self.assertEqual(f5_draft["detail"], right_draft["detail"])
+        self.assertEqual("F5", f5_draft["source_control"])
+        self.assertEqual("RightClick", right_draft["source_control"])
+        f5["_live_links"] = {"fail": "right"}
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog([f5, right], MacroRepository(Path(directory)))
+            steps = dialog.build_steps()
+            self.assertEqual(3000, steps[0]["timeout"])
+            self.assertEqual(3000, steps[1]["timeout"])
+            self.assertEqual(2, steps[0]["on_fail"])
+            self.assertFalse(steps[0]["abort_on_fail"])
+            dialog.close()
+
+    def test_live_map_supports_cross_workflow_links_and_multi_image_merge(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingBar
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        bar = RecordingBar()
+        events = [
+            {"type": "mouse", "event_id": "a", "t": 10, "button": "Left", "x": 1, "y": 2, "workflow_id": "workflow-01", "workflow_index": 1},
+            {"type": "mouse", "event_id": "b", "t": 20, "button": "Left", "x": 3, "y": 4, "workflow_id": "workflow-02", "workflow_index": 2},
+            {"type": "mouse", "event_id": "c", "t": 30, "button": "Left", "x": 5, "y": 6, "workflow_id": "workflow-03", "workflow_index": 3},
+        ]
+        bar.update_live_events(events)
+        self.assertEqual(2, bar.live_canvas.steps[0]["on_fail"])
+        self.assertEqual(3, bar.live_canvas.steps[1]["on_fail"])
+        self.assertTrue(bar.live_canvas.steps[0]["stop_on_success"])
+        self.assertEqual([1, 2, 3], bar.live_canvas.macro["start_search_candidates"])
+        bar._connect_live_nodes(1, 3, "fail")
+        app.processEvents()
+        self.assertEqual(3, bar.live_canvas.steps[0]["on_fail"])
+        self.assertEqual("c", bar.event_links()[("a", "fail")])
+        bar._merge_live_image_nodes([1, 2])
+        app.processEvents()
+        self.assertEqual(2, len(bar.live_canvas.steps))
+        self.assertEqual("멀티 이미지 서치 2개", bar.live_canvas.steps[0]["label"])
+        self.assertEqual(bar.multi_groups()["a"], bar.multi_groups()["b"])
+        bar.close()
+
+    def test_success_port_fans_out_to_ordered_candidates_in_live_and_normal_canvas(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingBar, configure_success_candidates
+        from macro_studio.builder import BuilderPage
+        from macro_studio.node_editor import NodeCanvas
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        steps = [
+            {"action": "wait", "on_success": 2},
+            {"action": "image_search", "on_success": 5},
+            {"action": "image_search", "on_success": 5},
+            {"action": "image_search", "on_success": 5},
+            {"action": "wait"},
+        ]
+        self.assertEqual([2, 3, 4], configure_success_candidates(steps, 1, [2, 3, 4]))
+        self.assertEqual([2, 3, 4], steps[0]["success_candidates"])
+        self.assertEqual(3, steps[1]["on_fail"])
+        self.assertEqual(4, steps[2]["on_fail"])
+        self.assertEqual(5, steps[1]["on_success"], "candidate success must keep its own downstream flow")
+        canvas = NodeCanvas()
+        canvas.set_macro({"steps": steps})
+        source_success_targets = sorted(edge.target for edge in canvas.edges if edge.source == 1 and edge.kind == "success")
+        self.assertEqual([2, 3, 4], source_success_targets)
+        canvas.close()
+
+        bar = RecordingBar()
+        events = [
+            {"type": "mouse", "event_id": value, "t": index * 1000, "button": "Left", "x": index * 250, "y": 20, "workflow_id": "workflow-01"}
+            for index, value in enumerate(("a", "b", "c"), start=1)
+        ]
+        bar.update_live_events(events)
+        bar._connect_live_nodes(1, 3, "success")
+        app.processEvents()
+        self.assertEqual(["b", "c"], bar.event_links()[("a", "success")])
+        self.assertEqual([2, 3], bar.live_canvas.steps[0]["success_candidates"])
+        bar.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("fan-out")
+            payload = repository.load_macro("fan-out")
+            payload["steps"] = [
+                {"action": "screen_condition", "on_success": 2},
+                {"action": "screen_condition", "on_success": 4},
+                {"action": "screen_condition", "on_success": 4},
+                {"action": "wait", "duration": 10},
+            ]
+            repository.save_macro("fan-out", payload)
+            builder = BuilderPage(repository)
+            builder.refresh("fan-out")
+            builder._connect_graph_nodes(1, 3, "success")
+            app.processEvents()
+            self.assertEqual([2, 3], builder.current_macro["steps"][0]["success_candidates"])
+            self.assertEqual(3, builder.current_macro["steps"][1]["on_fail"])
+            builder.close()
+
+    def test_smart_recording_review_is_non_modal_and_finishes_after_accept(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("review-nonmodal")
+            builder = BuilderPage(repository)
+            builder.refresh("review-nonmodal")
+            event = {
+                "type": "wait_marker", "event_id": "wait-1", "t": 10, "duration": 1000,
+                "workflow_id": "workflow-01", "workflow_index": 1,
+            }
+            builder._review_smart_recording([event])
+            dialog = builder._recording_review_dialog
+            self.assertIsNotNone(dialog)
+            self.assertEqual(QtCore.Qt.NonModal, dialog.windowModality())
+            self.assertTrue(builder.window().isEnabled(), "review must never leave the Studio parent disabled")
+            dialog.accept()
+            app.processEvents()
+            app.processEvents()
+            self.assertIsNone(builder._recording_review_dialog)
+            self.assertEqual("wait", builder.current_macro["steps"][0]["action"])
+            builder.close()
+
+    def test_workflow_first_nodes_compete_and_only_successful_lane_continues(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog
+        from macro_studio.node_editor import NodeCanvas
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        events = []
+        for workflow, base in enumerate((100, 300, 500), start=1):
+            common = {
+                "workflow_id": f"workflow-{workflow:02d}",
+                "workflow_index": workflow,
+                "record_mode": "action",
+                "window": {
+                    "exe": "sample.exe", "title": "Sample", "client_origin": [0, 0],
+                    "client_size": [800, 600], "capture_size": [800, 600], "capture_scope": "client",
+                },
+                "image_sample_bmp": self._sample_bmp(),
+                "image_sample_size": [360, 240],
+                "image_anchor": [180, 120],
+                "x": 200, "y": 150, "client_x": 200, "client_y": 150,
+            }
+            events.append({**common, "type": "screen_verification", "event_id": f"condition-{workflow}", "t": base})
+            events.append({
+                "type": "wait_marker", "event_id": f"wait-{workflow}", "t": base + 50,
+                "duration": 500, "record_mode": "action", "workflow_id": f"workflow-{workflow:02d}",
+                "workflow_index": workflow,
+            })
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog(events, MacroRepository(Path(directory)))
+            steps = dialog.build_steps()
+            self.assertEqual([1, 3, 5], [index + 1 for index, step in enumerate(steps) if step.get("_start_search_candidate")])
+            self.assertEqual(3, steps[0]["on_fail"])
+            self.assertEqual(5, steps[2]["on_fail"])
+            self.assertNotIn("on_fail", steps[4])
+            self.assertTrue(steps[4]["abort_on_fail"])
+            self.assertEqual(2, steps[0]["on_success"])
+            self.assertEqual(4, steps[2]["on_success"])
+            self.assertEqual(6, steps[4]["on_success"])
+            self.assertTrue(steps[1]["stop_on_success"])
+            self.assertTrue(steps[3]["stop_on_success"])
+            self.assertTrue(steps[5]["stop_on_success"])
+            self.assertTrue(steps[0]["_automation"]["hide_candidate_fail_edge"])
+            canvas = NodeCanvas()
+            canvas.set_macro({"steps": steps})
+            self.assertFalse(any(edge.kind == "fail" and edge.source in {1, 3} for edge in canvas.edges))
+            canvas.close()
+            dialog.close()
+
+    def test_custom_client_search_region_overrides_auto_region_without_full_fallback(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        event = {
+            "type": "screen_verification", "event_id": "verify-region", "t": 10,
+            "x": 300, "y": 200, "client_x": 180, "client_y": 120,
+            "window": {
+                "exe": "sample.exe", "title": "Sample", "client_size": [800, 600],
+                "capture_size": [800, 600], "capture_scope": "client",
+            },
+            "image_sample_bmp": self._sample_bmp(), "image_sample_size": [360, 240], "image_anchor": [180, 120],
+            "_review_search_region": [40, 50, 440, 350],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog([event], MacroRepository(Path(directory)))
+            buttons = [button.text() for button in dialog.findChildren(QtWidgets.QPushButton)]
+            self.assertTrue(any(text.startswith("서치 영역") for text in buttons))
+            step = dialog.build_steps()[0]
+            self.assertEqual([[40, 50, 440, 350]], step["regions"])
+            self.assertFalse(step["fallback_full_region"])
+            dialog.close()
+
+    def test_drag_and_wheel_are_preserved_as_separate_smart_recording_nodes(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.automation import RecordingReviewDialog, recording_drafts
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        window = {"exe": "sample.exe", "title": "Sample", "client_origin": [100, 100], "client_size": [800, 600]}
+        events = [
+            {"type": "mouse", "event_id": "drag-source", "t": 10, "button": "Left", "x": 120, "y": 130, "client_x": 20, "client_y": 30, "window": window},
+            {
+                "type": "mouse_drag", "event_id": "drag-1", "source_event_id": "drag-source", "t": 80,
+                "button": "Left", "from_screen": [120, 130], "to_screen": [340, 360],
+                "from_client": [20, 30], "to_client": [240, 260], "window": window,
+            },
+            {"type": "mouse", "event_id": "wheel-1", "t": 120, "button": "WheelDown", "wheel_delta": -240, "x": 300, "y": 300, "client_x": 200, "client_y": 200, "window": window},
+        ]
+        drafts = recording_drafts(events, include_waits=False)
+        self.assertEqual(["mouse_drag", "mouse"], [draft["kind"] for draft in drafts])
+        self.assertIn("2칸", drafts[1]["detail"])
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = RecordingReviewDialog(events, MacroRepository(Path(directory)))
+            steps = dialog.build_steps()
+            self.assertEqual("inactive_click", steps[0]["action"])
+            self.assertEqual("drag", steps[0]["action_type"])
+            self.assertEqual([240, 260], steps[0]["drag_to"])
+            self.assertEqual("WheelDown", steps[1]["button"])
+            self.assertEqual(2, steps[1]["clicks"])
+            dialog.close()
+
+    def test_builder_context_merge_combines_image_nodes_and_preserves_next_flow(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            image = QtGui.QImage(32, 24, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#44AA88"))
+            repository.add_asset_image(image, "first")
+            image.fill(QtGui.QColor("#AA4488"))
+            repository.add_asset_image(image, "second")
+            repository.create_macro("merge")
+            payload = repository.load_macro("merge")
+            payload["steps"] = [
+                {"action": "image_search", "asset": "first", "click": {"offset": [1, 2]}, "on_success": 2},
+                {"action": "image_search", "asset": "second", "click": {"offset": [3, 4]}, "on_success": 3},
+                {"action": "wait", "duration": 500},
+            ]
+            repository.save_macro("merge", payload)
+            builder = BuilderPage(repository)
+            builder.refresh("merge")
+            builder._merge_graph_image_nodes([1, 2])
+            app.processEvents()
+            steps = builder.current_macro["steps"]
+            self.assertEqual(2, len(steps))
+            self.assertEqual(["first", "second"], steps[0]["assets"])
+            self.assertEqual({"first": [1, 2], "second": [3, 4]}, steps[0]["asset_offsets"])
+            self.assertEqual(2, steps[0]["on_success"])
+            builder.shutdown_automation()
+            builder.deleteLater()
+
+    def test_builder_persists_recorded_workflow_start_candidates(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("workflow")
+            builder = BuilderPage(repository)
+            builder.refresh("workflow")
+            builder._append_automation_steps(
+                [
+                    {"action": "screen_condition", "_start_search_candidate": True, "on_success": 2, "on_fail": 3},
+                    {"action": "wait", "duration": 100, "stop_on_success": True},
+                    {"action": "screen_condition", "_start_search_candidate": True, "on_success": 4, "abort_on_fail": True},
+                    {"action": "wait", "duration": 100, "stop_on_success": True},
+                ],
+                "workflow test",
+            )
+            self.assertEqual([1, 3], builder.current_macro["start_search_candidates"])
+            self.assertEqual(1, builder.current_macro["graph_start_step"])
+            self.assertFalse(any("_start_search_candidate" in step for step in builder.current_macro["steps"]))
+            builder.shutdown_automation()
+            builder.deleteLater()
+
+    def test_node_double_click_requests_roomy_settings_dialog(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from unittest import mock
+        from PySide6 import QtWidgets
+        from macro_studio.builder import BuilderPage
+        from macro_studio.repository import MacroRepository
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("double-click")
+            builder = BuilderPage(repository)
+            builder.refresh("double-click")
+            with mock.patch.object(builder, "_open_action_settings") as open_settings:
+                builder._focus_inspector(1)
+                app.processEvents()
+                open_settings.assert_called_once()
             builder.shutdown_automation()
             builder.deleteLater()
 

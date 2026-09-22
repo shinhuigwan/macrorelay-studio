@@ -11,30 +11,12 @@ import os
 import subprocess
 import sys
 import time
-import ctypes
 from pathlib import Path
 from typing import Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .repository import MacroRepository, MacroSummary
-
-
-_PLAYER_MUTEX_NAME = "Local\\MacroRelayPlayerStandalone"
-
-
-def _acquire_player_mutex() -> int:
-    """Keep desktop/studio launches from opening duplicate player windows."""
-    if sys.platform != "win32":
-        return 1
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    handle = int(kernel32.CreateMutexW(None, True, _PLAYER_MUTEX_NAME) or 0)
-    if handle and int(kernel32.GetLastError()) == 183:  # ERROR_ALREADY_EXISTS
-        kernel32.CloseHandle(ctypes.c_void_p(handle))
-        return 0
-    return handle
 
 
 class MacroPlayerWindow(QtWidgets.QMainWindow):
@@ -54,7 +36,6 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.total_steps: int = 0
         self.current_macro_payload: dict[str, Any] = {}
         self._compact_mode = False
-        self._shutting_down = False
 
         self._stopwatch_timer = QtCore.QTimer(self)
         self._stopwatch_timer.setInterval(50)
@@ -219,26 +200,24 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
         central_widget = QtWidgets.QWidget(self)
         self.setCentralWidget(central_widget)
-        self.main_layout = QtWidgets.QVBoxLayout(central_widget)
-        self.main_layout.setContentsMargins(14, 12, 14, 14)
-        self.main_layout.setSpacing(10)
+        main_layout = QtWidgets.QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(14, 12, 14, 14)
+        main_layout.setSpacing(10)
 
         # 1. Top Bar: Brand, Always-on-top, Compact toggle
-        self.header_widget = QtWidgets.QWidget(self)
-        top_bar = QtWidgets.QHBoxLayout(self.header_widget)
-        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar = QtWidgets.QHBoxLayout()
         top_bar.setSpacing(8)
 
-        self.brand_label = QtWidgets.QLabel("⚡ <b>MACRO PLAYER</b>")
-        self.brand_label.setStyleSheet("color: #58A6FF; font-size: 13px; font-weight: 800;")
-        top_bar.addWidget(self.brand_label)
+        brand_label = QtWidgets.QLabel("⚡ <b>MACRO PLAYER</b>")
+        brand_label.setStyleSheet("color: #58A6FF; font-size: 13px; font-weight: 800;")
+        top_bar.addWidget(brand_label)
 
-        self.ver_badge = QtWidgets.QLabel("TURBO")
-        self.ver_badge.setStyleSheet(
+        ver_badge = QtWidgets.QLabel("TURBO")
+        ver_badge.setStyleSheet(
             "background: #1F6FEB; color: white; font-size: 9px; font-weight: 800; "
             "border-radius: 4px; padding: 2px 5px;"
         )
-        top_bar.addWidget(self.ver_badge)
+        top_bar.addWidget(ver_badge)
         top_bar.addStretch()
 
         self.btn_pin = QtWidgets.QToolButton(self)
@@ -255,12 +234,12 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_compact.toggled.connect(self._toggle_compact_mode)
         top_bar.addWidget(self.btn_compact)
 
-        self.main_layout.addWidget(self.header_widget)
+        main_layout.addLayout(top_bar)
 
         # 2. Macro Selection Card
-        self.select_card = QtWidgets.QFrame(self)
-        self.select_card.setObjectName("Card")
-        select_layout = QtWidgets.QHBoxLayout(self.select_card)
+        select_card = QtWidgets.QFrame(self)
+        select_card.setObjectName("Card")
+        select_layout = QtWidgets.QHBoxLayout(select_card)
         select_layout.setContentsMargins(10, 8, 10, 8)
         select_layout.setSpacing(8)
 
@@ -279,17 +258,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_refresh.clicked.connect(self.refresh_macro_list)
         select_layout.addWidget(self.btn_refresh)
 
-        self.main_layout.addWidget(self.select_card)
-
-        self.lbl_compact_macro = QtWidgets.QLabel("선택된 매크로 없음", self)
-        self.lbl_compact_macro.setAlignment(QtCore.Qt.AlignCenter)
-        self.lbl_compact_macro.setStyleSheet(
-            "background:#161B22; border:1px solid #30363D; border-radius:7px; "
-            "color:#E6EDF3; font-size:12px; font-weight:800; padding:7px 10px;"
-        )
-        self.lbl_compact_macro.setToolTip("현재 선택되었거나 실행 중인 매크로")
-        self.lbl_compact_macro.hide()
-        self.main_layout.addWidget(self.lbl_compact_macro)
+        main_layout.addWidget(select_card)
 
         # 3. Mode & Loop Options
         self.opts_card = QtWidgets.QFrame(self)
@@ -309,7 +278,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         opts_layout.addWidget(self.chk_loop)
 
         opts_layout.addStretch()
-        self.main_layout.addWidget(self.opts_card)
+        main_layout.addWidget(self.opts_card)
 
         # 4. Live Dashboard Card
         self.dash_card = QtWidgets.QFrame(self)
@@ -347,7 +316,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.progress_bar.setFormat("0 / 0 단계")
         dash_layout.addWidget(self.progress_bar)
 
-        self.main_layout.addWidget(self.dash_card)
+        main_layout.addWidget(self.dash_card)
 
         # 5. Big Control Buttons Bar
         ctrl_bar = QtWidgets.QHBoxLayout()
@@ -373,7 +342,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_stop.clicked.connect(self.stop_macro)
         ctrl_bar.addWidget(self.btn_stop, 3)
 
-        self.main_layout.addLayout(ctrl_bar)
+        main_layout.addLayout(ctrl_bar)
 
         # 6. Global Shortcuts
         self._shortcut_f5 = QtGui.QShortcut(QtGui.QKeySequence("F5"), self)
@@ -394,10 +363,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             "color: #8B949E; font-family: 'Consolas', monospace; font-size: 11px;"
         )
         self.log_edit.appendPlainText("Macro Player 준비 완료. 매크로를 선택하고 [F5]를 누르세요.")
-        self.main_layout.addWidget(self.log_edit)
-
-        self._shortcut_f8 = QtGui.QShortcut(QtGui.QKeySequence("F8"), self)
-        self._shortcut_f8.activated.connect(lambda: self.btn_compact.toggle())
+        main_layout.addWidget(self.log_edit)
 
     def _load_settings(self) -> None:
         settings = QtCore.QSettings("MacroRelay", "Player")
@@ -422,15 +388,10 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             settings.setValue("last_macro", self.macro_combo.currentData() or self.macro_combo.currentText())
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self.shutdown_runtime()
+        if self.is_running:
+            self.stop_macro()
         self._save_settings()
         super().closeEvent(event)
-
-    def shutdown_runtime(self) -> None:
-        """Idempotently stop the Player-owned macro before the UI exits."""
-        self._shutting_down = True
-        self.stop_macro()
-        self.repository.shutdown_vision_engine_if_idle()
 
     def _toggle_always_on_top(self, checked: bool) -> None:
         pos = self.pos()
@@ -444,50 +405,18 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
     def _toggle_compact_mode(self, checked: bool) -> None:
         self._compact_mode = checked
         if checked:
-            self.header_widget.hide()
-            self.select_card.hide()
             self.opts_card.hide()
-            self.dash_card.hide()
             self.log_edit.hide()
-            self.lbl_compact_macro.show()
-            self.main_layout.setContentsMargins(8, 7, 8, 8)
-            self.main_layout.setSpacing(6)
-            self.setMinimumSize(360, 108)
-            self.setMaximumHeight(145)
-            self.resize(420, 118)
-            self.setWindowTitle("⚡ Macro Player · F8 일반 모드")
+            self.progress_bar.hide()
+            self.setMinimumHeight(160)
+            self.adjustSize()
         else:
-            self.header_widget.show()
-            self.select_card.show()
             self.opts_card.show()
-            self.dash_card.show()
             self.log_edit.show()
-            self.lbl_compact_macro.hide()
-            self.main_layout.setContentsMargins(14, 12, 14, 14)
-            self.main_layout.setSpacing(10)
-            self.setMaximumHeight(16777215)
-            self.setMinimumSize(380, 220)
+            self.progress_bar.show()
+            self.setMinimumHeight(220)
             self.resize(self.width(), 430)
-            self.setWindowTitle("⚡ Macro Player")
-        self._sync_control_button_labels()
         self._save_settings()
-
-    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self._compact_mode:
-            self.btn_compact.setChecked(False)
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
-
-    def _sync_control_button_labels(self) -> None:
-        if self._compact_mode:
-            self.btn_run.setText("▶ 실행")
-            self.btn_pause.setText("▶ 재개" if self.is_paused else "Ⅱ 일시정지")
-            self.btn_stop.setText("■ 종료")
-        else:
-            self.btn_run.setText("▶ 실 행  [F5]")
-            self.btn_pause.setText("▶ 계속 진행 [F7]" if self.is_paused else "⏸ 일시정지 [F7]")
-            self.btn_stop.setText("⏹ 비상 정지  [F6]")
 
     def move_to_cursor(self) -> None:
         """Position the player window near the mouse cursor, clamped within screen bounds."""
@@ -541,7 +470,6 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         if index < 0 or index >= self.macro_combo.count():
             return
         name = self.macro_combo.itemData(index)
-        self.lbl_compact_macro.setText(str(name or "선택된 매크로 없음"))
         try:
             self.current_macro_payload = self.repository.load_macro(name)
             steps = self.current_macro_payload.get("steps") or []
@@ -562,7 +490,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
     def start_macro(self) -> None:
         """Start or restart the selected macro with turbo speed."""
-        if self._shutting_down or self.is_running:
+        if self.is_running:
             return
         macro_name = self.macro_combo.currentData()
         if not macro_name:
@@ -586,21 +514,15 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.start_time = time.time()
         self.elapsed_offset = 0.0
         self.loop_count += 1
-        self.current_step = 0
 
         self.lbl_status.setText(f"🟢 실행 중 ({mode_str})")
         self.lbl_status.setStyleSheet("color: #3FB950; font-size: 13px; font-weight: 800;")
         self.lbl_loop_count.setText(f"{self.loop_count}회차 실행")
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat(f"0 / {self.total_steps} 단계")
-        self.lbl_step_detail.setText("실행 준비 중 · 첫 노드 상태를 확인하고 있습니다.")
 
         self.btn_run.setEnabled(False)
         self.btn_pause.setEnabled(True)
         self.btn_pause.setText("⏸ 일시정지 [F7]")
         self.btn_stop.setEnabled(True)
-        self.lbl_compact_macro.setText(str(macro_name))
-        self._sync_control_button_labels()
 
         self._stopwatch_timer.start()
         self._monitor_timer.start()
@@ -638,12 +560,10 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             self.start_time = time.time() - self.elapsed_offset
             self._stopwatch_timer.start()
             self.log_edit.appendPlainText(f"[{time.strftime('%H:%M:%S')}] ▶ 매크로 재개")
-        self._sync_control_button_labels()
 
     def stop_macro(self) -> None:
         """Immediately and forcibly terminate the running macro."""
         if not self.is_running and not self.current_process:
-            self.repository.shutdown_vision_engine_if_idle()
             return
 
         proc = self.current_process
@@ -655,28 +575,15 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
         if proc:
             pid = getattr(proc, "pid", None)
-            tree_stopped = False
-            if pid:
-                try:
-                    result = subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(pid)],
-                        capture_output=True,
-                        timeout=1.5,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                    tree_stopped = result.returncode == 0
-                except Exception:
-                    pass
-            if not tree_stopped:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
             try:
-                proc.wait(timeout=1.0)
+                proc.kill()
             except Exception:
                 pass
-            self.repository.release_macro_process(proc)
+            if pid:
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=1.0)
+                except Exception:
+                    pass
 
         self.lbl_status.setText("🔴 비상 정지됨")
         self.lbl_status.setStyleSheet("color: #F85149; font-size: 13px; font-weight: 800;")
@@ -686,10 +593,8 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("⏸ 일시정지 [F7]")
         self.btn_stop.setEnabled(False)
-        self._sync_control_button_labels()
 
         self.log_edit.appendPlainText(f"[{time.strftime('%H:%M:%S')}] ⏹ 매크로 정지 완료")
-        self.repository.shutdown_vision_engine_if_idle()
 
     def _update_stopwatch(self) -> None:
         if not self.is_running or self.is_paused:
@@ -708,53 +613,31 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
 
         # Update step progress
         progress_path = getattr(self.current_process, "macrorelay_progress_path", None)
-        step_num = self._read_progress_file(progress_path)
-        if step_num > 0:
-            self._show_running_step(step_num)
+        if progress_path and os.path.exists(progress_path):
+            try:
+                with open(progress_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content.isdigit():
+                    step_num = int(content)
+                    if step_num != self.current_step and step_num > 0:
+                        self.current_step = step_num
+                        self.progress_bar.setValue(self.current_step)
+                        self.progress_bar.setFormat(f"{self.current_step} / {self.total_steps} 단계")
+
+                        steps = self.current_macro_payload.get("steps") or []
+                        if 0 < self.current_step <= len(steps):
+                            st = steps[self.current_step - 1]
+                            action = st.get("action", "step")
+                            label = st.get("label") or action
+                            self.lbl_step_detail.setText(f"진행 중: {self.current_step}번 [{label}]")
+            except Exception:
+                pass
 
         if ret is not None:
             # Process terminated
             self._handle_finished(ret)
 
-    @staticmethod
-    def _read_progress_file(progress_path: Any) -> int:
-        """Read AHK's UTF-8 progress file, including its optional BOM."""
-        if not progress_path:
-            return 0
-        path = Path(progress_path)
-        if not path.is_file():
-            return 0
-        try:
-            return max(0, int(path.read_text(encoding="utf-8-sig").strip()))
-        except (OSError, TypeError, ValueError):
-            return 0
-
-    def _show_running_step(self, step_num: int) -> None:
-        self.current_step = int(step_num)
-        self.progress_bar.setValue(self.current_step)
-        self.progress_bar.setFormat(f"{self.current_step} / {self.total_steps} 단계")
-
-        steps = self.current_macro_payload.get("steps") or []
-        if not 0 < self.current_step <= len(steps):
-            self.lbl_step_detail.setText(f"진행 중: {self.current_step}번 노드")
-            self.lbl_status.setText(f"🟢 실행 중 · {self.current_step}번 노드")
-            return
-
-        step = steps[self.current_step - 1]
-        action = str(step.get("action") or "step")
-        label = str(step.get("label") or step.get("name") or action)
-        self.lbl_step_detail.setText(
-            f"현재 실행 노드: {self.current_step}번 · {label}  ({action})"
-        )
-        if self.is_paused:
-            self.lbl_status.setText(f"🟡 일시정지 · {self.current_step}번 [{label}]")
-            self.lbl_status.setStyleSheet("color: #D29922; font-size: 13px; font-weight: 800;")
-        else:
-            self.lbl_status.setText(f"🟢 실행 중 · {self.current_step}번 [{label}]")
-            self.lbl_status.setStyleSheet("color: #3FB950; font-size: 13px; font-weight: 800;")
-
     def _handle_finished(self, return_code: int) -> None:
-        self.repository.release_macro_process(self.current_process)
         self.is_running = False
         self.is_paused = False
         self._stopwatch_timer.stop()
@@ -768,7 +651,7 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
             self.log_edit.appendPlainText(f"[{time.strftime('%H:%M:%S')}] ✔ 매크로 1회 정상 완료 ({self.lbl_timer.text()})")
 
             # Check infinite loop option
-            if self.chk_loop.isChecked() and not self._shutting_down:
+            if self.chk_loop.isChecked():
                 self.log_edit.appendPlainText(f"[{time.strftime('%H:%M:%S')}] 🔁 무한 반복: 다음 회차 즉시 시작...")
                 QtCore.QTimer.singleShot(150, self.start_macro)
                 return
@@ -781,21 +664,16 @@ class MacroPlayerWindow(QtWidgets.QMainWindow):
         self.btn_run.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
-        self._sync_control_button_labels()
 
 
 def launch_player(macro_name: str = "") -> int:
     """Entry point to launch the standalone Macro Player."""
-    mutex_handle = _acquire_player_mutex()
-    if not mutex_handle:
-        return 0
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     app.setApplicationName("MacroRelay Player")
     app.setStyle("Fusion")
 
     repo = MacroRepository()
     window = MacroPlayerWindow(repository=repo, default_macro=macro_name)
-    app.aboutToQuit.connect(window.shutdown_runtime)
 
     icon_path = repo.root / "branding" / "macrorelay-runner.ico"
     if not icon_path.exists():
@@ -806,14 +684,10 @@ def launch_player(macro_name: str = "") -> int:
 
     window.show()
     window.move_to_cursor()
-    try:
-        return app.exec()
-    finally:
-        if sys.platform == "win32" and mutex_handle != 1:
-            ctypes.windll.kernel32.ReleaseMutex(ctypes.c_void_p(mutex_handle))
-            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(mutex_handle))
+    return app.exec()
 
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else ""
     sys.exit(launch_player(target))
+

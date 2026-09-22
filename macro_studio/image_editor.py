@@ -8,7 +8,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .theme import COLORS
 from .widgets import Card, WheelSafeSpinBox, primary_button
-from .screen_coordinates import logical_rect_to_native
 
 
 def virtual_desktop_geometry() -> QtCore.QRect:
@@ -44,39 +43,24 @@ class SelectionRubberBand(QtWidgets.QRubberBand):
         self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        if not self.isVisible() or self.width() < 10 or self.height() < 10:
-            return
-        try:
-            super().paintEvent(event)
-        except Exception:
-            return
-        painter = QtGui.QPainter()
-        if not painter.begin(self):
-            return
-        try:
-            painter.setRenderHint(QtGui.QPainter.Antialiasing)
-            painter.setPen(QtGui.QPen(QtGui.QColor("#D9FFFF"), 1))
-            painter.setBrush(QtGui.QColor("#19D7D0"))
-            rect = self.rect().adjusted(1, 1, -2, -2)
-            if not rect.isValid():
-                return
-            points = (
-                rect.topLeft(),
-                QtCore.QPoint(rect.center().x(), rect.top()),
-                rect.topRight(),
-                QtCore.QPoint(rect.left(), rect.center().y()),
-                QtCore.QPoint(rect.right(), rect.center().y()),
-                rect.bottomLeft(),
-                QtCore.QPoint(rect.center().x(), rect.bottom()),
-                rect.bottomRight(),
-            )
-            for point in points:
-                painter.drawRect(QtCore.QRect(point.x() - 4, point.y() - 4, 9, 9))
-        except Exception:
-            pass
-        finally:
-            if painter.isActive():
-                painter.end()
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#D9FFFF"), 1))
+        painter.setBrush(QtGui.QColor("#19D7D0"))
+        rect = self.rect().adjusted(1, 1, -2, -2)
+        points = (
+            rect.topLeft(),
+            QtCore.QPoint(rect.center().x(), rect.top()),
+            rect.topRight(),
+            QtCore.QPoint(rect.left(), rect.center().y()),
+            QtCore.QPoint(rect.right(), rect.center().y()),
+            rect.bottomLeft(),
+            QtCore.QPoint(rect.center().x(), rect.bottom()),
+            rect.bottomRight(),
+        )
+        for point in points:
+            painter.drawRect(QtCore.QRect(point.x() - 4, point.y() - 4, 9, 9))
 
 
 class PrecisionImageView(QtWidgets.QLabel):
@@ -136,17 +120,13 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         self._drag_mode = ""
         self._drag_start = QtCore.QPoint()
         self._drag_rect = QtCore.QRect()
-        self._zoom = 1.0
-        self._view_origin = QtCore.QPointF(0.0, 0.0)
-        self._pan_start: QtCore.QPoint | None = None
-        self._pan_origin = QtCore.QPointF()
-        self._closing = False
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
         self.setGeometry(geometry)
         self.setCursor(QtCore.Qt.CrossCursor)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.canvas = QtWidgets.QLabel()
+        self.canvas.setPixmap(pixmap.scaled(geometry.size(), QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))
         self.canvas.setFixedSize(geometry.size())
         self.canvas.setMouseTracking(True)
         self.canvas.installEventFilter(self)
@@ -175,82 +155,6 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         self.cursor_hint.setText("⬚ 검색할 영역을 마우스로 드래그하세요\n(Enter: 확정, Esc: 취소)")
         self.cursor_hint.adjustSize()
         self.cursor_hint.show()
-
-        self.zoom_hint = QtWidgets.QLabel(self)
-        self.zoom_hint.setStyleSheet(
-            "background:rgba(12,14,20,225); color:#63FFE0; padding:8px 12px; "
-            "border:1px solid #2B7A70; border-radius:7px; font-weight:700;"
-        )
-        self.zoom_hint.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
-        self._render_view()
-
-    def _clamp_view_origin(self) -> None:
-        visible_width = self.canvas.width() / max(0.01, self._zoom)
-        visible_height = self.canvas.height() / max(0.01, self._zoom)
-        max_x = max(0.0, self._source.width() - visible_width)
-        max_y = max(0.0, self._source.height() - visible_height)
-        self._view_origin.setX(max(0.0, min(max_x, self._view_origin.x())))
-        self._view_origin.setY(max(0.0, min(max_y, self._view_origin.y())))
-
-    def _view_to_source(self, point: QtCore.QPoint | QtCore.QPointF) -> QtCore.QPoint:
-        x = self._view_origin.x() + float(point.x()) / max(0.01, self._zoom)
-        y = self._view_origin.y() + float(point.y()) / max(0.01, self._zoom)
-        return QtCore.QPoint(
-            max(0, min(max(0, self._source.width() - 1), round(x))),
-            max(0, min(max(0, self._source.height() - 1), round(y))),
-        )
-
-    def _source_rect_to_view(self, rect: QtCore.QRect) -> QtCore.QRect:
-        if not rect.isValid():
-            return QtCore.QRect()
-        mapped = QtCore.QRectF(
-            (rect.x() - self._view_origin.x()) * self._zoom,
-            (rect.y() - self._view_origin.y()) * self._zoom,
-            rect.width() * self._zoom,
-            rect.height() * self._zoom,
-        ).toAlignedRect()
-        return mapped.intersected(self.canvas.rect())
-
-    def _set_zoom(self, value: float, anchor: QtCore.QPoint | None = None) -> None:
-        old_zoom = self._zoom
-        new_zoom = max(1.0, min(16.0, float(value)))
-        if abs(new_zoom - old_zoom) < 0.0001:
-            return
-        anchor = QtCore.QPoint(anchor if anchor is not None else self.canvas.rect().center())
-        source_anchor_x = self._view_origin.x() + anchor.x() / old_zoom
-        source_anchor_y = self._view_origin.y() + anchor.y() / old_zoom
-        self._zoom = new_zoom
-        self._view_origin = QtCore.QPointF(
-            source_anchor_x - anchor.x() / new_zoom,
-            source_anchor_y - anchor.y() / new_zoom,
-        )
-        self._clamp_view_origin()
-        self._render_view()
-
-    def _render_view(self) -> None:
-        self._clamp_view_origin()
-        shown = QtGui.QPixmap(self.canvas.size())
-        shown.fill(QtCore.Qt.black)
-        source_rect = QtCore.QRectF(
-            self._view_origin.x(),
-            self._view_origin.y(),
-            self.canvas.width() / max(0.01, self._zoom),
-            self.canvas.height() / max(0.01, self._zoom),
-        )
-        painter = QtGui.QPainter(shown)
-        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self._zoom < 1.5)
-        painter.drawPixmap(QtCore.QRectF(shown.rect()), self._source, source_rect)
-        painter.end()
-        self.canvas.setPixmap(shown)
-        self._show_selection()
-        if hasattr(self, "zoom_hint"):
-            self.zoom_hint.setText(
-                f"🔍 {round(self._zoom * 100)}% · 휠 확대/축소 · 중클릭 드래그 이동 · 0 초기화\n"
-                "보기 배율만 변경되며 저장되는 이미지는 원본 픽셀을 사용합니다."
-            )
-            self.zoom_hint.adjustSize()
-            self.zoom_hint.move(max(12, self.width() - self.zoom_hint.width() - 24), 24)
-            self.zoom_hint.raise_()
 
     @staticmethod
     def _hit_test(rect: QtCore.QRect, point: QtCore.QPoint, margin: int = 8) -> str:
@@ -327,35 +231,14 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         return QtCore.QRect(QtCore.QPoint(left, top), QtCore.QPoint(right, bottom))
 
     def _show_selection(self) -> None:
-        if not self._selection.isValid() or self._selection.width() < 1 or self._selection.height() < 1:
-            self.rubber.hide()
-            return
-        shown = self._source_rect_to_view(self._selection.normalized())
-        if shown.isValid():
-            self.rubber.setGeometry(shown)
-            self.rubber.show()
-        else:
-            self.rubber.hide()
+        self.rubber.setGeometry(self._selection.normalized())
+        self.rubber.show()
 
     def eventFilter(self, obj, event):
         if obj is self.canvas:
-            if event.type() == QtCore.QEvent.Wheel:
-                steps = event.angleDelta().y() / 120.0
-                if steps:
-                    factor = 1.18 ** steps
-                    self._set_zoom(self._zoom * factor, event.position().toPoint())
-                event.accept()
-                return True
-            if event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.MiddleButton:
-                self._pan_start = event.position().toPoint()
-                self._pan_origin = QtCore.QPointF(self._view_origin)
-                self.canvas.setCursor(QtCore.Qt.ClosedHandCursor)
-                return True
             if event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
-                view_point = event.position().toPoint()
-                point = self._view_to_source(view_point)
-                shown_selection = self._source_rect_to_view(self._selection)
-                self._drag_mode = self._hit_test(shown_selection, view_point) or "new"
+                point = event.position().toPoint()
+                self._drag_mode = self._hit_test(self._selection, point) or "new"
                 self._drag_start = point
                 self._drag_rect = QtCore.QRect(self._selection)
                 self._origin = point
@@ -365,18 +248,9 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
                 self.canvas.setCursor(self._cursor_for_mode(self._drag_mode))
                 return True
             if event.type() == QtCore.QEvent.MouseMove:
-                view_pos = event.position().toPoint()
-                if self._pan_start is not None and event.buttons() & QtCore.Qt.MiddleButton:
-                    delta = view_pos - self._pan_start
-                    self._view_origin = QtCore.QPointF(
-                        self._pan_origin.x() - delta.x() / max(0.01, self._zoom),
-                        self._pan_origin.y() - delta.y() / max(0.01, self._zoom),
-                    )
-                    self._render_view()
-                    return True
-                pos = self._view_to_source(view_pos)
-                hx = min(view_pos.x() + 16, self.width() - self.cursor_hint.width() - 10)
-                hy = min(view_pos.y() + 16, self.height() - self.cursor_hint.height() - 10)
+                pos = event.position().toPoint()
+                hx = min(pos.x() + 16, self.width() - self.cursor_hint.width() - 10)
+                hy = min(pos.y() + 16, self.height() - self.cursor_hint.height() - 10)
                 self.cursor_hint.move(max(10, hx), max(10, hy))
                 self.cursor_hint.raise_()
                 if self._origin is not None:
@@ -385,8 +259,7 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
                         self._drag_rect,
                         self._drag_start,
                         pos,
-                        self._source.rect(),
-                        minimum=max(1, round(12 / max(1.0, self._zoom))),
+                        self.canvas.rect(),
                     )
                     self._show_selection()
                     w, h = self._selection.width(), self._selection.height()
@@ -394,7 +267,7 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
                     self.cursor_hint.adjustSize()
                     return True
                 else:
-                    mode = self._hit_test(self._source_rect_to_view(self._selection), view_pos)
+                    mode = self._hit_test(self._selection, pos)
                     self.canvas.setCursor(self._cursor_for_mode(mode))
                     if self._selection.isValid() and self._selection.width() >= 4:
                         w, h = self._selection.width(), self._selection.height()
@@ -403,206 +276,47 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
                         self.cursor_hint.setText(self._hint_text or "⬚ 검색할 영역을 마우스로 드래그하세요\n(Enter: 확정, Esc: 취소)")
                     self.cursor_hint.adjustSize()
                     return False
-            if event.type() == QtCore.QEvent.MouseButtonRelease and event.button() == QtCore.Qt.MiddleButton:
-                self._pan_start = None
-                mode = self._hit_test(self._source_rect_to_view(self._selection), event.position().toPoint())
-                self.canvas.setCursor(self._cursor_for_mode(mode))
-                return True
             if event.type() == QtCore.QEvent.MouseButtonRelease and self._origin is not None:
-                self._selection = self._selection.normalized().intersected(self._source.rect())
+                self._selection = self.rubber.geometry().normalized().intersected(self.canvas.rect())
                 self._origin = None
                 self._drag_mode = ""
-                mode = self._hit_test(self._source_rect_to_view(self._selection), event.position().toPoint())
+                mode = self._hit_test(self._selection, event.position().toPoint())
                 self.canvas.setCursor(self._cursor_for_mode(mode))
                 if self._accept_on_release and self._selection.width() >= 4 and self._selection.height() >= 4:
-                    if not getattr(self, "_closing", False):
-                        QtCore.QTimer.singleShot(0, self.accept)
+                    QtCore.QTimer.singleShot(0, self.accept)
                 return True
             if event.type() == QtCore.QEvent.MouseButtonDblClick and self._selection.width() >= 4:
                 self.accept()
                 return True
-            if event.type() == QtCore.QEvent.KeyPress:
-                if event.key() == QtCore.Qt.Key_0:
-                    self._zoom = 1.0
-                    self._view_origin = QtCore.QPointF()
-                    self._render_view()
-                    event.accept()
-                    return True
-                if event.key() == QtCore.Qt.Key_Escape:
-                    event.accept()
-                    self._cancel_and_reject()
-                    return True
-                if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-                    if self._selection.width() >= 4 and self._selection.height() >= 4:
-                        event.accept()
-                        self.accept()
-                        return True
         return super().eventFilter(obj, event)
 
-    def _cancel_and_reject(self) -> None:
-        if getattr(self, "_closing", False):
-            return
-        self._closing = True
-        self._origin = None
-        self._selection = QtCore.QRect()
-        try:
-            if hasattr(self, "rubber") and self.rubber is not None:
-                self.rubber.hide()
-        except Exception:
-            pass
-        self.reject()
-
-    def accept(self) -> None:
-        if getattr(self, "_closing", False):
-            return
-        self._closing = True
-        super().accept()
-
-    def reject(self) -> None:
-        self._closing = True
-        self._origin = None
-        self._selection = QtCore.QRect()
-        try:
-            if hasattr(self, "rubber") and self.rubber is not None:
-                self.rubber.hide()
-        except Exception:
-            pass
-        super().reject()
-
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        if event.key() == QtCore.Qt.Key_0:
-            self._zoom = 1.0
-            self._view_origin = QtCore.QPointF()
-            self._render_view()
-            event.accept()
+        if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) and self._selection.width() >= 4:
+            self.accept()
             return
-        if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-            if self._selection.width() >= 4 and self._selection.height() >= 4:
-                event.accept()
-                self.accept()
-                return
         if event.key() == QtCore.Qt.Key_Escape:
-            event.accept()
-            self._cancel_and_reject()
+            self.reject()
             return
         super().keyPressEvent(event)
 
     def captured_image(self) -> QtGui.QImage:
         if self._selection.width() < 4 or self._selection.height() < 4:
             return QtGui.QImage()
-        # Qt composes the desktop in logical pixels.  Searching is performed
-        # against Win32/OpenCV physical pixels, so save the template from the
-        # native rectangle instead of a DPI-scaled preview whenever possible.
-        native_rect = self.selected_native_screen_rect()
-        if native_rect.isValid():
-            try:
-                from opencv_search import capture_region
-
-                frame = capture_region(
-                    native_rect.x(), native_rect.y(),
-                    native_rect.x() + native_rect.width(),
-                    native_rect.y() + native_rect.height(),
-                )
-                if frame is not None and frame.size:
-                    if len(frame.shape) == 2:
-                        qimage = QtGui.QImage(
-                            frame.data, frame.shape[1], frame.shape[0], frame.strides[0],
-                            QtGui.QImage.Format_Grayscale8,
-                        )
-                    else:
-                        qimage = QtGui.QImage(
-                            frame.data, frame.shape[1], frame.shape[0], frame.strides[0],
-                            QtGui.QImage.Format_BGR888,
-                        )
-                    return qimage.copy()
-            except Exception:
-                pass
-        return self._source.toImage().copy(self._selection.intersected(self._source.rect()))
+        sx = self._source.width() / max(1, self.canvas.width())
+        sy = self._source.height() / max(1, self.canvas.height())
+        rect = QtCore.QRect(
+            round(self._selection.x() * sx),
+            round(self._selection.y() * sy),
+            round(self._selection.width() * sx),
+            round(self._selection.height() * sy),
+        ).intersected(self._source.rect())
+        return self._source.toImage().copy(rect)
 
     def selected_screen_rect(self) -> QtCore.QRect:
-        """선택한 범위를 Qt 전역 논리 좌표로 반환합니다."""
+        """선택한 범위를 현재 화면의 전역 좌표로 반환합니다."""
         if self._selection.width() < 4 or self._selection.height() < 4:
             return QtCore.QRect()
         return self._selection.translated(self.geometry().topLeft())
-
-    def selected_native_screen_rect(self) -> QtCore.QRect:
-        """Return the selection in Win32/OpenCV physical screen pixels."""
-        return logical_rect_to_native(self.selected_screen_rect())
-
-    @property
-    def selected_rect(self) -> QtCore.QRect:
-        """Property alias for selected_screen_rect."""
-        return self.selected_screen_rect()
-
-
-def select_region_on_snapshot(
-    snapshot_pixmap: QtGui.QPixmap,
-    parent=None,
-    hint_text: str | None = None,
-) -> list[int] | None:
-    """Open snapshot in a focused overlay allowing the user to drag an ROI directly on the snapshot frame.
-    Returns [left, top, right, bottom] relative to the snapshot (0, 0) or None if cancelled.
-    """
-    if snapshot_pixmap.isNull() or snapshot_pixmap.width() < 4 or snapshot_pixmap.height() < 4:
-        return None
-    geometry = virtual_desktop_geometry()
-    if not geometry.isValid():
-        geometry = QtCore.QRect(0, 0, 1920, 1080)
-
-    # Create dark dimmed overlay matching virtual desktop
-    overlay = QtGui.QPixmap(geometry.size())
-    overlay.fill(QtGui.QColor(12, 16, 24, 235))
-
-    sw = snapshot_pixmap.width()
-    sh = snapshot_pixmap.height()
-
-    # Center the snapshot on the screen (or primary monitor)
-    primary_screen = QtGui.QGuiApplication.primaryScreen()
-    if primary_screen:
-        p_geo = primary_screen.geometry()
-        cx = (p_geo.left() - geometry.left()) + max(0, (p_geo.width() - sw) // 2)
-        cy = (p_geo.top() - geometry.top()) + max(0, (p_geo.height() - sh) // 2)
-    else:
-        cx = max(0, (geometry.width() - sw) // 2)
-        cy = max(0, (geometry.height() - sh) // 2)
-
-    snap_target = QtCore.QRect(cx, cy, sw, sh)
-
-    painter = QtGui.QPainter(overlay)
-    painter.drawPixmap(cx, cy, snapshot_pixmap)
-
-    # Draw border and title banner
-    painter.setPen(QtGui.QPen(QtGui.QColor("#4D9FFF"), 2))
-    painter.drawRect(cx - 1, cy - 1, sw + 2, sh + 2)
-
-    painter.setPen(QtGui.QPen(QtGui.QColor("#E2E8F0")))
-    font = QtGui.QFont("Segoe UI", 10)
-    font.setBold(True)
-    painter.setFont(font)
-    banner_text = f"📸 녹화 당시 화면 (스냅샷: {sw}×{sh} px) · 틀 안쪽에서 검색할 영역을 마우스로 드래그하세요"
-    painter.drawText(cx, max(18, cy - 8), banner_text)
-    painter.end()
-
-    hint = hint_text or "📸 [녹화 당시 화면] 파란 틀 안쪽에서 검색할 영역을 드래그하세요 (Enter: 확정, Esc: 취소)"
-    picker = ScreenCaptureDialog(overlay, geometry, parent=parent, hint_text=hint)
-    try:
-        if picker.exec() != QtWidgets.QDialog.Accepted:
-            return None
-        selected = picker.selected_screen_rect()
-        local_sel = selected.translated(-geometry.topLeft())
-        intersected = local_sel.intersected(snap_target)
-        if not intersected.isValid() or intersected.width() < 4 or intersected.height() < 4:
-            return None
-        rel_left = intersected.left() - cx
-        rel_top = intersected.top() - cy
-        rel_right = intersected.right() - cx
-        rel_bottom = intersected.bottom() - cy
-        return [max(0, rel_left), max(0, rel_top), min(sw, rel_right), min(sh, rel_bottom)]
-    finally:
-        try:
-            picker.deleteLater()
-        except Exception:
-            pass
 
 
 class ImageEditorDialog(QtWidgets.QDialog):
@@ -793,7 +507,7 @@ class ImageEditorDialog(QtWidgets.QDialog):
         root.addWidget(tools)
 
         self.scroll = QtWidgets.QScrollArea()
-        self.scroll.setWidgetResizable(False)
+        self.scroll.setWidgetResizable(True)
         self.scroll.setAlignment(QtCore.Qt.AlignCenter)
         self.scroll.setStyleSheet("background:#090B10; border:1px solid #303647; border-radius:10px;")
         self.view = PrecisionImageView(alignment=QtCore.Qt.AlignCenter)
@@ -801,7 +515,6 @@ class ImageEditorDialog(QtWidgets.QDialog):
         self.view.setMouseTracking(True)
         self.view.installEventFilter(self)
         self.scroll.setWidget(self.view)
-        self.scroll.viewport().installEventFilter(self)
         self.rubber = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self.view)
         root.addWidget(self.scroll, 1)
 
@@ -810,14 +523,12 @@ class ImageEditorDialog(QtWidgets.QDialog):
         zoom_in = QtWidgets.QPushButton("＋")
         fit = QtWidgets.QPushButton("화면 맞춤")
         actual = QtWidgets.QPushButton("100%")
-        zoom_out.clicked.connect(lambda: self.set_zoom(self.zoom / 1.2))
-        zoom_in.clicked.connect(lambda: self.set_zoom(self.zoom * 1.2))
+        zoom_out.clicked.connect(lambda: self.set_zoom(self.zoom - 0.1))
+        zoom_in.clicked.connect(lambda: self.set_zoom(self.zoom + 0.1))
         fit.clicked.connect(self.fit)
         actual.clicked.connect(lambda: self.set_zoom(1.0))
         self.zoom_label = QtWidgets.QLabel("100%")
         self.zoom_label.setObjectName("Muted")
-        zoom_help = QtWidgets.QLabel("휠: 커서 중심 확대/축소 · 보기 배율만 변경")
-        zoom_help.setObjectName("Muted")
         save_copy = QtWidgets.QPushButton("복사본 저장")
         save_copy.clicked.connect(self.save_copy)
         save = primary_button("원본에 저장")
@@ -827,7 +538,6 @@ class ImageEditorDialog(QtWidgets.QDialog):
         bottom.addWidget(actual)
         bottom.addWidget(fit)
         bottom.addWidget(self.zoom_label)
-        bottom.addWidget(zoom_help)
         bottom.addStretch(1)
         bottom.addWidget(save_copy)
         bottom.addWidget(save)
@@ -859,22 +569,9 @@ class ImageEditorDialog(QtWidgets.QDialog):
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
         if self.fit_to_view and hasattr(self, "scroll"):
-            selected = self._image_rect(self.selection)
-            self._update_view(selected)
+            self._update_view()
 
     def eventFilter(self, obj, event):
-        if (obj is self.view or obj is self.scroll.viewport()) and event.type() == QtCore.QEvent.Wheel:
-            viewport_point = event.position().toPoint()
-            if obj is self.view:
-                view_point = viewport_point
-                viewport_point = self.view.mapTo(self.scroll.viewport(), view_point)
-            else:
-                view_point = self.view.mapFrom(self.scroll.viewport(), viewport_point)
-            steps = event.angleDelta().y() / 120.0
-            if steps:
-                self.set_zoom(self.zoom * (1.18 ** steps), view_point, viewport_point)
-            event.accept()
-            return True
         if obj is self.view:
             point = event.position().toPoint() if hasattr(event, "position") else QtCore.QPoint()
             if event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
@@ -911,13 +608,12 @@ class ImageEditorDialog(QtWidgets.QDialog):
                     self.selection = self.rubber.geometry().normalized()
                     self.origin = None
                     return True
+            if event.type() == QtCore.QEvent.Wheel and event.modifiers() & QtCore.Qt.ControlModifier:
+                self.set_zoom(self.zoom + (0.1 if event.angleDelta().y() > 0 else -0.1))
+                return True
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        if event.key() == QtCore.Qt.Key_0:
-            self.set_zoom(1.0)
-            event.accept()
-            return
         if self.erase_mode and event.key() in (
             QtCore.Qt.Key_Left,
             QtCore.Qt.Key_Right,
@@ -944,7 +640,7 @@ class ImageEditorDialog(QtWidgets.QDialog):
             return
         super().keyPressEvent(event)
 
-    def _update_view(self, selected_image_rect: QtCore.QRect | None = None) -> None:
+    def _update_view(self) -> None:
         pixmap = QtGui.QPixmap.fromImage(self.image)
         if self.fit_to_view:
             target = self.scroll.viewport().size() - QtCore.QSize(24, 24)
@@ -959,50 +655,20 @@ class ImageEditorDialog(QtWidgets.QDialog):
             )
         self.view.setPixmap(shown)
         self.view.setFixedSize(shown.size())
-        if selected_image_rect is not None and selected_image_rect.isValid():
-            self.selection = self._view_rect(selected_image_rect)
-            self.rubber.setGeometry(self.selection)
-            self.rubber.show()
-        elif not self.selection.isValid():
-            self.rubber.hide()
         self.zoom_label.setText(f"{round(self.zoom * 100)}%")
         self.info.setText(f"{self.image.width()} × {self.image.height()} px · {self.path.name}")
         self.undo_button.setEnabled(self.history_index > 0)
         self.redo_button.setEnabled(self.history_index < len(self.history) - 1)
         self._update_brush_preview()
 
-    def set_zoom(
-        self,
-        value: float,
-        anchor_point: QtCore.QPoint | None = None,
-        anchor_viewport: QtCore.QPoint | None = None,
-    ) -> None:
-        previous = self.view.pixmap()
-        selected = self._image_rect(self.selection)
-        anchor_ratio: tuple[float, float] | None = None
-        if anchor_point is not None and previous is not None and not previous.isNull():
-            anchor_ratio = (
-                max(0.0, min(1.0, anchor_point.x() / max(1, previous.width()))),
-                max(0.0, min(1.0, anchor_point.y() / max(1, previous.height()))),
-            )
-            if anchor_viewport is None:
-                anchor_viewport = self.view.mapTo(self.scroll.viewport(), anchor_point)
+    def set_zoom(self, value: float) -> None:
         self.fit_to_view = False
-        self.zoom = max(0.1, min(16.0, value))
-        self._update_view(selected)
-        shown = self.view.pixmap()
-        if anchor_ratio is not None and anchor_viewport is not None and shown is not None and not shown.isNull():
-            self.scroll.horizontalScrollBar().setValue(
-                round(anchor_ratio[0] * shown.width() - anchor_viewport.x())
-            )
-            self.scroll.verticalScrollBar().setValue(
-                round(anchor_ratio[1] * shown.height() - anchor_viewport.y())
-            )
+        self.zoom = max(0.1, min(8.0, value))
+        self._update_view()
 
     def fit(self) -> None:
-        selected = self._image_rect(self.selection)
         self.fit_to_view = True
-        self._update_view(selected)
+        self._update_view()
 
     def _image_point(self, point: QtCore.QPoint) -> QtCore.QPoint | None:
         pixmap = self.view.pixmap()
@@ -1021,19 +687,6 @@ class ImageEditorDialog(QtWidgets.QDialog):
         sx = self.image.width() / max(1, pixmap.width())
         sy = self.image.height() / max(1, pixmap.height())
         return QtCore.QRect(round(rect.x() * sx), round(rect.y() * sy), round(rect.width() * sx), round(rect.height() * sy)).intersected(self.image.rect())
-
-    def _view_rect(self, rect: QtCore.QRect) -> QtCore.QRect:
-        pixmap = self.view.pixmap()
-        if not rect.isValid() or not pixmap or pixmap.isNull() or self.image.isNull():
-            return QtCore.QRect()
-        sx = pixmap.width() / max(1, self.image.width())
-        sy = pixmap.height() / max(1, self.image.height())
-        return QtCore.QRect(
-            round(rect.x() * sx),
-            round(rect.y() * sy),
-            max(1, round(rect.width() * sx)),
-            max(1, round(rect.height() * sy)),
-        ).intersected(self.view.rect())
 
     def _replace(self, image: QtGui.QImage, push: bool = True) -> None:
         self.image = image.convertToFormat(QtGui.QImage.Format_ARGB32)

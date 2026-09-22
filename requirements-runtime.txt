@@ -1,0 +1,9 @@
+# MacroRelay core automation engines installed into runtime_packages.
+# Keep compiled packages on Python 3.11 for portable export compatibility.
+opencv-python>=4.9,<5
+mss>=9,<11
+rapidocr>=3.9,<4
+onnxruntime>=1.17,<2
+pywin32>=306
+pywinauto>=0.6.8
+uiautomation>=2.0

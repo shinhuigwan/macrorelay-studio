@@ -7,8 +7,6 @@ __pycache__/
 .vscode/
 node_modules/
 .wrangler/
-scratch/
-.backups/
 
 # Local runtimes and downloaded third-party binaries/models
 .venv/
@@ -46,9 +44,6 @@ opencv_*_result.txt
 opencv_live_check.txt
 .component-installing
 studio-launch-error.txt
-startup.cooldown
-ocr_last.txt
-/바탕 화면
 
 # Generated UI captures and design drafts
 /*.png
@@ -67,5 +62,3 @@ branding/*
 *.jks
 *.keystore
 *.building-*
-*.bak
-*.exe

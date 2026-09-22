@@ -355,6 +355,9 @@ class QuickSlotDeckTests(unittest.TestCase):
                 self.assertIn("target_exe", dialog.widgets)
                 self.assertTrue(dialog.btn_edit_icon.text())
                 self.assertTrue(dialog.btn_test.text())
+                if kind == "text":
+                    self.assertEqual(5, dialog.widgets["text_method"].count())
+                    self.assertEqual("auto", dialog.widgets["text_method"].currentData())
                 if kind == "mouse_click":
                     self.assertIn("x", dialog.widgets)
                     self.assertIn("y", dialog.widgets)
@@ -385,11 +388,49 @@ class QuickSlotDeckTests(unittest.TestCase):
                 action = {"kind": "text", "label": "입력", "text": "hello", "input_mode": "inactive", "target_exe": "notepad.exe"}
                 window._execute_deck_action(action)
                 resolve.assert_called_once_with(action)
-                send_text.assert_called_once_with(321, "hello")
+                send_text.assert_called_once_with(321, "hello", "wm_char", 0)
             with mock.patch.object(window, "_click_action_target") as click:
                 action = {"kind": "mouse_click", "label": "클릭", "x": 40, "y": 50, "input_mode": "inactive"}
                 window._execute_deck_action(action)
                 click.assert_called_once_with(action, inactive=True)
+            window.close()
+
+    def test_deck_save_button_saves_once_and_closes(self) -> None:
+        from macro_studio.deck_dock import DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dock = DeckDockWindow(window)
+            with mock.patch.object(dock, "save", return_value=True) as save, mock.patch.object(dock, "close") as close:
+                dock._save_and_close()
+                save.assert_called_once_with()
+                close.assert_called_once_with()
+            dock.close(); window.close()
+
+    def test_text_action_supports_clipboard_typing_and_enter(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            inactive = {
+                "kind": "text", "label": "붙여넣기", "text": "hello", "input_mode": "inactive",
+                "text_method": "clipboard", "key_interval_ms": 12, "press_enter": True,
+            }
+            with mock.patch.object(window, "_resolve_action_window", return_value=44), mock.patch.object(window, "_send_inactive_text") as send_text, mock.patch.object(window, "_send_inactive_hotkey") as send_key:
+                window._execute_deck_action(inactive)
+                send_text.assert_called_once_with(44, "hello", "clipboard", 12)
+                send_key.assert_called_once_with(44, "Enter")
+
+            active = {
+                "kind": "text", "label": "타이핑", "text": "가나다", "input_mode": "active",
+                "text_method": "type", "key_interval_ms": 25,
+            }
+            with mock.patch.object(window, "_activate_window_by_title"), mock.patch.object(window, "_send_active_unicode_text") as type_text:
+                window._execute_deck_action(active)
+                type_text.assert_called_once_with("가나다", 25)
             window.close()
 
     def test_system_deck_actions_dispatch_to_runtime_services(self) -> None:

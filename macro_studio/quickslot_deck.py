@@ -3616,7 +3616,50 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         for vk in keys: user32.PostMessageW(target, 0x0100, vk, 0)
         for vk in reversed(keys): user32.PostMessageW(target, 0x0101, vk, 0)
 
-    def _send_inactive_text(self, hwnd: int, text: str) -> None:
+    def _send_active_unicode_text(self, text: str, delay_ms: int = 0) -> None:
+        if os.name != "nt":
+            raise RuntimeError("글자별 키 입력은 Windows에서만 지원됩니다.")
+        pointer_int = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", pointer_int),
+            ]
+
+        class INPUTUNION(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("union",)
+            _fields_ = [("type", wintypes.DWORD), ("union", INPUTUNION)]
+
+        encoded = text.encode("utf-16-le")
+        for offset in range(0, len(encoded), 2):
+            code_unit = int.from_bytes(encoded[offset:offset + 2], "little")
+            events = (INPUT * 2)(
+                INPUT(1, INPUTUNION(ki=KEYBDINPUT(0, code_unit, 0x0004, 0, 0))),
+                INPUT(1, INPUTUNION(ki=KEYBDINPUT(0, code_unit, 0x0004 | 0x0002, 0, 0))),
+            )
+            if ctypes.windll.user32.SendInput(2, events, ctypes.sizeof(INPUT)) != 2:
+                raise RuntimeError("Windows 키 입력 전송에 실패했습니다.")
+            if delay_ms > 0:
+                QtCore.QThread.msleep(delay_ms)
+
+    def _send_inactive_text(self, hwnd: int, text: str, method: str = "clipboard", delay_ms: int = 0) -> None:
+        target = self._focused_child_window(hwnd)
+        if method == "set_text":
+            ctypes.windll.user32.SendMessageW(target, 0x000C, 0, str(text))
+            return
+        if method in {"type", "wm_char"}:
+            encoded = str(text).encode("utf-16-le")
+            for offset in range(0, len(encoded), 2):
+                code_unit = int.from_bytes(encoded[offset:offset + 2], "little")
+                ctypes.windll.user32.PostMessageW(target, 0x0102, code_unit, 0)
+                if delay_ms > 0:
+                    QtCore.QThread.msleep(delay_ms)
+            return
         QtWidgets.QApplication.clipboard().setText(text)
         self._send_inactive_hotkey(hwnd, "Ctrl+V")
 
@@ -3731,15 +3774,30 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                     self._send_windows_hotkey(str(action.get("keys") or ""))
             elif kind == "text":
                 text_value = str(action.get("text") or "")
-                if str(action.get("input_mode") or "active") == "inactive":
-                    self._send_inactive_text(self._resolve_action_window(action), text_value)
+                input_mode = str(action.get("input_mode") or "active")
+                method = str(action.get("text_method") or "auto")
+                delay_ms = max(0, int(action.get("key_interval_ms") or 0))
+                press_enter = bool(action.get("press_enter", False))
+                if input_mode == "inactive":
+                    resolved_method = "wm_char" if method == "auto" else method
+                    hwnd = self._resolve_action_window(action)
+                    self._send_inactive_text(hwnd, text_value, resolved_method, delay_ms)
+                    if press_enter:
+                        self._send_inactive_hotkey(hwnd, "Enter")
                 else:
                     if action.get("target_window") or action.get("target_exe"):
                         self._activate_action_window(action)
                     else:
                         self._activate_window_by_title(str(action.get("target_title") or ""))
-                    QtWidgets.QApplication.clipboard().setText(text_value)
-                    self._send_windows_hotkey("Ctrl+V")
+                    if method in {"type", "wm_char"}:
+                        self._send_active_unicode_text(text_value, delay_ms)
+                    elif method == "set_text":
+                        self._send_inactive_text(self._resolve_action_window(action), text_value, "set_text", delay_ms)
+                    else:
+                        QtWidgets.QApplication.clipboard().setText(text_value)
+                        self._send_windows_hotkey("Ctrl+V")
+                    if press_enter:
+                        self._send_windows_hotkey("Enter")
             elif kind == "mouse_click":
                 self._click_action_target(action, inactive=str(action.get("input_mode") or "inactive") == "inactive")
             elif kind == "wait":

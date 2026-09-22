@@ -292,6 +292,17 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
             edit = QtWidgets.QPlainTextEdit(str(self.action.get("text") or "")); edit.setMaximumHeight(120)
             self.widgets["text"] = edit
             form.addRow("입력할 텍스트", edit)
+            method = QtWidgets.QComboBox()
+            method.addItem("자동 · 실행 방식에 맞춤", "auto")
+            method.addItem("클립보드 붙여넣기 · 빠름", "clipboard")
+            method.addItem("글자별 키 입력 · 실제 타이핑", "type")
+            method.addItem("WM_CHAR · 비활성 문자 메시지", "wm_char")
+            method.addItem("WM_SETTEXT · 입력 컨트롤 값 직접 설정", "set_text")
+            method.setCurrentIndex(max(0, method.findData(str(self.action.get("text_method") or "auto"))))
+            interval = QtWidgets.QSpinBox(); interval.setRange(0, 1000); interval.setSuffix(" ms"); interval.setValue(int(self.action.get("key_interval_ms") or 0))
+            enter = QtWidgets.QCheckBox("입력 후 Enter 전송"); enter.setChecked(bool(self.action.get("press_enter", False)))
+            self.widgets.update(text_method=method, key_interval_ms=interval, press_enter=enter)
+            form.addRow("입력 엔진", method); form.addRow("글자 입력 간격", interval); form.addRow("완료 동작", enter)
             self._add_target_fields(form)
         elif kind == "mouse_click":
             button = QtWidgets.QComboBox()
@@ -467,6 +478,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.main_window = main_window
         self.repository = main_window.repository
         self.current_page = int(main_window.current_page)
+        self._saving = False
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setWindowTitle("MacroRelay · Deck Dock")
         self.setWindowIcon(main_window.windowIcon())
@@ -483,7 +495,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         top = QtWidgets.QHBoxLayout(toolbar); top.setContentsMargins(16, 10, 16, 10)
         title = QtWidgets.QLabel("Deck Dock"); title.setObjectName("Title")
         self.preset_combo = QtWidgets.QComboBox(); self.preset_combo.setMinimumWidth(220); self.preset_combo.currentIndexChanged.connect(self._preset_changed)
-        save = QtWidgets.QPushButton("저장 및 덱 적용"); save.clicked.connect(self.save)
+        save = QtWidgets.QPushButton("저장 및 닫기"); save.clicked.connect(self._save_and_close)
         self.grid_rows_spin = QtWidgets.QSpinBox(); self.grid_rows_spin.setRange(1, 10); self.grid_rows_spin.setSuffix(" 행")
         self.grid_cols_spin = QtWidgets.QSpinBox(); self.grid_cols_spin.setRange(1, 10); self.grid_cols_spin.setSuffix(" 열")
         self.grid_apply_btn = QtWidgets.QPushButton("그리드 적용"); self.grid_apply_btn.clicked.connect(self._apply_grid_size)
@@ -660,11 +672,25 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             self.main_window.custom_icons[str(empty)] = copy.deepcopy(self.main_window.custom_icons[str(index)])
         self.save()
 
-    def save(self) -> None:
-        self.payload["deck_page_count"] = self.page_count
-        self.main_window._save_preset_hotkeys(self.payload)
-        self.main_window.current_page = min(self.main_window.current_page, self.page_count - 1)
-        self.main_window.refresh_slots(); self.main_window._capture_active_slot_preset(); self.main_window._save_config(); self._render_page()
+    def save(self) -> bool:
+        if self._saving:
+            return False
+        self._saving = True
+        try:
+            self.payload["deck_page_count"] = self.page_count
+            self.main_window._save_preset_hotkeys(self.payload)
+            self.main_window.current_page = min(self.main_window.current_page, self.page_count - 1)
+            self.main_window.refresh_slots()
+            self.main_window._capture_active_slot_preset()
+            self.main_window._save_config()
+            self._render_page()
+            return True
+        finally:
+            self._saving = False
+
+    def _save_and_close(self) -> None:
+        if self.save():
+            self.close()
 
     def _preset_changed(self, index: int) -> None:
         if index < 0: return

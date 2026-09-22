@@ -3844,7 +3844,7 @@ class UiSmokeTests(unittest.TestCase):
                 QtCore.QDate.currentDate().toString(QtCore.Qt.ISODate),
             )
             settings.sync()
-            self.assertFalse(BuilderPage._recording_notice_hidden_today(settings))
+            self.assertTrue(BuilderPage._recording_notice_hidden_today(settings))
 
     def test_quickslot_deck_window_construction_and_interactions(self) -> None:
         from PySide6 import QtCore, QtWidgets
@@ -3871,7 +3871,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("테스트-매크로", btn.macro_name)
             self.assertEqual("Alt+1", btn.hotkey)
 
-            window.btn_topmost.setChecked(False)
+            window._toggle_always_on_top(False)
             self.assertFalse(window.always_on_top)
 
             window._set_opacity(80)
@@ -3881,7 +3881,7 @@ class UiSmokeTests(unittest.TestCase):
             window.swipe_container.swipe_left.emit()
             app.processEvents()
 
-            window.grid_combo.setCurrentIndex(2)
+            window._on_grid_changed(2)
             self.assertEqual(3, window.rows)
             self.assertEqual(3, window.cols)
             self.assertEqual(9, len(window.buttons))

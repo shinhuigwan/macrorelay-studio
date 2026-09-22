@@ -4186,7 +4186,7 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     lines.append("        if (!DirectPost)")
     lines.append("            Sleep, 10")
     lines.append("        PostMessage, %DownMessage%, %DownWParam%, %lParam%, , ahk_id %ClickHwnd%")
-    lines.append("        Sleep, 50")
+    lines.append("        Sleep, 20")
     lines.append("        PostMessage, %UpMessage%, 0, %lParam%, , ahk_id %ClickHwnd%")
     lines.append("        if (DirectPost)")
     lines.append('            Log("inactive click direct post: mousemove/down/up sent")')

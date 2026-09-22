@@ -2362,6 +2362,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._save_config()
 
     def _update_topmost_btn_style(self) -> None:
+        if not hasattr(self, "btn_topmost") or not self.btn_topmost:
+            return
         if self.always_on_top:
             self.btn_topmost.setText("📌 최상위 ON")
             self.btn_topmost.setStyleSheet("""
@@ -2398,7 +2400,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def _set_opacity(self, pct: int) -> None:
         self.opacity_val = pct
-        self.btn_opacity.setText(f"💧 {pct}%")
+        if hasattr(self, "btn_opacity") and self.btn_opacity:
+            self.btn_opacity.setText(f"💧 {pct}%")
         self.setWindowOpacity(pct / 100.0)
         self._save_config()
 
@@ -2507,6 +2510,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
             row = i // self.cols
             col = i % self.cols
+            self.grid_layout.addWidget(btn, row, col)
+            self.buttons.append(btn)
         self.refresh_states()
 
         # Dynamic Auto-Fit Window Size according to configured active slots
@@ -2549,6 +2554,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         return False
 
     def _run_slot_macro(self, slot_index: int, macro_name: str) -> None:
+        if not macro_name:
+            return
+        # Defer macro invocation out of mouseReleaseEvent to allow Qt to release implicit
+        # mouse grab and allow Windows to settle physical mouse movement deltas before clicking.
+        QtCore.QTimer.singleShot(75, lambda: self._execute_slot_macro(slot_index, macro_name))
+
+    def _execute_slot_macro(self, slot_index: int, macro_name: str) -> None:
         if not macro_name:
             return
         try:

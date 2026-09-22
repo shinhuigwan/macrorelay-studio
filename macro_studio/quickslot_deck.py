@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import ctypes
 import hashlib
 import json
 import math
@@ -21,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1370,6 +1372,7 @@ RADIAL_ACTION_PRESETS: Dict[str, tuple[str, str, str]] = {
     "prev_page": ("◀ 이전 페이지", "◀", "#3B82F6"),
     "next_page": ("▶ 다음 페이지", "▶", "#3B82F6"),
     "settings": ("🛠️ 환경 설정", "⚙️", "#6A55FF"),
+    "deck_dock": ("▦ Deck Dock", "▦", "#14B8A6"),
     "emergency": ("🔴 전체 중지", "🛑", "#E85566"),
     "refresh": ("🔄 슬롯 갱신", "🔄", "#00A6FF"),
     "studio": ("⚙️ Studio 실행", "🖥️", "#35C89A"),
@@ -1461,7 +1464,7 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         self._init_default_items()
 
     def _init_default_items(self) -> None:
-        default_keys = ["prev_page", "next_page", "settings", "preset_settings", "emergency", "refresh", "studio", "topmost"]
+        default_keys = ["prev_page", "next_page", "settings", "deck_dock", "preset_settings", "emergency", "studio", "topmost"]
         self.items = []
         for k in default_keys:
             title, icon_text, color = RADIAL_ACTION_PRESETS[k]
@@ -1938,6 +1941,8 @@ class SlotPresetDialog(QtWidgets.QDialog):
         preset = self.main_window._build_slot_preset(name)
         preset["slots"] = []
         preset["custom_icons"] = {}
+        preset["deck_page_count"] = 1
+        preset["deck_page_names"] = ["페이지 1"]
         self.presets[preset_id] = preset
         self._reload_list(preset_id)
 
@@ -2569,7 +2574,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "theme_index": 0,
             "auto_stretch_default": True,
             "empty_slot_opacity": 0,
-            "radial_items": ["prev_page", "next_page", "settings", "preset_settings", "emergency", "refresh", "studio", "topmost"],
+            "radial_items": ["prev_page", "next_page", "settings", "deck_dock", "preset_settings", "emergency", "studio", "topmost"],
             "slot_presets": {},
             "active_slot_preset": "default",
         }
@@ -2634,6 +2639,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                     self.config.update(data["config"])
                 self.config["compact_auto_fit"] = True
                 radial_items = list(self.config.get("radial_items") or [])
+                if "deck_dock" not in radial_items:
+                    if "refresh" in radial_items:
+                        radial_items[radial_items.index("refresh")] = "deck_dock"
+                    elif len(radial_items) < 8:
+                        radial_items.append("deck_dock")
+                    elif radial_items:
+                        radial_items[3] = "deck_dock"
                 if "preset_settings" not in radial_items:
                     if "add_slot" in radial_items:
                         radial_items[radial_items.index("add_slot")] = "preset_settings"
@@ -2684,6 +2696,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         return {
             "name": str(name).strip() or "이름 없는 모드",
             "slots": copy.deepcopy(list(hotkeys.get("slots") or [])),
+            "deck_page_count": max(1, int(hotkeys.get("deck_page_count") or 1)),
+            "deck_page_names": copy.deepcopy(list(hotkeys.get("deck_page_names") or [])),
             "custom_icons": copy.deepcopy(self.custom_icons),
             "rows": int(self.rows),
             "cols": int(self.cols),
@@ -2737,6 +2751,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.stop_all_macros()
             hotkeys = self.repository.load_hotkeys()
             hotkeys["slots"] = copy.deepcopy(list(preset.get("slots") or []))
+            hotkeys["deck_page_count"] = max(1, int(preset.get("deck_page_count") or 1))
+            hotkeys["deck_page_names"] = copy.deepcopy(list(preset.get("deck_page_names") or []))
             self._save_preset_hotkeys(hotkeys)
             self.custom_icons = copy.deepcopy(dict(preset.get("custom_icons") or {}))
             self.rows = max(1, int(preset.get("rows", self.rows)))
@@ -2977,6 +2993,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.stop_all_macros()
             hotkeys = self.repository.load_hotkeys()
             hotkeys["slots"] = copy.deepcopy(list(preset.get("slots") or []))
+            hotkeys["deck_page_count"] = max(1, int(preset.get("deck_page_count") or 1))
+            hotkeys["deck_page_names"] = copy.deepcopy(list(preset.get("deck_page_names") or []))
             self._save_preset_hotkeys(hotkeys)
             self.custom_icons = copy.deepcopy(dict(preset.get("custom_icons") or {}))
             self.rows = max(1, int(preset.get("rows", self.rows)))
@@ -3001,6 +3019,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self._next_page()
         elif key == "settings":
             self._open_settings_dialog(target_tab=0)
+        elif key == "deck_dock":
+            self._open_deck_dock()
         elif key == "emergency":
             self.stop_all_macros()
         elif key == "refresh":
@@ -3030,6 +3050,26 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             dlg.tabs.setCurrentIndex(target_tab)
         position_dialog_beside(self, dlg)
         dlg.exec_()
+
+    def _open_deck_dock(self) -> None:
+        existing = getattr(self, "_deck_dock_window", None)
+        if existing is not None and existing.isVisible():
+            existing.showNormal()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        from macro_studio.deck_dock import DeckDockWindow
+
+        self._deck_dock_window = DeckDockWindow(self)
+        screen = QtGui.QGuiApplication.screenAt(self.frameGeometry().center()) or self.screen()
+        if screen:
+            available = screen.availableGeometry()
+            x = max(available.left(), min(self.frameGeometry().right() + 18, available.right() - self._deck_dock_window.width() + 1))
+            y = max(available.top(), min(self.frameGeometry().top(), available.bottom() - self._deck_dock_window.height() + 1))
+            self._deck_dock_window.move(x, y)
+        self._deck_dock_window.show()
+        self._deck_dock_window.raise_()
+        self._deck_dock_window.activateWindow()
 
     # Window Drag Support for Frameless Window & Long-press / Right-click Radial Menu
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -3195,12 +3235,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         empty_index = next((i for i, slot in enumerate(slots) if not str(slot.get("macro") or "").strip()), None)
         if empty_index is None:
             slots.append(new_slot)
+            inserted_index = len(slots) - 1
         else:
             slots[empty_index] = new_slot
+            inserted_index = empty_index
         payload["slots"] = slots
         self.repository.save_hotkeys(payload)
-        filled_count = sum(1 for slot in slots if str(slot.get("macro") or "").strip())
-        self.current_page = max(0, (filled_count - 1) // max(1, self.rows * self.cols))
+        self.current_page = max(0, inserted_index // max(1, self.rows * self.cols))
         self.refresh_slots()
         self._capture_active_slot_preset()
         self._save_config()
@@ -3274,14 +3315,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
         hotkeys_data = self.repository.load_hotkeys()
         slots = list(hotkeys_data.get("slots") or [])
-        filled_slots = [
-            (index, slot)
-            for index, slot in enumerate(slots)
-            if str(slot.get("macro") or "").strip()
-        ]
-
         pageSize = self.rows * self.cols
-        totalPages = max(1, (len(filled_slots) + pageSize - 1) // pageSize)
+        totalPages = max(1, int(hotkeys_data.get("deck_page_count") or 1), math.ceil(len(slots) / pageSize))
         if self.current_page >= totalPages:
             self.current_page = totalPages - 1
 
@@ -3303,7 +3338,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.dots_label.setText("   ".join(dots_html))
 
         start_idx = self.current_page * pageSize
-        page_slots = filled_slots[start_idx:start_idx + pageSize]
+        page_slots = [
+            (index, slot)
+            for index, slot in enumerate(slots[start_idx:start_idx + pageSize], start=start_idx)
+            if str(slot.get("macro") or "").strip()
+        ]
 
         visible_cols = min(self.cols, max(1, len(page_slots)))
         visible_rows = max(1, math.ceil(len(page_slots) / visible_cols))
@@ -3318,7 +3357,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         for i, (slot_idx, slot_info) in enumerate(page_slots):
             btn = StreamDeckButton(slot_idx, self.swipe_container)
             btn.setMinimumSize(MIN_TILE_SIDE, MIN_TILE_SIDE)
-            btn.set_display_number(start_idx + i + 1)
+            btn.set_display_number(slot_idx + 1)
 
             # Apply custom icon config if present
             icon_cfg = self.custom_icons.get(str(slot_idx), {})
@@ -3369,9 +3408,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def _next_page(self) -> None:
         hotkeys_data = self.repository.load_hotkeys()
-        slots = [slot for slot in list(hotkeys_data.get("slots") or []) if str(slot.get("macro") or "").strip()]
+        slots = list(hotkeys_data.get("slots") or [])
         pageSize = self.rows * self.cols
-        totalPages = max(1, (len(slots) + pageSize - 1) // pageSize)
+        totalPages = max(1, int(hotkeys_data.get("deck_page_count") or 1), math.ceil(len(slots) / pageSize))
         if self.current_page < totalPages - 1:
             self.current_page += 1
             self.refresh_slots()
@@ -3384,6 +3423,12 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
     def _run_slot_macro(self, slot_index: int, macro_name: str) -> None:
         if not macro_name:
             return
+        slots = list(self.repository.load_hotkeys().get("slots") or [])
+        if 0 <= slot_index < len(slots):
+            action = slots[slot_index].get("action")
+            if isinstance(action, dict) and action.get("kind"):
+                self._execute_deck_action(action)
+                return
         try:
             proc = self.repository.run_macro(macro_name)
             self.active_processes[int(proc.pid)] = (macro_name, proc)
@@ -3395,6 +3440,195 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.refresh_states()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "실행 오류", f"매크로 '{macro_name}' 실행 중 오류 발생:\n{exc}")
+
+    def _set_deck_status(self, title: str, detail: str = "", error: bool = False) -> None:
+        color = "#E85566" if error else "#26D07C"
+        if hasattr(self, "status_title") and self.status_title:
+            self.status_title.setText(title)
+            self.status_title.setStyleSheet(f"font-size: 10pt; font-weight: 700; color: {color};")
+        if hasattr(self, "status_sub") and self.status_sub:
+            self.status_sub.setText(detail)
+
+    def _send_windows_hotkey(self, sequence: str) -> None:
+        if os.name != "nt":
+            raise RuntimeError("단축키 전송은 Windows에서만 지원됩니다.")
+        parts = [part.strip() for part in str(sequence).replace("-", "+").split("+") if part.strip()]
+        if not parts:
+            raise ValueError("단축키가 비어 있습니다.")
+        aliases = {
+            "ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B,
+            "enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B,
+            "space": 0x20, "backspace": 0x08, "delete": 0x2E, "home": 0x24, "end": 0x23,
+            "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+        }
+        user32 = ctypes.windll.user32
+        virtual_keys: list[int] = []
+        for token in parts:
+            lowered = token.casefold()
+            if lowered in aliases:
+                virtual_keys.append(aliases[lowered])
+            elif lowered.startswith("f") and lowered[1:].isdigit() and 1 <= int(lowered[1:]) <= 24:
+                virtual_keys.append(0x6F + int(lowered[1:]))
+            elif len(token) == 1:
+                virtual_keys.append(int(user32.VkKeyScanW(ord(token))) & 0xFF)
+            else:
+                raise ValueError(f"지원하지 않는 키: {token}")
+        for vk in virtual_keys:
+            user32.keybd_event(vk, 0, 0, 0)
+        for vk in reversed(virtual_keys):
+            user32.keybd_event(vk, 0, 0x0002, 0)
+
+    def _activate_window_by_title(self, title_fragment: str) -> None:
+        fragment = str(title_fragment or "").strip().casefold()
+        if not fragment:
+            return
+        if os.name != "nt":
+            raise RuntimeError("대상 창 선택은 Windows에서만 지원됩니다.")
+        user32 = ctypes.windll.user32
+        matches: list[int] = []
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def enum_callback(hwnd: int, _param: int) -> bool:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            if fragment in buffer.value.casefold():
+                matches.append(int(hwnd))
+                return False
+            return True
+
+        user32.EnumWindows(callback_type(enum_callback), 0)
+        if not matches:
+            raise ValueError(f"대상 창을 찾지 못했습니다: {title_fragment}")
+        user32.ShowWindow(matches[0], 9)
+        user32.SetForegroundWindow(matches[0])
+        QtCore.QThread.msleep(80)
+
+    def _start_registered_macro(self, macro_name: str) -> subprocess.Popen[Any]:
+        proc = self.repository.run_macro(macro_name)
+        self.active_processes[int(proc.pid)] = (macro_name, proc)
+        return proc
+
+    def _run_macro_batch(self, action: Dict[str, Any]) -> None:
+        names = [str(value).strip() for value in list(action.get("macros") or []) if str(value).strip()]
+        if not names:
+            raise ValueError("실행할 매크로가 선택되지 않았습니다.")
+        mode = str(action.get("mode") or "sequential")
+        delay = max(0, int(action.get("delay_ms") or 0))
+        continue_on_error = bool(action.get("continue_on_error", True))
+        if mode == "parallel":
+            failures = []
+            for name in names:
+                try:
+                    self._start_registered_macro(name)
+                except Exception as exc:
+                    failures.append(f"{name}: {exc}")
+                    if not continue_on_error:
+                        break
+            if failures:
+                self._set_deck_status("일부 작업 실패", failures[0], error=True)
+            return
+
+        def run_at(index: int) -> None:
+            if index >= len(names):
+                self.refresh_states()
+                return
+            try:
+                proc = self._start_registered_macro(names[index])
+            except Exception as exc:
+                self._set_deck_status("다중 작업 실패", f"{names[index]}: {exc}", error=True)
+                if not continue_on_error:
+                    return
+                QtCore.QTimer.singleShot(delay, lambda: run_at(index + 1))
+                return
+
+            def wait_for_finish() -> None:
+                return_code = proc.poll()
+                if return_code is None:
+                    QtCore.QTimer.singleShot(100, wait_for_finish)
+                    return
+                if return_code != 0 and not continue_on_error:
+                    self._set_deck_status("다중 작업 중단", f"{names[index]} 종료 코드 {return_code}", error=True)
+                    return
+                QtCore.QTimer.singleShot(delay, lambda: run_at(index + 1))
+
+            wait_for_finish()
+
+        run_at(0)
+
+    def _execute_deck_action(self, action: Dict[str, Any]) -> None:
+        kind = str(action.get("kind") or "")
+        label = str(action.get("label") or kind)
+        try:
+            if kind == "open_target":
+                target = str(action.get("target") or "").strip()
+                if not target:
+                    raise ValueError("열기 대상이 비어 있습니다.")
+                if target.lower().startswith(("http://", "https://")):
+                    webbrowser.open(target)
+                elif os.name == "nt":
+                    os.startfile(target)
+                else:
+                    subprocess.Popen([target])
+            elif kind == "terminate_program":
+                process_name = str(action.get("process") or "").strip()
+                if not process_name:
+                    raise ValueError("종료할 프로세스 이름이 비어 있습니다.")
+                subprocess.Popen(
+                    ["taskkill", "/IM", process_name, "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            elif kind == "hotkey":
+                self._activate_window_by_title(str(action.get("target_title") or ""))
+                self._send_windows_hotkey(str(action.get("keys") or ""))
+            elif kind == "text":
+                text_value = str(action.get("text") or "")
+                self._activate_window_by_title(str(action.get("target_title") or ""))
+                QtWidgets.QApplication.clipboard().setText(text_value)
+                self._send_windows_hotkey("Ctrl+V")
+            elif kind == "wait":
+                wait_ms = max(10, int(action.get("ms") or 1000))
+                self._set_deck_status("대기 중", f"{wait_ms}ms")
+                QtCore.QTimer.singleShot(wait_ms, lambda: self._set_deck_status("준비 완료", "Deck 액션 대기 완료"))
+                return
+            elif kind == "studio":
+                self._open_studio()
+            elif kind == "stop_all":
+                self.stop_all_macros()
+            elif kind == "run_macro":
+                macro_name = str(action.get("macro") or "").strip()
+                if not macro_name:
+                    raise ValueError("실행할 매크로가 선택되지 않았습니다.")
+                self._start_registered_macro(macro_name)
+            elif kind == "multi_macros":
+                self._run_macro_batch(action)
+            elif kind == "switch_preset":
+                self._switch_slot_preset(str(action.get("preset_id") or ""))
+            elif kind == "page_prev":
+                self._prev_page()
+            elif kind == "page_next":
+                self._next_page()
+            elif kind == "page_first":
+                self.current_page = 0
+                self.refresh_slots()
+            elif kind == "page_goto":
+                payload = self.repository.load_hotkeys()
+                count = max(1, int(payload.get("deck_page_count") or 1))
+                self.current_page = max(0, min(count - 1, int(action.get("page") or 1) - 1))
+                self.refresh_slots()
+            else:
+                raise ValueError(f"지원하지 않는 Deck 액션: {kind}")
+            self._set_deck_status("Deck 액션 실행", label)
+            self.refresh_states()
+        except Exception as exc:
+            self._set_deck_status("Deck 액션 실패", str(exc), error=True)
+            QtWidgets.QMessageBox.warning(self, "Deck 액션 오류", f"'{label}' 실행 중 오류가 발생했습니다.\n{exc}")
 
     def _stop_slot_macro(self, slot_index: int, macro_name: str) -> None:
         for pid, (name, proc) in list(self.active_processes.items()):

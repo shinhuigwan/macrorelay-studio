@@ -242,6 +242,102 @@ class QuickSlotDeckTests(unittest.TestCase):
             dialog.close()
             window.close()
 
+    def test_right_click_radial_includes_deck_dock(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            keys = [item.key for item in window.radial_menu.items]
+            self.assertIn("deck_dock", keys)
+            window.close()
+
+    def test_deck_dock_persists_actions_and_pages(self) -> None:
+        from macro_studio.deck_dock import DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": []})
+            window = QuickSlotDeckWindow(repository)
+            dock = DeckDockWindow(window)
+            self.assertEqual(window.rows * window.cols, dock.grid.count())
+            self.assertEqual(14, len(dock.action_buttons))
+
+            dock.payload["slots"][0] = dock._slot_from_action({"kind": "page_next", "label": "다음"})
+            dock.add_page()
+            saved = repository.load_hotkeys()
+            self.assertEqual(2, saved["deck_page_count"])
+            self.assertEqual("page_next", saved["slots"][0]["action"]["kind"])
+            self.assertEqual(window.rows * window.cols * 2, len(saved["slots"]))
+            dock.close()
+            window.close()
+
+    def test_deck_page_action_changes_runtime_page(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({
+                "deck_page_count": 2,
+                "deck_page_names": ["첫 페이지", "둘째 페이지"],
+                "slots": [{"macro": "", "hotkey": "", "mode": "hybrid"} for _ in range(30)],
+            })
+            window = QuickSlotDeckWindow(repository)
+            window._execute_deck_action({"kind": "page_next", "label": "다음"})
+            self.assertEqual(1, window.current_page)
+            window._execute_deck_action({"kind": "page_first", "label": "처음"})
+            self.assertEqual(0, window.current_page)
+            window.close()
+
+    def test_parallel_multi_action_starts_each_selected_macro(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            action = {"kind": "multi_macros", "macros": ["A", "B"], "mode": "parallel", "continue_on_error": True}
+            with mock.patch.object(window, "_start_registered_macro") as run_macro:
+                window._execute_deck_action(action)
+            self.assertEqual([mock.call("A"), mock.call("B")], run_macro.call_args_list)
+            window.close()
+
+    def test_every_deck_dock_palette_action_has_a_config_dialog(self) -> None:
+        from macro_studio.deck_dock import ACTION_LIBRARY, DeckActionConfigDialog
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            kinds = [kind for entries in ACTION_LIBRARY.values() for kind, _title, _description in entries]
+            for kind in kinds:
+                dialog = DeckActionConfigDialog(kind, None, window)
+                result = dialog.result_action()
+                self.assertEqual(kind, result["kind"])
+                self.assertTrue(result["label"])
+                dialog.close()
+            window.close()
+
+    def test_system_deck_actions_dispatch_to_runtime_services(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            with mock.patch("macro_studio.quickslot_deck.webbrowser.open") as open_url:
+                window._execute_deck_action({"kind": "open_target", "target": "https://example.com", "label": "웹"})
+                open_url.assert_called_once_with("https://example.com")
+            with mock.patch.object(window, "_activate_window_by_title") as activate, mock.patch.object(window, "_send_windows_hotkey") as send_keys:
+                window._execute_deck_action({"kind": "hotkey", "keys": "Ctrl+K", "target_title": "메모장", "label": "키"})
+                activate.assert_called_once_with("메모장")
+                send_keys.assert_called_once_with("Ctrl+K")
+            with mock.patch.object(window, "_open_studio") as open_studio:
+                window._execute_deck_action({"kind": "studio", "label": "Studio"})
+                open_studio.assert_called_once()
+            window.close()
+
     def test_right_click_and_hold_radials_have_separate_content(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository

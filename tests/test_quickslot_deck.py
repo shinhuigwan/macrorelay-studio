@@ -337,7 +337,7 @@ class QuickSlotDeckTests(unittest.TestCase):
                 dialog = DeckActionConfigDialog(kind, None, window)
                 result = dialog.result_action()
                 self.assertEqual(kind, result["kind"])
-                self.assertTrue(result["label"])
+                self.assertEqual("", result["label"])
                 dialog.close()
             window.close()
 
@@ -363,6 +363,33 @@ class QuickSlotDeckTests(unittest.TestCase):
                     self.assertIn("y", dialog.widgets)
                 dialog.close()
             window.close()
+
+    def test_target_picker_is_child_of_modal_action_dialog(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.deck_dock import DeckActionConfigDialog
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        class FakePicker:
+            window_hwnd = 0
+            window_token = "ahk_id 0x1234"
+            exe_name = "sample.exe"
+
+            def exec(self) -> int:
+                return QtWidgets.QDialog.Accepted
+
+            def selected_client_point(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dialog = DeckActionConfigDialog("text", None, window, slot_index=0)
+            with mock.patch("macro_studio.action_editor.WindowPickerDialog", return_value=FakePicker()) as picker_type:
+                dialog._pick_target(False)
+            self.assertIs(dialog, picker_type.call_args.args[0])
+            self.assertEqual("sample.exe", dialog.widgets["target_exe"].text())
+            self.assertEqual("ahk_id 0x1234", dialog.widgets["target_window"].text())
+            dialog.close(); window.close()
 
     def test_program_action_automatically_uses_native_executable_icon(self) -> None:
         from macro_studio.deck_dock import DeckActionConfigDialog
@@ -503,6 +530,46 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertIs(original_button, window.buttons[0])
             dialog.close()
             window.close()
+
+    def test_icon_only_themes_hide_tile_chrome_and_apply_compact_size(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow, THEMES
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": [{"macro": "아이콘 슬롯", "hotkey": "", "mode": "hybrid"}]})
+            window = QuickSlotDeckWindow(repository)
+            window.show(); self.app.processEvents()
+            dialog = QuickSlotDeckSettingsDialog(window)
+            self.assertTrue(THEMES[4]["icon_only"])
+            self.assertTrue(THEMES[5]["icon_only"])
+            self.assertEqual(6, dialog.theme_combo.count())
+            dialog._on_theme_live_changed(5)
+            button = window.buttons[0]
+            self.assertTrue(button.slot_number_label.isHidden())
+            self.assertTrue(button.opt_btn.isHidden())
+            self.assertTrue(button.title_label.isHidden())
+            self.assertLessEqual(float(window.config["tile_scale"]), 0.5)
+            dialog.close(); window.close()
+
+    def test_empty_slot_toggle_renders_full_configured_grid(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": [{"macro": "하나", "hotkey": "", "mode": "hybrid"}]})
+            window = QuickSlotDeckWindow(repository)
+            window.rows, window.cols = 2, 3
+            dialog = QuickSlotDeckSettingsDialog(window)
+            dialog.show_empty_slots_check.setChecked(True)
+            self.app.processEvents()
+            self.assertTrue(window.config["show_empty_slots"])
+            self.assertEqual(6, len(window.buttons))
+            dialog.show_empty_slots_check.setChecked(False)
+            self.app.processEvents()
+            self.assertEqual(1, len(window.buttons))
+            dialog.close(); window.close()
 
     def test_icon_editor_changes_are_previewed_on_real_slot(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow, SlotIconEditDialog

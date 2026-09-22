@@ -44,7 +44,7 @@ PRESET_ICON_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ic
 BASE_TILE_SIDE = 190
 MIN_TILE_SIDE = 48
 WINDOW_PADDING = 16
-PRESET_STYLE_KEYS = ("theme_index", "tile_scale", "tile_gap", "tile_radius", "hover_glow", "empty_slot_opacity")
+PRESET_STYLE_KEYS = ("theme_index", "tile_scale", "tile_gap", "tile_radius", "hover_glow", "empty_slot_opacity", "show_empty_slots")
 QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS = 240
 
 
@@ -884,6 +884,7 @@ class StreamDeckButton(QtWidgets.QFrame):
         self.setObjectName("SlotCard")
         self.slot_index = slot_index
         self.macro_name = ""
+        self.display_title = ""
         self.hotkey = ""
         self.mode = "hybrid"
         self.is_running = False
@@ -930,7 +931,9 @@ class StreamDeckButton(QtWidgets.QFrame):
         top_bar.addStretch(1)
         top_bar.addWidget(self.opt_btn)
 
-        layout.addLayout(top_bar)
+        # 번호와 점 메뉴는 화면에서 숨기고, 동일 메뉴는 타일 우클릭으로 제공합니다.
+        self.slot_number_label.hide()
+        self.opt_btn.hide()
 
         # Center Container Area
         self.center_container = QtWidgets.QWidget()
@@ -981,8 +984,11 @@ class StreamDeckButton(QtWidgets.QFrame):
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
         tiny = min(self.width(), self.height()) < 70
-        self.slot_number_label.setVisible(not tiny)
-        self.glow_bar.setVisible(not tiny)
+        self.slot_number_label.setVisible(False)
+        self.opt_btn.setVisible(False)
+        win_cfg = getattr(self.window(), "config", {}) if hasattr(self.window(), "config") else {}
+        theme = THEMES.get(int(win_cfg.get("theme_index", 0)), THEMES[0])
+        self.glow_bar.setVisible(not tiny and not bool(theme.get("icon_only", False)))
         self._reposition_title_label()
         self.update()
 
@@ -1003,7 +1009,7 @@ class StreamDeckButton(QtWidgets.QFrame):
         text_show = bool(self.custom_icon_config.get("text_show", True))
         text_pos = str(self.custom_icon_config.get("text_position", "bottom"))
 
-        if min(self.width(), self.height()) < 70 or not self.macro_name or not text_show or text_pos == "hidden":
+        if min(self.width(), self.height()) < 70 or not self.display_title or not text_show or text_pos == "hidden":
             self.title_label.setVisible(False)
             return
 
@@ -1061,7 +1067,7 @@ class StreamDeckButton(QtWidgets.QFrame):
                 painter.drawPixmap(self.rect(), scaled_pix)
                 theme_idx = int(win_cfg.get("theme_index", 0))
                 theme = THEMES.get(theme_idx, THEMES[0])
-                border_color = theme["card_border_1"] if self.slot_index % 2 == 0 else theme["card_border_2"]
+                border_color = str(theme.get("palette_border") or (theme["card_border_1"] if self.slot_index % 2 == 0 else theme["card_border_2"]))
                 painter.setClipping(False)
                 painter.setBrush(QtCore.Qt.NoBrush)
                 painter.setPen(QtGui.QPen(QtGui.QColor(border_color), 2.5))
@@ -1073,8 +1079,16 @@ class StreamDeckButton(QtWidgets.QFrame):
         self.custom_icon_config = dict(config or {})
         self._update_appearance()
 
-    def set_slot_data(self, macro_name: str, hotkey: str = "", mode: str = "hybrid", is_running: bool = False) -> None:
+    def set_slot_data(
+        self,
+        macro_name: str,
+        hotkey: str = "",
+        mode: str = "hybrid",
+        is_running: bool = False,
+        display_title: Optional[str] = None,
+    ) -> None:
         self.macro_name = (macro_name or "").strip()
+        self.display_title = self.macro_name if display_title is None else str(display_title).strip()
         self.hotkey = (hotkey or "").strip()
         self.mode = mode
         self.is_running = is_running
@@ -1091,6 +1105,9 @@ class StreamDeckButton(QtWidgets.QFrame):
         empty_opac = int(win_cfg.get("empty_slot_opacity", 100))
         tile_radius = int(win_cfg.get("tile_radius", 14))
         hover_glow = bool(win_cfg.get("hover_glow", True))
+        theme_idx = int(win_cfg.get("theme_index", 0))
+        theme = THEMES.get(theme_idx, THEMES[0])
+        icon_only = bool(theme.get("icon_only", False))
 
         # Custom Icon parameters
         pix = load_pixmap_from_config(self.custom_icon_config)
@@ -1109,6 +1126,8 @@ class StreamDeckButton(QtWidgets.QFrame):
         if main_layout:
             if full_stretch and has_custom:
                 main_layout.setContentsMargins(0, 0, 0, 0)
+            elif icon_only:
+                main_layout.setContentsMargins(4, 4, 4, 4)
             else:
                 main_layout.setContentsMargins(10, 8, 10, 8)
 
@@ -1162,7 +1181,12 @@ class StreamDeckButton(QtWidgets.QFrame):
 
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
         self.setCursor(QtCore.Qt.PointingHandCursor)
-        self.opt_btn.setVisible(True)
+        self.opt_btn.setVisible(False)
+        self.slot_number_label.setVisible(False)
+        if icon_only:
+            self.glow_bar.setVisible(False)
+            text_show = False
+            icon_size = max(24, min(icon_size, max(24, min(self.width(), self.height()) - 12)))
 
         # Apply Image or Emoji Icon
         if has_custom:
@@ -1204,7 +1228,7 @@ class StreamDeckButton(QtWidgets.QFrame):
                     }
                 """)
 
-        self.title_label.setText(self.macro_name)
+        self.title_label.setText(self.display_title)
         if not text_show or text_pos == "hidden":
             self.title_label.setVisible(False)
         else:
@@ -1221,8 +1245,15 @@ class StreamDeckButton(QtWidgets.QFrame):
 
         self._reposition_title_label()
 
-        theme_idx = int(win_cfg.get("theme_index", 0))
-        theme = THEMES.get(theme_idx, THEMES[0])
+        palette = list(theme.get("card_palette") or [])
+        if palette:
+            card_bg = palette[self.slot_index % len(palette)]
+            card_border = str(theme.get("palette_border", "#454A55"))
+            glow_color = str(theme.get("glow_1", card_border))
+        elif self.slot_index % 2 == 0:
+            card_bg, card_border, glow_color = theme["card_bg_1"], theme["card_border_1"], theme["glow_1"]
+        else:
+            card_bg, card_border, glow_color = theme["card_bg_2"], theme["card_border_2"], theme["glow_2"]
 
         if self.is_running:
             self.glow_bar.setStyleSheet("background: #35C89A; border-radius: 2px;")
@@ -1233,34 +1264,13 @@ class StreamDeckButton(QtWidgets.QFrame):
                     border-radius: {tile_radius}px;
                 }}
             """)
-        elif self.slot_index % 2 == 0:
-            self.glow_bar.setStyleSheet(f"background: {theme['glow_1']}; border-radius: 2px;")
-            if hover_glow:
-                self.setStyleSheet(f"""
-                    #SlotCard {{
-                        background: {theme['card_bg_1']};
-                        border: 2px solid {theme['card_border_1']};
-                        border-radius: {tile_radius}px;
-                    }}
-                    #SlotCard:hover {{
-                        border: 2.5px solid #FFFFFF;
-                    }}
-                """)
-            else:
-                self.setStyleSheet(f"""
-                    #SlotCard {{
-                        background: {theme['card_bg_1']};
-                        border: 2px solid {theme['card_border_1']};
-                        border-radius: {tile_radius}px;
-                    }}
-                """)
         else:
-            self.glow_bar.setStyleSheet(f"background: {theme['glow_2']}; border-radius: 2px;")
+            self.glow_bar.setStyleSheet(f"background: {glow_color}; border-radius: 2px;")
             if hover_glow:
                 self.setStyleSheet(f"""
                     #SlotCard {{
-                        background: {theme['card_bg_2']};
-                        border: 2px solid {theme['card_border_2']};
+                        background: {card_bg};
+                        border: 2px solid {card_border};
                         border-radius: {tile_radius}px;
                     }}
                     #SlotCard:hover {{
@@ -1270,8 +1280,8 @@ class StreamDeckButton(QtWidgets.QFrame):
             else:
                 self.setStyleSheet(f"""
                     #SlotCard {{
-                        background: {theme['card_bg_2']};
-                        border: 2px solid {theme['card_border_2']};
+                        background: {card_bg};
+                        border: 2px solid {card_border};
                         border-radius: {tile_radius}px;
                     }}
                 """)
@@ -1426,6 +1436,24 @@ THEMES: Dict[int, Dict[str, Any]] = {
         "glow_1": "#38BDF8",
         "glow_2": "#94A3B8",
         "central_bg": "rgba(15, 23, 42, 0.45)",
+    },
+    4: {
+        "name": "▦ Compact Icon Dark (아이콘 전용)",
+        "card_bg_1": "#25282D", "card_border_1": "#4B5058",
+        "card_bg_2": "#202328", "card_border_2": "#3F444C",
+        "glow_1": "#6B7280", "glow_2": "#4B5563",
+        "central_bg": "rgba(20, 21, 24, 0.96)",
+        "icon_only": True, "recommended_scale": 0.50, "recommended_gap": 5, "recommended_radius": 8,
+    },
+    5: {
+        "name": "▦ Color Icon Grid (컬러 아이콘 전용)",
+        "card_bg_1": "#315CF3", "card_border_1": "#4A4F59",
+        "card_bg_2": "#7C3AED", "card_border_2": "#4A4F59",
+        "glow_1": "#38BDF8", "glow_2": "#C084FC",
+        "central_bg": "rgba(18, 19, 23, 0.98)",
+        "icon_only": True, "recommended_scale": 0.45, "recommended_gap": 5, "recommended_radius": 7,
+        "palette_border": "#454A55",
+        "card_palette": ["#315CF3", "#392B83", "#F43F5E", "#A3E635", "#F97316", "#16A34A", "#14B8A6", "#D946EF", "#374151", "#6D28D9"],
     },
 }
 
@@ -2178,13 +2206,15 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         empty_opac_box.addWidget(self.empty_opac_slider, 1)
         empty_opac_box.addWidget(self.empty_opac_spin)
 
+        self.show_empty_slots_check = QtWidgets.QCheckBox("빈 슬롯도 그리드에 표시")
+        self.show_empty_slots_check.toggled.connect(self._on_show_empty_slots_toggled)
+
         form.addRow("슬롯 창 자동 축소:", self.compact_fit_check)
         form.addRow("슬롯 크기 프리셋:", self.tile_scale_combo)
         form.addRow("창 수동 크기:", win_size_box)
         form.addRow("그리드 레이아웃:", self.grid_preset_combo)
-        hidden_slots = QtWidgets.QLabel("항상 숨김 · 슬롯을 추가하면 창과 그리드가 자동 확장됩니다.")
-        hidden_slots.setObjectName("Muted")
-        form.addRow("빈 슬롯:", hidden_slots)
+        form.addRow("빈 슬롯:", self.show_empty_slots_check)
+        form.addRow("빈 슬롯 투명도:", empty_opac_box)
         form.addRow("카드 모서리 둥글기:", radius_box)
         form.addRow("타일 간격 (Gap):", gap_box)
         form.addRow("시각 효과:", self.hover_glow_check)
@@ -2231,6 +2261,16 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.main_window.config["empty_slot_opacity"] = val
         self.main_window.refresh_slots()
 
+    def _on_show_empty_slots_toggled(self, checked: bool) -> None:
+        if getattr(self, "_loading_settings", False):
+            return
+        self.main_window.config["show_empty_slots"] = checked
+        if checked and self.empty_opac_spin.value() <= 0:
+            self.empty_opac_spin.setValue(38)
+        self.empty_opac_slider.setEnabled(checked)
+        self.empty_opac_spin.setEnabled(checked)
+        self.main_window.refresh_slots()
+
     def _on_radius_live_changed(self, val: int) -> None:
         if getattr(self, "_loading_settings", False):
             return
@@ -2265,23 +2305,32 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         if getattr(self, "_loading_settings", False):
             return
         self.main_window.config["theme_index"] = index
+        theme = THEMES.get(index, THEMES[0])
+        if theme.get("icon_only"):
+            scale = float(theme.get("recommended_scale", 0.5))
+            self.main_window.config["tile_scale"] = scale
+            self.main_window.config["tile_gap"] = int(theme.get("recommended_gap", 5))
+            self.main_window.config["tile_radius"] = int(theme.get("recommended_radius", 8))
+            with QtCore.QSignalBlocker(self.tile_scale_combo), QtCore.QSignalBlocker(self.gap_spin), QtCore.QSignalBlocker(self.radius_spin):
+                scale_index = min(range(self.tile_scale_combo.count()), key=lambda idx: abs(float(self.tile_scale_combo.itemData(idx)) - scale))
+                self.tile_scale_combo.setCurrentIndex(scale_index)
+                self.gap_spin.setValue(self.main_window.config["tile_gap"])
+                self.radius_spin.setValue(self.main_window.config["tile_radius"])
         self.main_window._apply_theme()
-        for button in self.main_window.buttons:
-            button._update_appearance()
-            button.update()
-        self.main_window.update()
+        if theme.get("icon_only"):
+            self.main_window.refresh_slots()
+        else:
+            for button in self.main_window.buttons:
+                button._update_appearance()
+                button.update()
+            self.main_window.update()
 
     def _init_theme_tab(self) -> None:
         form = QtWidgets.QFormLayout(self.tab_theme)
         form.setSpacing(14)
 
         self.theme_combo = QtWidgets.QComboBox()
-        self.theme_combo.addItems([
-            "🌌 Cyber Dark (네온 파플 & 블루)",
-            "⬛ OLED Pure Black (심플 블랙)",
-            "💗 Synthwave Pink (분홍/보라 네온)",
-            "🧊 Steel Slate (차분한 스틸 블루)",
-        ])
+        self.theme_combo.addItems([THEMES[index]["name"] for index in sorted(THEMES)])
         self.theme_combo.currentIndexChanged.connect(self._on_theme_live_changed)
 
         self.auto_stretch_default = QtWidgets.QCheckBox("커스텀 이미지 로드 시 100% 가득 채우기 자동 기본 설정")
@@ -2375,7 +2424,11 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             self.tile_scale_combo.setCurrentIndex(scale_index)
 
             self.compact_fit_check.setChecked(True)
+            show_empty = bool(self.main_window.config.get("show_empty_slots", False))
+            self.show_empty_slots_check.setChecked(show_empty)
             self.empty_opac_spin.setValue(int(self.main_window.config.get("empty_slot_opacity", 0)))
+            self.empty_opac_slider.setEnabled(show_empty)
+            self.empty_opac_spin.setEnabled(show_empty)
             self.radius_spin.setValue(int(self.main_window.config.get("tile_radius", 14)))
             self.gap_spin.setValue(int(self.main_window.config.get("tile_gap", 10)))
             self.hover_glow_check.setChecked(bool(self.main_window.config.get("hover_glow", True)))
@@ -2404,6 +2457,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.main_window.cols = c
 
         self.main_window.config["compact_auto_fit"] = True
+        self.main_window.config["show_empty_slots"] = self.show_empty_slots_check.isChecked()
         self.main_window.config["empty_slot_opacity"] = self.empty_opac_spin.value()
         self.main_window.config["tile_radius"] = self.radius_spin.value()
         self.main_window.config["tile_gap"] = self.gap_spin.value()
@@ -2575,6 +2629,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "theme_index": 0,
             "auto_stretch_default": True,
             "empty_slot_opacity": 0,
+            "show_empty_slots": False,
             "radial_items": ["prev_page", "next_page", "settings", "deck_dock", "preset_settings", "emergency", "studio", "topmost"],
             "slot_presets": {},
             "active_slot_preset": "default",
@@ -3339,11 +3394,20 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.dots_label.setText("   ".join(dots_html))
 
         start_idx = self.current_page * pageSize
-        page_slots = [
-            (index, slot)
-            for index, slot in enumerate(slots[start_idx:start_idx + pageSize], start=start_idx)
-            if str(slot.get("macro") or "").strip()
-        ]
+        show_empty_slots = bool(self.config.get("show_empty_slots", False))
+        current_page_slots = list(slots[start_idx:start_idx + pageSize])
+        if show_empty_slots:
+            current_page_slots.extend(
+                {"macro": "", "hotkey": "", "mode": "hybrid"}
+                for _ in range(max(0, pageSize - len(current_page_slots)))
+            )
+            page_slots = [(start_idx + offset, slot) for offset, slot in enumerate(current_page_slots)]
+        else:
+            page_slots = [
+                (index, slot)
+                for index, slot in enumerate(current_page_slots, start=start_idx)
+                if str(slot.get("macro") or "").strip()
+            ]
 
         visible_cols = min(self.cols, max(1, len(page_slots)))
         visible_rows = max(1, math.ceil(len(page_slots) / visible_cols))
@@ -3358,17 +3422,18 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         for i, (slot_idx, slot_info) in enumerate(page_slots):
             btn = StreamDeckButton(slot_idx, self.swipe_container)
             btn.setMinimumSize(MIN_TILE_SIDE, MIN_TILE_SIDE)
-            btn.set_display_number(slot_idx + 1)
 
             # Apply custom icon config if present
             icon_cfg = self.custom_icons.get(str(slot_idx), {})
             btn.set_custom_icon_config(icon_cfg)
 
             macro_name = str(slot_info.get("macro") or "").strip()
+            action = slot_info.get("action") if isinstance(slot_info.get("action"), dict) else None
+            display_title = str(action.get("label") or "") if action is not None else macro_name
             hotkey = str(slot_info.get("hotkey") or "").strip()
             mode = str(slot_info.get("mode") or "hybrid")
             is_running = self._is_macro_running(macro_name)
-            btn.set_slot_data(macro_name, hotkey, mode, is_running)
+            btn.set_slot_data(macro_name, hotkey, mode, is_running, display_title=display_title)
 
             btn.slot_triggered.connect(self._run_slot_macro)
             btn.slot_stopped.connect(self._stop_slot_macro)

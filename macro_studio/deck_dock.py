@@ -249,7 +249,8 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         root.addWidget(title)
         form = QtWidgets.QFormLayout()
         form.setSpacing(11)
-        label = QtWidgets.QLineEdit(str(self.action.get("label") or ACTION_TITLES.get(kind, "Deck 액션")))
+        label = QtWidgets.QLineEdit(str(self.action.get("label") or ""))
+        label.setPlaceholderText("선택 사항 · 비워 두면 아이콘만 표시됩니다")
         self.widgets["label"] = label
         form.addRow("슬롯 이름", label)
         self._build_fields(form)
@@ -378,10 +379,10 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
                     ignored.add(int(widget.winId()))
                 except Exception:
                     pass
-        self.hide()
-        picker = WindowPickerDialog(None, ignored_hwnds=ignored, hint_text="대상 프로그램을 클릭하세요 · 클릭 기능은 위치까지 함께 저장됩니다 · Esc 취소")
+        # 현재 설정창이 exec() 모달이므로 선택기도 자식으로 연결해야 Windows가 클릭을 차단하지 않습니다.
+        picker = WindowPickerDialog(self, ignored_hwnds=ignored, hint_text="대상 프로그램을 클릭하세요 · 클릭 기능은 위치까지 함께 저장됩니다 · Esc 취소")
         accepted = picker.exec() == QtWidgets.QDialog.Accepted
-        self.show(); self.raise_(); self.activateWindow()
+        self.raise_(); self.activateWindow()
         if not accepted:
             return
         title = ""
@@ -455,7 +456,7 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         self.btn_edit_icon.setText("✓ 프로그램 아이콘 자동 적용 · 편집")
 
     def result_action(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {"kind": self.kind, "label": self.widgets["label"].text().strip() or ACTION_TITLES.get(self.kind, "Deck 액션")}
+        result: Dict[str, Any] = {"kind": self.kind, "label": self.widgets["label"].text().strip()}
         for key, widget in self.widgets.items():
             if key == "label":
                 continue
@@ -627,8 +628,15 @@ class DeckDockWindow(QtWidgets.QMainWindow):
     def _configure_new_action(self, index: int, kind: str) -> None:
         dialog = DeckActionConfigDialog(kind, None, self.main_window, self, slot_index=index)
         if dialog.exec() == QtWidgets.QDialog.Accepted:
-            self.payload["slots"][index] = self._slot_from_action(dialog.result_action())
+            action = dialog.result_action()
+            self.payload["slots"][index] = self._slot_from_action(action)
             icon_config = dialog.result_icon_config()
+            if not icon_config:
+                icon_config = {
+                    "emoji": ACTION_ICONS.get(kind, "•"), "icon_size": 58,
+                    "text_show": bool(action.get("label")), "text_position": "bottom",
+                    "font_size": 11, "spacing": 3,
+                }
             if icon_config: self.main_window.custom_icons[str(index)] = icon_config
             else: self.main_window.custom_icons.pop(str(index), None)
             self.save()

@@ -91,6 +91,31 @@ class QuickSlotDeckTests(unittest.TestCase):
             dialog.close()
             window.close()
 
+    def test_touch_sound_settings_and_playback_toggle(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dialog = QuickSlotDeckSettingsDialog(window)
+            self.assertTrue(dialog.touch_sound_check.isChecked())
+            self.assertEqual(22, dialog.touch_volume_spin.value())
+
+            effect = mock.Mock()
+            effect.isPlaying.return_value = False
+            window._touch_sound_effect = effect
+            window.config["touch_sound_enabled"] = True
+            window.config["touch_sound_volume"] = 35
+            window._play_touch_sound()
+            effect.setVolume.assert_called_with(0.35)
+            effect.play.assert_called_once_with()
+
+            effect.reset_mock()
+            window.config["touch_sound_enabled"] = False
+            window._play_touch_sound()
+            effect.play.assert_not_called()
+            dialog.close(); window.close()
+
     def test_border_resize_keeps_grid_cells_square(self) -> None:
         from PySide6 import QtCore
         from macro_studio.quickslot_deck import QuickSlotDeckWindow, WINDOW_PADDING

@@ -20,8 +20,11 @@ import json
 import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
+import wave
 import webbrowser
 from ctypes import wintypes
 from pathlib import Path
@@ -33,6 +36,11 @@ except ImportError:
     winreg = None
 
 from PySide6 import QtCore, QtGui, QtWidgets
+
+try:
+    from PySide6.QtMultimedia import QSoundEffect
+except ImportError:
+    QSoundEffect = None
 
 from macro_studio.repository import MacroRepository
 from macro_studio.theme import stylesheet
@@ -46,6 +54,33 @@ MIN_TILE_SIDE = 48
 WINDOW_PADDING = 16
 PRESET_STYLE_KEYS = ("theme_index", "tile_scale", "tile_gap", "tile_radius", "hover_glow", "empty_slot_opacity", "show_empty_slots")
 QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS = 240
+
+
+def _quickslot_touch_sound_path() -> Path:
+    """Create a tiny, pre-loadable click sound in the user's temp folder."""
+    sound_dir = Path(tempfile.gettempdir()) / "MacroRelay"
+    sound_path = sound_dir / "quickslot-touch-v1.wav"
+    if sound_path.exists():
+        return sound_path
+    try:
+        sound_dir.mkdir(parents=True, exist_ok=True)
+        sample_rate = 44100
+        duration = 0.032
+        frames = bytearray()
+        for index in range(int(sample_rate * duration)):
+            progress = index / max(1, int(sample_rate * duration) - 1)
+            envelope = (1.0 - progress) ** 3
+            tone = math.sin(2.0 * math.pi * 1250.0 * index / sample_rate)
+            value = int(32767 * 0.42 * envelope * tone)
+            frames.extend(struct.pack("<h", value))
+        with wave.open(str(sound_path), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(sample_rate)
+            output.writeframes(bytes(frames))
+    except Exception:
+        return Path()
+    return sound_path
 
 
 _ULONG_PTR = wintypes.WPARAM
@@ -1419,6 +1454,9 @@ class StreamDeckButton(QtWidgets.QFrame):
                 event.accept()
                 return
 
+            if self.macro_name and hasattr(win, "_play_touch_sound"):
+                win._play_touch_sound()
+
             self._press_pos = event.globalPos()
             if hasattr(win, "_start_mouse_hold_check"):
                 win._start_mouse_hold_check(event.globalPos())
@@ -2226,10 +2264,37 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         opac_box.addWidget(self.opac_slider, 1)
         opac_box.addWidget(self.opac_spin)
 
+        self.touch_sound_check = QtWidgets.QCheckBox("슬롯을 누를 때 짧은 터치음 재생")
+        self.touch_volume_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.touch_volume_slider.setRange(0, 100)
+        self.touch_volume_spin = QtWidgets.QSpinBox()
+        self.touch_volume_spin.setRange(0, 100)
+        self.touch_volume_spin.setSuffix(" %")
+        self.touch_volume_slider.valueChanged.connect(self.touch_volume_spin.setValue)
+        self.touch_volume_spin.valueChanged.connect(self.touch_volume_slider.setValue)
+        self.touch_sound_check.toggled.connect(self.touch_volume_slider.setEnabled)
+        self.touch_sound_check.toggled.connect(self.touch_volume_spin.setEnabled)
+        touch_test = QtWidgets.QPushButton("▶ 소리 테스트")
+        touch_test.clicked.connect(self._preview_touch_sound)
+        touch_box = QtWidgets.QHBoxLayout()
+        touch_box.addWidget(self.touch_sound_check)
+        touch_box.addWidget(self.touch_volume_slider, 1)
+        touch_box.addWidget(self.touch_volume_spin)
+        touch_box.addWidget(touch_test)
+
         form.addRow("윈도우 시작:", self.autostart_check)
         form.addRow("트레이 시작:", self.start_min_check)
         form.addRow("항상 위 고정:", self.topmost_check)
         form.addRow("창 기본 투명도:", opac_box)
+        form.addRow("터치 피드백:", touch_box)
+
+    def _preview_touch_sound(self) -> None:
+        previous = self.main_window.config.get("touch_sound_volume", 22)
+        try:
+            self.main_window.config["touch_sound_volume"] = self.touch_volume_spin.value()
+            self.main_window._play_touch_sound(force=True)
+        finally:
+            self.main_window.config["touch_sound_volume"] = previous
 
     def _init_grid_tab(self) -> None:
         form = QtWidgets.QFormLayout(self.tab_grid)
@@ -2538,6 +2603,11 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             self.start_min_check.setChecked(bool(self.main_window.config.get("start_minimized", False)))
             self.topmost_check.setChecked(self.main_window.always_on_top)
             self.opac_spin.setValue(self.main_window.opacity_val)
+            touch_enabled = bool(self.main_window.config.get("touch_sound_enabled", True))
+            self.touch_sound_check.setChecked(touch_enabled)
+            self.touch_volume_spin.setValue(int(self.main_window.config.get("touch_sound_volume", 22)))
+            self.touch_volume_slider.setEnabled(touch_enabled)
+            self.touch_volume_spin.setEnabled(touch_enabled)
 
             self.win_w_spin.setValue(self.main_window.width())
             self.win_h_spin.setValue(self.main_window.height())
@@ -2578,6 +2648,9 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
 
         self.main_window.opacity_val = self.opac_spin.value()
         self.main_window.setWindowOpacity(self.main_window.opacity_val / 100.0)
+        self.main_window.config["touch_sound_enabled"] = self.touch_sound_check.isChecked()
+        self.main_window.config["touch_sound_volume"] = self.touch_volume_spin.value()
+        self.main_window._sync_touch_sound_volume()
 
         grid_presets = [(3, 5), (4, 4), (3, 3), (2, 4), (4, 5), (2, 6)]
         r, c = grid_presets[self.grid_preset_combo.currentIndex()]
@@ -2756,6 +2829,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "hover_glow": True,
             "theme_index": 0,
             "auto_stretch_default": True,
+            "touch_sound_enabled": True,
+            "touch_sound_volume": 22,
             "empty_slot_opacity": 0,
             "show_empty_slots": False,
             "radial_items": ["prev_page", "next_page", "settings", "deck_dock", "preset_settings", "emergency", "studio", "topmost"],
@@ -2791,6 +2866,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.setWindowIcon(QtGui.QIcon(str(icon_path)))
 
         self._load_config()
+        self._touch_sound_effect = None
+        self._init_touch_sound()
         self._ensure_slot_presets()
         self.radial_menu = RadialPieMenuWidget(self)
         self.radial_menu.load_custom_items(self.config.get("radial_items"))
@@ -2810,6 +2887,39 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.poll_timer.start()
 
         self.refresh_slots()
+
+    def _init_touch_sound(self) -> None:
+        if QSoundEffect is None or os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            return
+        sound_path = _quickslot_touch_sound_path()
+        if not sound_path.is_file():
+            return
+        effect = QSoundEffect(self)
+        effect.setSource(QtCore.QUrl.fromLocalFile(str(sound_path)))
+        effect.setLoopCount(1)
+        self._touch_sound_effect = effect
+        self._sync_touch_sound_volume()
+
+    def _sync_touch_sound_volume(self) -> None:
+        effect = getattr(self, "_touch_sound_effect", None)
+        if effect is None:
+            return
+        volume = max(0, min(100, int(self.config.get("touch_sound_volume", 22))))
+        effect.setVolume(volume / 100.0)
+
+    def _play_touch_sound(self, *, force: bool = False) -> None:
+        if not force and not bool(self.config.get("touch_sound_enabled", True)):
+            return
+        effect = getattr(self, "_touch_sound_effect", None)
+        if effect is None:
+            self._init_touch_sound()
+            effect = getattr(self, "_touch_sound_effect", None)
+        if effect is None:
+            return
+        self._sync_touch_sound_volume()
+        if effect.isPlaying():
+            effect.stop()
+        effect.play()
 
     def _load_config(self) -> None:
         if self.config_path.exists():

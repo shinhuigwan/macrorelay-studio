@@ -566,6 +566,11 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.app.processEvents()
             self.assertTrue(window.config["show_empty_slots"])
             self.assertEqual(6, len(window.buttons))
+            empty_button = window.buttons[1]
+            self.assertEqual("", empty_button.icon_label.text())
+            self.assertTrue(empty_button.icon_label.isHidden())
+            self.assertIn(" solid ", empty_button.styleSheet())
+            self.assertNotIn("dashed", empty_button.styleSheet())
             dialog.show_empty_slots_check.setChecked(False)
             self.app.processEvents()
             self.assertEqual(1, len(window.buttons))

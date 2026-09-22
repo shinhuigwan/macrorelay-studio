@@ -1046,6 +1046,9 @@ class StreamDeckButton(QtWidgets.QFrame):
         win = self.window()
         win_cfg = getattr(win, "config", {}) if hasattr(win, "config") else {}
         tile_radius = float(win_cfg.get("tile_radius", 14))
+        theme_idx = int(win_cfg.get("theme_index", 0))
+        theme = THEMES.get(theme_idx, THEMES[0])
+        border_width = float(theme.get("grid_border_width", 2.0))
 
         pix = load_pixmap_from_config(self.custom_icon_config)
         has_custom = not pix.isNull()
@@ -1065,12 +1068,10 @@ class StreamDeckButton(QtWidgets.QFrame):
             if target_size.width() > 0 and target_size.height() > 0:
                 scaled_pix = self._scale_full_stretch_pixmap(pix, target_size)
                 painter.drawPixmap(self.rect(), scaled_pix)
-                theme_idx = int(win_cfg.get("theme_index", 0))
-                theme = THEMES.get(theme_idx, THEMES[0])
-                border_color = str(theme.get("palette_border") or (theme["card_border_1"] if self.slot_index % 2 == 0 else theme["card_border_2"]))
+                border_color = str(theme.get("grid_border") or theme.get("palette_border") or (theme["card_border_1"] if self.slot_index % 2 == 0 else theme["card_border_2"]))
                 painter.setClipping(False)
                 painter.setBrush(QtCore.Qt.NoBrush)
-                painter.setPen(QtGui.QPen(QtGui.QColor(border_color), 2.5))
+                painter.setPen(QtGui.QPen(QtGui.QColor(border_color), border_width))
                 border_rect = QtCore.QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
                 painter.drawRoundedRect(border_rect, tile_radius, tile_radius)
             painter.end()
@@ -1136,9 +1137,11 @@ class StreamDeckButton(QtWidgets.QFrame):
             self.title_label.setVisible(False)
             self.glow_bar.setStyleSheet("background: transparent;")
             self.setCursor(QtCore.Qt.ArrowCursor)
+            self.icon_label.setPixmap(QtGui.QPixmap())
+            self.icon_label.clear()
+            self.icon_label.setVisible(False)
 
             if empty_opac <= 0:
-                self.icon_label.setVisible(False)
                 self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
                 self.setStyleSheet("""
                     #SlotCard {
@@ -1149,30 +1152,31 @@ class StreamDeckButton(QtWidgets.QFrame):
                 """)
             else:
                 alpha = empty_opac / 100.0
-                self.icon_label.setVisible(True)
-                self.icon_label.setPixmap(QtGui.QPixmap())
-                self.icon_label.setText("⊕")
-                self.icon_label.setStyleSheet(f"background: transparent; border: none; font-size: 16pt; color: rgba(148, 163, 184, {alpha:.2f});")
-
+                border_alpha = max(0.45, alpha)
+                empty_bg = QtGui.QColor(str(theme.get("grid_empty_bg", "#121826")))
+                grid_border = QtGui.QColor(str(theme.get("grid_border") or theme.get("palette_border") or "#4B5563"))
+                empty_bg_css = f"rgba({empty_bg.red()}, {empty_bg.green()}, {empty_bg.blue()}, {alpha:.2f})"
+                border_css = f"rgba({grid_border.red()}, {grid_border.green()}, {grid_border.blue()}, {border_alpha:.2f})"
+                border_width = float(theme.get("grid_border_width", 1.5))
                 self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
                 if hover_glow:
                     self.setStyleSheet(f"""
                         #SlotCard {{
-                            background-color: rgba(18, 24, 38, {alpha:.2f});
-                            border: 1.5px dashed rgba(60, 75, 105, {alpha:.2f});
+                            background-color: {empty_bg_css};
+                            border: {border_width}px solid {border_css};
                             border-radius: {tile_radius}px;
                         }}
                         #SlotCard:hover {{
-                            background-color: rgba(30, 42, 68, {alpha:.2f});
-                            border: 1.5px dashed rgba(100, 140, 210, {alpha:.2f});
+                            background-color: {empty_bg_css};
+                            border: {border_width + 0.5}px solid rgba(148, 163, 184, {max(0.70, alpha):.2f});
                             border-radius: {tile_radius}px;
                         }}
                     """)
                 else:
                     self.setStyleSheet(f"""
                         #SlotCard {{
-                            background-color: rgba(18, 24, 38, {alpha:.2f});
-                            border: 1.5px dashed rgba(60, 75, 105, {alpha:.2f});
+                            background-color: {empty_bg_css};
+                            border: {border_width}px solid {border_css};
                             border-radius: {tile_radius}px;
                         }}
                     """)
@@ -1246,9 +1250,10 @@ class StreamDeckButton(QtWidgets.QFrame):
         self._reposition_title_label()
 
         palette = list(theme.get("card_palette") or [])
+        border_width = float(theme.get("grid_border_width", 2.0))
         if palette:
             card_bg = palette[self.slot_index % len(palette)]
-            card_border = str(theme.get("palette_border", "#454A55"))
+            card_border = str(theme.get("grid_border") or theme.get("palette_border", "#454A55"))
             glow_color = str(theme.get("glow_1", card_border))
         elif self.slot_index % 2 == 0:
             card_bg, card_border, glow_color = theme["card_bg_1"], theme["card_border_1"], theme["glow_1"]
@@ -1260,7 +1265,7 @@ class StreamDeckButton(QtWidgets.QFrame):
             self.setStyleSheet(f"""
                 #SlotCard {{
                     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #102B21, stop:1 #0A1C16);
-                    border: 2.5px solid #35C89A;
+                    border: {border_width + 0.5}px solid #35C89A;
                     border-radius: {tile_radius}px;
                 }}
             """)
@@ -1270,18 +1275,18 @@ class StreamDeckButton(QtWidgets.QFrame):
                 self.setStyleSheet(f"""
                     #SlotCard {{
                         background: {card_bg};
-                        border: 2px solid {card_border};
+                        border: {border_width}px solid {card_border};
                         border-radius: {tile_radius}px;
                     }}
                     #SlotCard:hover {{
-                        border: 2.5px solid #FFFFFF;
+                        border: {border_width + 0.5}px solid #FFFFFF;
                     }}
                 """)
             else:
                 self.setStyleSheet(f"""
                     #SlotCard {{
                         background: {card_bg};
-                        border: 2px solid {card_border};
+                        border: {border_width}px solid {card_border};
                         border-radius: {tile_radius}px;
                     }}
                 """)
@@ -1443,7 +1448,8 @@ THEMES: Dict[int, Dict[str, Any]] = {
         "card_bg_2": "#202328", "card_border_2": "#3F444C",
         "glow_1": "#6B7280", "glow_2": "#4B5563",
         "central_bg": "rgba(20, 21, 24, 0.96)",
-        "icon_only": True, "recommended_scale": 0.50, "recommended_gap": 5, "recommended_radius": 8,
+        "icon_only": True, "recommended_scale": 0.50, "recommended_gap": 3, "recommended_radius": 6,
+        "grid_border": "#5B616B", "grid_empty_bg": "#181A1E", "grid_border_width": 2.0,
     },
     5: {
         "name": "▦ Color Icon Grid (컬러 아이콘 전용)",
@@ -1451,7 +1457,8 @@ THEMES: Dict[int, Dict[str, Any]] = {
         "card_bg_2": "#7C3AED", "card_border_2": "#4A4F59",
         "glow_1": "#38BDF8", "glow_2": "#C084FC",
         "central_bg": "rgba(18, 19, 23, 0.98)",
-        "icon_only": True, "recommended_scale": 0.45, "recommended_gap": 5, "recommended_radius": 7,
+        "icon_only": True, "recommended_scale": 0.45, "recommended_gap": 3, "recommended_radius": 6,
+        "grid_border": "#5A606A", "grid_empty_bg": "#191B20", "grid_border_width": 2.0,
         "palette_border": "#454A55",
         "card_palette": ["#315CF3", "#392B83", "#F43F5E", "#A3E635", "#F97316", "#16A34A", "#14B8A6", "#D946EF", "#374151", "#6D28D9"],
     },

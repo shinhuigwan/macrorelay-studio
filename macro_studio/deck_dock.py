@@ -11,7 +11,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 ACTION_LIBRARY: Dict[str, list[tuple[str, str, str]]] = {
     "시스템": [
-        ("open_target", "열기", "프로그램·파일·폴더·웹사이트"),
+        ("open_target", "실행", "프로그램·파일·폴더·웹사이트 실행"),
         ("terminate_program", "프로그램 종료", "지정 프로세스 종료"),
         ("hotkey", "단축키", "키 조합 보내기"),
         ("text", "텍스트 입력", "클립보드 기반 텍스트 입력"),
@@ -238,6 +238,7 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         self.repository = main_window.repository
         self.slot_index = slot_index
         self.icon_config = copy.deepcopy(icon_config or {})
+        self._icon_manually_edited = bool(self.icon_config)
         self.widgets: Dict[str, Any] = {}
         self.setWindowTitle(f"{ACTION_TITLES.get(kind, 'Deck 액션')} 설정")
         self.setMinimumWidth(500)
@@ -275,6 +276,7 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
             edit.setPlaceholderText("실행 파일, 폴더, 문서 또는 https:// 주소")
             browse = QtWidgets.QPushButton("찾기")
             browse.clicked.connect(lambda: self._browse_target(edit))
+            edit.editingFinished.connect(lambda: self._set_icon_from_program(edit.text()))
             row = QtWidgets.QHBoxLayout(); row.addWidget(edit, 1); row.addWidget(browse)
             self.widgets["target"] = edit; form.addRow("대상", row)
         elif kind == "terminate_program":
@@ -394,18 +396,52 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         dialog = SlotIconEditDialog(max(0, self.slot_index), label, self.icon_config, self)
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.icon_config = dialog.get_config()
+            self._icon_manually_edited = True
             self.btn_edit_icon.setText("✓ 아이콘 편집 완료 · 다시 편집")
 
     def _test_action(self) -> None:
         self.main_window._execute_deck_action(self.result_action())
 
     def result_icon_config(self) -> Dict[str, Any]:
+        if self.kind == "open_target" and not self.icon_config:
+            target = self.widgets.get("target")
+            if isinstance(target, QtWidgets.QLineEdit):
+                self._set_icon_from_program(target.text())
         return copy.deepcopy(self.icon_config)
 
     def _browse_target(self, edit: QtWidgets.QLineEdit) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "실행할 파일 선택")
         if path:
             edit.setText(path)
+            self._set_icon_from_program(path)
+
+    def _set_icon_from_program(self, path: str) -> None:
+        target = str(path or "").strip()
+        if self._icon_manually_edited or not target or not QtCore.QFileInfo(target).exists():
+            return
+        provider = QtWidgets.QFileIconProvider()
+        icon = provider.icon(QtCore.QFileInfo(target))
+        pixmap = icon.pixmap(256, 256)
+        if pixmap.isNull():
+            return
+        data = QtCore.QByteArray()
+        buffer = QtCore.QBuffer(data); buffer.open(QtCore.QIODevice.WriteOnly)
+        if not pixmap.save(buffer, "PNG"):
+            return
+        self.icon_config = {
+            "image_path": "",
+            "image_data": bytes(data.toBase64()).decode("ascii"),
+            "full_stretch": False,
+            "text_show": True,
+            "emoji": "",
+            "icon_size": 64,
+            "text_position": "bottom",
+            "font_size": 12,
+            "spacing": 6,
+            "text_x_percent": 50,
+            "text_y_percent": 85,
+        }
+        self.btn_edit_icon.setText("✓ 프로그램 아이콘 자동 적용 · 편집")
 
     def result_action(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {"kind": self.kind, "label": self.widgets["label"].text().strip() or ACTION_TITLES.get(self.kind, "Deck 액션")}
@@ -448,19 +484,30 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         title = QtWidgets.QLabel("Deck Dock"); title.setObjectName("Title")
         self.preset_combo = QtWidgets.QComboBox(); self.preset_combo.setMinimumWidth(220); self.preset_combo.currentIndexChanged.connect(self._preset_changed)
         save = QtWidgets.QPushButton("저장 및 덱 적용"); save.clicked.connect(self.save)
-        top.addWidget(title); top.addSpacing(16); top.addWidget(QtWidgets.QLabel("프리셋")); top.addWidget(self.preset_combo); top.addStretch(1); top.addWidget(save)
+        self.grid_rows_spin = QtWidgets.QSpinBox(); self.grid_rows_spin.setRange(1, 10); self.grid_rows_spin.setSuffix(" 행")
+        self.grid_cols_spin = QtWidgets.QSpinBox(); self.grid_cols_spin.setRange(1, 10); self.grid_cols_spin.setSuffix(" 열")
+        self.grid_apply_btn = QtWidgets.QPushButton("그리드 적용"); self.grid_apply_btn.clicked.connect(self._apply_grid_size)
+        top.addWidget(title); top.addSpacing(16); top.addWidget(QtWidgets.QLabel("프리셋")); top.addWidget(self.preset_combo)
+        top.addSpacing(14); top.addWidget(QtWidgets.QLabel("그리드")); top.addWidget(self.grid_rows_spin); top.addWidget(QtWidgets.QLabel("×")); top.addWidget(self.grid_cols_spin); top.addWidget(self.grid_apply_btn)
+        top.addStretch(1); top.addWidget(save)
         outer.addWidget(toolbar)
         body = QtWidgets.QHBoxLayout(); body.setSpacing(14); outer.addLayout(body, 1)
         center = QtWidgets.QFrame(); center.setObjectName("DeckCard")
         center_layout = QtWidgets.QVBoxLayout(center); center_layout.setContentsMargins(20, 18, 20, 14)
+        page_header = QtWidgets.QHBoxLayout(); page_header.addStretch(1)
         self.deck_title = QtWidgets.QLabel("QuickSlot Deck"); self.deck_title.setAlignment(QtCore.Qt.AlignCenter); self.deck_title.setStyleSheet("font-size:14pt;font-weight:800;color:#FFFFFF;")
-        center_layout.addWidget(self.deck_title)
+        self.rename_page_btn = QtWidgets.QPushButton("이름 변경"); self.rename_page_btn.clicked.connect(self.rename_page)
+        page_header.addWidget(self.deck_title); page_header.addWidget(self.rename_page_btn); page_header.addStretch(1)
+        center_layout.addLayout(page_header)
         self.grid_host = QtWidgets.QWidget(); self.grid = QtWidgets.QGridLayout(self.grid_host); self.grid.setSpacing(9)
         center_layout.addWidget(self.grid_host, 1)
-        pager = QtWidgets.QHBoxLayout(); self.prev_btn = QtWidgets.QPushButton("◀"); self.next_btn = QtWidgets.QPushButton("▶"); self.add_page_btn = QtWidgets.QPushButton("＋ 페이지"); self.rename_page_btn = QtWidgets.QPushButton("이름 변경"); self.delete_page_btn = QtWidgets.QPushButton("페이지 삭제")
+        pager = QtWidgets.QGridLayout(); self.prev_btn = QtWidgets.QPushButton("◀"); self.next_btn = QtWidgets.QPushButton("▶"); self.add_page_btn = QtWidgets.QPushButton("＋ 페이지"); self.delete_page_btn = QtWidgets.QPushButton("－ 페이지")
         self.page_label = QtWidgets.QLabel(); self.page_label.setAlignment(QtCore.Qt.AlignCenter); self.page_label.setMinimumWidth(120)
-        self.prev_btn.clicked.connect(self.prev_page); self.next_btn.clicked.connect(self.next_page); self.add_page_btn.clicked.connect(self.add_page); self.rename_page_btn.clicked.connect(self.rename_page); self.delete_page_btn.clicked.connect(self.delete_page)
-        pager.addStretch(1); pager.addWidget(self.prev_btn); pager.addWidget(self.page_label); pager.addWidget(self.next_btn); pager.addWidget(self.add_page_btn); pager.addWidget(self.rename_page_btn); pager.addWidget(self.delete_page_btn); pager.addStretch(1)
+        self.prev_btn.clicked.connect(self.prev_page); self.next_btn.clicked.connect(self.next_page); self.add_page_btn.clicked.connect(self.add_page); self.delete_page_btn.clicked.connect(self.delete_page)
+        manage = QtWidgets.QHBoxLayout(); manage.addWidget(self.add_page_btn); manage.addWidget(self.delete_page_btn); manage.addStretch(1)
+        navigation = QtWidgets.QHBoxLayout(); navigation.addWidget(self.prev_btn); navigation.addWidget(self.page_label); navigation.addWidget(self.next_btn)
+        pager.addLayout(manage, 0, 0); pager.addLayout(navigation, 0, 1, QtCore.Qt.AlignCenter); pager.addWidget(QtWidgets.QWidget(), 0, 2)
+        pager.setColumnStretch(0, 1); pager.setColumnStretch(1, 1); pager.setColumnStretch(2, 1)
         center_layout.addLayout(pager); body.addWidget(center, 1)
         panel = QtWidgets.QFrame(); panel.setObjectName("PanelCard"); panel.setFixedWidth(330)
         panel_layout = QtWidgets.QVBoxLayout(panel); panel_layout.setContentsMargins(12, 12, 12, 12)
@@ -499,6 +546,9 @@ class DeckDockWindow(QtWidgets.QMainWindow):
 
     def reload(self) -> None:
         self._ensure_payload()
+        with QtCore.QSignalBlocker(self.grid_rows_spin), QtCore.QSignalBlocker(self.grid_cols_spin):
+            self.grid_rows_spin.setValue(max(1, min(10, int(self.main_window.rows))))
+            self.grid_cols_spin.setValue(max(1, min(10, int(self.main_window.cols))))
         active = str(self.main_window.config.get("active_slot_preset") or "")
         with QtCore.QSignalBlocker(self.preset_combo):
             self.preset_combo.clear()
@@ -516,12 +566,48 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         for local in range(page_size):
             index = start + local; slot = self.payload["slots"][index]
             button = DeckSlotButton(index, slot, self.main_window.custom_icons.get(str(index), {}), self.grid_host)
+            button.setMinimumSize(max(48, min(92, 760 // max(1, cols))), max(44, min(82, 500 // max(1, rows))))
             button.action_dropped.connect(self._configure_new_action); button.slot_dropped.connect(self._move_slot); button.edit_requested.connect(self._edit_slot); button.clear_requested.connect(self._clear_slot); button.duplicate_requested.connect(self._duplicate_slot)
             self.grid.addWidget(button, local // cols, local % cols)
         page_name = self.payload["deck_page_names"][self.current_page]
         self.deck_title.setText(page_name)
         self.page_label.setText(f"{self.current_page + 1} / {self.page_count}")
         self.prev_btn.setEnabled(self.current_page > 0); self.next_btn.setEnabled(self.current_page + 1 < self.page_count); self.delete_page_btn.setEnabled(self.page_count > 1)
+
+    def _apply_grid_size(self) -> None:
+        new_rows, new_cols = self.grid_rows_spin.value(), self.grid_cols_spin.value()
+        old_rows, old_cols = int(self.main_window.rows), int(self.main_window.cols)
+        if (new_rows, new_cols) == (old_rows, old_cols):
+            return
+        old_size, new_size = max(1, old_rows * old_cols), max(1, new_rows * new_cols)
+        old_slots = list(self.payload.get("slots") or [])
+        old_names = list(self.payload.get("deck_page_names") or [])
+        old_icons = copy.deepcopy(self.main_window.custom_icons)
+        new_slots: list[Dict[str, Any]] = []
+        new_names: list[str] = []
+        new_icons: Dict[str, Any] = {}
+        for page in range(self.page_count):
+            chunk = old_slots[page * old_size:(page + 1) * old_size]
+            chunk.extend({"macro": "", "hotkey": "", "mode": "hybrid"} for _ in range(max(0, old_size - len(chunk))))
+            last_used = max((i for i, slot in enumerate(chunk) if str(slot.get("macro") or "").strip()), default=-1)
+            parts = max(1, math.ceil((last_used + 1) / new_size))
+            base_name = str(old_names[page] if page < len(old_names) else f"페이지 {page + 1}")
+            for part in range(parts):
+                segment = chunk[part * new_size:(part + 1) * new_size]
+                segment.extend({"macro": "", "hotkey": "", "mode": "hybrid"} for _ in range(max(0, new_size - len(segment))))
+                new_base = len(new_slots); new_slots.extend(segment)
+                new_names.append(base_name if parts == 1 else f"{base_name} ({part + 1})")
+                for local in range(part * new_size, min((part + 1) * new_size, old_size)):
+                    source_key = str(page * old_size + local)
+                    if source_key in old_icons:
+                        new_icons[str(new_base + local - part * new_size)] = old_icons[source_key]
+        self.main_window.rows, self.main_window.cols = new_rows, new_cols
+        self.main_window.custom_icons = new_icons
+        self.payload["slots"] = new_slots
+        self.payload["deck_page_names"] = new_names
+        self.page_count = len(new_names)
+        self.current_page = min(self.current_page, self.page_count - 1)
+        self.save()
 
     def _slot_from_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         return {"macro": action_title(action), "hotkey": "", "mode": "deck_action", "action": action}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -274,6 +275,26 @@ class QuickSlotDeckTests(unittest.TestCase):
             dock.close()
             window.close()
 
+    def test_deck_dock_uses_execution_label_centered_pager_and_large_grid(self) -> None:
+        from macro_studio.deck_dock import ACTION_TITLES, DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dock = DeckDockWindow(window)
+            self.assertEqual("실행", ACTION_TITLES["open_target"])
+            self.assertEqual("이름 변경", dock.rename_page_btn.text())
+            self.assertEqual("＋ 페이지", dock.add_page_btn.text())
+            self.assertEqual("－ 페이지", dock.delete_page_btn.text())
+            self.assertEqual(10, dock.grid_rows_spin.maximum())
+            self.assertEqual(10, dock.grid_cols_spin.maximum())
+            dock.grid_rows_spin.setValue(10); dock.grid_cols_spin.setValue(10)
+            dock._apply_grid_size()
+            self.assertEqual((10, 10), (window.rows, window.cols))
+            self.assertEqual(100, dock.grid.count())
+            dock.close(); window.close()
+
     def test_deck_page_action_changes_runtime_page(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository
@@ -339,6 +360,20 @@ class QuickSlotDeckTests(unittest.TestCase):
                     self.assertIn("y", dialog.widgets)
                 dialog.close()
             window.close()
+
+    def test_program_action_automatically_uses_native_executable_icon(self) -> None:
+        from macro_studio.deck_dock import DeckActionConfigDialog
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dialog = DeckActionConfigDialog("open_target", None, window, slot_index=0)
+            dialog.widgets["target"].setText(sys.executable)
+            icon_config = dialog.result_icon_config()
+            self.assertTrue(icon_config.get("image_data"))
+            self.assertFalse(icon_config.get("full_stretch"))
+            dialog.close(); window.close()
 
     def test_deck_inactive_text_and_mouse_dispatch_without_activation(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow

@@ -459,6 +459,31 @@ class QuickSlotDeckTests(unittest.TestCase):
                 click.assert_called_once_with(action, inactive=True)
             window.close()
 
+    def test_action_window_title_change_falls_back_to_same_program(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+
+        candidates = [
+            (101, "TradingView - Whale".casefold(), "whale.exe"),
+            (202, "RUSD 1.4552 forex - Whale".casefold(), "whale.exe"),
+            (303, "메모장", "notepad.exe"),
+        ]
+
+        exact = QuickSlotDeckWindow._select_action_window_candidate(
+            candidates,
+            title_fragment="tradingview - whale",
+            exe_name="whale.exe",
+            foreground_hwnd=202,
+        )
+        changed_title = QuickSlotDeckWindow._select_action_window_candidate(
+            candidates,
+            title_fragment="이전 종목 - whale",
+            exe_name="whale.exe",
+            foreground_hwnd=202,
+        )
+
+        self.assertEqual(101, exact)
+        self.assertEqual(202, changed_title)
+
     def test_deck_save_button_saves_once_and_closes(self) -> None:
         from macro_studio.deck_dock import DeckDockWindow
         from macro_studio.quickslot_deck import QuickSlotDeckWindow

@@ -3732,7 +3732,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
         title_fragment = str(action.get("target_title") or "").strip().casefold()
         exe_name = str(action.get("target_exe") or "").strip().casefold()
-        matches: list[int] = []
+        candidates: list[tuple[int, str, str]] = []
         callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
         def process_name(hwnd: int) -> str:
@@ -3757,20 +3757,65 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             buffer = ctypes.create_unicode_buffer(max(1, length + 1))
             if length:
                 user32.GetWindowTextW(hwnd, buffer, length + 1)
-            title_ok = not title_fragment or title_fragment in buffer.value.casefold()
-            exe_ok = not exe_name or process_name(hwnd) == exe_name
-            if title_ok and exe_ok:
-                matches.append(int(hwnd))
-                return False
+            candidates.append((int(hwnd), buffer.value.casefold(), process_name(hwnd)))
             return True
 
         if title_fragment or exe_name:
             user32.EnumWindows(callback_type(enum_callback), 0)
-        if matches:
-            return matches[0]
+        matched = self._select_action_window_candidate(
+            candidates,
+            title_fragment=title_fragment,
+            exe_name=exe_name,
+            foreground_hwnd=int(user32.GetForegroundWindow() or 0),
+        )
+        if matched:
+            return matched
         if token or title_fragment or exe_name:
             raise ValueError(f"대상 창을 찾지 못했습니다: {action.get('target_exe') or action.get('target_title') or token}")
         return int(user32.GetForegroundWindow() or 0)
+
+    @staticmethod
+    def _select_action_window_candidate(
+        candidates: list[tuple[int, str, str]],
+        *,
+        title_fragment: str,
+        exe_name: str,
+        foreground_hwnd: int = 0,
+    ) -> int:
+        """Prefer an exact title match, then fall back to the same program.
+
+        Browser tab titles change frequently.  The saved executable therefore
+        remains the stable identity while the title is only a preference.  If
+        several windows belong to that executable, the foreground one wins.
+        """
+        title_fragment = str(title_fragment or "").strip().casefold()
+        exe_name = str(exe_name or "").strip().casefold()
+
+        def preferred(pool: list[tuple[int, str, str]]) -> int:
+            if not pool:
+                return 0
+            foreground = next((hwnd for hwnd, _title, _exe in pool if hwnd == foreground_hwnd), 0)
+            return foreground or pool[0][0]
+
+        exact = [
+            candidate
+            for candidate in candidates
+            if (not title_fragment or title_fragment in candidate[1])
+            and (not exe_name or candidate[2] == exe_name)
+        ]
+        if exact:
+            return preferred(exact)
+
+        if exe_name:
+            same_program = [candidate for candidate in candidates if candidate[2] == exe_name]
+            if same_program:
+                return preferred(same_program)
+
+        if title_fragment:
+            same_title = [candidate for candidate in candidates if title_fragment in candidate[1]]
+            if same_title:
+                return preferred(same_title)
+        return 0
 
     @staticmethod
     def _focused_child_window(hwnd: int) -> int:

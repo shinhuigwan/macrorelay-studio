@@ -2373,7 +2373,9 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
     def _on_tile_scale_changed(self, _index: int) -> None:
         if getattr(self, "_loading_settings", False):
             return
-        self.main_window.config["tile_scale"] = float(self.tile_scale_combo.currentData())
+        scale = float(self.tile_scale_combo.currentData())
+        self.main_window.config["tile_scale"] = scale
+        self.main_window._remember_manual_tile_side(BASE_TILE_SIDE * scale)
         self.main_window.refresh_slots()
         with QtCore.QSignalBlocker(self.win_w_spin), QtCore.QSignalBlocker(self.win_h_spin):
             self.win_w_spin.setValue(self.main_window.width())
@@ -2775,6 +2777,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._visible_cols = 1
         self._visible_rows = 1
         self._applying_slot_preset = False
+        self._restored_window_geometry = False
 
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
@@ -2838,7 +2841,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                     self.config["radial_items"] = radial_items
                 geom = data.get("geometry")
                 if geom:
-                    self.restoreGeometry(QtCore.QByteArray.fromHex(geom.encode("ascii")))
+                    self._restored_window_geometry = bool(
+                        self.restoreGeometry(QtCore.QByteArray.fromHex(geom.encode("ascii")))
+                    )
 
                 # Auto-migrate local image_path to embedded Base64 image_data
                 updated_any = False
@@ -3084,6 +3089,18 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         new_y = orig.bottom() - target.height() + 1 if "top" in edge else orig.y()
         self.setGeometry(new_x, new_y, target.width(), target.height())
 
+        self._remember_manual_tile_side(tile_side)
+
+    def _remember_manual_tile_side(self, tile_side: float) -> None:
+        self.config["manual_tile_side"] = round(max(MIN_TILE_SIDE, float(tile_side)), 3)
+
+    def _saved_manual_tile_side(self) -> float | None:
+        try:
+            value = float(self.config.get("manual_tile_side") or 0)
+        except (TypeError, ValueError):
+            return None
+        return max(MIN_TILE_SIDE, value) if value > 0 else None
+
     def _grid_extras(self) -> tuple[int, int]:
         gap = int(self.config.get("tile_gap", 10))
         return (
@@ -3107,10 +3124,14 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         return max(MIN_TILE_SIDE, (height - extra_h) / max(1, self._visible_rows))
 
     def resize_grid_from_width(self, width: int) -> None:
-        self.resize(self._size_for_tile_side(self._tile_side_from_width(width)))
+        tile_side = self._tile_side_from_width(width)
+        self._remember_manual_tile_side(tile_side)
+        self.resize(self._size_for_tile_side(tile_side))
 
     def resize_grid_from_height(self, height: int) -> None:
-        self.resize(self._size_for_tile_side(self._tile_side_from_height(height)))
+        tile_side = self._tile_side_from_height(height)
+        self._remember_manual_tile_side(tile_side)
+        self.resize(self._size_for_tile_side(tile_side))
 
     def _start_mouse_hold_check(self, global_pos: QtCore.QPoint) -> None:
         self._hold_start_pos = global_pos
@@ -3589,7 +3610,18 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.refresh_states()
 
         # Dynamic Auto-Fit Window Size according to configured active slots
-        if bool(self.config.get("compact_auto_fit", True)):
+        manual_tile_side = self._saved_manual_tile_side()
+        if manual_tile_side is not None:
+            self.resize(self._size_for_tile_side(manual_tile_side))
+        elif self._restored_window_geometry:
+            # Existing configs already carry the size chosen by the user.
+            # Adopt that size instead of overwriting it during first refresh.
+            side_from_width = self._tile_side_from_width(self.width())
+            side_from_height = self._tile_side_from_height(self.height())
+            self._remember_manual_tile_side(min(side_from_width, side_from_height))
+            self._restored_window_geometry = False
+            self._save_config()
+        elif bool(self.config.get("compact_auto_fit", True)):
             active_count = len(page_slots)
             if active_count > 0:
                 fit_cols = min(self.cols, active_count)

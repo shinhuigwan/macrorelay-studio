@@ -118,6 +118,31 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertGreaterEqual(cell_width, 48)
             window.close()
 
+    def test_icon_refresh_preserves_manually_selected_window_size(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({
+                "slots": [
+                    {"macro": "첫 번째", "hotkey": "", "mode": "hybrid"},
+                    {"macro": "두 번째", "hotkey": "", "mode": "hybrid"},
+                ]
+            })
+            window = QuickSlotDeckWindow(repository)
+            window.resize_grid_from_width(310)
+            selected_size = window.size()
+            window.custom_icons["0"] = {
+                "emoji": "A", "full_stretch": True, "text_show": False,
+            }
+
+            window.refresh_slots()
+
+            self.assertEqual(selected_size, window.size())
+            self.assertGreater(float(window.config.get("manual_tile_side") or 0), 0)
+            window.close()
+
     def test_radial_add_uses_first_empty_slot(self) -> None:
         from PySide6 import QtWidgets
         from macro_studio.quickslot_deck import QuickSlotDeckWindow

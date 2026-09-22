@@ -917,6 +917,7 @@ class WorkflowLaneItem(QtWidgets.QGraphicsObject):
         for edge in self.canvas.edges:
             if edge.source in moved or edge.target in moved:
                 edge.update_path()
+        self.canvas._update_group_proxy_edges(moved)
 
 
 class NodeItem(QtWidgets.QGraphicsObject):
@@ -3433,6 +3434,7 @@ class NodeGroupItem(QtWidgets.QGraphicsItem):
                     node.setPos(origin + delta)
             if self.collapsed:
                 self.setPos(self._group_origin + delta)
+            self.canvas._update_group_proxy_edges(set(self._node_origins))
             event.accept()
             return
 
@@ -3982,6 +3984,60 @@ class NodeCanvas(QtWidgets.QWidget):
                 pass
         self._group_proxy_edges = []
 
+    def _group_proxy_path(self, edge: EdgeItem) -> QtGui.QPainterPath | None:
+        """Build the current proxy path for an edge touching a folded group."""
+        source_group = self.group_for_node(edge.source, collapsed_only=True)
+        target_group = self.group_for_node(edge.target, collapsed_only=True)
+        if source_group is None and target_group is None:
+            return None
+        if source_group is not None and source_group is target_group:
+            return None
+        source_node = self.nodes.get(edge.source)
+        target_node = self.nodes.get(edge.target)
+        if source_node is None or target_node is None:
+            return None
+        if source_group is not None:
+            rect = source_group.sceneBoundingRect()
+            start = QtCore.QPointF(rect.right(), rect.center().y() + (-7 if edge.kind == "success" else 7))
+        else:
+            port = source_node.out_success_port if edge.kind == "success" else source_node.out_fail_port
+            start = port.mapToScene(port.rect().center())
+        if target_group is not None:
+            rect = target_group.sceneBoundingRect()
+            end = QtCore.QPointF(rect.left(), rect.center().y() + (-7 if edge.kind == "success" else 7))
+        else:
+            port = target_node.in_success_port if edge.kind == "success" else target_node.in_fail_port
+            end = port.mapToScene(port.rect().center())
+        bend = max(55.0, abs(end.x() - start.x()) * 0.42)
+        direction = 1.0 if end.x() >= start.x() else -1.0
+        path = QtGui.QPainterPath(start)
+        path.cubicTo(start.x() + direction * bend, start.y(), end.x() - direction * bend, end.y(), end.x(), end.y())
+        return path
+
+    def _update_group_proxy_edges(self, moved_indexes: set[int] | None = None) -> None:
+        """Move existing folded-group proxy lines without recreating them."""
+        folded_nodes, _folded_groups = self._folded_workflow_scope()
+        moved = {int(index) for index in (moved_indexes or set())}
+        for proxy in list(self._group_proxy_edges):
+            edge = getattr(proxy, "source_edge", None)
+            if edge is None:
+                continue
+            if moved and edge.source not in moved and edge.target not in moved:
+                continue
+            if edge.source in folded_nodes or edge.target in folded_nodes:
+                proxy.setVisible(False)
+                continue
+            path = self._group_proxy_path(edge)
+            if path is None:
+                proxy.setVisible(False)
+                continue
+            proxy.setPath(path)
+            proxy.setVisible(True)
+            label = getattr(proxy, "proxy_label", None)
+            if label is not None:
+                mid = path.pointAtPercent(0.5)
+                label.setPos(mid + QtCore.QPointF(-12, -17 if edge.kind == "success" else 4))
+
     def _rebuild_group_proxy_edges(self) -> None:
         self._clear_group_proxy_edges()
         folded_nodes, _folded_groups = self._folded_workflow_scope()
@@ -4000,27 +4056,11 @@ class NodeCanvas(QtWidgets.QWidget):
                 edge.setVisible(False)
                 continue
             edge.setVisible(False)
-            source_node = self.nodes.get(edge.source)
-            target_node = self.nodes.get(edge.target)
-            if source_node is None or target_node is None:
+            path = self._group_proxy_path(edge)
+            if path is None:
                 continue
-            if source_group is not None:
-                rect = source_group.sceneBoundingRect()
-                start = QtCore.QPointF(rect.right(), rect.center().y() + (-7 if edge.kind == "success" else 7))
-            else:
-                port = source_node.out_success_port if edge.kind == "success" else source_node.out_fail_port
-                start = port.mapToScene(port.rect().center())
-            if target_group is not None:
-                rect = target_group.sceneBoundingRect()
-                end = QtCore.QPointF(rect.left(), rect.center().y() + (-7 if edge.kind == "success" else 7))
-            else:
-                port = target_node.in_success_port if edge.kind == "success" else target_node.in_fail_port
-                end = port.mapToScene(port.rect().center())
-            bend = max(55.0, abs(end.x() - start.x()) * 0.42)
-            direction = 1.0 if end.x() >= start.x() else -1.0
-            path = QtGui.QPainterPath(start)
-            path.cubicTo(start.x() + direction * bend, start.y(), end.x() - direction * bend, end.y(), end.x(), end.y())
             proxy = QtWidgets.QGraphicsPathItem(path)
+            proxy.source_edge = edge
             color = QtGui.QColor(COLORS["success"] if edge.kind == "success" else COLORS["danger"])
             proxy.setPen(QtGui.QPen(color, 2.4, QtCore.Qt.DashLine, QtCore.Qt.RoundCap))
             proxy.setOpacity(0.72)
@@ -4030,6 +4070,7 @@ class NodeCanvas(QtWidgets.QWidget):
                 f"실행 {self.display_number(edge.source)} → 실행 {self.display_number(edge.target)}"
             )
             label = QtWidgets.QGraphicsSimpleTextItem("성공" if edge.kind == "success" else "실패", proxy)
+            proxy.proxy_label = label
             label.setBrush(color.lighter(135))
             label.setFont(QtGui.QFont("Malgun Gothic", 7, QtGui.QFont.Bold))
             mid = path.pointAtPercent(0.5)

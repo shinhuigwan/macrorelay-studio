@@ -299,6 +299,43 @@ class NodeGroupCollapseTests(unittest.TestCase):
         canvas.finish_node_move()
         canvas.close()
 
+    def test_branch_drag_updates_folded_group_proxy_edge_in_same_frame(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.node_editor import NodeCanvas
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        canvas = NodeCanvas()
+        canvas.set_macro({
+            "steps": [
+                {"action": "wait", "workflow_id": "branch-1", "workflow_label": "1번 분기", "on_success": 2},
+                {"action": "wait", "workflow_id": "branch-1", "workflow_label": "1번 분기", "on_success": 3},
+                {"action": "wait"},
+            ],
+            "graph_positions": {"1": [0, 0], "2": [280, 0], "3": [560, 0]},
+            "graph_comments": [{
+                "id": "folded-child", "title": "접힌 하위 그룹", "color": "yellow",
+                "node_indexes": [2], "collapsed": True,
+            }],
+        })
+        app.processEvents()
+
+        lane = canvas.workflow_items[0]
+        proxy = next(
+            item for item in canvas._group_proxy_edges
+            if item.source_edge.source == 2 and item.source_edge.target == 3
+        )
+        proxy_origin = QtCore.QRectF(proxy.path().boundingRect())
+        delta = QtCore.QPointF(75, 45)
+
+        lane._begin_hierarchy_drag(QtCore.QPointF(50, 50))
+        lane._move_hierarchy_drag(QtCore.QPointF(50, 50) + delta)
+
+        self.assertIn(proxy, canvas._group_proxy_edges)
+        self.assertEqual(proxy_origin.topLeft() + delta, proxy.path().boundingRect().topLeft())
+        lane._dragging = False
+        canvas.finish_node_move()
+        canvas.close()
+
     def test_alignment_keeps_first_selected_node_as_anchor(self) -> None:
         from PySide6 import QtWidgets
         from macro_studio.node_editor import NodeCanvas

@@ -376,6 +376,90 @@ class QuickSlotDeckTests(unittest.TestCase):
                 self.assertEqual("whale.exe", action["target_exe"])
             dock.close(); window.close()
 
+    def test_deck_backup_restores_slots_actions_pages_and_icons(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({
+                "deck_page_count": 2,
+                "deck_page_names": ["기본", "트레이딩"],
+                "slots": [{
+                    "macro": "텍스트 입력", "hotkey": "", "mode": "deck_action",
+                    "action": {"kind": "text", "text": "EURUSD", "key_interval_ms": 25, "press_enter": True},
+                }],
+            })
+            window = QuickSlotDeckWindow(repository)
+            window.custom_icons["0"] = {"emoji": "T", "full_stretch": True}
+            payload = window.build_deck_backup_payload()
+            self.assertEqual("macrorelay-deck-backup", payload["format"])
+            self.assertEqual(2, payload["hotkeys"]["deck_page_count"])
+            self.assertEqual({}, payload["deck_config"]["custom_icons"])
+
+            window._save_preset_hotkeys({"slots": []})
+            window.custom_icons = {}
+            window.restore_deck_backup_payload(payload)
+            restored = repository.load_hotkeys()
+            action = restored["slots"][0]["action"]
+            self.assertEqual("EURUSD", action["text"])
+            self.assertEqual(25, action["key_interval_ms"])
+            self.assertEqual(["기본", "트레이딩"], restored["deck_page_names"])
+            self.assertEqual("T", window.custom_icons["0"]["emoji"])
+            window.close()
+
+    def test_legacy_deck_config_import_restores_active_preset_slots(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            window = QuickSlotDeckWindow(repository)
+            legacy = {
+                "rows": 2, "cols": 2, "custom_icons": {"0": {"emoji": "L"}},
+                "config": {
+                    "active_slot_preset": "trading",
+                    "slot_presets": {"trading": {
+                        "name": "트레이딩", "rows": 2, "cols": 2,
+                        "slots": [{"macro": "대기", "mode": "deck_action", "action": {"kind": "wait", "ms": 350}}],
+                        "deck_page_count": 1, "deck_page_names": ["트레이딩"],
+                        "custom_icons": {"0": {"emoji": "L"}}, "style": {},
+                    }},
+                },
+            }
+            window.restore_deck_backup_payload(legacy)
+            restored = repository.load_hotkeys()
+            self.assertEqual(350, restored["slots"][0]["action"]["ms"])
+            self.assertEqual("트레이딩", restored["deck_page_names"][0])
+            window.close()
+
+    def test_deck_backup_embeds_referenced_macro_and_image_asset(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            source = MacroRepository(Path(source_dir))
+            source.save_hotkeys({"slots": [{
+                "macro": "매크로 실행", "mode": "deck_action",
+                "action": {"kind": "run_macro", "macro": "차트 클릭"},
+            }]})
+            image = source.assets_dir / "marker.png"
+            image.write_bytes(b"sample-image")
+            source._write_json(source.assets_index_path, {"marker": {"file": "assets/marker.png"}})
+            source.save_macro("차트 클릭", {"steps": [{"action": "image_search", "asset": "marker"}]})
+            source_window = QuickSlotDeckWindow(source)
+            backup = source_window.build_deck_backup_payload()
+            self.assertIn("차트 클릭", backup["macros"])
+            self.assertIn("marker", backup["assets"])
+
+            target = MacroRepository(Path(target_dir))
+            target_window = QuickSlotDeckWindow(target)
+            target_window.restore_deck_backup_payload(backup)
+            self.assertEqual("marker", target.load_macro("차트 클릭")["steps"][0]["asset"])
+            self.assertEqual(b"sample-image", (target.assets_dir / "marker.png").read_bytes())
+            self.assertEqual("차트 클릭", target.load_hotkeys()["slots"][0]["action"]["macro"])
+            source_window.close(); target_window.close()
+
     def test_deck_dock_image_drop_applies_full_tile_icon(self) -> None:
         from PySide6 import QtCore, QtGui
         from macro_studio.deck_dock import DeckDockWindow, DeckSlotButton

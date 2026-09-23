@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -593,12 +594,13 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         title = QtWidgets.QLabel("Deck Dock"); title.setObjectName("Title")
         self.preset_combo = QtWidgets.QComboBox(); self.preset_combo.setMinimumWidth(220); self.preset_combo.currentIndexChanged.connect(self._preset_changed)
         save = QtWidgets.QPushButton("저장 및 닫기"); save.clicked.connect(self._save_and_close)
+        bundled = QtWidgets.QPushButton("내장 구성 불러오기"); bundled.clicked.connect(self._load_bundled_backup)
         self.grid_rows_spin = QtWidgets.QSpinBox(); self.grid_rows_spin.setRange(1, 10); self.grid_rows_spin.setSuffix(" 행")
         self.grid_cols_spin = QtWidgets.QSpinBox(); self.grid_cols_spin.setRange(1, 10); self.grid_cols_spin.setSuffix(" 열")
         self.grid_apply_btn = QtWidgets.QPushButton("그리드 적용"); self.grid_apply_btn.clicked.connect(self._apply_grid_size)
         top.addWidget(title); top.addSpacing(16); top.addWidget(QtWidgets.QLabel("프리셋")); top.addWidget(self.preset_combo)
         top.addSpacing(14); top.addWidget(QtWidgets.QLabel("그리드")); top.addWidget(self.grid_rows_spin); top.addWidget(QtWidgets.QLabel("×")); top.addWidget(self.grid_cols_spin); top.addWidget(self.grid_apply_btn)
-        top.addStretch(1); top.addWidget(save)
+        top.addStretch(1); top.addWidget(bundled); top.addWidget(save)
         outer.addWidget(toolbar)
         body = QtWidgets.QHBoxLayout(); body.setSpacing(14); outer.addLayout(body, 1)
         center = QtWidgets.QFrame(); center.setObjectName("DeckCard")
@@ -647,6 +649,25 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         needle = text.strip().casefold()
         for button in self.action_buttons:
             button.setVisible(not needle or needle in button.kind.casefold() or needle in button.findChildren(QtWidgets.QLabel)[1].text().casefold())
+
+    def _load_bundled_backup(self) -> None:
+        from macro_studio.quickslot_deck import BUNDLED_DECK_BACKUP
+
+        if not BUNDLED_DECK_BACKUP.is_file():
+            QtWidgets.QMessageBox.warning(self, "내장 구성", "내장 Deck JSON 파일을 찾을 수 없습니다.")
+            return
+        answer = QtWidgets.QMessageBox.question(self, "내장 구성", "현재 Deck 구성을 GitHub 내장 구성으로 교체할까요?")
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            payload = json.loads(BUNDLED_DECK_BACKUP.read_text(encoding="utf-8"))
+            self.main_window.restore_deck_backup_payload(payload)
+            self.current_page = 0
+            self.selected_slots.clear()
+            self.reload()
+            QtWidgets.QMessageBox.information(self, "내장 구성", "페이지·슬롯 액션·아이콘을 모두 불러왔습니다.")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "내장 구성 오류", str(exc))
 
     def _page_size(self) -> int:
         return max(1, int(self.main_window.rows) * int(self.main_window.cols))

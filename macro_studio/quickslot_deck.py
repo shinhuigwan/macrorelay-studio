@@ -46,6 +46,10 @@ from macro_studio.repository import MacroRepository
 from macro_studio.theme import stylesheet
 
 
+DECK_BACKUP_VERSION = 2
+BUNDLED_DECK_BACKUP = Path(__file__).resolve().parent.parent / "deck_presets" / "macrorelay_bundled_deck.json"
+
+
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "MacroRelayQuickSlot"
 PRESET_ICON_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ico"}
@@ -2573,7 +2577,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         layout.setSpacing(12)
 
         info_label = QtWidgets.QLabel(
-            "💾 QuickSlot Deck의 모든 매크로 슬롯 설정과 내장 커스텀 아이콘(Base64) 데이터를 백업 파일(.json)로 내보내거나 복원할 수 있습니다."
+            "💾 페이지·프리셋·슬롯 액션·아이콘과 슬롯이 참조하는 매크로·이미지를 JSON으로 내보내거나 복원할 수 있습니다."
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet("color: #637187; font-size: 9.5pt;")
@@ -2587,12 +2591,19 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         btn_import.setStyleSheet("background: #EAFBF4; border: 1.5px solid #74C9A9; color: #176B50; font-weight: 700; padding: 10px; border-radius: 9px;")
         btn_import.clicked.connect(self._import_config)
 
+        btn_bundled = QtWidgets.QPushButton("📦 내장 Deck Dock 구성 불러오기")
+        btn_bundled.setStyleSheet("background: #F1ECFF; border: 1.5px solid #A78BFA; color: #5B21B6; font-weight: 700; padding: 10px; border-radius: 9px;")
+        btn_bundled.setEnabled(BUNDLED_DECK_BACKUP.is_file())
+        btn_bundled.setToolTip(str(BUNDLED_DECK_BACKUP))
+        btn_bundled.clicked.connect(self._import_bundled_config)
+
         btn_reset_all = QtWidgets.QPushButton("⚠️ 모든 슬롯 및 설정 초기화")
         btn_reset_all.setStyleSheet("background: #FFF1F2; border: 1.5px solid #FDA4AF; color: #BE123C; font-weight: 700; padding: 10px; border-radius: 9px;")
         btn_reset_all.clicked.connect(self._reset_all_config)
 
         layout.addWidget(btn_export)
         layout.addWidget(btn_import)
+        layout.addWidget(btn_bundled)
         layout.addWidget(btn_reset_all)
         layout.addStretch(1)
 
@@ -2685,10 +2696,9 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             self, "QuickSlot 덱 백업 내보내기", "quickslot_deck_backup.json", "JSON 파일 (*.json)"
         )
         if path:
-            self.main_window._save_config()
-            content = self.main_window.config_path.read_text(encoding="utf-8")
-            Path(path).write_text(content, encoding="utf-8")
-            QtWidgets.QMessageBox.information(self, "백업 완료", f"설정 및 백업 아이콘이 내보내졌습니다.\n{path}")
+            payload = self.main_window.build_deck_backup_payload()
+            Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            QtWidgets.QMessageBox.information(self, "백업 완료", f"페이지·슬롯 액션·대상·딜레이·아이콘·그리드·프리셋이 모두 내보내졌습니다.\n{path}")
 
     def _import_config(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -2697,15 +2707,25 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         if path:
             try:
                 data = json.loads(Path(path).read_text(encoding="utf-8"))
-                self.main_window.config_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-                self.main_window._load_config()
-                self.main_window._ensure_slot_presets()
-                self.main_window._refresh_preset_radial_menu()
-                self.main_window.refresh_slots()
-                QtWidgets.QMessageBox.information(self, "복원 완료", "성공적으로 설정을 복원했습니다!")
+                self.main_window.restore_deck_backup_payload(data)
+                QtWidgets.QMessageBox.information(self, "복원 완료", "페이지와 슬롯에 지정된 액션을 포함한 전체 Deck 구성을 복원했습니다!")
                 self.accept()
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "오류", f"백업 파일 로드 실패: {e}")
+
+    def _import_bundled_config(self) -> None:
+        answer = QtWidgets.QMessageBox.question(
+            self, "내장 Deck Dock 구성", "현재 Deck 구성을 내장 백업으로 교체할까요?"
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            data = json.loads(BUNDLED_DECK_BACKUP.read_text(encoding="utf-8"))
+            self.main_window.restore_deck_backup_payload(data)
+            QtWidgets.QMessageBox.information(self, "복원 완료", "GitHub에 포함된 내장 Deck Dock 구성을 불러왔습니다.")
+            self.accept()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "오류", f"내장 Deck 구성 로드 실패: {e}")
 
     def _reset_all_config(self) -> None:
         ans = QtWidgets.QMessageBox.warning(
@@ -2987,6 +3007,131 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             os.replace(temp_path, self.config_path)
         except Exception:
             pass
+
+    def build_deck_backup_payload(self) -> Dict[str, Any]:
+        """Return a portable backup containing both visuals and executable slots."""
+        self._capture_active_slot_preset()
+        self._save_config()
+        deck_config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        # The active preset already owns an identical icon set. Avoid storing
+        # large embedded images twice in one backup.
+        deck_config["custom_icons"] = {}
+        hotkeys = copy.deepcopy(self.repository.load_hotkeys())
+        macro_names: set[str] = set()
+        for slot_list in [hotkeys.get("slots") or []] + [
+            preset.get("slots") or []
+            for preset in self.config.get("slot_presets", {}).values()
+            if isinstance(preset, dict)
+        ]:
+            for slot in slot_list:
+                if not isinstance(slot, dict):
+                    continue
+                action = slot.get("action") or {}
+                if isinstance(action, dict):
+                    if action.get("kind") == "run_macro" and action.get("macro"):
+                        macro_names.add(str(action["macro"]))
+                    elif action.get("kind") == "multi_macros":
+                        macro_names.update(str(name) for name in action.get("macros") or [] if name)
+                if slot.get("macro") and slot.get("mode") != "deck_action":
+                    macro_names.add(str(slot["macro"]))
+        macros: Dict[str, Any] = {}
+        assets: Dict[str, Any] = {}
+        asset_index = self.repository.load_assets()
+        for name in sorted(macro_names):
+            path = self.repository.macro_path(name)
+            if not path.is_file():
+                continue
+            macro = json.loads(path.read_text(encoding="utf-8"))
+            macros[name] = macro
+            for step in macro.get("steps") or []:
+                if not isinstance(step, dict):
+                    continue
+                aliases = [step.get("asset")]
+                aliases.extend(step.get("assets") or [] if isinstance(step.get("assets"), list) else [])
+                for alias in aliases:
+                    if not isinstance(alias, str) or not alias or alias in assets:
+                        continue
+                    path = self.repository.asset_path(alias, asset_index)
+                    if path is not None and path.is_file():
+                        assets[alias] = {
+                            "file": path.name,
+                            "image_data": base64.b64encode(path.read_bytes()).decode("ascii"),
+                        }
+        return {
+            "format": "macrorelay-deck-backup",
+            "version": DECK_BACKUP_VERSION,
+            "deck_config": deck_config,
+            "hotkeys": hotkeys,
+            "macros": macros,
+            "assets": assets,
+        }
+
+    @staticmethod
+    def _legacy_backup_hotkeys(deck_config: Dict[str, Any]) -> Dict[str, Any]:
+        config = dict(deck_config.get("config") or {})
+        presets = dict(config.get("slot_presets") or {})
+        active_id = str(config.get("active_slot_preset") or "")
+        preset = dict(presets.get(active_id) or {})
+        if not preset:
+            return {}
+        return {
+            "slots": copy.deepcopy(list(preset.get("slots") or [])),
+            "deck_page_count": max(1, int(preset.get("deck_page_count") or 1)),
+            "deck_page_names": copy.deepcopy(list(preset.get("deck_page_names") or [])),
+        }
+
+    def restore_deck_backup_payload(self, payload: Dict[str, Any]) -> None:
+        """Restore new full backups and migrate config-only legacy exports."""
+        if not isinstance(payload, dict):
+            raise ValueError("올바른 Deck 백업 JSON이 아닙니다.")
+        is_full = payload.get("format") == "macrorelay-deck-backup"
+        deck_config = copy.deepcopy(payload.get("deck_config") if is_full else payload)
+        if not isinstance(deck_config, dict):
+            raise ValueError("Deck 설정 데이터가 없습니다.")
+        hotkeys = copy.deepcopy(payload.get("hotkeys") if is_full else self._legacy_backup_hotkeys(deck_config))
+        if not isinstance(hotkeys, dict) or not isinstance(hotkeys.get("slots"), list):
+            raise ValueError("백업에 슬롯 구성 데이터가 없습니다.")
+
+        macros = payload.get("macros") or {}
+        assets = payload.get("assets") or {}
+        if not isinstance(macros, dict) or not isinstance(assets, dict):
+            raise ValueError("매크로 또는 이미지 자산 형식이 올바르지 않습니다.")
+        for name, macro in macros.items():
+            if not isinstance(name, str) or not isinstance(macro, dict):
+                raise ValueError("매크로 백업 형식이 올바르지 않습니다.")
+            self.repository.save_macro(name, macro)
+        if assets:
+            asset_index = self.repository.load_assets()
+            for alias, asset in assets.items():
+                if not isinstance(alias, str) or not isinstance(asset, dict):
+                    raise ValueError("이미지 자산 형식이 올바르지 않습니다.")
+                filename = Path(str(asset.get("file") or "")).name
+                if not filename or filename != str(asset.get("file") or ""):
+                    raise ValueError("이미지 자산 파일명이 올바르지 않습니다.")
+                image_bytes = base64.b64decode(str(asset.get("image_data") or ""), validate=True)
+                if not image_bytes:
+                    raise ValueError("이미지 자산 데이터가 비어 있습니다.")
+                target = self.repository.assets_dir / filename
+                target.write_bytes(image_bytes)
+                asset_index[alias] = {"file": str(target.relative_to(self.repository.root)).replace("\\", "/"), "source": "deck-backup", "size": len(image_bytes)}
+            self.repository._write_json(self.repository.assets_index_path, asset_index)
+
+        temp_path = self.config_path.with_suffix(self.config_path.suffix + ".import.tmp")
+        temp_path.write_text(json.dumps(deck_config, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp_path, self.config_path)
+        self._load_config()
+        self._ensure_slot_presets()
+        active_id = str(self.config.get("active_slot_preset") or "")
+        active = dict(self.config.get("slot_presets", {}).get(active_id) or {})
+        if not self.custom_icons and active.get("custom_icons"):
+            self.custom_icons = copy.deepcopy(dict(active["custom_icons"]))
+        self._save_preset_hotkeys(hotkeys)
+        self.current_page = 0
+        self._refresh_preset_radial_menu()
+        self.radial_menu.load_custom_items(self.config.get("radial_items"))
+        self._apply_theme()
+        self.refresh_slots()
+        self._save_config()
 
     def _build_slot_preset(self, name: str) -> Dict[str, Any]:
         hotkeys = self.repository.load_hotkeys()

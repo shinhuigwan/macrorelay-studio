@@ -2824,6 +2824,53 @@ class RadialMenuIconButton(QtWidgets.QPushButton):
             self.setText("🎯")
 
 
+class DeckResizeGrip(QtWidgets.QWidget):
+    """Visible corner handle using the deck's square-tile resize behavior."""
+
+    def __init__(self, deck: "QuickSlotDeckWindow") -> None:
+        super().__init__(deck)
+        self.deck = deck
+        self.setFixedSize(24, 24)
+        self.setCursor(QtCore.Qt.SizeFDiagCursor)
+        self.setAttribute(QtCore.Qt.WA_Hover, True)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(10, 17, 29, 190))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 7, 7)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#8EF0DA"), 2, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        for offset in (0, 5, 10):
+            painter.drawLine(8 + offset, 19, 19, 8 + offset)
+        painter.end()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            self.deck._resize_edge = "bottom_right"
+            self.deck._resize_start_geom = self.deck.geometry()
+            self.deck._resize_start_pos = event.globalPosition().toPoint()
+            self.deck._cancel_mouse_hold_check()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.buttons() & QtCore.Qt.LeftButton and getattr(self.deck, "_resize_edge", "") == "bottom_right":
+            self.deck._handle_border_resize(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton and getattr(self.deck, "_resize_edge", "") == "bottom_right":
+            self.deck._resize_edge = ""
+            self.deck._save_config()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class QuickSlotDeckWindow(QtWidgets.QMainWindow):
     """Stream Deck Style Standalone QuickSlot Window with full fill and text position controls."""
 
@@ -3236,6 +3283,18 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.grid_layout.setSpacing(10)
 
         main_layout.addWidget(self.swipe_container, 1)
+        self.resize_grip = DeckResizeGrip(self)
+        self.resize_grip.setToolTip("드래그하여 덱 크기 조절")
+        self.resize_grip.move(self.width() - self.resize_grip.width(), self.height() - self.resize_grip.height())
+        self.resize_grip.show()
+        self.resize_grip.raise_()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        grip = getattr(self, "resize_grip", None)
+        if grip is not None:
+            grip.move(self.width() - grip.width(), self.height() - grip.height())
+            grip.raise_()
 
     def _apply_theme(self) -> None:
         theme_idx = int(self.config.get("theme_index", 0))

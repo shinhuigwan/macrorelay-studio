@@ -143,6 +143,30 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertGreaterEqual(cell_width, 48)
             window.close()
 
+    def test_deck_shows_bottom_right_resize_grip(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            window.show()
+            self.app.processEvents()
+            grip = window.resize_grip
+            self.assertTrue(grip.isVisible())
+            self.assertEqual(window.width() - grip.width(), grip.x())
+            self.assertEqual(window.height() - grip.height(), grip.y())
+
+            QtTest.QTest.mousePress(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertEqual("bottom_right", window._resize_edge)
+            old_width = window.width()
+            window._handle_border_resize(window._resize_start_pos + QtCore.QPoint(40, 40))
+            self.assertGreater(window.width(), old_width)
+            self.assertEqual(window.width() - grip.width(), grip.x())
+            QtTest.QTest.mouseRelease(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertEqual("", window._resize_edge)
+            window.close()
+
     def test_icon_refresh_preserves_manually_selected_window_size(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository

@@ -131,11 +131,14 @@ class DeckSlotButton(QtWidgets.QFrame):
     edit_requested = QtCore.Signal(int)
     clear_requested = QtCore.Signal(int)
     duplicate_requested = QtCore.Signal(int)
+    selection_requested = QtCore.Signal(int)
 
-    def __init__(self, slot_index: int, slot: Dict[str, Any], icon_config: Optional[Dict[str, Any]] = None, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(self, slot_index: int, slot: Dict[str, Any], icon_config: Optional[Dict[str, Any]] = None, parent: Optional[QtWidgets.QWidget] = None, *, selection_mode: bool = False, selected: bool = False):
         super().__init__(parent)
         self.slot_index = slot_index
         self.slot = copy.deepcopy(slot)
+        self.selection_mode = selection_mode
+        self.selected = selected
         self._press_pos: Optional[QtCore.QPoint] = None
         self.setAcceptDrops(True)
         self.setMinimumSize(92, 82)
@@ -168,6 +171,13 @@ class DeckSlotButton(QtWidgets.QFrame):
         layout.addWidget(title)
         if not macro:
             self.setStyleSheet("QFrame { background:#202329; border:1px dashed #555B66; border-radius:9px; } QFrame:hover { border:2px solid #18DDC0; }")
+        if selected:
+            self.setStyleSheet("QFrame { background:#173B38; border:3px solid #18DDC0; border-radius:9px; }")
+            badge = QtWidgets.QLabel("✓", self)
+            badge.setAlignment(QtCore.Qt.AlignCenter)
+            badge.setFixedSize(22, 22)
+            badge.move(5, 5)
+            badge.setStyleSheet("background:#18DDC0;color:#07110F;border:none;border-radius:11px;font-weight:900;")
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
@@ -175,6 +185,8 @@ class DeckSlotButton(QtWidgets.QFrame):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self.selection_mode:
+            return
         if self._press_pos is not None and event.buttons() & QtCore.Qt.LeftButton:
             if (event.pos() - self._press_pos).manhattanLength() >= QtWidgets.QApplication.startDragDistance():
                 drag = QtGui.QDrag(self)
@@ -188,7 +200,10 @@ class DeckSlotButton(QtWidgets.QFrame):
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton and self._press_pos is not None:
-            self.edit_requested.emit(self.slot_index)
+            if self.selection_mode:
+                self.selection_requested.emit(self.slot_index)
+            else:
+                self.edit_requested.emit(self.slot_index)
         self._press_pos = None
         super().mouseReleaseEvent(event)
 
@@ -486,6 +501,71 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         return result
 
 
+class DeckBulkEditDialog(QtWidgets.QDialog):
+    """Edits only explicitly enabled fields across actions of one kind."""
+
+    FIELD_SPECS = {
+        "text": [("text", "입력할 텍스트", "text"), ("text_method", "입력 엔진", "text_method"), ("key_interval_ms", "글자 입력 간격", "ms"), ("press_enter", "입력 후 Enter", "bool"), ("input_mode", "실행 방식", "input_mode")],
+        "wait": [("ms", "대기 시간", "ms")],
+        "multi_macros": [("delay_ms", "작업 간격", "ms"), ("continue_on_error", "실패해도 계속", "bool")],
+        "mouse_click": [("button", "마우스 버튼", "button"), ("clicks", "클릭 횟수", "clicks"), ("input_mode", "실행 방식", "input_mode")],
+        "hotkey": [("keys", "키 조합", "line"), ("input_mode", "실행 방식", "input_mode")],
+        "open_target": [("target", "실행 대상", "line")],
+        "terminate_program": [("process", "프로세스 이름", "line")],
+        "page_goto": [("page", "이동할 페이지", "page")],
+    }
+
+    def __init__(self, kind: str, sample: Dict[str, Any], count: int, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.kind = kind
+        self.controls: Dict[str, tuple[QtWidgets.QCheckBox, QtWidgets.QWidget]] = {}
+        self.setWindowTitle(f"{count}개 슬롯 일괄 편집")
+        self.setMinimumWidth(520)
+        self.setStyleSheet(deck_dock_stylesheet())
+        root = QtWidgets.QVBoxLayout(self)
+        hint = QtWidgets.QLabel("체크한 항목만 선택한 모든 슬롯에 적용됩니다.")
+        hint.setObjectName("Hint"); root.addWidget(hint)
+        form = QtWidgets.QFormLayout(); form.setSpacing(10)
+        specs = [("label", "슬롯 이름", "line")] + self.FIELD_SPECS.get(kind, [])
+        for key, title, widget_kind in specs:
+            enabled = QtWidgets.QCheckBox(title)
+            widget = self._make_widget(widget_kind, sample.get(key))
+            widget.setEnabled(False); enabled.toggled.connect(widget.setEnabled)
+            form.addRow(enabled, widget); self.controls[key] = (enabled, widget)
+        root.addLayout(form)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Apply | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); root.addWidget(buttons)
+
+    def _make_widget(self, kind: str, value: Any) -> QtWidgets.QWidget:
+        if kind == "text":
+            widget = QtWidgets.QPlainTextEdit(str(value or "")); widget.setMaximumHeight(110); return widget
+        if kind in {"ms", "clicks", "page"}:
+            widget = QtWidgets.QSpinBox(); widget.setRange(0 if kind == "ms" else 1, 600000 if kind == "ms" else 99); widget.setValue(int(value or (1 if kind != "ms" else 0))); return widget
+        if kind == "bool":
+            widget = QtWidgets.QCheckBox("사용"); widget.setChecked(bool(value)); return widget
+        if kind in {"text_method", "input_mode", "button"}:
+            widget = QtWidgets.QComboBox()
+            choices = {
+                "text_method": [("자동", "auto"), ("클립보드", "clipboard"), ("글자별 입력", "type"), ("WM_CHAR", "wm_char"), ("WM_SETTEXT", "set_text")],
+                "input_mode": [("비활성", "inactive"), ("활성", "active")],
+                "button": [("좌클릭", "left"), ("우클릭", "right"), ("가운데 클릭", "middle")],
+            }[kind]
+            for label, data in choices: widget.addItem(label, data)
+            widget.setCurrentIndex(max(0, widget.findData(str(value or choices[0][1])))); return widget
+        return QtWidgets.QLineEdit(str(value or ""))
+
+    def patch(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, (enabled, widget) in self.controls.items():
+            if not enabled.isChecked(): continue
+            if isinstance(widget, QtWidgets.QPlainTextEdit): result[key] = widget.toPlainText()
+            elif isinstance(widget, QtWidgets.QLineEdit): result[key] = widget.text()
+            elif isinstance(widget, QtWidgets.QSpinBox): result[key] = widget.value()
+            elif isinstance(widget, QtWidgets.QCheckBox): result[key] = widget.isChecked()
+            elif isinstance(widget, QtWidgets.QComboBox): result[key] = widget.currentData()
+        return result
+
+
 class DeckDockWindow(QtWidgets.QMainWindow):
     """Visual standalone editor kept in sync with a QuickSlotDeckWindow."""
 
@@ -495,6 +575,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.repository = main_window.repository
         self.current_page = int(main_window.current_page)
         self._saving = False
+        self.selected_slots: set[int] = set()
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setWindowTitle("MacroRelay · Deck Dock")
         self.setWindowIcon(main_window.windowIcon())
@@ -527,6 +608,19 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.rename_page_btn = QtWidgets.QPushButton("이름 변경"); self.rename_page_btn.clicked.connect(self.rename_page)
         page_header.addWidget(self.deck_title); page_header.addWidget(self.rename_page_btn); page_header.addStretch(1)
         center_layout.addLayout(page_header)
+        selection_bar = QtWidgets.QHBoxLayout()
+        self.selection_toggle = QtWidgets.QPushButton("다중 선택")
+        self.selection_toggle.setCheckable(True); self.selection_toggle.toggled.connect(self._selection_mode_changed)
+        self.selection_label = QtWidgets.QLabel("선택 0개")
+        self.select_page_btn = QtWidgets.QPushButton("현재 페이지 전체 선택"); self.select_page_btn.clicked.connect(self._select_current_page)
+        self.target_page_combo = QtWidgets.QComboBox(); self.target_page_combo.setMinimumWidth(120)
+        self.move_selected_btn = QtWidgets.QPushButton("선택 이동"); self.move_selected_btn.clicked.connect(self._move_selected_to_target_page)
+        self.bulk_edit_btn = QtWidgets.QPushButton("일괄 편집"); self.bulk_edit_btn.clicked.connect(self._bulk_edit_selected)
+        self.clear_selection_btn = QtWidgets.QPushButton("선택 해제"); self.clear_selection_btn.clicked.connect(self._clear_selection)
+        selection_bar.addWidget(self.selection_toggle); selection_bar.addWidget(self.selection_label); selection_bar.addWidget(self.select_page_btn)
+        selection_bar.addStretch(1); selection_bar.addWidget(QtWidgets.QLabel("이동할 페이지")); selection_bar.addWidget(self.target_page_combo)
+        selection_bar.addWidget(self.move_selected_btn); selection_bar.addWidget(self.bulk_edit_btn); selection_bar.addWidget(self.clear_selection_btn)
+        center_layout.addLayout(selection_bar)
         self.grid_host = QtWidgets.QWidget(); self.grid = QtWidgets.QGridLayout(self.grid_host); self.grid.setSpacing(9)
         center_layout.addWidget(self.grid_host, 1)
         pager = QtWidgets.QGridLayout(); self.prev_btn = QtWidgets.QPushButton("◀"); self.next_btn = QtWidgets.QPushButton("▶"); self.add_page_btn = QtWidgets.QPushButton("＋ 페이지"); self.delete_page_btn = QtWidgets.QPushButton("－ 페이지")
@@ -574,6 +668,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
 
     def reload(self) -> None:
         self._ensure_payload()
+        self.selected_slots.intersection_update(range(len(self.payload["slots"])))
         with QtCore.QSignalBlocker(self.grid_rows_spin), QtCore.QSignalBlocker(self.grid_cols_spin):
             self.grid_rows_spin.setValue(max(1, min(10, int(self.main_window.rows))))
             self.grid_cols_spin.setValue(max(1, min(10, int(self.main_window.cols))))
@@ -593,14 +688,94 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         rows, cols = int(self.main_window.rows), int(self.main_window.cols)
         for local in range(page_size):
             index = start + local; slot = self.payload["slots"][index]
-            button = DeckSlotButton(index, slot, self.main_window.custom_icons.get(str(index), {}), self.grid_host)
+            button = DeckSlotButton(index, slot, self.main_window.custom_icons.get(str(index), {}), self.grid_host, selection_mode=self.selection_toggle.isChecked(), selected=index in self.selected_slots)
             button.setMinimumSize(max(48, min(92, 760 // max(1, cols))), max(44, min(82, 500 // max(1, rows))))
-            button.action_dropped.connect(self._configure_new_action); button.slot_dropped.connect(self._move_slot); button.image_dropped.connect(self._apply_dropped_icon); button.edit_requested.connect(self._edit_slot); button.clear_requested.connect(self._clear_slot); button.duplicate_requested.connect(self._duplicate_slot)
+            button.action_dropped.connect(self._configure_new_action); button.slot_dropped.connect(self._move_slot); button.image_dropped.connect(self._apply_dropped_icon); button.edit_requested.connect(self._edit_slot); button.clear_requested.connect(self._clear_slot); button.duplicate_requested.connect(self._duplicate_slot); button.selection_requested.connect(self._toggle_slot_selection)
             self.grid.addWidget(button, local // cols, local % cols)
         page_name = self.payload["deck_page_names"][self.current_page]
         self.deck_title.setText(page_name)
         self.page_label.setText(f"{self.current_page + 1} / {self.page_count}")
         self.prev_btn.setEnabled(self.current_page > 0); self.next_btn.setEnabled(self.current_page + 1 < self.page_count); self.delete_page_btn.setEnabled(self.page_count > 1)
+        with QtCore.QSignalBlocker(self.target_page_combo):
+            current_target = self.target_page_combo.currentData()
+            self.target_page_combo.clear()
+            for page, name in enumerate(self.payload["deck_page_names"]): self.target_page_combo.addItem(f"{page + 1}. {name}", page)
+            target_index = self.target_page_combo.findData(current_target)
+            self.target_page_combo.setCurrentIndex(target_index if target_index >= 0 else min(self.current_page, self.page_count - 1))
+        self._update_selection_controls()
+
+    def _selection_mode_changed(self, enabled: bool) -> None:
+        if not enabled: self.selected_slots.clear()
+        self._render_page()
+
+    def _toggle_slot_selection(self, index: int) -> None:
+        if index in self.selected_slots: self.selected_slots.remove(index)
+        else: self.selected_slots.add(index)
+        self._render_page()
+
+    def _select_current_page(self) -> None:
+        self.selection_toggle.setChecked(True)
+        start = self.current_page * self._page_size()
+        self.selected_slots.update(
+            index for index in range(start, start + self._page_size())
+            if self._is_filled_slot(self.payload["slots"][index])
+        )
+        self._render_page()
+
+    def _clear_selection(self) -> None:
+        self.selected_slots.clear(); self._render_page()
+
+    def _update_selection_controls(self) -> None:
+        count = len(self.selected_slots); self.selection_label.setText(f"선택 {count}개")
+        self.move_selected_btn.setEnabled(count > 0); self.bulk_edit_btn.setEnabled(count > 0); self.clear_selection_btn.setEnabled(count > 0)
+
+    @staticmethod
+    def _is_filled_slot(slot: Dict[str, Any]) -> bool:
+        return bool(str(slot.get("macro") or "").strip() or slot.get("action"))
+
+    def _move_selected_slots(self, target_page: int) -> tuple[bool, str]:
+        sources = [index for index in sorted(self.selected_slots) if self._is_filled_slot(self.payload["slots"][index])]
+        if not sources: return False, "선택한 슬롯 중 이동할 항목이 없습니다."
+        size = self._page_size(); start = target_page * size; end = start + size
+        source_set = set(sources)
+        targets = [index for index in range(start, end) if index in source_set or not self._is_filled_slot(self.payload["slots"][index])]
+        if len(targets) < len(sources): return False, f"대상 페이지에 빈 슬롯이 {len(sources)}개 필요합니다."
+        snapshots = [(copy.deepcopy(self.payload["slots"][index]), copy.deepcopy(self.main_window.custom_icons.get(str(index)))) for index in sources]
+        for index in sources:
+            self.payload["slots"][index] = {"macro": "", "hotkey": "", "mode": "hybrid"}; self.main_window.custom_icons.pop(str(index), None)
+        for target, (slot, icon) in zip(targets, snapshots):
+            self.payload["slots"][target] = slot
+            if icon is not None: self.main_window.custom_icons[str(target)] = icon
+        self.selected_slots = set(targets[:len(sources)]); self.current_page = target_page
+        return True, ""
+
+    def _move_selected_to_target_page(self) -> None:
+        target = int(self.target_page_combo.currentData())
+        moved, message = self._move_selected_slots(target)
+        if not moved: QtWidgets.QMessageBox.information(self, "선택 이동", message); return
+        self.save()
+
+    def _apply_bulk_patch(self, indexes: list[int], patch: Dict[str, Any]) -> int:
+        changed = 0
+        for index in indexes:
+            slot = self.payload["slots"][index]; action = copy.deepcopy(slot.get("action") or {})
+            if not action: continue
+            action.update(copy.deepcopy(patch)); self.payload["slots"][index] = self._slot_from_action(action); changed += 1
+        return changed
+
+    def _bulk_edit_selected(self) -> None:
+        indexes = [index for index in sorted(self.selected_slots) if self.payload["slots"][index].get("action")]
+        if not indexes:
+            QtWidgets.QMessageBox.information(self, "일괄 편집", "Deck 액션이 설정된 슬롯을 선택해 주세요."); return
+        kinds = {str(self.payload["slots"][index]["action"].get("kind") or "") for index in indexes}
+        if len(kinds) != 1:
+            QtWidgets.QMessageBox.information(self, "일괄 편집", "같은 종류의 액션 슬롯만 함께 편집할 수 있습니다."); return
+        kind = next(iter(kinds)); sample = dict(self.payload["slots"][indexes[0]]["action"])
+        dialog = DeckBulkEditDialog(kind, sample, len(indexes), self)
+        if dialog.exec() != QtWidgets.QDialog.Accepted: return
+        patch = dialog.patch()
+        if not patch: return
+        self._apply_bulk_patch(indexes, patch); self.save()
 
     def _apply_grid_size(self) -> None:
         new_rows, new_cols = self.grid_rows_spin.value(), self.grid_cols_spin.value()

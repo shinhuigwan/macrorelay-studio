@@ -325,6 +325,57 @@ class QuickSlotDeckTests(unittest.TestCase):
             dock.close()
             window.close()
 
+    def test_deck_dock_moves_multiple_selected_slots_between_pages(self) -> None:
+        from macro_studio.deck_dock import DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dock = DeckDockWindow(window)
+            dock.add_page()
+            size = dock._page_size()
+            first = dock._slot_from_action({"kind": "text", "text": "A"})
+            second = dock._slot_from_action({"kind": "text", "text": "B"})
+            dock.payload["slots"][size] = first
+            dock.payload["slots"][size + 2] = second
+            window.custom_icons[str(size)] = {"emoji": "A"}
+            dock.selected_slots = {size, size + 2}
+
+            moved, message = dock._move_selected_slots(0)
+
+            self.assertTrue(moved, message)
+            self.assertEqual(["A", "B"], [dock.payload["slots"][i]["action"]["text"] for i in (0, 1)])
+            self.assertFalse(dock._is_filled_slot(dock.payload["slots"][size]))
+            self.assertEqual({0, 1}, dock.selected_slots)
+            self.assertEqual("A", window.custom_icons["0"]["emoji"])
+            dock.close(); window.close()
+
+    def test_deck_dock_bulk_patch_changes_only_requested_fields(self) -> None:
+        from macro_studio.deck_dock import DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dock = DeckDockWindow(window)
+            for index, text in enumerate(("old-a", "old-b")):
+                dock.payload["slots"][index] = dock._slot_from_action({
+                    "kind": "text", "text": text, "key_interval_ms": 5,
+                    "press_enter": False, "target_exe": "whale.exe",
+                })
+
+            changed = dock._apply_bulk_patch([0, 1], {"text": "same", "key_interval_ms": 40, "press_enter": True})
+
+            self.assertEqual(2, changed)
+            for index in (0, 1):
+                action = dock.payload["slots"][index]["action"]
+                self.assertEqual("same", action["text"])
+                self.assertEqual(40, action["key_interval_ms"])
+                self.assertTrue(action["press_enter"])
+                self.assertEqual("whale.exe", action["target_exe"])
+            dock.close(); window.close()
+
     def test_deck_dock_image_drop_applies_full_tile_icon(self) -> None:
         from PySide6 import QtCore, QtGui
         from macro_studio.deck_dock import DeckDockWindow, DeckSlotButton

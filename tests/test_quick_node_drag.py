@@ -445,6 +445,22 @@ class QuickNodeDragTests(unittest.TestCase):
             editor.close()
         app.processEvents()
 
+    def test_inactive_image_click_uses_short_pulse_and_clears_drag_state(self) -> None:
+        from macro_tool import render_inactive_click_from_hit
+
+        script = "\n".join(render_inactive_click_from_hit({
+            "mode": "inactive",
+            "method": "auto",
+            "window_exe": "whale.exe",
+            "button": "left",
+            "count": 1,
+        }))
+        down = script.index("PostMessage, %DownMessage%")
+        release = script.index("PostMessage, %UpMessage%")
+        cleanup = script.index("PostMessage, 0x200, 0, %lParam%", release)
+        self.assertIn("Sleep, 8", script[down:release])
+        self.assertGreater(cleanup, release)
+
 
 if __name__ == "__main__":
     unittest.main()

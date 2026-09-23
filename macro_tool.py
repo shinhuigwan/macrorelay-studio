@@ -4377,6 +4377,11 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     retry_count = int(click_info.get("retry_count", 2) or 2)
     retry_delay = int(click_info.get("retry_delay", 100) or 100)
     retry_post = bool(click_info.get("retry_post", False))
+    # Browser canvases such as TradingView can interpret a long synthetic
+    # button-down pulse as the beginning of a drag.  Keep the pulse short and
+    # explicitly finish with an unpressed mouse-move so the renderer cannot
+    # retain a stale drag state.
+    click_hold_ms = max(1, min(30, int(click_info.get("click_hold_ms", 8) or 8)))
     show_cursor = bool(click_info.get("show_cursor", True))
     offsets = click_info.get("offset", [0, 0])
     offset_x, offset_y = (offsets + [0, 0])[:2]
@@ -4525,8 +4530,9 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     lines.append("        if (!DirectPost)")
     lines.append("            Sleep, 10")
     lines.append("        PostMessage, %DownMessage%, %DownWParam%, %lParam%, , ahk_id %ClickHwnd%")
-    lines.append("        Sleep, 50")
+    lines.append(f"        Sleep, {click_hold_ms}")
     lines.append("        PostMessage, %UpMessage%, 0, %lParam%, , ahk_id %ClickHwnd%")
+    lines.append("        PostMessage, 0x200, 0, %lParam%, , ahk_id %ClickHwnd%")
     lines.append("        if (DirectPost)")
     lines.append('            Log("inactive click direct post: mousemove/down/up sent")')
     lines.append("        ClickOk := 1")

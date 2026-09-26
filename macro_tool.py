@@ -8,6 +8,7 @@ import ast
 import copy
 import hashlib
 import json
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -278,6 +279,16 @@ def debug_variable_names(steps: Iterable[Dict[str, Any]]) -> List[str]:
         candidates: List[Any] = [step.get("repeat_var")]
         if action in {"set_var", "calc_var"}:
             candidates.append(step.get("name") or step.get("var"))
+        if action == "set_var" and step.get("value_source") == "variable":
+            candidates.append(step.get("source_var"))
+        if action == "calc_var" and step.get("operand_source") == "variable":
+            candidates.append(step.get("operand"))
+        if action == "text_condition" and step.get("source") == "variable":
+            candidates.append(step.get("variable"))
+        if action == "inactive_click" and step.get("coordinate_source") == "saved_variables":
+            candidates.extend((step.get("x_var"), step.get("y_var")))
+        if action == "type_text" and step.get("text_source") == "variable":
+            candidates.append(step.get("text_variable"))
         if action == "vault_get":
             candidates.append(step.get("name") or step.get("var"))
         if action == "ocr":
@@ -520,9 +531,15 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "    }",
         "}",
         "EnsureTargetWindow(ByRef out_hwnd, win_title := \"\", win_exe := \"\", timeout_sec := 2) {",
+        "    if (out_hwnd && !DllCall(\"IsWindow\", \"ptr\", out_hwnd))",
+        "        out_hwnd := 0",
         "    if (out_hwnd && DllCall(\"IsWindow\", \"ptr\", out_hwnd)) {",
         "        WinGetClass, cur_cls, ahk_id %out_hwnd%",
-        "        if (cur_cls != \"tooltips_class32\" && cur_cls != \"IME\")",
+        "        WinGet, cur_exe, ProcessName, ahk_id %out_hwnd%",
+        "        VarSetCapacity(__cur_rc, 16, 0)",
+        "        DllCall(\"GetClientRect\", \"ptr\", out_hwnd, \"ptr\", &__cur_rc)",
+        "        __cur_area := NumGet(__cur_rc, 8, \"int\") * NumGet(__cur_rc, 12, \"int\")",
+        "        if (cur_cls != \"tooltips_class32\" && cur_cls != \"IME\" && __cur_area > 0 && (win_exe = \"\" || cur_exe = win_exe))",
         "            return out_hwnd",
         "        out_hwnd := 0",
         "    }",
@@ -535,6 +552,11 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "        }",
         "        if (!out_hwnd && win_title != \"\")",
         "            out_hwnd := WinExist(win_title)",
+        "        if (out_hwnd && win_exe != \"\") {",
+        "            WinGet, found_exe, ProcessName, ahk_id %out_hwnd%",
+        "            if (found_exe != win_exe)",
+        "                out_hwnd := 0",
+        "        }",
         "        if (!out_hwnd && win_exe != \"\")",
         "            out_hwnd := WinExist(\"ahk_exe \" . win_exe)",
         "        if (out_hwnd && DllCall(\"IsWindow\", \"ptr\", out_hwnd)) {",
@@ -543,7 +565,7 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "            DllCall(\"GetClientRect\", \"ptr\", out_hwnd, \"ptr\", &__chk_rc)",
         "            __chk_area := NumGet(__chk_rc, 8, \"int\") * NumGet(__chk_rc, 12, \"int\")",
         "            if (check_cls = \"tooltips_class32\" or check_cls = \"IME\" or __chk_area < 10000) {",
-        "                cand_spec := win_title != \"\" ? win_title : (\"ahk_exe \" . (win_exe != \"\" ? win_exe : \"dnplayer.exe\"))",
+        "                cand_spec := win_exe != \"\" ? (\"ahk_exe \" . win_exe) : win_title",
         "                WinGet, cand_list, List, %cand_spec%",
         "                best_cand := 0",
         "                max_cand_area := 0",
@@ -555,16 +577,19 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "                    VarSetCapacity(__cand_rc, 16, 0)",
         "                    DllCall(\"GetClientRect\", \"ptr\", cand_id, \"ptr\", &__cand_rc)",
         "                    c_area := NumGet(__cand_rc, 8, \"int\") * NumGet(__cand_rc, 12, \"int\")",
-        "                    if (c_area > max_cand_area) {",
+        "                    if (cand_cls != \"tooltips_class32\" && cand_cls != \"IME\" && c_area > max_cand_area) {",
         "                        max_cand_area := c_area",
         "                        best_cand := cand_id",
         "                    }",
         "                }",
         "                if (best_cand)",
         "                    out_hwnd := best_cand",
+        "                else if (__chk_area <= 0)",
+        "                    out_hwnd := 0",
         "            }",
-        "            WinGetClass, final_cls, ahk_id %out_hwnd%",
-        "            if (final_cls != \"tooltips_class32\" && final_cls != \"IME\") {",
+        "            if (out_hwnd)",
+        "                WinGetClass, final_cls, ahk_id %out_hwnd%",
+        "            if (out_hwnd && final_cls != \"tooltips_class32\" && final_cls != \"IME\") {",
         "                Log(\"window auto-reconnect: HWND \" . out_hwnd . \" (\" . win_title . \" / \" . win_exe . \")\")",
         "                return out_hwnd",
         "            }",
@@ -574,6 +599,49 @@ def build_macro_header(macro: Dict[str, Any]) -> List[str]:
         "        Sleep, 200",
         "    }",
         "    return out_hwnd",
+        "}",
+        "ResolveBrowserClickWindow(hwnd, win_exe, ref_x := \"\", ref_y := \"\", coord_scope := \"client\") {",
+        "    if (win_exe != \"whale.exe\" && win_exe != \"chrome.exe\" && win_exe != \"msedge.exe\")",
+        "        return hwnd",
+        "    candidate_spec := \"ahk_class Chrome_WidgetWin_1 ahk_exe \" . win_exe",
+        "    WinGet, browser_candidates, List, %candidate_spec%",
+        "    best_hwnd := 0",
+        "    best_score := -1",
+        "    Loop, %browser_candidates% {",
+        "        candidate := browser_candidates%A_Index%",
+        "        if (!DllCall(\"IsWindowVisible\", \"ptr\", candidate) || DllCall(\"IsIconic\", \"ptr\", candidate))",
+        "            continue",
+        "        VarSetCapacity(client_rect, 16, 0)",
+        "        if (!DllCall(\"GetClientRect\", \"ptr\", candidate, \"ptr\", &client_rect))",
+        "            continue",
+        "        client_w := NumGet(client_rect, 8, \"Int\")",
+        "        client_h := NumGet(client_rect, 12, \"Int\")",
+        "        if (client_w < 30 || client_h < 30)",
+        "            continue",
+        "        score := Min(100, Floor(client_w * client_h / 100000))",
+        "        WinGetTitle, candidate_title, ahk_id %candidate%",
+        "        if (candidate_title != \"\")",
+        "            score += 100",
+        "        if (candidate = hwnd)",
+        "            score += 50",
+        "        if (WinActive(\"ahk_id \" . candidate))",
+        "            score += 20",
+        "        if (ref_x != \"\" && ref_y != \"\" && (coord_scope = \"screen\" || ref_x < 0 || ref_y < 0 || ref_x >= client_w || ref_y >= client_h)) {",
+        "            VarSetCapacity(origin, 8, 0)",
+        "            DllCall(\"ClientToScreen\", \"ptr\", candidate, \"ptr\", &origin)",
+        "            left := NumGet(origin, 0, \"Int\")",
+        "            top := NumGet(origin, 4, \"Int\")",
+        "            if (ref_x >= left && ref_x < left + client_w && ref_y >= top && ref_y < top + client_h)",
+        "                score += 1000",
+        "        }",
+        "        if (score > best_score) {",
+        "            best_score := score",
+        "            best_hwnd := candidate",
+        "        }",
+        "    }",
+        "    if (best_hwnd && best_hwnd != hwnd)",
+        "        Log(\"inactive click browser main window selected: \" . best_hwnd)",
+        "    return best_hwnd ? best_hwnd : hwnd",
         "}",
         "StuckGuard_LastStep := 0",
         "StuckGuard_Consecutive := 0",
@@ -812,13 +880,30 @@ def render_mouse_click(step: Dict[str, Any]) -> List[str]:
     button = step.get("button", "Left")
     x = step.get("x")
     y = step.get("y")
-    count = step.get("count", 1)
+    count = max(1, int(step.get("count") or 1))
+    press_duration = max(0, min(10_000, int(step.get("press_duration") or 0)))
     coordinate_scope = str(step.get("coordinate_scope") or "screen").lower()
     window = str(step.get("window") or "")
     window_exe = str(step.get("window_exe") or "")
     window_hwnd = int(step.get("window_hwnd") or 0)
     action_type = str(step.get("action_type") or "click").lower()
     drag_to = step.get("drag_to") if isinstance(step.get("drag_to"), list) else []
+
+    def click_commands(click_x: Any, click_y: Any) -> List[str]:
+        coordinates = f", {click_x}, {click_y}" if click_x is not None and click_y is not None else ",,"
+        if action_type != "click" or press_duration == 0 or str(button).casefold().startswith("wheel"):
+            return [f"MouseClick, {button}{coordinates}, {count}"]
+        lines = [f"Loop, {count}", "{"] if count > 1 else []
+        indent = "    " if count > 1 else ""
+        lines.extend([
+            f"{indent}MouseClick, {button}{coordinates}, 1, 0, D",
+            f"{indent}Sleep, {press_duration}",
+            f"{indent}MouseClick, {button}{coordinates}, 1, 0, U",
+        ])
+        if count > 1:
+            lines.append("}")
+        return lines
+
     if coordinate_scope == "client" and x is not None and y is not None and (window or window_exe or window_hwnd):
         lines: List[str] = []
         if window_hwnd:
@@ -867,7 +952,7 @@ def render_mouse_click(step: Dict[str, Any]) -> List[str]:
             lines.append(f"MouseClickDrag, {button}, %ClickX%, %ClickY%, %DragEndX%, %DragEndY%, 12")
             lines.append('SetLastClick(DragEndX, DragEndY, "foreground-drag")')
         else:
-            lines.append(f"MouseClick, {button}, %ClickX%, %ClickY%, {count}")
+            lines.extend(click_commands("%ClickX%", "%ClickY%"))
             lines.append('SetLastClick(ClickX, ClickY, "foreground")')
         lines.append("CoordMode, Mouse, %MacroMouseCoordMode%")
         lines.append(f'Log("foreground client click: {ahk_quote(window_exe or window)} at " . ClickX . "," . ClickY)')
@@ -878,12 +963,7 @@ def render_mouse_click(step: Dict[str, Any]) -> List[str]:
     if action_type == "drag" and x is not None and y is not None and len(drag_to) >= 2:
         lines = [f"MouseClickDrag, {button}, {int(x)}, {int(y)}, {int(drag_to[0])}, {int(drag_to[1])}, 12"]
     else:
-        args = ["MouseClick", button]
-        if x is not None and y is not None:
-            args.append(str(x))
-            args.append(str(y))
-        args.append(str(count))
-        lines = [", ".join(args)]
+        lines = click_commands(x, y)
     lines.append("CoordMode, Mouse, Screen")
     lines.append("MouseGetPos, __LastClickX, __LastClickY")
     lines.append('SetLastClick(__LastClickX, __LastClickY, "foreground")')
@@ -905,7 +985,20 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
     options = step.get("options", "NA")
     x = step.get("x")
     y = step.get("y")
+    coordinate_source = str(step.get("coordinate_source") or "fixed")
+    use_image_hit = coordinate_source == "last_image_search"
+    use_saved_vars = coordinate_source == "saved_variables"
+    fixed_screen = not (use_image_hit or use_saved_vars) and str(step.get("coordinate_scope") or "client").lower() == "screen"
+    x_var = normalize_variable_name(step.get("x_var")) if use_saved_vars else ""
+    y_var = normalize_variable_name(step.get("y_var")) if use_saved_vars else ""
+    if use_saved_vars and (not x_var or not y_var):
+        return ["; inactive click skipped, invalid coordinate variable names"]
+    if use_image_hit or use_saved_vars:
+        x, y = 0, 0  # The saved X/Y fields are ignored in this mode.
+    result_offset_x = int(step.get("result_offset_x") or 0)
+    result_offset_y = int(step.get("result_offset_y") or 0)
     action_type = str(step.get("action_type") or "click").lower()
+    click_count = 2 if action_type == "double_click" else max(1, int(clicks or 1))
     press_duration = max(0, min(10000, int(step.get("press_duration") if step.get("press_duration") is not None else 60)))
     method = str(step.get("method") or "controlclick").lower()
     direct_post = method == "direct_postmessage"
@@ -924,12 +1017,36 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
         retry_delay = 10
     drag_to = step.get("drag_to")
     drag_click_after = bool(step.get("drag_click_after", False))
-    lines = [f'TargetHwnd := EnsureTargetWindow(TargetHwnd, "{ahk_quote(str(window))}", "{ahk_quote(str(window_exe))}")']
+    if use_image_hit:
+        lines = [
+            "if (!LastImageHitValid)",
+            "{",
+            '    Log("inactive click skipped: no valid image search result")',
+            "    Return",
+            "}",
+            "TargetHwnd := LastImageHitHwnd",
+            'if (!TargetHwnd or !DllCall("IsWindow", "ptr", TargetHwnd))',
+            "{",
+            '    Log("inactive click skipped: image search target window is no longer available")',
+            "    Return",
+            "}",
+        ]
+    else:
+        lines = [f'TargetHwnd := EnsureTargetWindow(TargetHwnd, "{ahk_quote(str(window))}", "{ahk_quote(str(window_exe))}")']
     lines.append("if !TargetHwnd")
     lines.append("{")
     lines.append(f'    Log("inactive click failed: window not found - {window}")')
     lines.append("    Return")
     lines.append("}")
+    browser_exe = str(window_exe or "").strip().lower()
+    if browser_exe in {"whale.exe", "chrome.exe", "msedge.exe"}:
+        reference_x = str(int(x)) if coordinate_source == "fixed" and x is not None else '""'
+        reference_y = str(int(y)) if coordinate_source == "fixed" and y is not None else '""'
+        reference_scope = str(step.get("coordinate_scope") or "legacy")
+        lines.append(
+            f'TargetHwnd := ResolveBrowserClickWindow(TargetHwnd, "{browser_exe}", '
+            f'{reference_x}, {reference_y}, "{ahk_quote(reference_scope)}")'
+        )
     lines.append("WinGetClass, TargetClass, ahk_id %TargetHwnd%")
     lines.append("DirectPost := 0")
     lines.append("ManualChild := 0")
@@ -988,8 +1105,68 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
     lines.append("ScreenX := 0")
     lines.append("ScreenY := 0")
     if x is not None and y is not None:
-        lines.append(f"RawClickX := {int(x)}")
-        lines.append(f"RawClickY := {int(y)}")
+        if use_image_hit:
+            lines.extend([
+                "VarSetCapacity(__hit_point, 8, 0)",
+                f'NumPut(LastImageHitX + ({result_offset_x}), __hit_point, 0, "Int")',
+                f'NumPut(LastImageHitY + ({result_offset_y}), __hit_point, 4, "Int")',
+                'DllCall("ScreenToClient", "ptr", TargetHwnd, "ptr", &__hit_point)',
+                'RawClickX := NumGet(__hit_point, 0, "Int")',
+                'RawClickY := NumGet(__hit_point, 4, "Int")',
+            ])
+        elif use_saved_vars:
+            lines.extend([
+                f'if (!RegExMatch({x_var}, "^-?\\d+$") || !RegExMatch({y_var}, "^-?\\d+$"))',
+                "{",
+                '    Log("inactive click skipped: coordinate variables are missing or invalid")',
+                "    Return",
+                "}",
+            ])
+            if str(step.get("variable_coord_mode") or "screen") == "screen":
+                lines.extend([
+                    "VarSetCapacity(__var_point, 8, 0)",
+                    f'NumPut({x_var} + 0, __var_point, 0, "Int")',
+                    f'NumPut({y_var} + 0, __var_point, 4, "Int")',
+                    'DllCall("ScreenToClient", "ptr", TargetHwnd, "ptr", &__var_point)',
+                    'RawClickX := NumGet(__var_point, 0, "Int")',
+                    'RawClickY := NumGet(__var_point, 4, "Int")',
+                ])
+            else:
+                lines.extend([f"RawClickX := {x_var} + 0", f"RawClickY := {y_var} + 0"])
+        else:
+            lines.append(f"RawClickX := {int(x)}")
+            lines.append(f"RawClickY := {int(y)}")
+            if fixed_screen:
+                lines.extend([
+                    "VarSetCapacity(__fixed_point, 8, 0)",
+                    'NumPut(RawClickX, __fixed_point, 0, "Int")',
+                    'NumPut(RawClickY, __fixed_point, 4, "Int")',
+                    'DllCall("ScreenToClient", "ptr", TargetHwnd, "ptr", &__fixed_point)',
+                    'RawClickX := NumGet(__fixed_point, 0, "Int")',
+                    'RawClickY := NumGet(__fixed_point, 4, "Int")',
+                ])
+            elif "coordinate_scope" not in step:
+                # Older picker versions wrote absolute screen coordinates without
+                # recording their scope. Recover only unambiguous off-client points.
+                lines.extend([
+                    "VarSetCapacity(__legacy_rect, 16, 0)",
+                    'DllCall("GetClientRect", "ptr", TargetHwnd, "ptr", &__legacy_rect)',
+                    '__legacy_w := NumGet(__legacy_rect, 8, "Int")',
+                    '__legacy_h := NumGet(__legacy_rect, 12, "Int")',
+                    'if (__legacy_w > 0 && __legacy_h > 0 && (RawClickX < 0 || RawClickY < 0 || RawClickX >= __legacy_w || RawClickY >= __legacy_h))',
+                    '{',
+                    '    VarSetCapacity(__legacy_origin, 8, 0)',
+                    '    DllCall("ClientToScreen", "ptr", TargetHwnd, "ptr", &__legacy_origin)',
+                    '    __legacy_left := NumGet(__legacy_origin, 0, "Int")',
+                    '    __legacy_top := NumGet(__legacy_origin, 4, "Int")',
+                    '    if (RawClickX >= __legacy_left && RawClickX < __legacy_left + __legacy_w && RawClickY >= __legacy_top && RawClickY < __legacy_top + __legacy_h)',
+                    '    {',
+                    '        RawClickX -= __legacy_left',
+                    '        RawClickY -= __legacy_top',
+                    '        Log("inactive click legacy screen coordinates recovered")',
+                    '    }',
+                    '}',
+                ])
         lines.append("VarSetCapacity(_pt, 8, 0)")
         lines.append('NumPut(RawClickX, _pt, 0, "Int")')
         lines.append('NumPut(RawClickY, _pt, 4, "Int")')
@@ -1017,7 +1194,8 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
         lines.append("VarSetCapacity(_drag_end_pt, 8, 0)")
         lines.append('NumPut(RawDragEndX, _drag_end_pt, 0, "Int")')
         lines.append('NumPut(RawDragEndY, _drag_end_pt, 4, "Int")')
-        lines.append('DllCall("ClientToScreen", "ptr", TargetHwnd, "ptr", &_drag_end_pt)')
+        if not fixed_screen:
+            lines.append('DllCall("ClientToScreen", "ptr", TargetHwnd, "ptr", &_drag_end_pt)')
         lines.append('DllCall("ScreenToClient", "ptr", ClickHwnd, "ptr", &_drag_end_pt)')
         lines.append('DragEndX := NumGet(_drag_end_pt, 0, "Int")')
         lines.append('DragEndY := NumGet(_drag_end_pt, 4, "Int")')
@@ -1103,10 +1281,12 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
                     lines.append(f"PostMessage, {up_msg}, 0, %lParam%, , {click_token}")
                     if direct_post:
                         lines.append('Log("inactive click direct post: mousemove/down/up sent")')
-                    if int(clicks or 1) > 1:
-                        for _ in range(int(clicks or 1) - 1):
+                    if click_count > 1:
+                        double_msg = "0x206" if effective_button.lower() == "right" else "0x203"
+                        for repeat_index in range(click_count - 1):
                             lines.append("Sleep, 30")
-                            lines.append(f"PostMessage, {down_msg}, {down_wparam}, %lParam%, , {click_token}")
+                            next_down = double_msg if action_type == "double_click" and repeat_index == 0 else down_msg
+                            lines.append(f"PostMessage, {next_down}, {down_wparam}, %lParam%, , {click_token}")
                             if press_duration > 0:
                                 lines.append(f"Sleep, {press_duration}")
                             lines.append(f"PostMessage, {up_msg}, 0, %lParam%, , {click_token}")
@@ -1134,7 +1314,7 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
                 ]
                 lines.append("ControlClick, " + ", ".join(parts))
             else:
-                if press_duration > 0:
+                if press_duration > 0 and action_type != "double_click":
                     parts_down = [
                         control_or_pos,
                         click_token,
@@ -1160,7 +1340,7 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
                         click_token,
                         "",
                         effective_button,
-                        str(clicks),
+                        str(click_count),
                         click_options,
                     ]
                     line = "ControlClick, " + ", ".join(parts)
@@ -1179,7 +1359,7 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
             else:
                 lines.append(f'__click_control := "{ahk_quote(control)}"')
             lines.append(f'__click_button := "{ahk_quote(str(effective_button))}"')
-            lines.append(f"__click_count := {int(clicks or 1)}")
+            lines.append(f"__click_count := {click_count}")
             lines.append(f'__click_opts := "{ahk_quote(str(options))}"')
             lines.append("if (__click_button = \"WheelUp\" or __click_button = \"WheelDown\")")
             lines.append("{")
@@ -1213,7 +1393,7 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
                 lines.append("    {")
                 lines.append("        __try_idx := A_Index")
                 lines.append("        ErrorLevel := 0")
-                if press_duration > 0:
+                if press_duration > 0 and action_type != "double_click":
                     lines.append('        ControlClick, %__click_control%, %__click_target%, , %__click_button%, 1, %__click_opts% D')
                     lines.append(f'        Sleep, {press_duration}')
                     lines.append('        ControlClick, %__click_control%, %__click_target%, , %__click_button%, 1, %__click_opts% U')
@@ -1245,11 +1425,15 @@ def render_inactive_click(step: Dict[str, Any]) -> List[str]:
                 if press_duration > 0:
                     lines.append(f"        Sleep, {press_duration}")
                 lines.append("        PostMessage, %__up%, 0, %lParam%, , ahk_id %ClickHwnd%")
-                if int(clicks or 1) > 1:
+                if click_count > 1:
                     lines.append("        Loop, % (__click_count - 1)")
                     lines.append("        {")
                     lines.append("            Sleep, 30")
-                    lines.append("            PostMessage, %__down%, %__down_wparam%, %lParam%, , ahk_id %ClickHwnd%")
+                    if action_type == "double_click":
+                        lines.append('            __next_down := (__click_button = "Right") ? 0x206 : 0x203')
+                    else:
+                        lines.append("            __next_down := __down")
+                    lines.append("            PostMessage, %__next_down%, %__down_wparam%, %lParam%, , ahk_id %ClickHwnd%")
                     if press_duration > 0:
                         lines.append(f"            Sleep, {press_duration}")
                     lines.append("            PostMessage, %__up%, 0, %lParam%, , ahk_id %ClickHwnd%")
@@ -1395,6 +1579,10 @@ def render_text_condition(step: Dict[str, Any], step_index: int) -> List[str]:
     lines = [f"; text_condition step={step_index}", "__tc_src := \"\""]
     if source == "clipboard":
         lines.append("__tc_src := Clipboard")
+    elif source == "variable":
+        variable = normalize_variable_name(step.get("variable"))
+        if variable:
+            lines.append(f"__tc_src := {variable}")
     elif source == "table":
         lines.append("__tc_src := OCR_LastText")
     else:
@@ -1408,20 +1596,30 @@ def render_text_condition(step: Dict[str, Any], step_index: int) -> List[str]:
     if not case_sensitive:
         lines.append("StringLower, __tc_hay, __tc_hay")
     lines.append("__tc_match := 0")
-    for raw in needles:
-        token = raw
-        if normalize:
-            token = token.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
-        if not case_sensitive:
-            token = token.lower()
-        escaped = ahk_quote(token)
-        if mode == "equals":
-            lines.append(f'if (__tc_hay = "{escaped}")')
-        else:
-            lines.append(f'if (InStr(__tc_hay, "{escaped}"))')
-        lines.append("{")
-        lines.append("    __tc_match := 1")
-        lines.append("}")
+    numeric_ops = {"greater": ">", "greater_equal": ">=", "less": "<", "less_equal": "<="}
+    if mode in numeric_ops:
+        try:
+            threshold = str(float(needles[0]))
+        except ValueError:
+            threshold = None
+        if threshold is not None:
+            lines.append(f'if (RegExMatch(__tc_hay, "^-?\\d+(\\.\\d+)?$") && (__tc_hay + 0) {numeric_ops[mode]} {threshold})')
+            lines.append("    __tc_match := 1")
+    else:
+        for raw in needles:
+            token = raw
+            if normalize:
+                token = token.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
+            if not case_sensitive:
+                token = token.lower()
+            escaped = ahk_quote(token)
+            if mode == "equals":
+                lines.append(f'if (__tc_hay = "{escaped}")')
+            else:
+                lines.append(f'if (InStr(__tc_hay, "{escaped}"))')
+            lines.append("{")
+            lines.append("    __tc_match := 1")
+            lines.append("}")
     lines.append("__tc_log_hay := __tc_hay")
     lines.append("if (StrLen(__tc_log_hay) > 80)")
     lines.append("    __tc_log_hay := SubStr(__tc_log_hay, 1, 80) . \"...\"")
@@ -1467,23 +1665,85 @@ def render_text_condition(step: Dict[str, Any], step_index: int) -> List[str]:
 
 
 def render_set_var(step: Dict[str, Any]) -> List[str]:
-    name = str(step.get("name") or step.get("var") or "").strip()
+    name = normalize_variable_name(step.get("name") or step.get("var"))
     if not name:
         return ["; set_var skipped, no name"]
-    value = step.get("value", "")
-    if isinstance(value, bool):
-        value_token = "1" if value else "0"
-    elif isinstance(value, (int, float)):
-        value_token = str(value)
+    source = str(step.get("value_source") or "fixed").lower()
+    if source == "variable":
+        origin = normalize_variable_name(step.get("source_var"))
+        if not origin:
+            return ["; set_var skipped, invalid source variable"]
+        lines = [f"{name} := {origin}"]
+    elif source == "result":
+        result = str(step.get("result_key") or "image_x")
+        results = {
+            "image_x": "LastImageHitX", "image_y": "LastImageHitY",
+            "image_hwnd": "LastImageHitHwnd", "ocr_text": "OCR_LastText",
+            "ocr_number": "OCR_LastNumber", "clipboard": "Clipboard",
+            "tick_count": "A_TickCount",
+        }
+        origin = results.get(result)
+        if not origin:
+            return ["; set_var skipped, unknown result"]
+        if result.startswith("image_"):
+            lines = [f'{name} := LastImageHitValid ? {origin} : ""']
+        else:
+            lines = [f"{name} := {origin}"]
     else:
-        value_token = f'"{ahk_quote(str(value))}"'
-    return [f"{name} := {value_token}"]
+        value = step.get("value", "")
+        kind = str(step.get("value_kind") or "text")
+        if isinstance(value, bool):
+            value_token = "1" if value else "0"
+        elif isinstance(value, (int, float)):
+            value_token = str(value)
+        elif kind == "number":
+            try:
+                value_token = str(float(str(value).strip()))
+            except (TypeError, ValueError):
+                return ["; set_var skipped, invalid number"]
+        elif kind == "boolean":
+            value_token = "1" if str(value).strip().casefold() in {"1", "true", "yes", "on", "참"} else "0"
+        else:
+            value_token = f'"{ahk_quote(str(value))}"'
+        lines = [f"{name} := {value_token}"]
+    if str(step.get("scope") or "run") == "stored":
+        lines.extend([f"if (!IsObject({name}))", f"    IniWrite, %{name}%, %MacroVariableStore%, variables, {name}"])
+    return lines
 
 
 def render_calc_var(step: Dict[str, Any]) -> List[str]:
-    name = str(step.get("name") or step.get("var") or "").strip()
+    name = normalize_variable_name(step.get("name") or step.get("var"))
     if not name:
         return ["; calc_var skipped, no name"]
+    quick = str(step.get("quick_operation") or "advanced")
+    if quick != "advanced":
+        if str(step.get("operand_source") or "fixed") == "variable":
+            operand = normalize_variable_name(step.get("operand"))
+            if not operand:
+                return ["; calc_var skipped, invalid operand variable"]
+        else:
+            raw_operand = str(step.get("operand") or "")
+            if quick in {"add", "subtract"}:
+                try:
+                    operand = str(float(raw_operand.strip()))
+                except ValueError:
+                    return ["; calc_var skipped, invalid number"]
+            else:
+                operand = f'"{ahk_quote(raw_operand)}"'
+        if quick == "add":
+            return [f"{name} := ({name} + 0) + ({operand} + 0)"]
+        if quick == "subtract":
+            return [f"{name} := ({name} + 0) - ({operand} + 0)"]
+        if quick == "append":
+            return [f"{name} := {name} . {operand}"]
+        if quick == "replace":
+            find_text = str(step.get("find_text") or "")
+            if not find_text:
+                return ["; calc_var skipped, no text to replace"]
+            return [f'{name} := StrReplace({name}, "{ahk_quote(find_text)}", {operand})']
+        if quick == "list_append":
+            return [f"if (!IsObject({name}))", f"    {name} := []", f"{name}.Push({operand})"]
+        return ["; calc_var skipped, unknown operation"]
     expr = str(step.get("expr") or "").strip()
     op = str(step.get("op") or "").strip()
     value = step.get("value", "")
@@ -2222,31 +2482,125 @@ def render_coord_mode(step: Dict[str, Any]) -> List[str]:
 
 
 def render_type_text(step: Dict[str, Any]) -> List[str]:
-    text = str(step.get("text", ""))
-    send_mode = str(step.get("send_mode", "raw")).lower()
-    mode = str(step.get("mode", "active")).lower()
+    """Send literal Unicode text; only recognized key tokens use AHK key syntax."""
+    send_mode = str(step.get("send_mode") or "input").lower()
+    mode = str(step.get("mode") or "active").lower()
+    interval = max(0, min(5000, int(step.get("char_interval") or 0)))
+    source = str(step.get("text_source") or "fixed")
+    lines: List[str] = []
     if mode == "inactive":
         window = str(step.get("window") or "").strip()
-        if not window:
-            return ["; type_text inactive skipped, no window"]
-        if send_mode in ("input", "sendinput"):
-            lines = [f"ControlSend,, {text}, {window}"]
-        elif send_mode in ("event", "send"):
-            lines = [f"ControlSend,, {text}, {window}"]
-        else:
-            escaped = text.replace("%", "%%")
-            lines = [f"ControlSend,, {escaped}, {window}"]
-    elif send_mode in ("input", "sendinput"):
-        lines = [f"SendInput, {text}"]
-    elif send_mode in ("event", "send"):
-        lines = [f"Send, {text}"]
+        window_exe = str(step.get("window_exe") or "").strip()
+        if not window and not window_exe:
+            return ["; type_text inactive skipped, no target window"]
+        lines.append("__MRTextHwnd := 0")
+        if window.lower().startswith("ahk_id "):
+            # Recorded HWNDs are session-local. A preceding inactive click already
+            # resolved the current top-level target, so keep typing in that window.
+            lines.extend([
+                "if (TargetHwnd && DllCall(\"IsWindow\", \"ptr\", TargetHwnd))",
+                "{",
+            ])
+            if window_exe:
+                lines.extend([
+                    "    WinGet, __MRTextClickExe, ProcessName, ahk_id %TargetHwnd%",
+                    f'    if (__MRTextClickExe = "{ahk_quote(window_exe)}")',
+                    "        __MRTextHwnd := TargetHwnd",
+                ])
+            else:
+                lines.append("    __MRTextHwnd := TargetHwnd")
+            lines.append("}")
+        lines.extend([
+            "if (!__MRTextHwnd)",
+            f'    __MRTextHwnd := EnsureTargetWindow(__MRTextHwnd, "{ahk_quote(window)}", "{ahk_quote(window_exe)}")',
+        ])
+        if window_exe:
+            lines.extend([
+                "if (__MRTextHwnd)", "{",
+                "    WinGet, __MRTextActualExe, ProcessName, ahk_id %__MRTextHwnd%",
+                f'    if (__MRTextActualExe != "{ahk_quote(window_exe)}")',
+                "    {",
+                "        __MRTextHwnd := 0",
+                f'        __MRTextHwnd := EnsureTargetWindow(__MRTextHwnd, "", "{ahk_quote(window_exe)}")',
+                "    }",
+                "}",
+            ])
+        lines.extend([
+            "if (!__MRTextHwnd)", "{",
+            '    Log("type_text skipped: target window not found")',
+            "    Return", "}",
+        ])
+        send_line = "ControlSend,, %KeyPayload%, ahk_id %__MRTextHwnd%"
     else:
-        escaped = text.replace("%", "%%")
-        lines = [f"SendRaw, {escaped}"]
-    delay = step.get("delay")
+        send_line = "Send, %KeyPayload%" if send_mode in {"event", "send"} else "SendInput, %KeyPayload%"
+
+    def literal(value: str) -> str:
+        return '"' + value.replace("`", "``").replace('"', '""').replace("\r", "`r").replace("\n", "`n") + '"'
+
+    def emit_text(value_expression: str) -> None:
+        lines.append(f"__MRTextChunk := {value_expression}")
+        if interval:
+            lines.extend([
+                "Loop, Parse, __MRTextChunk", "{",
+                '    KeyPayload := "{Text}" . A_LoopField',
+                f"    {send_line}",
+                f"    Sleep, {interval}",
+                "}",
+            ])
+        else:
+            lines.extend(['KeyPayload := "{Text}" . __MRTextChunk', send_line])
+
+    if source == "variable":
+        variable = normalize_variable_name(step.get("text_variable"))
+        if not variable:
+            return ["; type_text skipped, invalid text variable"]
+        emit_text(variable)
+    elif source == "result":
+        result = {"ocr_text": "OCR_LastText", "clipboard": "Clipboard"}.get(str(step.get("text_result") or "ocr_text"))
+        if not result:
+            return ["; type_text skipped, invalid result"]
+        emit_text(result)
+    else:
+        segments = step.get("text_segments")
+        if not isinstance(segments, list):
+            segments = [{"kind": "text", "text": str(step.get("text") or "")}]
+        key_pattern = re.compile(r"(\{(?:Enter|Return|Tab|Esc|Escape|Backspace|BS|Delete|Del|Home|End|PgUp|PgDn|Up|Down|Left|Right|F(?:[1-9]|1[0-2]))\}|\^[acv]|!\{F4\}|\+\{Tab\})", re.IGNORECASE)
+        wait_pattern = re.compile(r"\(\s*대기\s*(\d{1,6}(?:\.\d{1,3})?)\s*(초|ms|밀리초)\s*\)", re.IGNORECASE)
+
+        def emit_plain_text(value: str) -> None:
+            chunks = [value] if send_mode == "raw" else key_pattern.split(value)
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                if send_mode != "raw" and key_pattern.fullmatch(chunk):
+                    lines.extend([f"KeyPayload := {literal(chunk)}", send_line])
+                    if interval:
+                        lines.append(f"Sleep, {interval}")
+                else:
+                    emit_text(literal(chunk))
+
+        for index, segment in enumerate(segments):
+            if not isinstance(segment, dict):
+                continue
+            if segment.get("kind") == "vault":
+                secret = str(segment.get("secret") or "")
+                temporary_var = f"__MRTextSecret{index}"
+                lines.extend(render_vault_get({"name": temporary_var, "secret": secret}))
+                emit_text(temporary_var)
+                continue
+            value = str(segment.get("text") or "")
+            cursor = 0
+            for match in wait_pattern.finditer(value):
+                emit_plain_text(value[cursor:match.start()])
+                amount = float(match.group(1))
+                milliseconds = round(amount * (1000 if match.group(2) == "초" else 1))
+                lines.append(f"Sleep, {min(600_000, milliseconds)}")
+                cursor = match.end()
+            emit_plain_text(value[cursor:])
+    delay = max(0, int(step.get("delay") or 0))
     if delay:
         lines.append(f"Sleep, {delay}")
-    return lines
+    return lines or ["; type_text skipped, empty input"]
 
 
 def render_run(step: Dict[str, Any]) -> List[str]:
@@ -2402,6 +2756,7 @@ def render_image_search(
     found_var = f"__step_found_{step_index}"
     if not alias:
         return [
+            "LastImageHitValid := 0",
             f"{found_var} := 0",
             '; image_search skipped, no asset alias',
             'Log("image search configuration error: no asset selected")',
@@ -2419,6 +2774,7 @@ def render_image_search(
         safe_alias = ahk_quote(str(alias))
         safe_missing = ahk_quote(", ".join(missing_aliases))
         return [
+            "LastImageHitValid := 0",
             f"{found_var} := 0",
             f"; image_search skipped, assets missing: {safe_missing}",
             f'Log("image search configuration error: missing asset - {safe_missing}")',
@@ -2427,6 +2783,7 @@ def render_image_search(
     asset_file = asset_files[0]
     image_path = rf"{asset_file}"
     lines: List[str] = [
+        "LastImageHitValid := 0",
         f"{found_var} := 0",
         f'ImagePath := A_ScriptDir . "\\assets\\{image_path}"',
         "if !FileExist(ImagePath)",
@@ -3197,6 +3554,7 @@ def render_image_search(
         lines.append(f'    SetRunResult("PARTIAL", "IMAGE_NOT_FOUND", "이미지를 찾지 못해 클릭을 건너뛰고 계속 진행합니다: {ahk_quote(str(alias))}")')
     lines.append("}")
     click_info = step.get("click")
+    click_press_duration = max(0, min(10_000, int(click_info.get("press_duration") or 0))) if isinstance(click_info, dict) else 0
     lines.append("else")
     lines.append("{")
     lines.append(f"    {found_var} := 1")
@@ -3205,6 +3563,15 @@ def render_image_search(
         lines.append(f"    {prefix} (MatchedImageIndex = {match_index})")
         lines.append(f'        MatchedImageName := "{ahk_quote(candidate_alias)}"')
     lines.append(f'    Log("✅ [이미지 검색 성공] 대상: {alias} (화면 발견 위치: X=" . FoundX . ", Y=" . FoundY . " 발견=" . {store_count_var} . "개)")')
+    if wait_cond != "vanish":
+        lines.extend([
+            "    LastImageHitValid := 1",
+            "    LastImageHitX := FoundX",
+            "    LastImageHitY := FoundY",
+            f"    LastImageHitHwnd := {region_hwnd}",
+            "    if (!LastImageHitHwnd)",
+            '        LastImageHitHwnd := DllCall("GetAncestor", "ptr", DllCall("WindowFromPoint", "Int64", (FoundY << 32) | (FoundX & 0xFFFFFFFF), "ptr"), "uint", 2, "ptr")',
+        ])
     click_target = str(step.get("click_target") or "").strip().lower()
     if wait_cond == "vanish":
         # A successful vanish condition means there is no current hit to click.
@@ -3260,7 +3627,17 @@ def render_image_search(
             lines.append(f'            __sy := NumGet(__pt, 4, "Int")')
             lines.append(f"            WinActivate, ahk_id %__target_hwnd%")
             lines.append(f"            WinWaitActive, ahk_id %__target_hwnd%, , 0.5")
-            lines.append(f"            Click, %__sx%, %__sy%, {click_btn}, {click_count}")
+            if click_press_duration:
+                lines.extend([
+                    f"            Loop, {click_count}",
+                    "            {",
+                    f"                MouseClick, {click_btn}, %__sx%, %__sy%, 1, 0, D",
+                    f"                Sleep, {click_press_duration}",
+                    f"                MouseClick, {click_btn}, %__sx%, %__sy%, 1, 0, U",
+                    "            }",
+                ])
+            else:
+                lines.append(f"            Click, %__sx%, %__sy%, {click_btn}, {click_count}")
             lines.append(f'            SetLastClick(__sx, __sy, "foreground")')
             lines.append(f"        }}")
             lines.append(f"        else")
@@ -3284,14 +3661,16 @@ def render_image_search(
             lines.append(f"            {{")
             if click_btn == "Right":
                 lines.append(f"                PostMessage, 0x204, 2, %__lparam%,, ahk_id %__target_hwnd%")
-                lines.append(f"                Sleep, 35")
+                lines.append(f"                Sleep, {click_press_duration or 35}")
                 lines.append(f"                PostMessage, 0x205, 0, %__lparam%,, ahk_id %__target_hwnd%")
-                lines.append(f"                ControlClick, x{custom_x} y{custom_y}, ahk_id %__target_hwnd%,, Right, 1, NA")
+                if not click_press_duration:
+                    lines.append(f"                ControlClick, x{custom_x} y{custom_y}, ahk_id %__target_hwnd%,, Right, 1, NA")
             else:
                 lines.append(f"                PostMessage, 0x201, 1, %__lparam%,, ahk_id %__target_hwnd%")
-                lines.append(f"                Sleep, 35")
+                lines.append(f"                Sleep, {click_press_duration or 35}")
                 lines.append(f"                PostMessage, 0x202, 0, %__lparam%,, ahk_id %__target_hwnd%")
-                lines.append(f"                ControlClick, x{custom_x} y{custom_y}, ahk_id %__target_hwnd%,, Left, 1, NA")
+                if not click_press_duration:
+                    lines.append(f"                ControlClick, x{custom_x} y{custom_y}, ahk_id %__target_hwnd%,, Left, 1, NA")
             lines.append(f"                if (A_Index < {click_count})")
             lines.append(f"                    Sleep, 50")
             lines.append(f"            }}")
@@ -3300,7 +3679,17 @@ def render_image_search(
             lines.append(f"        else")
             lines.append(f"        {{")
             lines.append(f"            CoordMode, Mouse, Screen")
-            lines.append(f"            Click, {custom_x}, {custom_y}, {click_btn}, {click_count}")
+            if click_press_duration:
+                lines.extend([
+                    f"            Loop, {click_count}",
+                    "            {",
+                    f"                MouseClick, {click_btn}, {custom_x}, {custom_y}, 1, 0, D",
+                    f"                Sleep, {click_press_duration}",
+                    f"                MouseClick, {click_btn}, {custom_x}, {custom_y}, 1, 0, U",
+                    "            }",
+                ])
+            else:
+                lines.append(f"            Click, {custom_x}, {custom_y}, {click_btn}, {click_count}")
             lines.append(f"            CoordMode, Mouse, %MacroMouseCoordMode%")
             lines.append(f'            SetLastClick({custom_x}, {custom_y}, "foreground")')
             lines.append(f"        }}")
@@ -3363,7 +3752,17 @@ def render_image_search(
         lines.append(f'        else')
         lines.append(f'        {{')
         if mode == "active":
-            lines.append(f'            Click, %__target_x%, %__target_y%, {click_btn}, {click_count}')
+            if click_press_duration:
+                lines.extend([
+                    f"            Loop, {click_count}",
+                    "            {",
+                    f"                MouseClick, {click_btn}, %__target_x%, %__target_y%, 1, 0, D",
+                    f"                Sleep, {click_press_duration}",
+                    f"                MouseClick, {click_btn}, %__target_x%, %__target_y%, 1, 0, U",
+                    "            }",
+                ])
+            else:
+                lines.append(f'            Click, %__target_x%, %__target_y%, {click_btn}, {click_count}')
             lines.append(f'            SetLastClick(__target_x, __target_y, "foreground")')
         else:
             lines.append(f'            if (__target_hwnd)')
@@ -3379,14 +3778,16 @@ def render_image_search(
             lines.append(f'                {{')
             if click_btn == "Right":
                 lines.append(f'                    PostMessage, 0x204, 2, %__lparam%,, ahk_id %__target_hwnd%')
-                lines.append(f'                    Sleep, 35')
+                lines.append(f'                    Sleep, {click_press_duration or 35}')
                 lines.append(f'                    PostMessage, 0x205, 0, %__lparam%,, ahk_id %__target_hwnd%')
-                lines.append(f'                    ControlClick, x%__cx% y%__cy%, ahk_id %__target_hwnd%,, Right, 1, NA')
+                if not click_press_duration:
+                    lines.append(f'                    ControlClick, x%__cx% y%__cy%, ahk_id %__target_hwnd%,, Right, 1, NA')
             else:
                 lines.append(f'                    PostMessage, 0x201, 1, %__lparam%,, ahk_id %__target_hwnd%')
-                lines.append(f'                    Sleep, 35')
+                lines.append(f'                    Sleep, {click_press_duration or 35}')
                 lines.append(f'                    PostMessage, 0x202, 0, %__lparam%,, ahk_id %__target_hwnd%')
-                lines.append(f'                    ControlClick, x%__cx% y%__cy%, ahk_id %__target_hwnd%,, Left, 1, NA')
+                if not click_press_duration:
+                    lines.append(f'                    ControlClick, x%__cx% y%__cy%, ahk_id %__target_hwnd%,, Left, 1, NA')
             lines.append(f'                    if (A_Index < {click_count})')
             lines.append(f'                        Sleep, 50')
             lines.append(f'                }}')
@@ -3395,7 +3796,17 @@ def render_image_search(
             lines.append(f'            else')
             lines.append(f'            {{')
             lines.append(f'                CoordMode, Mouse, Screen')
-            lines.append(f'                Click, %__target_x%, %__target_y%, {click_btn}, {click_count}')
+            if click_press_duration:
+                lines.extend([
+                    f"                Loop, {click_count}",
+                    "                {",
+                    f"                    MouseClick, {click_btn}, %__target_x%, %__target_y%, 1, 0, D",
+                    f"                    Sleep, {click_press_duration}",
+                    f"                    MouseClick, {click_btn}, %__target_x%, %__target_y%, 1, 0, U",
+                    "                }",
+                ])
+            else:
+                lines.append(f'                Click, %__target_x%, %__target_y%, {click_btn}, {click_count}')
             lines.append(f'                SetLastClick(__target_x, __target_y, "foreground")')
             lines.append(f'            }}')
         lines.append(f'        }}')
@@ -4298,6 +4709,7 @@ def render_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     click_type = click_info.get("type", "relative")
     button = click_info.get("button", "Left")
     count = click_info.get("count", 1)
+    press_duration = max(0, min(10_000, int(click_info.get("press_duration") or 0)))
     retry_count = int(click_info.get("retry_count", 1) or 1)
     retry_delay = int(click_info.get("retry_delay", 80) or 80)
     show_cursor = bool(click_info.get("show_cursor", True))
@@ -4323,8 +4735,18 @@ def render_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
         "Loop, %RetryCount%",
         "{",
         "    Attempt := A_Index",
-        f"    MouseClick, {button}, %ClickX%, %ClickY%, {count}",
     ]
+    if press_duration:
+        lines.extend([
+            f"    Loop, {max(1, int(count or 1))}",
+            "    {",
+            f"        MouseClick, {button}, %ClickX%, %ClickY%, 1, 0, D",
+            f"        Sleep, {press_duration}",
+            f"        MouseClick, {button}, %ClickX%, %ClickY%, 1, 0, U",
+            "    }",
+        ])
+    else:
+        lines.append(f"    MouseClick, {button}, %ClickX%, %ClickY%, {count}")
     if show_cursor:
         lines.extend(
             [
@@ -4377,11 +4799,13 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     retry_count = int(click_info.get("retry_count", 2) or 2)
     retry_delay = int(click_info.get("retry_delay", 100) or 100)
     retry_post = bool(click_info.get("retry_post", False))
-    # Browser canvases such as TradingView can interpret a long synthetic
-    # button-down pulse as the beginning of a drag.  Keep the pulse short and
-    # explicitly finish with an unpressed mouse-move so the renderer cannot
-    # retain a stale drag state.
+    # Keep the synthetic press short. Browser targets additionally use
+    # synchronous delivery below so a queued release cannot lag behind a
+    # subsequent mouse movement and turn the click into a chart drag.
     click_hold_ms = max(1, min(30, int(click_info.get("click_hold_ms", 8) or 8)))
+    press_duration = max(0, min(10_000, int(click_info.get("press_duration") or 0)))
+    if press_duration:
+        click_hold_ms = press_duration
     show_cursor = bool(click_info.get("show_cursor", True))
     offsets = click_info.get("offset", [0, 0])
     offset_x, offset_y = (offsets + [0, 0])[:2]
@@ -4408,10 +4832,14 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     lines.append("}")
     lines.append("WinGetClass, TargetClass, ahk_id %TargetHwnd%")
     lines.append("UsePost := 0")
+    lines.append("UseSynchronousClick := 0")
     lines.append("DirectPost := 0")
     lines.append("ManualChild := 0")
     lines.append('if (TargetClass = "Chrome_WidgetWin_1" or TargetClass = "Chrome_WidgetWin_0" or TargetClass = "Chrome Legacy Window")')
+    lines.append("{")
     lines.append("    UsePost := 1")
+    lines.append("    UseSynchronousClick := 1")
+    lines.append("}")
     lines.append('if (InStr(TargetClass, "HwndWrapper"))')
     lines.append("    UsePost := 1")
     lines.append('if (InStr(TargetClass, "EVA_") or InStr(TargetClass, "Qt") or InStr(TargetClass, "LDPlayer"))')
@@ -4429,6 +4857,8 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     lines.append("    UsePost := 1")
     lines.append("if (\"%s\" = \"controlclick\")" % method)
     lines.append("    UsePost := 0")
+    lines.append("if (\"%s\" != \"auto\")" % method)
+    lines.append("    UseSynchronousClick := 0")
     lines.append("ClickHwnd := TargetHwnd")
     lines.append("ClickLeft := 0")
     lines.append("ClickTop := 0")
@@ -4526,17 +4956,34 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     lines.append("    if (UsePost)")
     lines.append("    {")
     lines.append("        lParam := (ClickY << 16) | (ClickX & 0xFFFF)")
-    lines.append("        PostMessage, 0x200, 0, %lParam%, , ahk_id %ClickHwnd%")
-    lines.append("        if (!DirectPost)")
-    lines.append("            Sleep, 10")
-    lines.append("        PostMessage, %DownMessage%, %DownWParam%, %lParam%, , ahk_id %ClickHwnd%")
-    lines.append(f"        Sleep, {click_hold_ms}")
-    lines.append("        PostMessage, %UpMessage%, 0, %lParam%, , ahk_id %ClickHwnd%")
-    lines.append("        PostMessage, 0x200, 0, %lParam%, , ahk_id %ClickHwnd%")
-    lines.append("        if (DirectPost)")
-    lines.append('            Log("inactive click direct post: mousemove/down/up sent")')
-    lines.append("        ClickOk := 1")
-    lines.append("        if (!RetryPost)")
+    lines.append("        if (UseSynchronousClick)")
+    lines.append("        {")
+    lines.append('            MoveOk := DllCall("SendMessageTimeoutW", "Ptr", ClickHwnd, "UInt", 0x200, "Ptr", 0, "Ptr", lParam, "UInt", 2, "UInt", 500, "Ptr*", MessageResult, "Ptr")')
+    lines.append('            DownOk := DllCall("SendMessageTimeoutW", "Ptr", ClickHwnd, "UInt", DownMessage, "Ptr", DownWParam, "Ptr", lParam, "UInt", 2, "UInt", 500, "Ptr*", MessageResult, "Ptr")')
+    if press_duration:
+        lines.append(f"            Sleep, {press_duration}")
+    # Do not leave a browser's synthetic button held while the real pointer
+    # can move; that movement is interpreted as a chart drag.
+    lines.append('            UpOk := DllCall("SendMessageTimeoutW", "Ptr", ClickHwnd, "UInt", UpMessage, "Ptr", 0, "Ptr", lParam, "UInt", 2, "UInt", 500, "Ptr*", MessageResult, "Ptr")')
+    lines.append('            DllCall("SendMessageTimeoutW", "Ptr", ClickHwnd, "UInt", 0x200, "Ptr", 0, "Ptr", lParam, "UInt", 2, "UInt", 500, "Ptr*", MessageResult, "Ptr")')
+    lines.append("            ClickOk := DownOk && UpOk")
+    lines.append("            if (!ClickOk)")
+    lines.append('                Log("inactive click synchronous delivery failed: move=" . MoveOk . " down=" . DownOk . " up=" . UpOk)')
+    lines.append("        }")
+    lines.append("        else")
+    lines.append("        {")
+    lines.append("            PostMessage, 0x200, 0, %lParam%, , ahk_id %ClickHwnd%")
+    lines.append("            if (!DirectPost)")
+    lines.append("                Sleep, 10")
+    lines.append("            PostMessage, %DownMessage%, %DownWParam%, %lParam%, , ahk_id %ClickHwnd%")
+    lines.append(f"            Sleep, {click_hold_ms}")
+    lines.append("            PostMessage, %UpMessage%, 0, %lParam%, , ahk_id %ClickHwnd%")
+    lines.append("            PostMessage, 0x200, 0, %lParam%, , ahk_id %ClickHwnd%")
+    lines.append("            if (DirectPost)")
+    lines.append('                Log("inactive click direct post: mousemove/down/up sent")')
+    lines.append("            ClickOk := 1")
+    lines.append("        }")
+    lines.append("        if (ClickOk && !RetryPost)")
     lines.append("            break")
     lines.append("    }")
     lines.append("    else")
@@ -4544,7 +4991,15 @@ def render_inactive_click_from_hit(click_info: Dict[str, Any]) -> List[str]:
     options = "NA"
     line = f"ControlClick, x%ClickX% y%ClickY%, ahk_id %ClickHwnd%, , {button}, {clicks}, {options}"
     lines.append("        ErrorLevel := 0")
-    lines.append(f"        {line}")
+    if press_duration:
+        lines.append(f"        Loop, {max(1, int(clicks or 1))}")
+        lines.append("        {")
+        lines.append(f"            ControlClick, x%ClickX% y%ClickY%, ahk_id %ClickHwnd%, , {button}, 1, {options} D")
+        lines.append(f"            Sleep, {press_duration}")
+        lines.append(f"            ControlClick, x%ClickX% y%ClickY%, ahk_id %ClickHwnd%, , {button}, 1, {options} U")
+        lines.append("        }")
+    else:
+        lines.append(f"        {line}")
     lines.append("        if (!ErrorLevel)")
     lines.append("            ClickOk := 1")
     lines.append("        else")
@@ -5360,7 +5815,11 @@ def render_step(
     if action == "vault_get":
         return render_vault_get(step)
     if action == "calc_var":
-        return render_calc_var(step)
+        result = render_calc_var(step)
+        name = normalize_variable_name(step.get("name") or step.get("var"))
+        if name and str(step.get("scope") or "run") == "stored" and step.get("quick_operation") != "list_append" and result and not result[0].startswith(";"):
+            result.extend([f"if (!IsObject({name}))", f"    IniWrite, %{name}%, %MacroVariableStore%, variables, {name}"])
+        return result
     if action == "run_program":
         return render_run(step)
     if action == "terminate_program":
@@ -5561,6 +6020,25 @@ def render_macro_script(
     header_macro = dict(macro)
     header_macro["_debug_variables"] = debug_variable_names(steps)
     lines = build_macro_header(header_macro)
+    stored_names = list(dict.fromkeys(
+        name for step in steps
+        if isinstance(step, dict) and step.get("action") in {"set_var", "calc_var"}
+        and str(step.get("scope") or "run") == "stored"
+        and step.get("quick_operation") != "list_append"
+        for name in [normalize_variable_name(step.get("name") or step.get("var"))] if name
+    ))
+    if stored_names:
+        store_id = slugify(str(macro.get("name") or "macro"))
+        lines.extend([
+            "FileCreateDir, %A_AppData%\\MacroRelay\\variables",
+            f'MacroVariableStore := A_AppData . "\\MacroRelay\\variables\\{ahk_quote(store_id)}.ini"',
+        ])
+        for name in stored_names:
+            lines.extend([
+                f"IniRead, {name}, %MacroVariableStore%, variables, {name}, __MR_UNSET__",
+                f'if ({name} = "__MR_UNSET__")',
+                f'    {name} := ""',
+            ])
     total_steps = len(steps)
     source_start_step = int(macro.get("graph_start_step", 0) or 0)
     source_end_step = int(macro.get("graph_end_step", 0) or 0)
@@ -5664,6 +6142,8 @@ def render_macro_script(
     if len(distinct_lanes) > 1:
         for l_idx, lane_steps in enumerate(distinct_lanes[:-1]):
             next_lane_start = distinct_lanes[l_idx + 1][0]
+            if str(steps[next_lane_start - 1].get("entry_name") or "").strip():
+                continue
             for step_idx in lane_steps:
                 branch_next_fallback[step_idx] = next_lane_start
 
@@ -5696,6 +6176,11 @@ def render_macro_script(
             on_success = None
         if on_fail and (on_fail < 1 or on_fail > total_steps):
             on_fail = None
+        # A named entry is an independent deck-launchable lane. Without an
+        # explicit success edge, do not fall through into the next entry.
+        stop_at_next_entry = count < total_steps and bool(str(steps[count].get("entry_name") or "").strip())
+        if stop_at_next_entry and not on_success:
+            stop_on_success = True
         if on_success_delay < 0:
             on_success_delay = 0
         if on_fail_delay < 0:
@@ -5893,6 +6378,17 @@ def render_macro_script(
             lines.append("}")
             lines.append("else")
             lines.append("{")
+            if action == "screen_condition" and bool(step.get("wait_until_appear")):
+                # A condition used as a gate should not follow its failure edge
+                # merely because an application took longer to show the image.
+                # Retry only a normal not-found result; extraction/engine errors
+                # still use the existing failure path instead of looping forever.
+                wait_poll = max(50, int(step.get("poll_delay") or 40))
+                lines.append("    if (ErrorLevel = 1)")
+                lines.append("    {")
+                lines.append(f"        Sleep, {wait_poll}")
+                lines.append(f"        Goto, Step{count}")
+                lines.append("    }")
             lines.append(f'    TraceStep({count}, "{ahk_quote(str(label))}", "FAIL")')
             if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
                 lines.append(
@@ -5947,7 +6443,9 @@ def render_macro_script(
                 if on_fail_delay > 0:
                     lines.append(f"    Sleep, {on_fail_delay}")
                 lines.append(f"    Goto, Step{on_fail}")
-            elif bool(step.get("_subflow_abort_on_fail")):
+            elif bool(step.get("_subflow_abort_on_fail")) or bool(step.get("abort_on_fail")):
+                lines.append("    Return")
+            elif stop_at_next_entry:
                 lines.append("    Return")
             elif count >= total_steps:
                 lines.append("    Return")
@@ -5972,7 +6470,7 @@ def render_macro_script(
                 if on_success_delay > 0:
                     lines.append(f"Sleep, {on_success_delay}")
                 lines.append(f"Goto, Step{on_success}")
-            elif count >= total_steps:
+            elif stop_on_success or count >= total_steps:
                 lines.append("Return")
         elif on_success:
             lines.append(f"__node_retry_{count} := 0")
@@ -5991,11 +6489,14 @@ def render_macro_script(
             if action in {"set_var", "calc_var"}:
                 variable = normalize_variable_name(step.get("name"))
                 if variable:
-                    lines.append(
-                        f'TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "var:{variable}=" . {variable})'
-                    )
+                    if action == "calc_var" and step.get("quick_operation") == "list_append":
+                        lines.append(f'TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "var:{variable} count=" . {variable}.Length())')
+                    else:
+                        lines.append(
+                            f'TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "var:{variable}=" . {variable})'
+                        )
             lines.extend(render_edge_conditions(step, count, "success"))
-            if count >= total_steps:
+            if stop_on_success or count >= total_steps:
                 lines.append("Return")
         lines.append("")
     return "\n".join(lines).strip() + "\n"

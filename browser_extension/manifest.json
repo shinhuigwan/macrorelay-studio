@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "MacroRelay Deck URL Presets",
+  "version": "1.0.0",
+  "description": "Sends only the focused tab URL to the local QuickSlot Deck for opt-in preset switching.",
+  "permissions": ["tabs", "webNavigation", "storage"],
+  "host_permissions": ["http://127.0.0.1:18773/*"],
+  "background": {"service_worker": "background.js"},
+  "options_page": "options.html"
+}

@@ -16,7 +16,7 @@ from typing import Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .action_editor import ActionEditor, CoordinatePickerDialog, WindowPickerDialog, action_template
+from .action_editor import ActionEditor, ActionEditorDialog, CoordinatePickerDialog, WindowPickerDialog, action_template
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
 from .node_editor import ACTION_TITLES
 from .screen_coordinates import display_coordinate_maps, logical_point_to_native, logical_rect_to_native, native_point_to_logical, native_rect_to_logical, rect_to_exclusive_list
@@ -5800,6 +5800,21 @@ class DiagnosticsDialog(QtWidgets.QDialog):
         ]
 
 
+def inactive_click_preview_screen_point(
+    step: dict[str, Any], origin: QtCore.QPoint, client_size: QtCore.QSize
+) -> QtCore.QPoint:
+    """Match the runtime's fixed-coordinate interpretation for the test marker."""
+    x, y = int(step.get("x") or 0), int(step.get("y") or 0)
+    scope = str(step.get("coordinate_scope") or "").lower()
+    if scope == "screen":
+        return QtCore.QPoint(x, y)
+    width, height = client_size.width(), client_size.height()
+    if not scope and width > 0 and height > 0 and (x < 0 or y < 0 or x >= width or y >= height):
+        if origin.x() <= x < origin.x() + width and origin.y() <= y < origin.y() + height:
+            return QtCore.QPoint(x, y)
+    return origin + QtCore.QPoint(x, y)
+
+
 class AutomationOverlay(QtWidgets.QWidget):
     def __init__(self, points: list[QtCore.QPoint], regions: list[QtCore.QRect], parent=None) -> None:
         super().__init__(None)
@@ -5837,10 +5852,30 @@ class AutomationOverlay(QtWidgets.QWidget):
         if action == "mouse_click":
             points.append(QtCore.QPoint(int(step.get("x") or 0), int(step.get("y") or 0)))
         elif action == "inactive_click":
-            metadata = step.get("_automation") if isinstance(step.get("_automation"), dict) else {}
-            recorded = metadata.get("recorded_screen") if isinstance(metadata.get("recorded_screen"), list) else []
-            if len(recorded) >= 2:
-                points.append(QtCore.QPoint(int(recorded[0]), int(recorded[1])))
+            if str(step.get("coordinate_source") or "fixed") == "fixed":
+                scope = str(step.get("coordinate_scope") or "").lower()
+                if scope == "screen":
+                    native_point = QtCore.QPoint(int(step.get("x") or 0), int(step.get("y") or 0))
+                    points.append(native_point_to_logical(native_point))
+                else:
+                    try:
+                        from .image_search_test import _find_window
+                        exe = str(step.get("window_exe") or "").lower()
+                        token = str(step.get("window") or "")
+                        if exe in {"whale.exe", "chrome.exe", "msedge.exe"}:
+                            token = f"ahk_class Chrome_WidgetWin_1 ahk_exe {exe}"
+                        hwnd = _find_window(exe, token)
+                        if hwnd:
+                            rect = wintypes.RECT()
+                            origin = wintypes.POINT(0, 0)
+                            user32 = ctypes.windll.user32
+                            if user32.GetClientRect(hwnd, ctypes.byref(rect)) and user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+                                native_point = inactive_click_preview_screen_point(
+                                    step, QtCore.QPoint(origin.x, origin.y), QtCore.QSize(rect.right, rect.bottom)
+                                )
+                                points.append(native_point_to_logical(native_point))
+                    except (OSError, RuntimeError, ValueError):
+                        pass
         elif action == "image_search":
             values = step.get("region") if isinstance(step.get("region"), list) else []
             if len(values) >= 4 and str(step.get("region_coords") or "screen") == "screen":
@@ -6097,44 +6132,98 @@ class QuickActionWizard:
                 geometry,
                 parent,
                 accept_on_release=False,
-                hint_text="[ 2단계 · 검색 영역 지정 ] 실제로 검색할 범위를 드래그한 뒤 Enter · Esc 취소",
+                multiple_regions=True,
+                hint_text=(
+                    "[ 2단계 · 검색 영역 지정 ] Shift+Enter: 영역 추가 · Enter: 완료 · Esc: 대상 클라이언트 전체"
+                    if action == "image_search"
+                    else "[ 2단계 · 검색 영역 지정 ] Shift+Enter: 영역 추가 · Enter: 완료 · Esc: 취소"
+                ),
             )
+            full_client_region = False
             try:
-                if region_dialog.exec() != QtWidgets.QDialog.Accepted:
+                if region_dialog.exec() == QtWidgets.QDialog.Accepted:
+                    selected_regions = (
+                        region_dialog.selected_native_screen_rects()
+                        if hasattr(region_dialog, "selected_native_screen_rects")
+                        else [region_dialog.selected_native_screen_rect()]
+                    )
+                elif action == "image_search" and region_dialog.cancelled_by_escape:
+                    full_client_region = True
+                    selected_regions = []
+                else:
                     return None
-                selected_region = region_dialog.selected_native_screen_rect()
             finally:
                 region_dialog.deleteLater()
-            if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
+            if not full_client_region and (
+                not selected_regions
+                or any(
+                    not region.isValid() or region.width() < 4 or region.height() < 4
+                    for region in selected_regions
+                )
+            ):
                 return None
+
+            if full_client_region:
+                origin = target.get("client_origin") if target else None
+                size = target.get("client_size") if target else None
+                if (
+                    not isinstance(origin, (list, tuple)) or len(origin) < 2
+                    or not isinstance(size, (list, tuple)) or len(size) < 2
+                    or int(size[0]) < 4 or int(size[1]) < 4
+                ):
+                    QtWidgets.QMessageBox.warning(
+                        parent,
+                        "대상 클라이언트 없음",
+                        "검색 이미지를 선택한 프로그램의 클라이언트 영역을 찾지 못했습니다. "
+                        "대상 프로그램 위에서 이미지를 다시 선택해 주세요.",
+                    )
+                    return None
+                client_rect = QtCore.QRect(
+                    int(origin[0]), int(origin[1]), int(size[0]), int(size[1])
+                )
+                if not client_rect.contains(rect.center()):
+                    QtWidgets.QMessageBox.warning(
+                        parent,
+                        "클라이언트 밖 이미지",
+                        "선택한 이미지가 대상 프로그램의 클라이언트 영역 밖에 있습니다. "
+                        "프로그램 내부의 이미지를 다시 선택해 주세요.",
+                    )
+                    return None
 
             window_token = ""
             window_exe = ""
             region_mode = "screen"
             region_coords = "screen"
-            search_region = rect_to_exclusive_list(selected_region)
+            search_regions = [rect_to_exclusive_list(region) for region in selected_regions]
             if target:
-                scope = str(target.get("capture_scope") or "client")
-                origin = target.get("capture_origin") or target.get("client_origin") or [0, 0]
-                size = target.get("capture_size") or target.get("client_size") or [0, 0]
+                scope = "client" if full_client_region else str(target.get("capture_scope") or "client")
+                origin = (
+                    target.get("client_origin") if full_client_region else target.get("capture_origin")
+                ) or target.get("client_origin") or [0, 0]
+                size = (
+                    target.get("client_size") if full_client_region else target.get("capture_size")
+                ) or target.get("client_size") or [0, 0]
                 ox, oy = int(origin[0]), int(origin[1])
                 sw, sh = max(0, int(size[0])), max(0, int(size[1]))
-                target_rect = QtCore.QRect(ox, oy, sw, sh)
-                if target_rect.isValid():
-                    selected_region = selected_region.intersected(target_rect)
-                if not selected_region.isValid() or selected_region.width() < 4 or selected_region.height() < 4:
-                    QtWidgets.QMessageBox.warning(
-                        parent,
-                        "검색 영역 확인",
-                        "검색 영역은 처음 이미지를 선택한 대상 프로그램 안에서 지정해 주세요.",
-                    )
-                    return None
-                search_region = [
-                    selected_region.left() - ox,
-                    selected_region.top() - oy,
-                    selected_region.left() - ox + selected_region.width(),
-                    selected_region.top() - oy + selected_region.height(),
-                ]
+                if full_client_region:
+                    search_regions = [[0, 0, sw, sh]]
+                else:
+                    target_rect = QtCore.QRect(ox, oy, sw, sh)
+                    if target_rect.isValid():
+                        selected_regions = [region.intersected(target_rect) for region in selected_regions]
+                    if any(not region.isValid() or region.width() < 4 or region.height() < 4 for region in selected_regions):
+                        QtWidgets.QMessageBox.warning(
+                            parent,
+                            "검색 영역 확인",
+                            "검색 영역은 처음 이미지를 선택한 대상 프로그램 안에서 지정해 주세요.",
+                        )
+                        return None
+                    search_regions = [[
+                        region.left() - ox,
+                        region.top() - oy,
+                        region.left() - ox + region.width(),
+                        region.top() - oy + region.height(),
+                    ] for region in selected_regions]
                 region_mode = scope if scope in {"client", "window"} else "client"
                 region_coords = "relative"
                 window_token = str(target.get("window") or "")
@@ -6153,7 +6242,8 @@ class QuickActionWizard:
                     "region_coords": region_coords,
                     "region_window": window_token,
                     "region_window_exe": window_exe,
-                    "region": search_region,
+                    "region": search_regions[0],
+                    "regions": search_regions,
                     "click_enabled": not is_cond,
                     "click": {
                         "mode": "inactive" if target else "active",
@@ -6208,11 +6298,24 @@ class QuickActionWizard:
             )
             return step
         if action == "type_text":
-            text, ok = QtWidgets.QInputDialog.getMultiLineText(parent, "텍스트 입력 자동 설정", "입력할 내용")
-            if not ok:
+            ignored = {int(parent.winId())} if parent else set()
+            window_picker = WindowPickerDialog(
+                parent,
+                ignored_hwnds=ignored,
+                hint_text="1단계 · 텍스트를 입력할 대상 프로그램의 클라이언트 영역을 클릭하세요  ·  Esc 취소",
+            )
+            if window_picker.exec() != QtWidgets.QDialog.Accepted:
                 return None
-            step.update({"text": text, "send_mode": "raw", "label": "자동 설정 텍스트 입력"})
-            return step
+            step.update({
+                "mode": "inactive", "send_mode": "input",
+                "window": window_picker.window_token,
+                "window_exe": window_picker.exe_name,
+                "label": f"{window_picker.exe_name or '대상 창'} 텍스트 입력",
+            })
+            detail = ActionEditorDialog(repository, step, parent)
+            if detail.exec() != QtWidgets.QDialog.Accepted:
+                return None
+            return detail.payload()
         if action == "wait":
             duration, ok = QtWidgets.QInputDialog.getInt(parent, "대기 자동 설정", "대기 시간(ms)", 500, 0, 3_600_000, 100)
             if not ok:

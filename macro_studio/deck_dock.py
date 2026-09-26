@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .repository import macro_entry_points
+
 
 ACTION_LIBRARY: Dict[str, list[tuple[str, str, str]]] = {
     "시스템": [
@@ -50,7 +52,8 @@ ACTION_ICONS = {
 
 
 def action_title(action: Dict[str, Any]) -> str:
-    return str(action.get("label") or ACTION_TITLES.get(str(action.get("kind") or ""), "Deck 액션"))
+    fallback = str(action.get("entry_name") or "").strip() if action.get("kind") == "run_macro" else ""
+    return str(action.get("label") or fallback or ACTION_TITLES.get(str(action.get("kind") or ""), "Deck 액션"))
 
 
 def deck_dock_stylesheet() -> str:
@@ -133,13 +136,16 @@ class DeckSlotButton(QtWidgets.QFrame):
     clear_requested = QtCore.Signal(int)
     duplicate_requested = QtCore.Signal(int)
     selection_requested = QtCore.Signal(int)
+    pin_requested = QtCore.Signal(int)
+    unpin_requested = QtCore.Signal(int)
 
-    def __init__(self, slot_index: int, slot: Dict[str, Any], icon_config: Optional[Dict[str, Any]] = None, parent: Optional[QtWidgets.QWidget] = None, *, selection_mode: bool = False, selected: bool = False):
+    def __init__(self, slot_index: int, slot: Dict[str, Any], icon_config: Optional[Dict[str, Any]] = None, parent: Optional[QtWidgets.QWidget] = None, *, selection_mode: bool = False, selected: bool = False, pinned: bool = False):
         super().__init__(parent)
         self.slot_index = slot_index
         self.slot = copy.deepcopy(slot)
         self.selection_mode = selection_mode
         self.selected = selected
+        self.pinned = pinned
         self._press_pos: Optional[QtCore.QPoint] = None
         self.setAcceptDrops(True)
         self.setMinimumSize(92, 82)
@@ -179,6 +185,11 @@ class DeckSlotButton(QtWidgets.QFrame):
             badge.setFixedSize(22, 22)
             badge.move(5, 5)
             badge.setStyleSheet("background:#18DDC0;color:#07110F;border:none;border-radius:11px;font-weight:900;")
+        if pinned:
+            pin_badge = QtWidgets.QLabel("📌", self)
+            pin_badge.setToolTip("모든 페이지에 고정된 슬롯")
+            pin_badge.move(6, 5)
+            pin_badge.setStyleSheet("background:transparent;border:none;")
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
@@ -246,12 +257,16 @@ class DeckSlotButton(QtWidgets.QFrame):
         menu = QtWidgets.QMenu(self)
         edit = menu.addAction("설정 편집")
         duplicate = menu.addAction("슬롯 복제")
+        pin_action = menu.addAction("모든 페이지 고정 해제" if self.pinned else "모든 페이지에 고정")
+        pin_action.setEnabled(bool(self.slot.get("macro") or self.slot.get("action")) or self.pinned)
         clear = menu.addAction("슬롯 비우기")
         selected = menu.exec(event.globalPos())
         if selected is edit:
             self.edit_requested.emit(self.slot_index)
         elif selected is duplicate:
             self.duplicate_requested.emit(self.slot_index)
+        elif selected is pin_action:
+            (self.unpin_requested if self.pinned else self.pin_requested).emit(self.slot_index)
         elif selected is clear:
             self.clear_requested.emit(self.slot_index)
 
@@ -276,7 +291,15 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         self.icon_config = copy.deepcopy(icon_config or {})
         icon_source = str(self.icon_config.get("icon_source") or "")
         has_visual = self._icon_config_has_visual(self.icon_config)
-        self._icon_manually_edited = icon_source == "manual" or (has_visual and icon_source != "program_auto")
+        default_macro_placeholder = (
+            kind == "run_macro" and not icon_source
+            and not self.icon_config.get("image_data") and not self.icon_config.get("image_path")
+            and self.icon_config.get("emoji") == ACTION_ICONS["run_macro"]
+            and int(self.icon_config.get("icon_size") or 0) == 58
+        )
+        self._icon_manually_edited = icon_source == "manual" or (
+            has_visual and icon_source != "program_auto" and not default_macro_placeholder
+        )
         self.widgets: Dict[str, Any] = {}
         self.setWindowTitle(f"{ACTION_TITLES.get(kind, 'Deck 액션')} 설정")
         self.setMinimumWidth(500)
@@ -357,7 +380,29 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         elif kind == "run_macro":
             combo = QtWidgets.QComboBox(); combo.addItems([item.name for item in self.main_window.repository.list_macros()])
             current = str(self.action.get("macro") or ""); combo.setCurrentText(current)
-            self.widgets["macro"] = combo; form.addRow("매크로", combo)
+            entry_combo = QtWidgets.QComboBox()
+            saved_entry = str(self.action.get("entry_name") or "").strip()
+
+            def refresh_entries(selected_entry: str = "") -> None:
+                entry_combo.clear()
+                entry_combo.addItem("기본 시작 지점", "")
+                macro_name = combo.currentText().strip()
+                if macro_name:
+                    try:
+                        for name, index in macro_entry_points(self.repository.load_macro(macro_name)):
+                            entry_combo.addItem(f"▶ {name} · {index}번 노드", name)
+                    except (OSError, ValueError, KeyError):
+                        pass
+                if selected_entry and entry_combo.findData(selected_entry) < 0:
+                    entry_combo.addItem(f"⚠ 찾을 수 없는 시작 지점: {selected_entry}", selected_entry)
+                entry_combo.setCurrentIndex(max(0, entry_combo.findData(selected_entry)))
+
+            combo.currentTextChanged.connect(lambda _text: refresh_entries())
+            refresh_entries(saved_entry)
+            self.widgets["macro"] = combo
+            self.widgets["entry_name"] = entry_combo
+            form.addRow("매크로", combo)
+            form.addRow("시작 지점", entry_combo)
         elif kind == "multi_macros":
             selected_order = [str(value) for value in list(self.action.get("macros") or [])]
             selected = set(selected_order)
@@ -458,6 +503,18 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
             target = self.widgets.get("target")
             if isinstance(target, QtWidgets.QLineEdit):
                 self._set_icon_from_program(target.text())
+        elif self.kind == "run_macro" and not self._icon_manually_edited:
+            from macro_studio.quickslot_deck import extract_program_icon_config, macro_program_icon_target
+
+            macro_widget = self.widgets.get("macro")
+            entry_widget = self.widgets.get("entry_name")
+            macro_name = macro_widget.currentText().strip() if isinstance(macro_widget, QtWidgets.QComboBox) else ""
+            entry_name = str(entry_widget.currentData() or "") if isinstance(entry_widget, QtWidgets.QComboBox) else ""
+            target = macro_program_icon_target(self.repository, macro_name, entry_name)
+            if target:
+                extracted = extract_program_icon_config(target)
+                if extracted:
+                    self.icon_config = extracted
         return copy.deepcopy(self.icon_config)
 
     @staticmethod
@@ -577,6 +634,8 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.current_page = int(main_window.current_page)
         self._saving = False
         self.selected_slots: set[int] = set()
+        self._undo_stack: list[Dict[str, Any]] = []
+        self._redo_stack: list[Dict[str, Any]] = []
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setWindowTitle("MacroRelay · Deck Dock")
         self.setWindowIcon(main_window.windowIcon())
@@ -584,6 +643,8 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.setMinimumSize(980, 620)
         self.setStyleSheet(deck_dock_stylesheet())
         self._init_ui()
+        QtGui.QShortcut(QtGui.QKeySequence.Undo, self, activated=self.undo)
+        QtGui.QShortcut(QtGui.QKeySequence.Redo, self, activated=self.redo)
         self.reload()
 
     def _init_ui(self) -> None:
@@ -598,9 +659,14 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.grid_rows_spin = QtWidgets.QSpinBox(); self.grid_rows_spin.setRange(1, 10); self.grid_rows_spin.setSuffix(" 행")
         self.grid_cols_spin = QtWidgets.QSpinBox(); self.grid_cols_spin.setRange(1, 10); self.grid_cols_spin.setSuffix(" 열")
         self.grid_apply_btn = QtWidgets.QPushButton("그리드 적용"); self.grid_apply_btn.clicked.connect(self._apply_grid_size)
+        self.pin_selected_btn = QtWidgets.QPushButton("📌 선택 슬롯 고정/해제")
+        self.pin_selected_btn.clicked.connect(self._toggle_selected_pin)
+        self.undo_btn = QtWidgets.QPushButton("↶ 실행 취소"); self.undo_btn.clicked.connect(self.undo)
+        self.redo_btn = QtWidgets.QPushButton("↷ 다시 실행"); self.redo_btn.clicked.connect(self.redo)
+        history = QtWidgets.QPushButton("실행 기록"); history.clicked.connect(self._show_execution_history)
         top.addWidget(title); top.addSpacing(16); top.addWidget(QtWidgets.QLabel("프리셋")); top.addWidget(self.preset_combo)
         top.addSpacing(14); top.addWidget(QtWidgets.QLabel("그리드")); top.addWidget(self.grid_rows_spin); top.addWidget(QtWidgets.QLabel("×")); top.addWidget(self.grid_cols_spin); top.addWidget(self.grid_apply_btn)
-        top.addStretch(1); top.addWidget(bundled); top.addWidget(save)
+        top.addStretch(1); top.addWidget(self.pin_selected_btn); top.addWidget(bundled); top.addWidget(save)
         outer.addWidget(toolbar)
         body = QtWidgets.QHBoxLayout(); body.setSpacing(14); outer.addLayout(body, 1)
         center = QtWidgets.QFrame(); center.setObjectName("DeckCard")
@@ -630,7 +696,12 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.prev_btn.clicked.connect(self.prev_page); self.next_btn.clicked.connect(self.next_page); self.add_page_btn.clicked.connect(self.add_page); self.delete_page_btn.clicked.connect(self.delete_page)
         manage = QtWidgets.QHBoxLayout(); manage.addWidget(self.add_page_btn); manage.addWidget(self.delete_page_btn); manage.addStretch(1)
         navigation = QtWidgets.QHBoxLayout(); navigation.addWidget(self.prev_btn); navigation.addWidget(self.page_label); navigation.addWidget(self.next_btn)
-        pager.addLayout(manage, 0, 0); pager.addLayout(navigation, 0, 1, QtCore.Qt.AlignCenter); pager.addWidget(QtWidgets.QWidget(), 0, 2)
+        history_controls = QtWidgets.QHBoxLayout()
+        history_controls.addStretch(1)
+        history_controls.addWidget(history)
+        history_controls.addWidget(self.undo_btn)
+        history_controls.addWidget(self.redo_btn)
+        pager.addLayout(manage, 0, 0); pager.addLayout(navigation, 0, 1, QtCore.Qt.AlignCenter); pager.addLayout(history_controls, 0, 2)
         pager.setColumnStretch(0, 1); pager.setColumnStretch(1, 1); pager.setColumnStretch(2, 1)
         center_layout.addLayout(pager); body.addWidget(center, 1)
         panel = QtWidgets.QFrame(); panel.setObjectName("PanelCard"); panel.setFixedWidth(330)
@@ -650,22 +721,48 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         for button in self.action_buttons:
             button.setVisible(not needle or needle in button.kind.casefold() or needle in button.findChildren(QtWidgets.QLabel)[1].text().casefold())
 
-    def _load_bundled_backup(self) -> None:
-        from macro_studio.quickslot_deck import BUNDLED_DECK_BACKUP
+    def _show_execution_history(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Deck 실행 기록")
+        dialog.resize(650, 430)
+        dialog.setStyleSheet(deck_dock_stylesheet())
+        layout = QtWidgets.QVBoxLayout(dialog)
+        listing = QtWidgets.QPlainTextEdit()
+        listing.setReadOnly(True)
+        entries = list(reversed(self.main_window.execution_history))
+        listing.setPlainText("\n".join(
+            f"{item['time']}  [{item['preset']}] {item['slot']}번  {item['state']}  {item['detail']}"
+            for item in entries
+        ) or "이번 실행 중 기록이 없습니다.")
+        layout.addWidget(listing)
+        close = QtWidgets.QPushButton("닫기")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
 
-        if not BUNDLED_DECK_BACKUP.is_file():
+    def _load_bundled_backup(self) -> None:
+        from macro_studio.quickslot_deck import bundled_deck_path
+
+        bundle_path = bundled_deck_path(self.main_window.repository.root)
+        if not bundle_path.is_file():
             QtWidgets.QMessageBox.warning(self, "내장 구성", "내장 Deck JSON 파일을 찾을 수 없습니다.")
             return
         answer = QtWidgets.QMessageBox.question(self, "내장 구성", "현재 Deck 구성을 GitHub 내장 구성으로 교체할까요?")
         if answer != QtWidgets.QMessageBox.Yes:
             return
         try:
-            payload = json.loads(BUNDLED_DECK_BACKUP.read_text(encoding="utf-8"))
+            payload = json.loads(bundle_path.read_text(encoding="utf-8"))
             self.main_window.restore_deck_backup_payload(payload)
             self.current_page = 0
             self.selected_slots.clear()
             self.reload()
-            QtWidgets.QMessageBox.information(self, "내장 구성", "페이지·슬롯 액션·아이콘을 모두 불러왔습니다.")
+            report = getattr(self.main_window, "last_portability_report", {}) or {}
+            caution = (
+                f"\n다시 확인할 항목: 실행 파일 {report.get('unresolved_programs', 0)}개, "
+                f"화면 절대 좌표 {report.get('screen_coordinates', 0)}개."
+                if report.get("unresolved_programs") or report.get("screen_coordinates") else ""
+            )
+            QtWidgets.QMessageBox.information(self, "내장 구성", "페이지·슬롯 액션·아이콘을 모두 불러왔습니다." + caution)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "내장 구성 오류", str(exc))
 
@@ -688,6 +785,8 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.current_page = max(0, min(self.current_page, self.page_count - 1))
 
     def reload(self) -> None:
+        self._undo_stack.clear(); self._redo_stack.clear()
+        self._update_history_buttons()
         self._ensure_payload()
         self.selected_slots.intersection_update(range(len(self.payload["slots"])))
         with QtCore.QSignalBlocker(self.grid_rows_spin), QtCore.QSignalBlocker(self.grid_cols_spin):
@@ -701,17 +800,69 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             self.preset_combo.setCurrentIndex(max(0, self.preset_combo.findData(active)))
         self._render_page()
 
+    def _snapshot(self) -> Dict[str, Any]:
+        return {
+            "payload": copy.deepcopy(self.payload),
+            "icons": copy.deepcopy(self.main_window.custom_icons),
+            "pins": copy.deepcopy(self.main_window._active_pinned_slots()),
+            "rows": self.main_window.rows,
+            "cols": self.main_window.cols,
+            "page": self.current_page,
+            "selection": set(self.selected_slots),
+        }
+
+    def _record_change(self) -> None:
+        self._undo_stack.append(self._snapshot())
+        self._undo_stack = self._undo_stack[-30:]
+        self._redo_stack.clear()
+        self._update_history_buttons()
+
+    def _update_history_buttons(self) -> None:
+        self.undo_btn.setEnabled(bool(self._undo_stack))
+        self.redo_btn.setEnabled(bool(self._redo_stack))
+
+    def _restore_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        self.payload = copy.deepcopy(snapshot["payload"])
+        self.main_window.custom_icons = copy.deepcopy(snapshot["icons"])
+        self.main_window.rows = int(snapshot["rows"])
+        self.main_window.cols = int(snapshot["cols"])
+        pins = self.main_window._active_pinned_slots()
+        pins.clear(); pins.update(copy.deepcopy(snapshot["pins"]))
+        self.page_count = int(self.payload.get("deck_page_count") or 1)
+        self.current_page = int(snapshot["page"])
+        self.selected_slots = set(snapshot["selection"])
+        self.save()
+
+    def undo(self) -> None:
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        self._restore_snapshot(self._undo_stack.pop())
+        self._update_history_buttons()
+
+    def redo(self) -> None:
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        self._restore_snapshot(self._redo_stack.pop())
+        self._update_history_buttons()
+
     def _render_page(self) -> None:
         while self.grid.count():
             item = self.grid.takeAt(0)
             if item.widget(): item.widget().deleteLater()
         page_size = self._page_size(); start = self.current_page * page_size
         rows, cols = int(self.main_window.rows), int(self.main_window.cols)
+        pins = self.main_window._active_pinned_slots()
         for local in range(page_size):
-            index = start + local; slot = self.payload["slots"][index]
-            button = DeckSlotButton(index, slot, self.main_window.custom_icons.get(str(index), {}), self.grid_host, selection_mode=self.selection_toggle.isChecked(), selected=index in self.selected_slots)
+            index = start + local
+            pin = pins.get(str(local))
+            pinned = isinstance(pin, dict) and isinstance(pin.get("slot"), dict)
+            slot = pin["slot"] if pinned else self.payload["slots"][index]
+            icon = pin.get("icon", {}) if pinned else self.main_window.custom_icons.get(str(index), {})
+            button = DeckSlotButton(index, slot, icon, self.grid_host, selection_mode=self.selection_toggle.isChecked(), selected=index in self.selected_slots, pinned=pinned)
             button.setMinimumSize(max(48, min(92, 760 // max(1, cols))), max(44, min(82, 500 // max(1, rows))))
-            button.action_dropped.connect(self._configure_new_action); button.slot_dropped.connect(self._move_slot); button.image_dropped.connect(self._apply_dropped_icon); button.edit_requested.connect(self._edit_slot); button.clear_requested.connect(self._clear_slot); button.duplicate_requested.connect(self._duplicate_slot); button.selection_requested.connect(self._toggle_slot_selection)
+            button.action_dropped.connect(self._configure_new_action); button.slot_dropped.connect(self._move_slot); button.image_dropped.connect(self._apply_dropped_icon); button.edit_requested.connect(self._edit_slot); button.clear_requested.connect(self._clear_slot); button.duplicate_requested.connect(self._duplicate_slot); button.selection_requested.connect(self._toggle_slot_selection); button.pin_requested.connect(self._pin_slot); button.unpin_requested.connect(self._unpin_slot)
             self.grid.addWidget(button, local // cols, local % cols)
         page_name = self.payload["deck_page_names"][self.current_page]
         self.deck_title.setText(page_name)
@@ -749,18 +900,68 @@ class DeckDockWindow(QtWidgets.QMainWindow):
     def _update_selection_controls(self) -> None:
         count = len(self.selected_slots); self.selection_label.setText(f"선택 {count}개")
         self.move_selected_btn.setEnabled(count > 0); self.bulk_edit_btn.setEnabled(count > 0); self.clear_selection_btn.setEnabled(count > 0)
+        self.pin_selected_btn.setEnabled(count == 1)
+
+    def _toggle_selected_pin(self) -> None:
+        if len(self.selected_slots) != 1:
+            return
+        index = next(iter(self.selected_slots))
+        if self._pin_entry(index):
+            self._unpin_slot(index)
+        else:
+            self._pin_slot(index)
 
     @staticmethod
     def _is_filled_slot(slot: Dict[str, Any]) -> bool:
         return bool(str(slot.get("macro") or "").strip() or slot.get("action"))
 
+    def _pin_entry(self, index: int) -> Optional[Dict[str, Any]]:
+        return self.main_window._active_pinned_slots().get(str(index % self._page_size()))
+
+    def _pin_slot(self, index: int) -> None:
+        local = index % self._page_size()
+        if self._pin_entry(index) or not self._is_filled_slot(self.payload["slots"][index]):
+            return
+        conflicting = [page + 1 for page in range(self.page_count)
+                       if page * self._page_size() + local != index and
+                       self._is_filled_slot(self.payload["slots"][page * self._page_size() + local])]
+        if conflicting:
+            QtWidgets.QMessageBox.information(self, "공통 슬롯", f"{', '.join(map(str, conflicting))}페이지의 같은 위치에 슬롯이 있습니다. 먼저 빈 위치로 옮겨 주세요.")
+            return
+        self._record_change()
+        self.main_window._active_pinned_slots()[str(local)] = {
+            "slot": copy.deepcopy(self.payload["slots"][index]),
+            "icon": copy.deepcopy(self.main_window.custom_icons.get(str(index), {})),
+        }
+        self.payload["slots"][index] = {"macro": "", "hotkey": "", "mode": "hybrid"}
+        self.main_window.custom_icons.pop(str(index), None)
+        self.save()
+
+    def _unpin_slot(self, index: int) -> None:
+        pin = self._pin_entry(index)
+        if not pin:
+            return
+        if self._is_filled_slot(self.payload["slots"][index]):
+            QtWidgets.QMessageBox.information(self, "공통 슬롯", "현재 페이지의 같은 위치가 사용 중입니다. 빈 페이지에서 고정을 해제해 주세요.")
+            return
+        self._record_change()
+        self.payload["slots"][index] = copy.deepcopy(pin["slot"])
+        if pin.get("icon"):
+            self.main_window.custom_icons[str(index)] = copy.deepcopy(pin["icon"])
+        self.main_window._active_pinned_slots().pop(str(index % self._page_size()), None)
+        self.save()
+
     def _move_selected_slots(self, target_page: int) -> tuple[bool, str]:
+        if any(self._pin_entry(index) for index in self.selected_slots):
+            return False, "고정 슬롯은 먼저 고정을 해제한 뒤 이동해 주세요."
         sources = [index for index in sorted(self.selected_slots) if self._is_filled_slot(self.payload["slots"][index])]
         if not sources: return False, "선택한 슬롯 중 이동할 항목이 없습니다."
         size = self._page_size(); start = target_page * size; end = start + size
         source_set = set(sources)
-        targets = [index for index in range(start, end) if index in source_set or not self._is_filled_slot(self.payload["slots"][index])]
+        targets = [index for index in range(start, end) if not self._pin_entry(index)
+                   and (index in source_set or not self._is_filled_slot(self.payload["slots"][index]))]
         if len(targets) < len(sources): return False, f"대상 페이지에 빈 슬롯이 {len(sources)}개 필요합니다."
+        self._record_change()
         snapshots = [(copy.deepcopy(self.payload["slots"][index]), copy.deepcopy(self.main_window.custom_icons.get(str(index)))) for index in sources]
         for index in sources:
             self.payload["slots"][index] = {"macro": "", "hotkey": "", "mode": "hybrid"}; self.main_window.custom_icons.pop(str(index), None)
@@ -785,6 +986,9 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         return changed
 
     def _bulk_edit_selected(self) -> None:
+        if any(self._pin_entry(index) for index in self.selected_slots):
+            QtWidgets.QMessageBox.information(self, "일괄 편집", "고정 슬롯은 개별 편집하거나 먼저 고정을 해제해 주세요.")
+            return
         indexes = [index for index in sorted(self.selected_slots) if self.payload["slots"][index].get("action")]
         if not indexes:
             QtWidgets.QMessageBox.information(self, "일괄 편집", "Deck 액션이 설정된 슬롯을 선택해 주세요."); return
@@ -796,6 +1000,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         if dialog.exec() != QtWidgets.QDialog.Accepted: return
         patch = dialog.patch()
         if not patch: return
+        self._record_change()
         self._apply_bulk_patch(indexes, patch); self.save()
 
     def _apply_grid_size(self) -> None:
@@ -804,6 +1009,15 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         if (new_rows, new_cols) == (old_rows, old_cols):
             return
         old_size, new_size = max(1, old_rows * old_cols), max(1, new_rows * new_cols)
+        old_pins = self.main_window._active_pinned_slots()
+        remapped_pins: Dict[str, Any] = {}
+        for local, entry in old_pins.items():
+            old_row, old_col = divmod(int(local), old_cols)
+            if old_row < new_rows and old_col < new_cols:
+                remapped_pins[str(old_row * new_cols + old_col)] = entry
+        if len(remapped_pins) != len(old_pins):
+            QtWidgets.QMessageBox.information(self, "그리드", "새 그리드에 들어가지 않는 고정 슬롯이 있습니다. 고정을 해제하거나 더 큰 그리드를 선택해 주세요.")
+            return
         old_slots = list(self.payload.get("slots") or [])
         old_names = list(self.payload.get("deck_page_names") or [])
         old_icons = copy.deepcopy(self.main_window.custom_icons)
@@ -825,7 +1039,13 @@ class DeckDockWindow(QtWidgets.QMainWindow):
                     source_key = str(page * old_size + local)
                     if source_key in old_icons:
                         new_icons[str(new_base + local - part * new_size)] = old_icons[source_key]
+        if any(self._is_filled_slot(new_slots[page * new_size + int(local)])
+               for page in range(len(new_names)) for local in remapped_pins):
+            QtWidgets.QMessageBox.information(self, "그리드", "새 그리드에서 고정 슬롯과 일반 슬롯이 겹칩니다. 일반 슬롯을 먼저 옮겨 주세요.")
+            return
+        self._record_change()
         self.main_window.rows, self.main_window.cols = new_rows, new_cols
+        old_pins.clear(); old_pins.update(remapped_pins)
         self.main_window.custom_icons = new_icons
         self.payload["slots"] = new_slots
         self.payload["deck_page_names"] = new_names
@@ -837,11 +1057,15 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         return {"macro": action_title(action), "hotkey": "", "mode": "deck_action", "action": action}
 
     def _configure_new_action(self, index: int, kind: str) -> None:
+        if self._pin_entry(index):
+            QtWidgets.QMessageBox.information(self, "공통 슬롯", "고정 슬롯은 클릭하여 편집하거나 먼저 고정을 해제해 주세요.")
+            return
         dialog = DeckActionConfigDialog(
             kind, None, self.main_window, self, slot_index=index,
             icon_config=self.main_window.custom_icons.get(str(index), {}),
         )
         if dialog.exec() == QtWidgets.QDialog.Accepted:
+            self._record_change()
             action = dialog.result_action()
             self.payload["slots"][index] = self._slot_from_action(action)
             icon_config = dialog.result_icon_config()
@@ -869,7 +1093,8 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             )
             return
 
-        previous = dict(self.main_window.custom_icons.get(str(index), {}) or {})
+        pin = self._pin_entry(index)
+        previous = dict((pin.get("icon") if pin else self.main_window.custom_icons.get(str(index))) or {})
         had_visual_layout = bool(
             previous.get("image_data") or previous.get("image_path") or previous.get("emoji")
         )
@@ -882,29 +1107,48 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             "text_position": str(previous.get("text_position") or "hidden") if had_visual_layout else "hidden",
             "icon_source": "manual",
         })
-        self.main_window.custom_icons[str(index)] = previous
+        self._record_change()
+        if pin:
+            pin["icon"] = previous
+        else:
+            self.main_window.custom_icons[str(index)] = previous
         self.main_window._capture_active_slot_preset()
         self.main_window._save_config()
-        self.main_window._preview_slot_icon(index, previous)
+        if pin:
+            self.main_window.refresh_slots()
+        else:
+            self.main_window._preview_slot_icon(index, previous)
         self._render_page()
 
     def _edit_slot(self, index: int) -> None:
-        slot = self.payload["slots"][index]; action = dict(slot.get("action") or {})
+        pin = self._pin_entry(index)
+        slot = pin["slot"] if pin else self.payload["slots"][index]
+        action = dict(slot.get("action") or {})
         if not action:
             return
         dialog = DeckActionConfigDialog(
             str(action.get("kind") or ""), action, self.main_window, self,
-            slot_index=index, icon_config=self.main_window.custom_icons.get(str(index), {}),
+            slot_index=index, icon_config=pin.get("icon", {}) if pin else self.main_window.custom_icons.get(str(index), {}),
         )
         if dialog.exec() == QtWidgets.QDialog.Accepted:
-            self.payload["slots"][index] = self._slot_from_action(dialog.result_action())
+            self._record_change()
+            updated_slot = self._slot_from_action(dialog.result_action())
             icon_config = dialog.result_icon_config()
-            if icon_config: self.main_window.custom_icons[str(index)] = icon_config
-            else: self.main_window.custom_icons.pop(str(index), None)
+            if pin:
+                pin["slot"] = updated_slot
+                pin["icon"] = icon_config or {}
+            else:
+                self.payload["slots"][index] = updated_slot
+                if icon_config: self.main_window.custom_icons[str(index)] = icon_config
+                else: self.main_window.custom_icons.pop(str(index), None)
             self.save()
 
     def _move_slot(self, source: int, target: int) -> None:
         if source == target: return
+        if self._pin_entry(source) or self._pin_entry(target):
+            QtWidgets.QMessageBox.information(self, "공통 슬롯", "고정 슬롯은 먼저 고정을 해제한 뒤 이동해 주세요.")
+            return
+        self._record_change()
         self.payload["slots"][source], self.payload["slots"][target] = self.payload["slots"][target], self.payload["slots"][source]
         source_icon = self.main_window.custom_icons.pop(str(source), None)
         target_icon = self.main_window.custom_icons.pop(str(target), None)
@@ -913,18 +1157,27 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.save()
 
     def _clear_slot(self, index: int) -> None:
+        self._record_change()
+        if self._pin_entry(index):
+            self.main_window._active_pinned_slots().pop(str(index % self._page_size()), None)
+            self.save()
+            return
         self.payload["slots"][index] = {"macro": "", "hotkey": "", "mode": "hybrid"}
         self.main_window.custom_icons.pop(str(index), None)
         self.save()
 
     def _duplicate_slot(self, index: int) -> None:
         start = self.current_page * self._page_size(); end = start + self._page_size()
-        empty = next((i for i in range(start, end) if not str(self.payload["slots"][i].get("macro") or "").strip()), None)
+        empty = next((i for i in range(start, end)
+                      if not self._pin_entry(i) and not self._is_filled_slot(self.payload["slots"][i])), None)
         if empty is None:
             QtWidgets.QMessageBox.information(self, "슬롯 복제", "현재 페이지에 빈 슬롯이 없습니다."); return
-        self.payload["slots"][empty] = copy.deepcopy(self.payload["slots"][index])
-        if str(index) in self.main_window.custom_icons:
-            self.main_window.custom_icons[str(empty)] = copy.deepcopy(self.main_window.custom_icons[str(index)])
+        self._record_change()
+        pin = self._pin_entry(index)
+        self.payload["slots"][empty] = copy.deepcopy(pin["slot"] if pin else self.payload["slots"][index])
+        icon = pin.get("icon") if pin else self.main_window.custom_icons.get(str(index))
+        if icon:
+            self.main_window.custom_icons[str(empty)] = copy.deepcopy(icon)
         self.save()
 
     def save(self) -> bool:
@@ -960,6 +1213,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         if self.current_page + 1 < self.page_count: self.current_page += 1; self._render_page()
 
     def add_page(self) -> None:
+        self._record_change()
         self.page_count += 1; self.payload["deck_page_names"].append(f"페이지 {self.page_count}")
         self.payload["slots"].extend({"macro":"", "hotkey":"", "mode":"hybrid"} for _ in range(self._page_size()))
         self.current_page = self.page_count - 1; self.save()
@@ -967,12 +1221,15 @@ class DeckDockWindow(QtWidgets.QMainWindow):
     def rename_page(self) -> None:
         current = self.payload["deck_page_names"][self.current_page]
         name, ok = QtWidgets.QInputDialog.getText(self, "페이지 이름", "새 페이지 이름", text=current)
-        if ok and name.strip(): self.payload["deck_page_names"][self.current_page] = name.strip(); self.save()
+        if ok and name.strip() and name.strip() != current:
+            self._record_change()
+            self.payload["deck_page_names"][self.current_page] = name.strip(); self.save()
 
     def delete_page(self) -> None:
         if self.page_count <= 1: return
         answer = QtWidgets.QMessageBox.question(self, "페이지 삭제", "현재 페이지와 포함된 슬롯을 삭제할까요?")
         if answer != QtWidgets.QMessageBox.Yes: return
+        self._record_change()
         size = self._page_size(); start = self.current_page * size
         del self.payload["slots"][start:start + size]; del self.payload["deck_page_names"][self.current_page]
         shifted_icons: Dict[str, Any] = {}

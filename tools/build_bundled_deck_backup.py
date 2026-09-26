@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
+import platform
+import shutil
 from pathlib import Path
 
 
@@ -78,13 +82,20 @@ def main() -> None:
         "format": "macrorelay-deck-backup",
         "version": 2,
         "description": "MacroRelay built-in Deck Dock configuration",
+        "source_environment": {
+            "host_fingerprint": hashlib.sha256(platform.node().casefold().encode("utf-8")).hexdigest()[:16],
+        },
         "deck_config": deck_config,
         "hotkeys": hotkeys,
         "macros": macros,
         "assets": assets,
     }
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if OUTPUT_PATH.is_file():
+        shutil.copy2(OUTPUT_PATH, OUTPUT_PATH.with_suffix(".json.prebuild.bak"))
+    temp_path = OUTPUT_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp_path, OUTPUT_PATH)
     print(f"Wrote {OUTPUT_PATH} ({OUTPUT_PATH.stat().st_size:,} bytes)")
 
 

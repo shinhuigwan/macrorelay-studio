@@ -127,10 +127,15 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         *,
         accept_on_release: bool = False,
         hint_text: str | None = None,
+        multiple_regions: bool = False,
     ) -> None:
         super().__init__(parent)
         self._source = pixmap
         self._accept_on_release = bool(accept_on_release)
+        self._multiple_regions = bool(multiple_regions)
+        self._saved_regions: list[QtCore.QRect] = []
+        self._saved_bands: list[SelectionRubberBand] = []
+        self._saved_labels: list[QtWidgets.QLabel] = []
         self._origin: QtCore.QPoint | None = None
         self._selection = QtCore.QRect()
         self._drag_mode = ""
@@ -141,6 +146,7 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         self._pan_start: QtCore.QPoint | None = None
         self._pan_origin = QtCore.QPointF()
         self._closing = False
+        self.cancelled_by_escape = False
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
         self.setGeometry(geometry)
         self.setCursor(QtCore.Qt.CrossCursor)
@@ -327,6 +333,12 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         return QtCore.QRect(QtCore.QPoint(left, top), QtCore.QPoint(right, bottom))
 
     def _show_selection(self) -> None:
+        for band, label, region in zip(self._saved_bands, self._saved_labels, self._saved_regions):
+            shown_region = self._source_rect_to_view(region)
+            band.setGeometry(shown_region)
+            band.setVisible(shown_region.isValid())
+            label.move(shown_region.left() + 4, shown_region.top() + 4)
+            label.setVisible(shown_region.isValid())
         if not self._selection.isValid() or self._selection.width() < 1 or self._selection.height() < 1:
             self.rubber.hide()
             return
@@ -419,7 +431,7 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
                         QtCore.QTimer.singleShot(0, self.accept)
                 return True
             if event.type() == QtCore.QEvent.MouseButtonDblClick and self._selection.width() >= 4:
-                self.accept()
+                self._finish_region(False)
                 return True
             if event.type() == QtCore.QEvent.KeyPress:
                 if event.key() == QtCore.Qt.Key_0:
@@ -433,9 +445,8 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
                     self._cancel_and_reject()
                     return True
                 if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-                    if self._selection.width() >= 4 and self._selection.height() >= 4:
+                    if self._finish_region(bool(event.modifiers() & QtCore.Qt.ShiftModifier)):
                         event.accept()
-                        self.accept()
                         return True
         return super().eventFilter(obj, event)
 
@@ -443,6 +454,7 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
         if getattr(self, "_closing", False):
             return
         self._closing = True
+        self.cancelled_by_escape = True
         self._origin = None
         self._selection = QtCore.QRect()
         try:
@@ -477,15 +489,37 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
             event.accept()
             return
         if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-            if self._selection.width() >= 4 and self._selection.height() >= 4:
+            if self._finish_region(bool(event.modifiers() & QtCore.Qt.ShiftModifier)):
                 event.accept()
-                self.accept()
                 return
         if event.key() == QtCore.Qt.Key_Escape:
             event.accept()
             self._cancel_and_reject()
             return
         super().keyPressEvent(event)
+
+    def _finish_region(self, add_another: bool) -> bool:
+        valid = self._selection.width() >= 4 and self._selection.height() >= 4
+        if not valid and not (self._multiple_regions and self._saved_regions and not add_another):
+            return False
+        if self._multiple_regions and valid:
+            self._saved_regions.append(QtCore.QRect(self._selection.normalized()))
+        if self._multiple_regions and add_another:
+            band = SelectionRubberBand(self.canvas)
+            band.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+            self._saved_bands.append(band)
+            label = QtWidgets.QLabel(str(len(self._saved_regions)), self.canvas)
+            label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+            label.setStyleSheet("background:#0C5F64; color:white; padding:2px 6px; border-radius:4px; font-weight:800;")
+            label.adjustSize()
+            self._saved_labels.append(label)
+            self._selection = QtCore.QRect()
+            self._show_selection()
+            self.hint.setText(f"{len(self._saved_regions)}개 영역 지정됨 · Shift+Enter 추가 · Enter 완료 · Esc 취소")
+            self.hint.adjustSize()
+        else:
+            self.accept()
+        return True
 
     def captured_image(self) -> QtGui.QImage:
         if self._selection.width() < 4 or self._selection.height() < 4:
@@ -528,6 +562,11 @@ class ScreenCaptureDialog(QtWidgets.QDialog):
     def selected_native_screen_rect(self) -> QtCore.QRect:
         """Return the selection in Win32/OpenCV physical screen pixels."""
         return logical_rect_to_native(self.selected_screen_rect())
+
+    def selected_native_screen_rects(self) -> list[QtCore.QRect]:
+        if not self._multiple_regions:
+            return [self.selected_native_screen_rect()]
+        return [logical_rect_to_native(rect.translated(self.geometry().topLeft())) for rect in self._saved_regions]
 
     @property
     def selected_rect(self) -> QtCore.QRect:

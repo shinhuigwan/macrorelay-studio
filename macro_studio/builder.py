@@ -15,6 +15,7 @@ from .action_editor import (
     action_template,
     exec_image_search_confidence_dialog,
     korean_contains,
+    type_text_display,
 )
 from .ai_macro_plan import validate_compiled_draft
 from .automation import (
@@ -27,6 +28,7 @@ from .automation import (
     configure_success_candidates,
 )
 from .bundle_dialog import MacroBundleDialog
+from .node_clipboard import MIME_TYPE as NODE_CLIPBOARD_MIME, copy_nodes, paste_nodes
 from .log_dialog import MacroLogDialog
 
 
@@ -1158,7 +1160,7 @@ class BuilderPage(QtWidgets.QWidget):
                 background: #151A26;
             }
         """)
-        self.add_node_button.setToolTip("<b>노드 배치 추가 (+)</b><br>버튼을 누른 뒤 캔버스에서 원하는 위치를 클릭하면 스마트 설정 후 연결되지 않은 노드가 생성됩니다.<br><b>Ctrl + 빈 캔버스 더블클릭</b>으로 해당 위치에서 액션 선택창을 열 수 있습니다.<br>일반 더블클릭 드래그는 캔버스를 이동합니다.<br>💡 <i>Shift 키를 누르면 빈 템플릿으로 추가됩니다.</i>")
+        self.add_node_button.setToolTip("<b>노드 빠른 추가 (+)</b><br>클릭하면 스마트 설정 후 빈 위치에 자동 배치합니다. 캔버스 위치를 따로 클릭할 필요가 없습니다.<br><b>Ctrl + 빈 캔버스 더블클릭</b> 또는 드래그로 원하는 위치에 직접 추가할 수도 있습니다.<br>💡 <i>Shift 키를 누르면 빈 템플릿으로 추가됩니다.</i>")
         self.add_node_button.clicked.connect(self._arm_step_placement)
         self.action_combo.currentIndexChanged.connect(self._update_add_node_label)
         self.action_combo.node_addition_requested.connect(self._arm_step_placement)
@@ -1217,13 +1219,13 @@ class BuilderPage(QtWidgets.QWidget):
         diagnose_btn.clicked.connect(self._diagnose_automation)
 
         self.step_test_toolbar_btn = QtWidgets.QPushButton("▷ 단계별 테스트")
-        self.step_test_toolbar_btn.setToolTip("<b>선택 노드 단계별 테스트 (Ctrl+Shift+T)</b><br>선택한 노드 1개만 단독으로 테스트하여, 이미지 탐지 성공 여부와 클릭 위치를 즉시 확인합니다.<br>💡 <b>우클릭</b>: 추가 테스트 옵션")
+        self.step_test_toolbar_btn.setToolTip("<b>선택 노드 단계별 테스트 (Alt+Shift+S)</b><br>선택한 노드 1개만 단독으로 테스트하여, 이미지 탐지 성공 여부와 클릭 위치를 즉시 확인합니다.<br>💡 <b>우클릭</b>: 추가 테스트 옵션")
         self.step_test_toolbar_btn.clicked.connect(self._test_selected_step)
         self.step_test_toolbar_btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.step_test_toolbar_btn.customContextMenuRequested.connect(self._show_step_test_menu)
 
         self.run_from_node_toolbar_btn = QtWidgets.QPushButton("▶ 선택 노드부터 실행")
-        self.run_from_node_toolbar_btn.setToolTip("<b>선택 노드부터 이어서 실행</b><br>매크로를 처음부터 다시 시작하지 않고, 캔버스에서 선택한 특정 노드부터 끝까지 연속으로 실행합니다.")
+        self.run_from_node_toolbar_btn.setToolTip("<b>선택 노드부터 이어서 실행 (Alt+Shift+A)</b><br>매크로를 처음부터 다시 시작하지 않고, 캔버스에서 선택한 특정 노드부터 끝까지 연속으로 실행합니다.")
         self.run_from_node_toolbar_btn.clicked.connect(self._run_from_selected_step)
 
         help_btn = QtWidgets.QPushButton("❓ 도움말 & 가이드")
@@ -1379,7 +1381,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.macro_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.macro_list.setDragDropMode(QtWidgets.QAbstractItemView.NoDragDrop)
         self.macro_list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-        self.macro_list.customContextMenuRequested.connect(lambda _pos: self._assign_selected_group())
+        self.macro_list.customContextMenuRequested.connect(self._show_macro_list_menu)
         self.macro_list.itemClicked.connect(self._toggle_macro_group)
         self.macro_list.currentItemChanged.connect(self._select_macro)
         self.macro_list.delete_requested.connect(self._delete_macro_list_selection)
@@ -1530,10 +1532,12 @@ class BuilderPage(QtWidgets.QWidget):
 
         self.node_canvas = NodeCanvas()
         self.node_canvas.node_selected.connect(self._select_graph_node)
+        self.node_canvas.deck_entry_requested.connect(self._set_deck_entry_from_canvas)
         self.node_canvas.inspector_requested.connect(self._focus_inspector)
         self.node_canvas.positions_changed.connect(self._graph_positions_changed)
         self.node_canvas.routes_changed.connect(self._graph_routes_changed)
         self.node_canvas.collapsed_changed.connect(self._graph_collapsed_changed)
+        self.node_canvas.chain_folds_changed.connect(self._graph_chain_folds_changed)
         self.node_canvas.comments_changed.connect(self._graph_comments_changed)
         self.node_canvas.link_requested.connect(self._connect_graph_nodes)
         self.node_canvas.edge_delete_requested.connect(self._delete_graph_edge)
@@ -1544,6 +1548,8 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_canvas.edge_condition_retarget_requested.connect(self._retarget_graph_condition)
         self.node_canvas.node_delete_requested.connect(self._delete_node_from_graph)
         self.node_canvas.node_duplicate_requested.connect(self._duplicate_node_from_graph)
+        self.node_canvas.nodes_copy_requested.connect(self._copy_selected_nodes)
+        self.node_canvas.nodes_paste_requested.connect(self._paste_selected_nodes)
         self.node_canvas.wait_duration_requested.connect(self._set_selected_wait_durations)
         self.node_canvas.all_wait_duration_requested.connect(self._set_all_wait_durations)
         self.node_canvas.start_search_group_requested.connect(self._configure_start_search_candidates)
@@ -1624,6 +1630,9 @@ class BuilderPage(QtWidgets.QWidget):
         self.inspector_action = QtWidgets.QComboBox()
         self._populate_action_combo(self.inspector_action)
         self.label_edit = QtWidgets.QLineEdit()
+        self.entry_name_edit = QtWidgets.QLineEdit()
+        self.entry_name_edit.setPlaceholderText("비워 두면 일반 노드 · 예: A계정 로그인")
+        self.entry_name_edit.setToolTip("덱덱 버튼에서 이 노드부터 실행할 때 사용할 시작 지점 이름입니다. 한 빌드 안에서 중복할 수 없습니다.")
         self.repeat_spin = WheelSafeSpinBox()
         self.repeat_var_edit = QtWidgets.QLineEdit()
         self.repeat_var_edit.setPlaceholderText("예: $run_count")
@@ -1649,6 +1658,7 @@ class BuilderPage(QtWidgets.QWidget):
         self.node_retry_delay_spin.setSuffix(" ms")
         form.addRow("액션", self.inspector_action)
         form.addRow("표시 이름", self.label_edit)
+        form.addRow("덱 시작 지점", self.entry_name_edit)
         form.addRow("단계 반복", self.repeat_spin)
         form.addRow("반복 횟수 변수", self.repeat_var_edit)
         form.addRow("성공 시 이동", self.success_spin)
@@ -1731,6 +1741,7 @@ class BuilderPage(QtWidgets.QWidget):
         for control in (
             self.inspector_action,
             self.label_edit,
+            self.entry_name_edit,
             self.repeat_spin,
             self.repeat_var_edit,
             self.success_spin,
@@ -1820,7 +1831,8 @@ class BuilderPage(QtWidgets.QWidget):
                     max_b = max(int(r[3]) for r in new_asset_regs.values())
                     if max_r > min_l and max_b > min_t:
                         step["region"] = [min_l, min_t, max_r, max_b]
-                        step["regions"] = [[min_l, min_t, max_r, max_b]]
+                        existing_regions = step.get("regions") if isinstance(step.get("regions"), list) else []
+                        step["regions"] = [[min_l, min_t, max_r, max_b], *existing_regions[1:]]
                         step["region_mode"] = "client"
                         step["region_coords"] = "relative"
                 except Exception:
@@ -1829,13 +1841,22 @@ class BuilderPage(QtWidgets.QWidget):
                 step.pop("asset_regions", None)
             if dialog.search_region():
                 step["region"] = dialog.search_region()
-                step["regions"] = [dialog.search_region()]
+                existing_regions = step.get("regions") if isinstance(step.get("regions"), list) else []
+                step["regions"] = [dialog.search_region(), *existing_regions[1:]]
                 step["region_mode"] = "client"
                 step["region_coords"] = "relative"
             elif "region" in step and (step["region"] == [0, 0, 0, 0] or not isinstance(step["region"], list) or len(step["region"]) < 4 or step["region"][2] <= step["region"][0]):
                 step.pop("region", None)
                 if isinstance(step.get("regions"), list) and step["regions"] == [[0, 0, 0, 0]]:
                     step.pop("regions", None)
+            if str(step.get("action") or "") in {"image_search", "screen_condition"}:
+                selected_regions = dialog.search_regions()
+                if selected_regions:
+                    step["regions"] = selected_regions
+                    step["region"] = selected_regions[0]
+                else:
+                    step.pop("regions", None)
+                    step.pop("region", None)
             for field in ("asset_offsets", "asset_confidences", "asset_regions", "asset_routes"):
                 mapping = step.get(field)
                 if isinstance(mapping, dict):
@@ -1881,6 +1902,11 @@ class BuilderPage(QtWidgets.QWidget):
             payload["label"] = label
         else:
             payload.pop("label", None)
+        entry_name = self.entry_name_edit.text().strip()
+        if entry_name:
+            payload["entry_name"] = entry_name
+        else:
+            payload.pop("entry_name", None)
         values = (
             ("repeat", self.repeat_spin.value(), 1),
             ("on_success", self.success_spin.value(), 0),
@@ -1964,7 +1990,7 @@ class BuilderPage(QtWidgets.QWidget):
         elif action in {"mouse_click", "inactive_click"}:
             details = [f"좌표: {step.get('x', 0)}, {step.get('y', 0)}", f"버튼: {step.get('button', 'Left')}"]
         elif action == "type_text":
-            details = [f"내용: {str(step.get('text') or '')[:35] or '비어 있음'}"]
+            details = [f"내용: {type_text_display(step, self.repository.credential_vault())[:35] or '비어 있음'}"]
         elif action == "wait":
             details = [f"대기: {int(step.get('duration') or 0)} ms"]
         elif action == "browser_action":
@@ -2037,6 +2063,7 @@ class BuilderPage(QtWidgets.QWidget):
 
     def _load_common_fields(self, step: dict[str, Any]) -> None:
         self.label_edit.setText(str(step.get("label") or ""))
+        self.entry_name_edit.setText(str(step.get("entry_name") or ""))
         self.repeat_spin.setValue(max(1, int(step.get("repeat") or 1)))
         self.repeat_var_edit.setText(str(step.get("repeat_var") or ""))
         self.success_spin.setValue(int(step.get("on_success") or 0))
@@ -2161,6 +2188,25 @@ class BuilderPage(QtWidgets.QWidget):
         self.repository.assign_macro_group(names, group)
         self.refresh(self.current_name or names[0])
         self.status.emit(f"{len(names)}개 매크로를 '{group or '미분류'}' 폴더로 이동했습니다.")
+
+    def _show_macro_list_menu(self, position: QtCore.QPoint) -> None:
+        item = self.macro_list.itemAt(position)
+        name = str(item.data(QtCore.Qt.UserRole) or "") if item else ""
+        if not name:
+            return
+        menu = QtWidgets.QMenu(self.macro_list)
+        duplicate = menu.addAction("복제…")
+        rename = menu.addAction("이름 변경…")
+        menu.addSeparator()
+        move = menu.addAction("선택한 폴더로 이동")
+        chosen = menu.exec(self.macro_list.mapToGlobal(position))
+        if chosen == duplicate:
+            self._duplicate_macro_named(name)
+        elif chosen == rename:
+            self._rename_macro_named(name)
+        elif chosen == move:
+            self._activate_macro_item(item)
+            self._assign_selected_group()
 
     def _toggle_macro_group(self, item: QtWidgets.QListWidgetItem) -> None:
         if item.data(QtCore.Qt.UserRole + 3) != "group_header":
@@ -2363,7 +2409,7 @@ class BuilderPage(QtWidgets.QWidget):
             target = str(step.get("window_exe") or "전체 화면")
             return f"픽셀 {count}개 · {condition} · {target}"
         if action == "type_text":
-            text = str(step.get("text") or "")
+            text = type_text_display(step)
             return text[:30] or "텍스트 입력"
         if action == "browser_action":
             return str(step.get("selector") or step.get("title") or "브라우저 액션")
@@ -2498,6 +2544,16 @@ class BuilderPage(QtWidgets.QWidget):
             self.current_macro["graph_collapsed"] = sorted({int(index) for index in indexes if int(index) > 0})
         else:
             self.current_macro.pop("graph_collapsed", None)
+        self._graph_save_timer.start()
+
+    @QtCore.Slot(list)
+    def _graph_chain_folds_changed(self, indexes: list[int]) -> None:
+        if self.current_macro is None:
+            return
+        if indexes:
+            self.current_macro["graph_chain_folds"] = sorted({int(index) for index in indexes if int(index) > 0})
+        else:
+            self.current_macro.pop("graph_chain_folds", None)
         self._graph_save_timer.start()
 
     @QtCore.Slot(list)
@@ -3148,6 +3204,7 @@ class BuilderPage(QtWidgets.QWidget):
         clone.pop("on_success_delay", None)
         clone.pop("on_fail_delay", None)
         clone.pop("edge_conditions", None)
+        clone.pop("entry_name", None)
         clone["label"] = (str(clone.get("label") or self._step_summary(clone)) + " 복사본").strip()
         steps.append(clone)
         positions = self.current_macro.setdefault("graph_positions", {})
@@ -3156,6 +3213,41 @@ class BuilderPage(QtWidgets.QWidget):
             positions[str(len(steps))] = [float(source_pos[0]) + 40, float(source_pos[1]) + 140]
         self._persist(f"{index}번 노드를 복제했습니다.")
         self._refresh_steps(len(steps) - 1)
+
+    @QtCore.Slot(list)
+    def _copy_selected_nodes(self, indexes: list[int]) -> None:
+        if not self.current_macro or not indexes:
+            return
+        snapshot = deepcopy(self.current_macro)
+        snapshot["graph_positions"] = self.node_canvas.positions()
+        payload = copy_nodes(snapshot, indexes)
+        mime = QtCore.QMimeData()
+        mime.setData(NODE_CLIPBOARD_MIME, QtCore.QByteArray(json.dumps(payload, ensure_ascii=False).encode("utf-8")))
+        QtWidgets.QApplication.clipboard().setMimeData(mime)
+        self.status.emit(f"노드 {len(payload['nodes'])}개를 복사했습니다. 다른 매크로에서 Ctrl+V로 붙여넣으세요.")
+
+    @QtCore.Slot(object)
+    def _paste_selected_nodes(self, scene_point: QtCore.QPointF) -> None:
+        if self.current_macro is None:
+            return
+        mime = QtWidgets.QApplication.clipboard().mimeData()
+        if mime is None or not mime.hasFormat(NODE_CLIPBOARD_MIME):
+            return
+        try:
+            payload = json.loads(bytes(mime.data(NODE_CLIPBOARD_MIME)).decode("utf-8"))
+            candidate = deepcopy(self.current_macro)
+            added = paste_nodes(candidate, payload, scene_point.x(), scene_point.y())
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            QtWidgets.QMessageBox.warning(self, "노드 붙여넣기 실패", str(exc))
+            return
+        self.current_macro = candidate
+        self._persist(f"노드 {len(added)}개를 붙여넣었습니다.")
+        self._refresh_steps(added[0] - 1)
+        self.node_canvas.scene.clearSelection()
+        for index in added:
+            node = self.node_canvas.nodes.get(index)
+            if node is not None:
+                node.setSelected(True)
 
     @QtCore.Slot(list)
     def _set_selected_wait_durations(self, indexes: list[int]) -> None:
@@ -3217,7 +3309,7 @@ class BuilderPage(QtWidgets.QWidget):
         current = self._build_form_payload()
         payload = deepcopy(ACTION_TEMPLATES.get(action, {"action": action}))
         payload["action"] = action
-        for key in ("label", "repeat", "repeat_var", "on_success", "on_fail", "on_success_delay", "on_fail_delay", "sleep_after"):
+        for key in ("label", "entry_name", "repeat", "repeat_var", "on_success", "on_fail", "on_success_delay", "on_fail_delay", "sleep_after"):
             if key in current:
                 payload[key] = current[key]
         self.action_editor.load_step(payload)
@@ -3232,17 +3324,56 @@ class BuilderPage(QtWidgets.QWidget):
         if not 0 <= row < len(steps):
             return
         payload = self._build_form_payload()
+        entry_name = str(payload.get("entry_name") or "").strip()
+        if entry_name and any(
+            index != row and str(step.get("entry_name") or "").strip().casefold() == entry_name.casefold()
+            for index, step in enumerate(steps) if isinstance(step, dict)
+        ):
+            QtWidgets.QMessageBox.warning(self, "시작 지점 이름 중복", f"'{entry_name}' 시작 지점이 이미 있습니다. 다른 이름을 사용하세요.")
+            return
         steps[row] = payload
         self._persist(f"{row + 1}번 단계를 저장했습니다.")
         self._refresh_steps(row)
+
+    @QtCore.Slot(int)
+    def _set_deck_entry_from_canvas(self, index: int) -> None:
+        steps = (self.current_macro or {}).get("steps") or []
+        if not 1 <= index <= len(steps) or self.node_canvas.selected_indexes() != [index]:
+            QtWidgets.QMessageBox.information(self, "덱 시작 지점", "시작할 노드 하나만 선택한 뒤 다시 눌러 주세요.")
+            return
+        current = str(steps[index - 1].get("entry_name") or "").strip()
+        name, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            "덱 시작 지점",
+            f"{index}번 노드의 시작 지점 이름을 입력하세요.\n덱덕의 '매크로 실행' 슬롯에서 이 이름을 선택할 수 있습니다.\n비워서 저장하면 시작 지점 지정이 해제됩니다.",
+            QtWidgets.QLineEdit.Normal,
+            current,
+        )
+        if not accepted:
+            return
+        name = name.strip()
+        if name == current:
+            return
+        if name and any(
+            other_index != index and str(step.get("entry_name") or "").strip().casefold() == name.casefold()
+            for other_index, step in enumerate(steps, 1) if isinstance(step, dict)
+        ):
+            QtWidgets.QMessageBox.warning(self, "시작 지점 이름 중복", f"'{name}' 시작 지점이 이미 있습니다. 다른 이름을 사용하세요.")
+            return
+        if name:
+            steps[index - 1]["entry_name"] = name
+        else:
+            steps[index - 1].pop("entry_name", None)
+        self._persist(f"{index}번 노드의 덱 시작 지점을 {'설정' if name else '해제'}했습니다.")
+        self._refresh_steps(index - 1)
 
     def _arm_step_placement(self, action_override: Any = None) -> None:
         if not self.current_macro:
             self.status.emit("먼저 매크로를 선택하세요.")
             return
         action = action_override if isinstance(action_override, str) and action_override else self._selected_action(self.action_combo)
-        self.node_canvas.begin_node_placement(action)
-        self.status.emit(f"{ACTION_LABELS.get(action, action)} 노드를 놓을 캔버스 위치를 클릭하세요. Esc로 취소할 수 있습니다.")
+        self.node_canvas.cancel_node_placement()
+        self._add_step(action)
 
     @QtCore.Slot(str, object)
     def _add_step_at_position(self, action_override: str, scene_position: object) -> None:
@@ -3273,7 +3404,7 @@ class BuilderPage(QtWidgets.QWidget):
         interactive_actions = {
             "image_search", "screen_condition", "inactive_click", "mouse_click",
             "pixel_search", "ocr", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio",
-            "animation_search",
+            "animation_search", "type_text",
         }
 
         step = None
@@ -4279,7 +4410,7 @@ class BuilderPage(QtWidgets.QWidget):
 
     def _show_step_test_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self.step_test_toolbar_btn)
-        act_step = menu.addAction("▷ 선택 단계만 테스트 (Ctrl+Shift+T)")
+        act_step = menu.addAction("▷ 선택 단계만 테스트 (Alt+Shift+S)")
         act_step.triggered.connect(self._test_selected_step)
         act_from = menu.addAction("▶ 선택 노드부터 이어서 실행")
         act_from.triggered.connect(self._resume_from_selected_node)
@@ -4498,19 +4629,20 @@ class BuilderPage(QtWidgets.QWidget):
     def _remap_graph_collapsed(self, mapping: dict[int, int]) -> None:
         if self.current_macro is None:
             return
-        collapsed = self.current_macro.get("graph_collapsed") or []
-        remapped = sorted(
-            {
-                mapping[index]
-                for value in collapsed if str(value).lstrip("-").isdigit()
-                for index in [int(value)]
-                if index in mapping
-            }
-        ) if isinstance(collapsed, list) else []
-        if remapped:
-            self.current_macro["graph_collapsed"] = remapped
-        else:
-            self.current_macro.pop("graph_collapsed", None)
+        for key in ("graph_collapsed", "graph_chain_folds"):
+            collapsed = self.current_macro.get(key) or []
+            remapped = sorted(
+                {
+                    mapping[index]
+                    for value in collapsed if str(value).lstrip("-").isdigit()
+                    for index in [int(value)]
+                    if index in mapping
+                }
+            ) if isinstance(collapsed, list) else []
+            if remapped:
+                self.current_macro[key] = remapped
+            else:
+                self.current_macro.pop(key, None)
 
     def _normalize_edges_after_delete(self, deleted: int) -> None:
         steps = (self.current_macro or {}).get("steps") or []
@@ -4820,16 +4952,32 @@ class BuilderPage(QtWidgets.QWidget):
     def _duplicate_macro(self) -> None:
         if not self.current_name:
             return
-        dialog = MacroDialog("매크로 복제", f"{self.current_name}-복사본", self)
+        self._duplicate_macro_named(self.current_name)
+
+    def _duplicate_macro_named(self, source: str) -> None:
+        dialog = MacroDialog("매크로 복제", f"{source}-복사본", self)
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
         try:
-            path = self.repository.duplicate_macro(self.current_name, dialog.name_edit.text())
+            path = self.repository.duplicate_macro(source, dialog.name_edit.text())
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "복제 실패", str(exc))
             return
         self.refresh(path.stem)
         self.data_changed.emit()
+
+    def _rename_macro_named(self, source: str) -> None:
+        name, accepted = QtWidgets.QInputDialog.getText(self, "매크로 이름 변경", "새 이름", text=source)
+        if not accepted or not name.strip() or name.strip() == source:
+            return
+        try:
+            path = self.repository.rename_macro(source, name.strip())
+        except (OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "이름 변경 실패", str(exc))
+            return
+        self.refresh(path.stem)
+        self.data_changed.emit()
+        self.status.emit(f"'{source}' → '{path.stem}' 이름을 변경했습니다.")
 
     def _archive_macro(self) -> None:
         names = self._selected_macro_names() or ([self.current_name] if self.current_name else [])

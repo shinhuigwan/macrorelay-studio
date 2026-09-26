@@ -73,4 +73,6 @@ branding/*
 *.keystore
 *.building-*
 *.bak
+/deck_presets/*.backup-*.json
+/deck_presets/*.json.tmp
 *.exe

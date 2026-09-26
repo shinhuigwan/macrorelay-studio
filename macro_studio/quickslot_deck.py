@@ -19,14 +19,17 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import urllib.request
 import wave
 import webbrowser
 from ctypes import wintypes
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -43,11 +46,55 @@ except ImportError:
     QSoundEffect = None
 
 from macro_studio.repository import MacroRepository
+from macro_studio.portable_deck import adapt_backup_for_host, host_fingerprint
+from macro_studio.deck_starter_actions import starter_action_pack
+from macro_studio.deck_browser_bridge import (
+    DeckBrowserBridge, foreground_program, normalize_program_rule,
+    normalize_site_rule, preset_for_program, preset_for_url,
+)
 from macro_studio.theme import stylesheet
 
 
 DECK_BACKUP_VERSION = 2
 BUNDLED_DECK_BACKUP = Path(__file__).resolve().parent.parent / "deck_presets" / "macrorelay_bundled_deck.json"
+GITHUB_BUNDLED_DECK_URL = (
+    "https://raw.githubusercontent.com/shinhuigwan/macrorelay-studio/main/"
+    "deck_presets/macrorelay_bundled_deck.json"
+)
+MAX_BUNDLED_DECK_BYTES = 100 * 1024 * 1024
+
+
+def bundled_deck_path(app_root: Path) -> Path:
+    local = Path(app_root) / "deck_presets" / "macrorelay_bundled_deck.json"
+    return local if local.is_file() else BUNDLED_DECK_BACKUP
+
+
+def download_github_bundled_deck() -> Dict[str, Any]:
+    request = urllib.request.Request(GITHUB_BUNDLED_DECK_URL, headers={"User-Agent": "MacroRelay-Deck"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        content = response.read(MAX_BUNDLED_DECK_BYTES + 1)
+    if len(content) > MAX_BUNDLED_DECK_BYTES:
+        raise ValueError("GitHub 내장 구성 파일이 허용 크기(100MB)를 넘습니다.")
+    payload = json.loads(content.decode("utf-8-sig"))
+    if not isinstance(payload, dict) or payload.get("format") != "macrorelay-deck-backup":
+        raise ValueError("GitHub 파일이 MacroRelay Deck 백업 형식이 아닙니다.")
+    if not isinstance(payload.get("hotkeys"), dict) or not isinstance(payload.get("macros"), dict):
+        raise ValueError("GitHub 내장 구성에 슬롯 또는 매크로 정보가 없습니다.")
+    return payload
+
+
+def save_bundled_deck_payload(app_root: Path, payload: Dict[str, Any]) -> Path:
+    if payload.get("format") != "macrorelay-deck-backup":
+        raise ValueError("내장 구성으로 저장할 수 있는 Deck 백업 형식이 아닙니다.")
+    path = Path(app_root) / "deck_presets" / "macrorelay_bundled_deck.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        backup = path.with_name(f"{path.stem}.backup-{datetime.now():%Y%m%d-%H%M%S%f}.json")
+        shutil.copy2(path, backup)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp_path, path)
+    return path
 
 
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -58,6 +105,52 @@ MIN_TILE_SIDE = 48
 WINDOW_PADDING = 16
 PRESET_STYLE_KEYS = ("theme_index", "tile_scale", "tile_gap", "tile_radius", "hover_glow", "empty_slot_opacity", "show_empty_slots")
 QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS = 240
+
+# Starter modes add no actions and never enable automatic switching on their own.
+# The first-run marker prevents a deleted starter mode from reappearing later.
+STARTER_PRESETS = (
+    ("youtube", "유튜브", "▶", "#FF4545", ("youtube.com",), ()),
+    ("naver", "네이버", "N", "#26C76D", ("naver.com",), ()),
+    ("ldplayer", "LDPlayer", "LD", "#4F9DFF", (), ("dnplayer.exe", "ldplayer.exe")),
+    ("explorer", "파일 탐색기", "▣", "#F2BF50", (), ("explorer.exe",)),
+    ("notepad", "메모장", "✎", "#67B7F7", (), ("notepad.exe",)),
+    ("calculator", "계산기", "∑", "#AD95F8", (), ("calculatorapp.exe", "calculator.exe", "calc.exe")),
+    ("settings", "Windows 설정", "⚙", "#94A3B8", (), ("systemsettings.exe",)),
+)
+DEFAULT_PRESET_VISUAL = ("⌂", "#7C6CFF")
+
+
+def preset_visual(preset_id: str, preset: Dict[str, Any]) -> tuple[str, str]:
+    icon = str(preset.get("icon") or "").strip()
+    color = str(preset.get("color") or "").strip()
+    if not icon or not QtGui.QColor(color).isValid():
+        if preset_id == "default":
+            fallback = DEFAULT_PRESET_VISUAL
+        else:
+            fallback = next(((glyph, accent) for key, _name, glyph, accent, _sites, _programs
+                             in STARTER_PRESETS if preset_id == f"starter-{key}"),
+                            ((str(preset.get("name") or preset_id).strip() or "?")[:1].upper(), "#818CF8"))
+        icon = icon or fallback[0]
+        color = color if QtGui.QColor(color).isValid() else fallback[1]
+    return icon[:3], color
+
+
+def preset_qicon(icon_text: str, color: str) -> QtGui.QIcon:
+    pixmap = QtGui.QPixmap(36, 36)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing)
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(QtGui.QColor(color))
+    painter.drawRoundedRect(QtCore.QRectF(2, 2, 32, 32), 9, 9)
+    font = painter.font()
+    font.setBold(True)
+    font.setPointSize(10 if len(icon_text) > 1 else 14)
+    painter.setFont(font)
+    painter.setPen(QtGui.QColor("#FFFFFF"))
+    painter.drawText(pixmap.rect(), QtCore.Qt.AlignCenter, icon_text)
+    painter.end()
+    return QtGui.QIcon(pixmap)
 
 
 def _quickslot_touch_sound_path() -> Path:
@@ -376,11 +469,65 @@ def icon_config_has_visual(config: Dict[str, Any]) -> bool:
 def extract_program_icon_config(target: str) -> Dict[str, Any]:
     """Extract a launch target's native Windows icon into a portable config."""
     path = str(target or "").strip().strip('"')
+    icon_index = 0
+    if path.lower().endswith(".lnk") and Path(path).is_file():
+        # QFileIconProvider returns the small shortcut thumbnail (including its
+        # arrow overlay). Resolve the link before extracting the actual icon.
+        script = (
+            "$OutputEncoding=[Console]::OutputEncoding=[Console]::InputEncoding="
+            "[System.Text.Encoding]::UTF8;"
+            "$link=(New-Object -ComObject WScript.Shell).CreateShortcut([Console]::In.ReadToEnd());"
+            "[Console]::Out.WriteLine($link.IconLocation);"
+            "[Console]::Out.WriteLine($link.TargetPath)"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                 base64.b64encode(script.encode("utf-16le")).decode("ascii")],
+                input=path, text=True, encoding="utf-8", capture_output=True,
+                timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0:
+                icon_location, _, shortcut_target = result.stdout.partition("\n")
+                icon_location = icon_location.strip().strip('"')
+                if "," in icon_location and icon_location.rsplit(",", 1)[1].lstrip("-").isdigit():
+                    icon_location, index_text = icon_location.rsplit(",", 1)
+                    icon_index = int(index_text)
+                icon_location = os.path.expandvars(icon_location)
+                shortcut_target = os.path.expandvars(shortcut_target.strip())
+                if Path(icon_location).is_file():
+                    path = icon_location
+                elif Path(shortcut_target).is_file():
+                    path = shortcut_target
+                    icon_index = 0
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
+            pass
     info = QtCore.QFileInfo(path)
     if not path or not info.exists():
         return {}
-    provider = QtWidgets.QFileIconProvider()
-    pixmap = provider.icon(info).pixmap(256, 256)
+    pixmap = QtGui.QPixmap()
+    native_icon = False
+    if os.name == "nt":
+        extractor = ctypes.windll.user32.PrivateExtractIconsW
+        extractor.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                              ctypes.POINTER(wintypes.HICON), ctypes.POINTER(wintypes.UINT),
+                              wintypes.UINT, wintypes.UINT]
+        extractor.restype = wintypes.UINT
+        handle = wintypes.HICON()
+        icon_id = wintypes.UINT()
+        try:
+            count = extractor(path, icon_index, 256, 256, ctypes.byref(handle), ctypes.byref(icon_id), 1, 0)
+            if count and handle.value:
+                image = QtGui.QImage.fromHICON(int(handle.value))
+                if not image.isNull():
+                    pixmap = QtGui.QPixmap.fromImage(image)
+                    native_icon = True
+        finally:
+            if handle.value:
+                ctypes.windll.user32.DestroyIcon(handle)
+    if pixmap.isNull():
+        provider = QtWidgets.QFileIconProvider()
+        pixmap = provider.icon(info).pixmap(256, 256)
     if pixmap.isNull():
         return {}
     data = QtCore.QByteArray()
@@ -402,7 +549,91 @@ def extract_program_icon_config(target: str) -> Dict[str, Any]:
         "text_x_percent": 50,
         "text_y_percent": 85,
         "icon_source": "program_auto",
+        "icon_extractor_version": 2,
+        "icon_quality": "native" if native_icon else "fallback",
     }
+
+
+def macro_program_icon_target(repository: MacroRepository, macro_name: str, entry_name: str = "") -> str:
+    """Find the first executable launched from a Deck macro's selected entry."""
+    if not macro_name:
+        return ""
+    try:
+        macro = repository.load_macro(macro_name)
+    except (OSError, ValueError, KeyError):
+        return ""
+    steps = macro.get("steps") or []
+    index = 1
+    if entry_name:
+        from macro_studio.repository import resolve_macro_entry
+        try:
+            index = resolve_macro_entry(macro, entry_name)
+        except ValueError:
+            return ""
+    visited: set[int] = set()
+    while 0 < index <= len(steps) and index not in visited:
+        visited.add(index)
+        step = steps[index - 1]
+        if not isinstance(step, dict):
+            break
+        if step.get("action") == "run_program":
+            command = os.path.expandvars(str(step.get("command") or "").strip())
+            if command.startswith('"'):
+                command = command[1:].split('"', 1)[0]
+            elif ".exe" in command.lower():
+                command = command[:command.lower().index(".exe") + 4]
+            target = shutil.which(command) or command
+            if Path(target).is_file():
+                return target
+        index = int(step.get("on_success") or (index + 1))
+    return ""
+
+
+def deck_action_needs_program_icon(action: Dict[str, Any] | None, icon: Dict[str, Any]) -> bool:
+    if not action or str(icon.get("icon_source") or "") == "manual":
+        return False
+    kind = str(action.get("kind") or "")
+    if kind not in {"open_target", "run_macro"}:
+        return False
+    if str(icon.get("icon_source") or "") == "program_auto" and int(icon.get("icon_extractor_version") or 0) < 2:
+        return True
+    if str(icon.get("image_data") or "") or str(icon.get("image_path") or ""):
+        return False
+    return not icon_config_has_visual(icon) or (kind == "run_macro" and icon.get("emoji") in {"▶", "M"})
+
+
+def manual_executable_icon_needs_upgrade(icon: Dict[str, Any]) -> bool:
+    return (
+        str(icon.get("icon_source") or "") == "manual"
+        and Path(str(icon.get("image_path") or "")).suffix.lower() in {".exe", ".lnk"}
+        and int(icon.get("icon_extractor_version") or 0) < 2
+    )
+
+
+def upgrade_manual_executable_icon(icon: Dict[str, Any]) -> Dict[str, Any]:
+    """Refresh only the bitmap, preserving a user's tile layout and text."""
+    if not manual_executable_icon_needs_upgrade(icon):
+        return icon
+    extracted = extract_program_icon_config(str(icon.get("image_path") or ""))
+    if not extracted.get("image_data"):
+        return icon
+    upgraded = dict(icon)
+    for key in ("image_data", "icon_extractor_version", "icon_quality"):
+        upgraded[key] = extracted[key]
+    return upgraded
+
+
+def deck_action_program_icon(repository: MacroRepository, action: Dict[str, Any]) -> Dict[str, Any]:
+    kind = str(action.get("kind") or "")
+    if kind == "open_target":
+        target = str(action.get("target") or "")
+    elif kind == "run_macro":
+        target = macro_program_icon_target(
+            repository, str(action.get("macro") or ""), str(action.get("entry_name") or "")
+        )
+    else:
+        return {}
+    return extract_program_icon_config(target)
 
 
 def encode_image_file_to_base64(file_path: str) -> str:
@@ -559,6 +790,10 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         self.slot_index = slot_index
         self.macro_name = macro_name or f"슬롯 #{slot_index + 1}"
         self.icon_config = dict(icon_config or {})
+        self._current_icon_meta = {
+            key: self.icon_config[key]
+            for key in ("icon_extractor_version", "icon_quality") if key in self.icon_config
+        }
         repository = getattr(parent, "repository", None)
         self.app_root = Path(getattr(repository, "root", Path(__file__).resolve().parents[1]))
         owner_config = getattr(parent, "config", None)
@@ -614,9 +849,13 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         btn_browse = QtWidgets.QPushButton("📁 파일 선택...")
         btn_browse.setStyleSheet("background: #FFFFFF; border: 1px solid #B9C6D6; color: #263449; font-weight: 700; padding: 6px 12px; border-radius: 8px;")
         btn_browse.clicked.connect(self._browse_image)
+        btn_program_icon = QtWidgets.QPushButton("💻 실행 파일 아이콘")
+        btn_program_icon.setToolTip("슬롯에서 실행하는 매크로와 관계없이 EXE 파일의 아이콘을 직접 가져옵니다.")
+        btn_program_icon.clicked.connect(self._browse_program_icon)
 
         file_box.addWidget(self.file_edit, 1)
         file_box.addWidget(btn_browse)
+        file_box.addWidget(btn_program_icon)
         form_layout.addRow("아이콘 이미지 파일:", file_box)
 
         preset_section = QtWidgets.QFrame()
@@ -874,8 +1113,28 @@ class SlotIconEditDialog(QtWidgets.QDialog):
             self.file_edit.setText(path)
             self.stretch_check.setChecked(True)
             self._current_base64 = encode_image_file_to_base64(path)
+            self._current_icon_meta = {}
             self._sync_preset_selection(path)
             self._update_preview()
+
+    def _browse_program_icon(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "아이콘을 가져올 실행 파일 선택", "", "실행 파일 (*.exe *.lnk);;모든 파일 (*.*)"
+        )
+        if not path:
+            return
+        config = extract_program_icon_config(path)
+        image_data = str(config.get("image_data") or "")
+        if not image_data:
+            QtWidgets.QMessageBox.warning(self, "아이콘 가져오기", "이 실행 파일에서 아이콘을 읽지 못했습니다.")
+            return
+        self._current_base64 = image_data
+        self._current_icon_meta = {
+            key: config[key] for key in ("icon_extractor_version", "icon_quality") if key in config
+        }
+        self.file_edit.setText(path)
+        self._sync_preset_selection("")
+        self._update_preview()
 
     def _reload_icon_gallery(self) -> None:
         while self.preset_row.count():
@@ -939,6 +1198,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
     def _select_preset_icon(self, path: Path) -> None:
         resolved = str(path.resolve())
         self._current_base64 = encode_image_file_to_base64(resolved)
+        self._current_icon_meta = {}
         self.file_edit.setText(resolved)
         self.stretch_check.setChecked(True)
         self.emoji_edit.clear()
@@ -956,6 +1216,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
     def _reset_config(self) -> None:
         self.file_edit.clear()
         self._current_base64 = ""
+        self._current_icon_meta = {}
         self._sync_preset_selection("")
         self.stretch_check.setChecked(self.default_full_stretch)
         self.show_text_check.setChecked(True)
@@ -986,7 +1247,7 @@ class SlotIconEditDialog(QtWidgets.QDialog):
         elif not img_path:
             b64_data = ""
 
-        return {
+        config = {
             "image_path": img_path,
             "image_data": b64_data,
             "full_stretch": self.stretch_check.isChecked(),
@@ -999,6 +1260,9 @@ class SlotIconEditDialog(QtWidgets.QDialog):
             "text_x_percent": self.x_spin.value(),
             "text_y_percent": self.y_spin.value(),
         }
+        if Path(img_path).suffix.lower() in {".exe", ".lnk"}:
+            config.update(self._current_icon_meta)
+        return config
 
 
 class StreamDeckButton(QtWidgets.QFrame):
@@ -1019,6 +1283,7 @@ class StreamDeckButton(QtWidgets.QFrame):
         self.hotkey = ""
         self.mode = "hybrid"
         self.is_running = False
+        self.feedback_state = ""
         self.custom_icon_config: Dict[str, Any] = {}
         self._suppress_next_release = False
 
@@ -1232,6 +1497,13 @@ class StreamDeckButton(QtWidgets.QFrame):
                 painter.setPen(QtGui.QPen(QtGui.QColor(border_color), border_width))
                 border_rect = QtCore.QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
                 painter.drawRoundedRect(border_rect, tile_radius, tile_radius)
+            feedback_color = {"started": "#56B8FF", "completed": "#32D7A0", "failed": "#F16B79"}.get(self.feedback_state)
+            if feedback_color:
+                painter.setClipping(False)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.setPen(QtGui.QPen(QtGui.QColor(feedback_color), max(3.0, border_width + 1.0)))
+                highlight_rect = rect.adjusted(2, 2, -2, -2)
+                painter.drawRoundedRect(highlight_rect, tile_radius, tile_radius)
             painter.end()
 
     def set_custom_icon_config(self, config: Dict[str, Any]) -> None:
@@ -1256,6 +1528,11 @@ class StreamDeckButton(QtWidgets.QFrame):
     def set_running(self, running: bool) -> None:
         if self.is_running != running:
             self.is_running = running
+            self._update_appearance()
+
+    def set_feedback(self, state: str) -> None:
+        if self.feedback_state != state:
+            self.feedback_state = state
             self._update_appearance()
 
     def _update_appearance(self) -> None:
@@ -1418,7 +1695,16 @@ class StreamDeckButton(QtWidgets.QFrame):
         else:
             card_bg, card_border, glow_color = theme["card_bg_2"], theme["card_border_2"], theme["glow_2"]
 
-        if self.is_running:
+        if self.feedback_state == "failed":
+            self.glow_bar.setStyleSheet("background:#F16B79;border-radius:2px;")
+            self.setStyleSheet(f"#SlotCard {{ background:{card_bg}; border:{border_width + 1}px solid #F16B79; border-radius:{tile_radius}px; }}")
+        elif self.feedback_state == "completed":
+            self.glow_bar.setStyleSheet("background:#32D7A0;border-radius:2px;")
+            self.setStyleSheet(f"#SlotCard {{ background:{card_bg}; border:{border_width + 1}px solid #32D7A0; border-radius:{tile_radius}px; }}")
+        elif self.feedback_state == "started":
+            self.glow_bar.setStyleSheet("background:#56B8FF;border-radius:2px;")
+            self.setStyleSheet(f"#SlotCard {{ background:{card_bg}; border:{border_width + 1}px solid #56B8FF; border-radius:{tile_radius}px; }}")
+        elif self.is_running:
             self.glow_bar.setStyleSheet("background: #35C89A; border-radius: 2px;")
             self.setStyleSheet(f"""
                 #SlotCard {{
@@ -1555,12 +1841,38 @@ RADIAL_ACTION_PRESETS: Dict[str, tuple[str, str, str]] = {
     "studio": ("⚙️ Studio 실행", "🖥️", "#35C89A"),
     "topmost": ("📌 최상위 고정", "📌", "#C026D3"),
     "minimize": ("📥 트레이 최소화", "—", "#94A3B8"),
-    "close_app": ("❌ 프로그램 종료", "✕", "#FF4D4D"),
+    "close_app": ("❌ 덱 닫기", "✕", "#FF4D4D"),
     "opacity": ("💧 투명도 조절", "💧", "#38BDF8"),
     "grid": ("▦ 그리드 변경", "▦", "#F59E0B"),
     "add_slot": ("＋ 슬롯 추가", "＋", "#22C55E"),
     "preset_settings": ("★ 덱 프리셋 관리", "★", "#FBBF24"),
+    "auto_resume": ("🌐 자동 프리셋 재개", "↺", "#20BFA8"),
 }
+
+DEFAULT_MANAGEMENT_RADIAL_ITEMS = [
+    "prev_page", "next_page", "settings", "deck_dock",
+    "preset_settings", "emergency", "studio", "close_app",
+]
+
+
+def normalize_management_radial_items(keys: Optional[List[str]]) -> List[str]:
+    """Keep Deck Close in the final management-menu sector across saved layouts."""
+    actions = [key for key in (keys or []) if key in RADIAL_ACTION_PRESETS and key != "close_app"][:7]
+    for fallback in DEFAULT_MANAGEMENT_RADIAL_ITEMS:
+        if len(actions) >= 7:
+            break
+        if fallback not in actions and fallback != "close_app":
+            actions.append(fallback)
+    for required, preferred, replace in (("deck_dock", 3, "refresh"),
+                                         ("preset_settings", 4, "add_slot")):
+        if required in actions:
+            continue
+        target = actions.index(replace) if replace in actions else preferred
+        if actions[target] in {"deck_dock", "preset_settings"}:
+            target = next((index for index, key in enumerate(actions)
+                           if key not in {"deck_dock", "preset_settings"}), target)
+        actions[target] = required
+    return actions + ["close_app"]
 
 THEMES: Dict[int, Dict[str, Any]] = {
     0: {
@@ -1661,35 +1973,30 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         self._init_default_items()
 
     def _init_default_items(self) -> None:
-        default_keys = ["prev_page", "next_page", "settings", "deck_dock", "preset_settings", "emergency", "studio", "topmost"]
         self.items = []
-        for k in default_keys:
+        for k in DEFAULT_MANAGEMENT_RADIAL_ITEMS:
             title, icon_text, color = RADIAL_ACTION_PRESETS[k]
             self.items.append(RadialPieMenuItem(k, title, icon_text, color))
 
     def load_custom_items(self, custom_keys: Optional[List[str]]) -> None:
         self.center_title = "Quick Actions"
         self.center_subtitle = "관리 메뉴"
-        if not custom_keys or len(custom_keys) < 8:
-            self._init_default_items()
-            return
-        new_items = []
-        for k in custom_keys[:8]:
-            if k in RADIAL_ACTION_PRESETS:
-                title, icon_text, color = RADIAL_ACTION_PRESETS[k]
-                new_items.append(RadialPieMenuItem(k, title, icon_text, color))
-        if len(new_items) == 8:
-            self.items = new_items
-        else:
-            self._init_default_items()
+        self.items = []
+        for key in normalize_management_radial_items(custom_keys):
+            title, icon_text, color = RADIAL_ACTION_PRESETS[key]
+            self.items.append(RadialPieMenuItem(key, title, icon_text, color))
+        self.update()
 
-    def load_deck_presets(self, presets: List[tuple[str, str]]) -> None:
+    def load_deck_presets(self, presets: List[tuple[str, ...]]) -> None:
         self.center_title = "Preset"
         self.center_subtitle = "모드 전환"
         colors = ["#38BDF8", "#A78BFA", "#34D399", "#F59E0B", "#F472B6", "#22D3EE", "#818CF8", "#FB7185"]
         self.items = [
-            RadialPieMenuItem(f"deck:{preset_id}", preset_name, str(position + 1), colors[position % len(colors)])
-            for position, (preset_id, preset_name) in enumerate(presets[:8])
+            RadialPieMenuItem(
+                f"deck:{entry[0]}", entry[1], entry[2] if len(entry) > 2 else str(position + 1),
+                entry[3] if len(entry) > 3 else colors[position % len(colors)],
+            )
+            for position, entry in enumerate(presets[:8])
         ]
         if not self.items:
             title, icon_text, color = RADIAL_ACTION_PRESETS["preset_settings"]
@@ -1943,14 +2250,13 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
         self.setFixedSize(300, 300)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
-        self.items_keys: List[str] = ["prev_page", "next_page", "settings", "emergency", "refresh", "studio", "topmost", "add_slot"]
+        self.items_keys: List[str] = list(DEFAULT_MANAGEMENT_RADIAL_ITEMS)
         self.hovered_slot: int = -1
         self.selected_slot: int = -1
 
     def set_radial_keys(self, keys: List[str]) -> None:
-        if len(keys) >= 8:
-            self.items_keys = list(keys[:8])
-            self.update()
+        self.items_keys = normalize_management_radial_items(keys)
+        self.update()
 
     def _get_slot_center(self, idx: int) -> QtCore.QPointF:
         count = 8
@@ -1994,13 +2300,15 @@ class RadialWheelPreviewWidget(QtWidgets.QWidget):
         if self.hovered_slot != slot:
             self.hovered_slot = slot
             self.update()
-        if slot >= 0:
+        if 0 <= slot < 7 and event.mimeData().text() != "close_app":
             event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
         slot = self._get_slot_at_pos(event.pos())
         action_key = event.mimeData().text()
-        if 0 <= slot < 8 and action_key in RADIAL_ACTION_PRESETS:
+        if 0 <= slot < 7 and action_key in RADIAL_ACTION_PRESETS and action_key != "close_app":
             self.items_keys[slot] = action_key
             self.slot_changed.emit(slot, action_key)
             self.update()
@@ -2064,6 +2372,7 @@ class SlotPresetDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.main_window = main_window
         self.presets: Dict[str, Dict[str, Any]] = copy.deepcopy(main_window.config.get("slot_presets") or {})
+        self.starter_rules: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
         self.active_id = str(main_window.config.get("active_slot_preset") or "default")
         self.setWindowTitle("QuickSlot 덱 프리셋 관리")
         self.setMinimumSize(620, 460)
@@ -2085,14 +2394,16 @@ class SlotPresetDialog(QtWidgets.QDialog):
 
         tools = QtWidgets.QHBoxLayout()
         add_button = QtWidgets.QPushButton("＋ 빈 프리셋")
+        starter_button = QtWidgets.QPushButton("＋ 기본 앱 모드")
         rename_button = QtWidgets.QPushButton("이름 변경")
         save_button = QtWidgets.QPushButton("현재 UI로 저장")
         delete_button = QtWidgets.QPushButton("삭제")
         add_button.clicked.connect(self._add_preset)
+        starter_button.clicked.connect(lambda: self._show_starter_menu(starter_button))
         rename_button.clicked.connect(self._rename_preset)
         save_button.clicked.connect(self._save_current_ui)
         delete_button.clicked.connect(self._delete_preset)
-        for button in (add_button, rename_button, save_button, delete_button):
+        for button in (add_button, starter_button, rename_button, save_button, delete_button):
             tools.addWidget(button)
         root.addLayout(tools)
 
@@ -2113,6 +2424,8 @@ class SlotPresetDialog(QtWidgets.QDialog):
             name = str(preset.get("name") or preset_id)
             marker = "● " if preset_id == self.active_id else ""
             item = QtWidgets.QListWidgetItem(f"{marker}{name}")
+            icon_text, color = preset_visual(preset_id, preset)
+            item.setIcon(preset_qicon(icon_text, color))
             item.setData(QtCore.Qt.UserRole, preset_id)
             self.list_widget.addItem(item)
             if preset_id == selected_id:
@@ -2143,6 +2456,34 @@ class SlotPresetDialog(QtWidgets.QDialog):
         self.presets[preset_id] = preset
         self._reload_list(preset_id)
 
+    def _show_starter_menu(self, button: QtWidgets.QPushButton) -> None:
+        menu = QtWidgets.QMenu(self)
+        for key, name, glyph, color, sites, programs in STARTER_PRESETS:
+            action = menu.addAction(preset_qicon(glyph, color), name)
+            action.setEnabled(not any(str(preset.get("name") or "").casefold() == name.casefold()
+                                      for preset in self.presets.values()))
+            action.triggered.connect(
+                lambda _checked=False, data=(key, name, glyph, color, sites, programs): self._add_starter(data)
+            )
+        menu.exec(button.mapToGlobal(QtCore.QPoint(0, button.height())))
+
+    def _add_starter(self, data: tuple[Any, ...]) -> None:
+        if len(self.presets) >= 8:
+            QtWidgets.QMessageBox.information(self, "기본 앱 모드", "좌클릭 라디얼에는 최대 8개 프리셋을 등록할 수 있습니다.")
+            return
+        key, name, glyph, color, sites, programs = data
+        preset_id = f"starter-{key}"
+        if preset_id in self.presets:
+            preset_id = self._new_id()
+        preset = self.main_window._build_slot_preset(name)
+        slots, icons = starter_action_pack(key)
+        preset.update(slots=slots, custom_icons=icons, deck_page_count=1,
+                      deck_page_names=["페이지 1"], pinned_slots={}, icon=glyph, color=color,
+                      starter_actions_initialized=True)
+        self.presets[preset_id] = preset
+        self.starter_rules.append((preset_id, sites, programs))
+        self._reload_list(preset_id)
+
     def _rename_preset(self) -> None:
         preset_id = self._selected_id()
         if not preset_id:
@@ -2159,7 +2500,11 @@ class SlotPresetDialog(QtWidgets.QDialog):
         if not preset_id:
             return
         name = str(self.presets[preset_id].get("name") or preset_id)
+        previous = self.presets[preset_id]
         self.presets[preset_id] = self.main_window._build_slot_preset(name)
+        for visual_key in ("icon", "color"):
+            if visual_key in previous:
+                self.presets[preset_id][visual_key] = previous[visual_key]
         self._reload_list(preset_id)
 
     def _delete_preset(self) -> None:
@@ -2174,6 +2519,17 @@ class SlotPresetDialog(QtWidgets.QDialog):
 
     def selected_preset_id(self) -> str:
         return self._selected_id() or self.active_id
+
+
+class BundledDeckDownloadWorker(QtCore.QThread):
+    payload_ready = QtCore.Signal(object)
+    download_failed = QtCore.Signal(str)
+
+    def run(self) -> None:
+        try:
+            self.payload_ready.emit(download_github_bundled_deck())
+        except Exception as exc:
+            self.download_failed.emit(str(exc))
 
 
 class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
@@ -2221,6 +2577,10 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.tab_radial = QtWidgets.QWidget()
         self._init_radial_tab()
         self.tabs.addTab(self.tab_radial, "🎯 라디얼 메뉴")
+
+        self.tab_browser = QtWidgets.QWidget()
+        self._init_browser_tab()
+        self.tabs.addTab(self.tab_browser, "🌐 프리셋 자동 전환")
 
         # Tab 5: Backup & Import/Export
         self.tab_backup = QtWidgets.QWidget()
@@ -2305,14 +2665,15 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         form.setSpacing(14)
 
         self.grid_preset_combo = QtWidgets.QComboBox()
-        self.grid_preset_combo.addItems([
-            "3 x 5 그리드 (15 슬롯)",
-            "4 x 4 그리드 (16 슬롯)",
-            "3 x 3 그리드 (9 슬롯)",
-            "2 x 4 그리드 (8 슬롯)",
-            "4 x 5 그리드 (20 슬롯)",
-            "2 x 6 그리드 (12 슬롯)",
-        ])
+        for title, shape in [
+            ("3 x 5 그리드 (15 슬롯)", (3, 5)),
+            ("4 x 4 그리드 (16 슬롯)", (4, 4)),
+            ("3 x 3 그리드 (9 슬롯)", (3, 3)),
+            ("2 x 4 그리드 (8 슬롯)", (2, 4)),
+            ("4 x 5 그리드 (20 슬롯)", (4, 5)),
+            ("2 x 6 그리드 (12 슬롯)", (2, 6)),
+        ]:
+            self.grid_preset_combo.addItem(title, shape)
         self.grid_preset_combo.currentIndexChanged.connect(self._on_grid_live_changed)
 
         self.tile_scale_combo = QtWidgets.QComboBox()
@@ -2489,9 +2850,14 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
     def _on_grid_live_changed(self, index: int) -> None:
         if getattr(self, "_loading_settings", False):
             return
-        presets = [(3, 5), (4, 4), (3, 3), (2, 4), (4, 5), (2, 6)]
-        if 0 <= index < len(presets):
-            r, c = presets[index]
+        shape = self.grid_preset_combo.itemData(index)
+        if shape:
+            r, c = shape
+            if not self.main_window._remap_active_pins_for_grid(r, c):
+                QtWidgets.QMessageBox.information(self, "고정 슬롯", "새 그리드에 들어가지 않는 고정 슬롯이 있습니다. 고정을 해제한 후 변경해 주세요.")
+                with QtCore.QSignalBlocker(self.grid_preset_combo):
+                    self.grid_preset_combo.setCurrentIndex(self.grid_preset_combo.findData((self.main_window.rows, self.main_window.cols)))
+                return
             self.main_window.rows = r
             self.main_window.cols = c
             self.main_window.current_page = 0
@@ -2541,7 +2907,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         layout.setContentsMargins(22, 18, 22, 18)
         layout.setSpacing(14)
 
-        info = QtWidgets.QLabel("원하는 기능을 아래 팔레트에서 원형 슬롯으로 끌어다 놓으세요.")
+        info = QtWidgets.QLabel("원하는 기능을 원형 슬롯으로 끌어다 놓으세요. 마지막 '덱 닫기' 칸은 항상 유지됩니다.")
         info.setAlignment(QtCore.Qt.AlignCenter)
         info.setStyleSheet("color: #536278; font-size: 10pt; font-weight: 700;")
         layout.addWidget(info)
@@ -2572,6 +2938,99 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
     def _on_preview_slot_changed(self, slot_idx: int, new_key: str) -> None:
         self.radial_preview.selected_slot = slot_idx
 
+    def _init_browser_tab(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self.tab_browser)
+        layout.setSpacing(12)
+        self.browser_auto_check = QtWidgets.QCheckBox("활성 프로그램·Whale 탭 주소에 따라 프리셋 자동 전환")
+        layout.addWidget(self.browser_auto_check)
+        hint = QtWidgets.QLabel("확실히 일치하는 주소만 전환합니다. 일치하지 않거나 연결이 끊기면 현재 프리셋을 유지합니다. 실행 중 매크로는 중지하지 않습니다.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.browser_rules_table = QtWidgets.QTableWidget(0, 2)
+        self.browser_rules_table.setHorizontalHeaderLabels(["사이트 도메인 또는 경로", "전환할 프리셋"])
+        self.browser_rules_table.horizontalHeader().setStretchLastSection(True)
+        self.browser_rules_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.browser_rules_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        layout.addWidget(self.browser_rules_table, 1)
+        buttons = QtWidgets.QHBoxLayout()
+        add = QtWidgets.QPushButton("＋ 규칙 추가")
+        add.clicked.connect(lambda: self._add_browser_rule())
+        remove = QtWidgets.QPushButton("－ 선택 규칙 삭제")
+        remove.clicked.connect(self._remove_browser_rule)
+        buttons.addWidget(add); buttons.addWidget(remove); buttons.addStretch(1)
+        layout.addLayout(buttons)
+        layout.addWidget(QtWidgets.QLabel("일반 프로그램 규칙 (실행 파일명 기준, 예: obs64.exe)"))
+        self.program_rules_table = QtWidgets.QTableWidget(0, 2)
+        self.program_rules_table.setHorizontalHeaderLabels(["실행 파일명", "전환할 프리셋"])
+        self.program_rules_table.horizontalHeader().setStretchLastSection(True)
+        self.program_rules_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.program_rules_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        layout.addWidget(self.program_rules_table, 1)
+        program_buttons = QtWidgets.QHBoxLayout()
+        add_program = QtWidgets.QPushButton("＋ 프로그램 규칙")
+        add_program.clicked.connect(lambda: self._add_program_rule())
+        remove_program = QtWidgets.QPushButton("－ 선택 규칙 삭제")
+        remove_program.clicked.connect(self._remove_program_rule)
+        program_buttons.addWidget(add_program); program_buttons.addWidget(remove_program); program_buttons.addStretch(1)
+        layout.addLayout(program_buttons)
+        token_row = QtWidgets.QHBoxLayout()
+        self.browser_token_edit = QtWidgets.QLineEdit()
+        self.browser_token_edit.setReadOnly(True)
+        copy_button = QtWidgets.QPushButton("연결 코드 복사")
+        copy_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.browser_token_edit.text()))
+        token_row.addWidget(QtWidgets.QLabel("Whale 확장앱 연결 코드"))
+        token_row.addWidget(self.browser_token_edit, 1)
+        token_row.addWidget(copy_button)
+        layout.addLayout(token_row)
+        self.browser_bridge_label = QtWidgets.QLabel()
+        layout.addWidget(self.browser_bridge_label)
+        extension_path = Path(__file__).resolve().parent.parent / "browser_extension"
+        help_label = QtWidgets.QLabel(f"Whale 확장앱 관리 → 개발자 모드 → 압축해제된 확장앱 로드: {extension_path}\n확장앱 옵션에서 연결 코드를 붙여넣은 뒤 이 설정을 저장하세요.")
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+        open_extension = QtWidgets.QPushButton("확장앱 폴더 열기")
+        open_extension.clicked.connect(lambda: os.startfile(str(extension_path)) if os.name == "nt" else None)
+        layout.addWidget(open_extension)
+        self.browser_lock_label = QtWidgets.QLabel()
+        resume = QtWidgets.QPushButton("수동 고정 해제 · 자동 전환 재개")
+        resume.clicked.connect(self._resume_browser_automatic)
+        layout.addWidget(self.browser_lock_label)
+        layout.addWidget(resume)
+
+    def _add_browser_rule(self, site: str = "", preset_id: str = "") -> None:
+        row = self.browser_rules_table.rowCount()
+        self.browser_rules_table.insertRow(row)
+        self.browser_rules_table.setItem(row, 0, QtWidgets.QTableWidgetItem(site))
+        combo = QtWidgets.QComboBox()
+        for key, preset in self.main_window.config.get("slot_presets", {}).items():
+            combo.addItem(str(preset.get("name") or key), key)
+        if preset_id:
+            combo.setCurrentIndex(max(0, combo.findData(preset_id)))
+        self.browser_rules_table.setCellWidget(row, 1, combo)
+
+    def _remove_browser_rule(self) -> None:
+        for index in sorted({cell.row() for cell in self.browser_rules_table.selectedIndexes()}, reverse=True):
+            self.browser_rules_table.removeRow(index)
+
+    def _add_program_rule(self, executable: str = "", preset_id: str = "") -> None:
+        row = self.program_rules_table.rowCount()
+        self.program_rules_table.insertRow(row)
+        self.program_rules_table.setItem(row, 0, QtWidgets.QTableWidgetItem(executable))
+        combo = QtWidgets.QComboBox()
+        for key, preset in self.main_window.config.get("slot_presets", {}).items():
+            combo.addItem(str(preset.get("name") or key), key)
+        if preset_id:
+            combo.setCurrentIndex(max(0, combo.findData(preset_id)))
+        self.program_rules_table.setCellWidget(row, 1, combo)
+
+    def _remove_program_rule(self) -> None:
+        for index in sorted({cell.row() for cell in self.program_rules_table.selectedIndexes()}, reverse=True):
+            self.program_rules_table.removeRow(index)
+
+    def _resume_browser_automatic(self) -> None:
+        self.main_window._resume_auto_preset()
+        self.browser_lock_label.setText("자동 전환 사용 가능")
+
     def _init_backup_tab(self) -> None:
         layout = QtWidgets.QVBoxLayout(self.tab_backup)
         layout.setSpacing(12)
@@ -2593,9 +3052,18 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
 
         btn_bundled = QtWidgets.QPushButton("📦 내장 Deck Dock 구성 불러오기")
         btn_bundled.setStyleSheet("background: #F1ECFF; border: 1.5px solid #A78BFA; color: #5B21B6; font-weight: 700; padding: 10px; border-radius: 9px;")
-        btn_bundled.setEnabled(BUNDLED_DECK_BACKUP.is_file())
-        btn_bundled.setToolTip(str(BUNDLED_DECK_BACKUP))
+        btn_bundled.setEnabled(bundled_deck_path(self.main_window.repository.root).is_file())
+        btn_bundled.setToolTip(str(bundled_deck_path(self.main_window.repository.root)))
         btn_bundled.clicked.connect(self._import_bundled_config)
+        self.btn_bundled = btn_bundled
+
+        btn_save_bundled = QtWidgets.QPushButton("💾 내 프리셋을 내장 구성으로 저장")
+        btn_save_bundled.setToolTip("현재 모든 프리셋·슬롯·참조 매크로·이미지·입력값을 로컬 내장 JSON으로 저장합니다. GitHub 전송은 별도입니다.")
+        btn_save_bundled.clicked.connect(self._save_current_as_bundled)
+
+        self.btn_download_bundled = QtWidgets.QPushButton("☁️ GitHub 최신 내장 구성 내려받기")
+        self.btn_download_bundled.setToolTip("GitHub의 내장 Deck 백업을 이 PC의 로컬 내장 구성으로 내려받습니다. 현재 사용 중인 덱은 자동 교체하지 않습니다.")
+        self.btn_download_bundled.clicked.connect(self._download_bundled_from_github)
 
         btn_reset_all = QtWidgets.QPushButton("⚠️ 모든 슬롯 및 설정 초기화")
         btn_reset_all.setStyleSheet("background: #FFF1F2; border: 1.5px solid #FDA4AF; color: #BE123C; font-weight: 700; padding: 10px; border-radius: 9px;")
@@ -2603,6 +3071,8 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
 
         layout.addWidget(btn_export)
         layout.addWidget(btn_import)
+        layout.addWidget(btn_save_bundled)
+        layout.addWidget(self.btn_download_bundled)
         layout.addWidget(btn_bundled)
         layout.addWidget(btn_reset_all)
         layout.addStretch(1)
@@ -2624,7 +3094,10 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             self.win_h_spin.setValue(self.main_window.height())
 
             grid_map = {(3, 5): 0, (4, 4): 1, (3, 3): 2, (2, 4): 3, (4, 5): 4, (2, 6): 5}
-            self.grid_preset_combo.setCurrentIndex(grid_map.get((self.main_window.rows, self.main_window.cols), 0))
+            current_shape = (self.main_window.rows, self.main_window.cols)
+            if current_shape not in grid_map:
+                self.grid_preset_combo.addItem(f"{current_shape[0]} x {current_shape[1]} 그리드 (현재)", current_shape)
+            self.grid_preset_combo.setCurrentIndex(self.grid_preset_combo.findData(current_shape))
             tile_scale = float(self.main_window.config.get("tile_scale", 1.0))
             scale_index = min(
                 range(self.tile_scale_combo.count()),
@@ -2644,12 +3117,74 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             self.theme_combo.setCurrentIndex(int(self.main_window.config.get("theme_index", 0)))
             self.auto_stretch_default.setChecked(bool(self.main_window.config.get("auto_stretch_default", True)))
 
-            radial_keys = list(self.main_window.config.get("radial_items") or ["prev_page", "next_page", "settings", "preset_settings", "emergency", "refresh", "studio", "topmost"])
+            radial_keys = list(self.main_window.config.get("radial_items") or DEFAULT_MANAGEMENT_RADIAL_ITEMS)
             self.radial_preview.set_radial_keys(radial_keys)
+            self.browser_auto_check.setChecked(bool(self.main_window.config.get("auto_preset_enabled")))
+            self.browser_token_edit.setText(str(self.main_window.config.get("auto_preset_token") or secrets.token_urlsafe(32)))
+            self.browser_lock_label.setText(
+                "수동 프리셋 고정 중" if self.main_window.config.get("auto_preset_manual_lock") else "자동 전환 사용 가능"
+            )
+            self.browser_bridge_label.setText(
+                f"로컬 연결 실패: {self.main_window._browser_bridge_error}" if self.main_window._browser_bridge_error
+                else ("Whale 확장앱 연결 대기 중 (127.0.0.1:18773)" if self.main_window._browser_bridge
+                      else ("프로그램 규칙만 사용 중" if self.main_window.config.get("auto_preset_enabled") else "자동 전환 꺼짐"))
+            )
+            self.browser_rules_table.setRowCount(0)
+            for rule in self.main_window.config.get("auto_preset_rules") or []:
+                if isinstance(rule, dict):
+                    self._add_browser_rule(str(rule.get("site") or ""), str(rule.get("preset_id") or ""))
+            self.program_rules_table.setRowCount(0)
+            for rule in self.main_window.config.get("auto_program_rules") or []:
+                if isinstance(rule, dict):
+                    self._add_program_rule(str(rule.get("exe") or ""), str(rule.get("preset_id") or ""))
         finally:
             self._loading_settings = False
 
     def _apply_settings(self) -> None:
+        browser_rules = []
+        program_rules = []
+        for row in range(self.browser_rules_table.rowCount()):
+            item = self.browser_rules_table.item(row, 0)
+            site = str(item.text() if item else "").strip()
+            if not site:
+                continue
+            try:
+                site = normalize_site_rule(site)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "사이트 규칙", str(exc))
+                self.tabs.setCurrentWidget(self.tab_browser)
+                return
+            combo = self.browser_rules_table.cellWidget(row, 1)
+            preset_id = str(combo.currentData() or "") if isinstance(combo, QtWidgets.QComboBox) else ""
+            if not preset_id:
+                QtWidgets.QMessageBox.warning(self, "사이트 규칙", "규칙에 사용할 프리셋을 선택해 주세요.")
+                return
+            browser_rules.append({"site": site, "preset_id": preset_id})
+        by_site: dict[str, str] = {}
+        for rule in browser_rules:
+            old = by_site.setdefault(rule["site"], rule["preset_id"])
+            if old != rule["preset_id"]:
+                QtWidgets.QMessageBox.warning(self, "사이트 규칙", "같은 사이트를 서로 다른 프리셋에 연결할 수 없습니다.")
+                return
+        by_program: dict[str, str] = {}
+        for row in range(self.program_rules_table.rowCount()):
+            item = self.program_rules_table.item(row, 0)
+            executable = str(item.text() if item else "").strip()
+            if not executable:
+                continue
+            try:
+                executable = normalize_program_rule(executable)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "프로그램 규칙", str(exc))
+                self.tabs.setCurrentWidget(self.tab_browser)
+                return
+            combo = self.program_rules_table.cellWidget(row, 1)
+            preset_id = str(combo.currentData() or "") if isinstance(combo, QtWidgets.QComboBox) else ""
+            old = by_program.setdefault(executable, preset_id)
+            if old != preset_id:
+                QtWidgets.QMessageBox.warning(self, "프로그램 규칙", "같은 프로그램을 서로 다른 프리셋에 연결할 수 없습니다.")
+                return
+            program_rules.append({"exe": executable, "preset_id": preset_id})
         autostart = self.autostart_check.isChecked()
         set_autostart_enabled(autostart, self.main_window.repository.root)
 
@@ -2663,8 +3198,11 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.main_window.config["touch_sound_volume"] = self.touch_volume_spin.value()
         self.main_window._sync_touch_sound_volume()
 
-        grid_presets = [(3, 5), (4, 4), (3, 3), (2, 4), (4, 5), (2, 6)]
-        r, c = grid_presets[self.grid_preset_combo.currentIndex()]
+        r, c = self.grid_preset_combo.currentData()
+        if not self.main_window._remap_active_pins_for_grid(r, c):
+            self.tabs.setCurrentWidget(self.tab_grid)
+            QtWidgets.QMessageBox.information(self, "고정 슬롯", "새 그리드에 들어가지 않는 고정 슬롯이 있습니다. 고정을 해제한 후 변경해 주세요.")
+            return
         self.main_window.rows = r
         self.main_window.cols = c
 
@@ -2677,8 +3215,19 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.main_window.config["hover_glow"] = self.hover_glow_check.isChecked()
         self.main_window.config["theme_index"] = self.theme_combo.currentIndex()
         self.main_window.config["auto_stretch_default"] = self.auto_stretch_default.isChecked()
+        self.main_window.config["auto_preset_enabled"] = self.browser_auto_check.isChecked()
+        self.main_window.config["auto_preset_rules"] = browser_rules
+        self.main_window.config["auto_program_rules"] = program_rules
+        self.main_window._update_preset_badge()
+        self.main_window.config["auto_preset_token"] = self.browser_token_edit.text().strip()
+        self.main_window._sync_browser_bridge()
+        if self.main_window._browser_bridge_error:
+            self.browser_bridge_label.setText(f"로컬 연결 실패: {self.main_window._browser_bridge_error}")
+            self.tabs.setCurrentWidget(self.tab_browser)
+            self.main_window._save_config()
+            return
 
-        radial_items = list(self.radial_preview.items_keys)
+        radial_items = normalize_management_radial_items(self.radial_preview.items_keys)
         self.main_window.config["radial_items"] = radial_items
         self.main_window.radial_menu.load_custom_items(radial_items)
 
@@ -2708,7 +3257,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             try:
                 data = json.loads(Path(path).read_text(encoding="utf-8"))
                 self.main_window.restore_deck_backup_payload(data)
-                QtWidgets.QMessageBox.information(self, "복원 완료", "페이지와 슬롯에 지정된 액션을 포함한 전체 Deck 구성을 복원했습니다!")
+                QtWidgets.QMessageBox.information(self, "복원 완료", "페이지와 슬롯에 지정된 액션을 포함한 전체 Deck 구성을 복원했습니다!" + self._portability_report_text())
                 self.accept()
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "오류", f"백업 파일 로드 실패: {e}")
@@ -2720,12 +3269,76 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         if answer != QtWidgets.QMessageBox.Yes:
             return
         try:
-            data = json.loads(BUNDLED_DECK_BACKUP.read_text(encoding="utf-8"))
-            self.main_window.restore_deck_backup_payload(data)
-            QtWidgets.QMessageBox.information(self, "복원 완료", "GitHub에 포함된 내장 Deck Dock 구성을 불러왔습니다.")
+            data = json.loads(bundled_deck_path(self.main_window.repository.root).read_text(encoding="utf-8"))
+            self.main_window.restore_deck_backup_payload(data, portable_mode=not bool(data.get("source_environment")))
+            QtWidgets.QMessageBox.information(self, "복원 완료", "내장 Deck Dock 구성을 불러왔습니다." + self._portability_report_text())
             self.accept()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "오류", f"내장 Deck 구성 로드 실패: {e}")
+
+    def _portability_report_text(self) -> str:
+        report = getattr(self.main_window, "last_portability_report", {}) or {}
+        if not any(report.values()):
+            return ""
+        return (
+            f"\n\n다른 PC 적용: 프로그램 경로 {report.get('rebound_programs', 0)}개, "
+            f"창 대상 {report.get('rebound_windows', 0)}개 자동 재연결."
+            f"\n이미지 검색 영역 {report.get('fallback_search_regions', 0)}개는 지정 범위에서 못 찾으면 대상 창 전체를 확인합니다."
+            f"\n재확인 필요: 찾지 못한 프로그램 {report.get('unresolved_programs', 0)}개, "
+            f"화면 절대 좌표 {report.get('screen_coordinates', 0)}개."
+            "\n이미지 크기가 다르면 OpenCV가 빠른 검색 후 배율 대응 검색을 시도합니다."
+        )
+
+    def _save_current_as_bundled(self) -> None:
+        answer = QtWidgets.QMessageBox.warning(
+            self, "내장 구성 저장",
+            "현재 프리셋과 참조 매크로·이미지·텍스트 입력값을 내장 JSON에 저장합니다. "
+            "이 파일을 GitHub에 올리면 입력값도 저장소 접근자에게 보입니다. 계속할까요?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            payload = self.main_window.build_deck_backup_payload()
+            path = save_bundled_deck_payload(self.main_window.repository.root, payload)
+            self.btn_bundled.setEnabled(True)
+            self.btn_bundled.setToolTip(str(path))
+            QtWidgets.QMessageBox.information(
+                self, "내장 구성 저장 완료",
+                f"현재 구성을 로컬 내장 파일로 저장했습니다. 이전 파일은 시간표시 백업으로 보존했습니다.\n{path}\n\nGitHub에는 아직 업로드되지 않았습니다.",
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "내장 구성 저장 실패", str(exc))
+
+    def _download_bundled_from_github(self) -> None:
+        self.btn_download_bundled.setEnabled(False)
+        self.btn_download_bundled.setText("☁️ GitHub 내장 구성 내려받는 중…")
+        worker = BundledDeckDownloadWorker(self.main_window)
+        self.main_window._bundled_deck_download_worker = worker
+        worker.payload_ready.connect(self._github_bundle_downloaded)
+        worker.download_failed.connect(self._github_bundle_download_failed)
+        worker.finished.connect(lambda: setattr(self.main_window, "_bundled_deck_download_worker", None))
+        worker.start()
+
+    def _github_bundle_downloaded(self, payload: Dict[str, Any]) -> None:
+        self.btn_download_bundled.setEnabled(True)
+        self.btn_download_bundled.setText("☁️ GitHub 최신 내장 구성 내려받기")
+        try:
+            path = save_bundled_deck_payload(self.main_window.repository.root, payload)
+            self.btn_bundled.setEnabled(True)
+            self.btn_bundled.setToolTip(str(path))
+            QtWidgets.QMessageBox.information(
+                self, "내려받기 완료",
+                "GitHub 구성을 이 PC의 내장 파일로 저장했습니다. 현재 덱은 바뀌지 않았습니다. "
+                "적용하려면 '내장 Deck Dock 구성 불러오기'를 누르세요.",
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "내려받기 저장 실패", str(exc))
+
+    def _github_bundle_download_failed(self, message: str) -> None:
+        self.btn_download_bundled.setEnabled(True)
+        self.btn_download_bundled.setText("☁️ GitHub 최신 내장 구성 내려받기")
+        QtWidgets.QMessageBox.warning(self, "GitHub 내려받기 실패", message)
 
     def _reset_all_config(self) -> None:
         ans = QtWidgets.QMessageBox.warning(
@@ -2882,6 +3495,10 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.repository = repository or MacroRepository()
         self.config_path = self.repository.root / ".quickslot_deck_config.json"
         self.active_processes: Dict[int, tuple[str, subprocess.Popen[Any]]] = {}
+        self._process_slot_map: Dict[int, tuple[str, int]] = {}
+        self._slot_feedback: Dict[tuple[str, int], str] = {}
+        self._feedback_sequence: Dict[tuple[str, int], int] = {}
+        self.execution_history: List[Dict[str, str]] = []
 
         self.always_on_top = True
         self.opacity_val = 100
@@ -2900,9 +3517,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "touch_sound_volume": 22,
             "empty_slot_opacity": 0,
             "show_empty_slots": False,
-            "radial_items": ["prev_page", "next_page", "settings", "deck_dock", "preset_settings", "emergency", "studio", "topmost"],
+            "radial_items": list(DEFAULT_MANAGEMENT_RADIAL_ITEMS),
             "slot_presets": {},
             "active_slot_preset": "default",
+            "auto_preset_enabled": False,
+            "auto_preset_rules": [],
+            "auto_program_rules": [],
+            "auto_preset_manual_lock": False,
         }
         self.custom_icons: Dict[str, Dict[str, Any]] = {}
         self.buttons: List[StreamDeckButton] = []
@@ -2920,6 +3541,14 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._visible_rows = 1
         self._applying_slot_preset = False
         self._restored_window_geometry = False
+        self._browser_bridge: Optional[DeckBrowserBridge] = None
+        self._browser_bridge_error = ""
+        self._last_browser_url = ""
+        self._last_browser_event_at = 0
+        self._last_foreground_identity = ("", 0)
+        self._auto_config_save = QtCore.QTimer(self)
+        self._auto_config_save.setSingleShot(True)
+        self._auto_config_save.timeout.connect(self._save_config)
 
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
@@ -2936,6 +3565,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._touch_sound_effect = None
         self._init_touch_sound()
         self._ensure_slot_presets()
+        seeded_starter_presets = self._seed_starter_presets()
+        seeded_starter_actions = self._seed_starter_actions()
         self.radial_menu = RadialPieMenuWidget(self)
         self.radial_menu.load_custom_items(self.config.get("radial_items"))
         self.radial_menu.action_triggered.connect(self._handle_radial_action)
@@ -2954,6 +3585,17 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.poll_timer.start()
 
         self.refresh_slots()
+        self.browser_event_timer = QtCore.QTimer(self)
+        self.browser_event_timer.setInterval(50)
+        self.browser_event_timer.timeout.connect(self._poll_browser_events)
+        self.browser_event_timer.start()
+        self.program_event_timer = QtCore.QTimer(self)
+        self.program_event_timer.setInterval(250)
+        self.program_event_timer.timeout.connect(self._poll_foreground_program)
+        self.program_event_timer.start()
+        self._sync_browser_bridge()
+        if seeded_starter_presets or seeded_starter_actions:
+            self._save_config()
 
     def _init_touch_sound(self) -> None:
         if QSoundEffect is None or os.environ.get("QT_QPA_PLATFORM") == "offscreen":
@@ -3000,22 +3642,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 if "config" in data and isinstance(data["config"], dict):
                     self.config.update(data["config"])
                 self.config["compact_auto_fit"] = True
-                radial_items = list(self.config.get("radial_items") or [])
-                if "deck_dock" not in radial_items:
-                    if "refresh" in radial_items:
-                        radial_items[radial_items.index("refresh")] = "deck_dock"
-                    elif len(radial_items) < 8:
-                        radial_items.append("deck_dock")
-                    elif radial_items:
-                        radial_items[3] = "deck_dock"
-                if "preset_settings" not in radial_items:
-                    if "add_slot" in radial_items:
-                        radial_items[radial_items.index("add_slot")] = "preset_settings"
-                    elif len(radial_items) < 8:
-                        radial_items.append("preset_settings")
-                    elif radial_items:
-                        radial_items[-1] = "preset_settings"
-                    self.config["radial_items"] = radial_items
+                self.config["radial_items"] = normalize_management_radial_items(
+                    self.config.get("radial_items")
+                )
                 geom = data.get("geometry")
                 if geom:
                     self._restored_window_geometry = bool(
@@ -3060,6 +3689,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._capture_active_slot_preset()
         self._save_config()
         deck_config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        deck_config.get("config", {}).pop("auto_preset_token", None)
         # The active preset already owns an identical icon set. Avoid storing
         # large embedded images twice in one backup.
         deck_config["custom_icons"] = {}
@@ -3107,6 +3737,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         return {
             "format": "macrorelay-deck-backup",
             "version": DECK_BACKUP_VERSION,
+            "source_environment": {"host_fingerprint": host_fingerprint()},
             "deck_config": deck_config,
             "hotkeys": hotkeys,
             "macros": macros,
@@ -3127,10 +3758,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "deck_page_names": copy.deepcopy(list(preset.get("deck_page_names") or [])),
         }
 
-    def restore_deck_backup_payload(self, payload: Dict[str, Any]) -> None:
+    def restore_deck_backup_payload(self, payload: Dict[str, Any], *, portable_mode: bool = False) -> None:
         """Restore new full backups and migrate config-only legacy exports."""
         if not isinstance(payload, dict):
             raise ValueError("올바른 Deck 백업 JSON이 아닙니다.")
+        payload, self.last_portability_report = adapt_backup_for_host(payload, force=portable_mode)
         is_full = payload.get("format") == "macrorelay-deck-backup"
         deck_config = copy.deepcopy(payload.get("deck_config") if is_full else payload)
         if not isinstance(deck_config, dict):
@@ -3166,7 +3798,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         temp_path = self.config_path.with_suffix(self.config_path.suffix + ".import.tmp")
         temp_path.write_text(json.dumps(deck_config, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(temp_path, self.config_path)
+        self.config["auto_preset_enabled"] = False
+        self.config["auto_preset_rules"] = []
+        self.config["auto_program_rules"] = []
+        self.config["auto_preset_manual_lock"] = False
         self._load_config()
+        self.config["auto_preset_token"] = secrets.token_urlsafe(32)
+        self.config["auto_preset_manual_lock"] = False
         self._ensure_slot_presets()
         active_id = str(self.config.get("active_slot_preset") or "")
         active = dict(self.config.get("slot_presets", {}).get(active_id) or {})
@@ -3178,6 +3816,75 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.radial_menu.load_custom_items(self.config.get("radial_items"))
         self._apply_theme()
         self.refresh_slots()
+        self._save_config()
+        self._sync_browser_bridge()
+
+    def _sync_browser_bridge(self) -> None:
+        enabled = bool(self.config.get("auto_preset_enabled", False) and self.config.get("auto_preset_rules"))
+        token = str(self.config.get("auto_preset_token") or "")
+        if self._browser_bridge is not None and (not enabled or self._browser_bridge.token != token):
+            self._browser_bridge.close()
+            self._browser_bridge = None
+        if not enabled:
+            self._browser_bridge_error = ""
+            return
+        if self._browser_bridge is not None:
+            return
+        if not token:
+            token = secrets.token_urlsafe(32)
+            self.config["auto_preset_token"] = token
+            self._save_config()
+        try:
+            self._browser_bridge = DeckBrowserBridge(token)
+            self._browser_bridge_error = ""
+            self._last_browser_event_at = 0
+            self._last_browser_url = ""
+        except OSError as exc:
+            self._browser_bridge_error = str(exc)
+
+    def _poll_browser_events(self) -> None:
+        bridge = self._browser_bridge
+        if bridge is None or not bool(self.config.get("auto_preset_enabled")):
+            return
+        latest_url = ""
+        latest_at = 0
+        while not bridge.events.empty():
+            try:
+                observed_at, url = bridge.events.get_nowait()
+                if observed_at >= latest_at:
+                    latest_at, latest_url = observed_at, url
+            except Exception:
+                break
+        if not latest_url or latest_at <= self._last_browser_event_at:
+            return
+        self._last_browser_event_at = latest_at
+        self._last_browser_url = latest_url
+        if bool(self.config.get("auto_preset_manual_lock")):
+            return
+        target = preset_for_url(latest_url, list(self.config.get("auto_preset_rules") or []))
+        if target in self.config.get("slot_presets", {}):
+            self._switch_slot_preset(target, automatic=True)
+
+    def _poll_foreground_program(self) -> None:
+        if (not self.config.get("auto_preset_enabled") or self.config.get("auto_preset_manual_lock")
+                or not self.config.get("auto_program_rules")):
+            return
+        executable, pid = foreground_program()
+        identity = (executable, pid)
+        if not executable or pid == os.getpid() or identity == self._last_foreground_identity:
+            return
+        self._last_foreground_identity = identity
+        # The focused Whale tab's site rule wins over a generic whale.exe rule.
+        if executable == "whale.exe" and self.config.get("auto_preset_rules"):
+            return
+        target = preset_for_program(executable, list(self.config.get("auto_program_rules") or []))
+        if target in self.config.get("slot_presets", {}):
+            self._switch_slot_preset(target, automatic=True)
+
+    def _resume_auto_preset(self) -> None:
+        self.config["auto_preset_manual_lock"] = False
+        self._last_foreground_identity = ("", 0)
+        self._update_preset_badge()
         self._save_config()
 
     def _build_slot_preset(self, name: str) -> Dict[str, Any]:
@@ -3191,6 +3898,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "rows": int(self.rows),
             "cols": int(self.cols),
             "style": {key: copy.deepcopy(self.config.get(key)) for key in PRESET_STYLE_KEYS},
+            "pinned_slots": {},
         }
 
     def _ensure_slot_presets(self) -> None:
@@ -3203,6 +3911,74 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if active_id not in presets:
             self.config["active_slot_preset"] = next(iter(presets))
 
+    def _seed_starter_presets(self) -> bool:
+        """Install a small, non-destructive first-run mode pack and disabled rules."""
+        if self.config.get("starter_presets_version"):
+            return False
+        self._ensure_slot_presets()
+        presets = self.config["slot_presets"]
+        default = presets.get("default")
+        if isinstance(default, dict):
+            default.setdefault("icon", DEFAULT_PRESET_VISUAL[0])
+            default.setdefault("color", DEFAULT_PRESET_VISUAL[1])
+        site_rules = self.config.setdefault("auto_preset_rules", [])
+        program_rules = self.config.setdefault("auto_program_rules", [])
+        for key, name, icon, color, sites, programs in STARTER_PRESETS[:3]:
+            preset_id = next((existing_id for existing_id, existing in presets.items()
+                              if str(existing.get("name") or "").casefold() == name.casefold()), "")
+            if not preset_id and len(presets) < 8:
+                preset_id = f"starter-{key}"
+                if preset_id in presets:
+                    continue
+                preset = self._build_slot_preset(name)
+                preset.update(slots=[], custom_icons={}, deck_page_count=1,
+                              deck_page_names=["페이지 1"], pinned_slots={})
+                presets[preset_id] = preset
+            if not preset_id:
+                continue
+            preset = presets[preset_id]
+            preset.setdefault("icon", icon)
+            preset.setdefault("color", color)
+            for site in sites:
+                if not any(isinstance(rule, dict) and str(rule.get("site") or "").casefold() == site
+                           for rule in site_rules):
+                    site_rules.append({"site": site, "preset_id": preset_id})
+            for executable in programs:
+                if not any(isinstance(rule, dict) and str(rule.get("exe") or "").casefold() == executable
+                           for rule in program_rules):
+                    program_rules.append({"exe": executable, "preset_id": preset_id})
+        self.config["starter_presets_version"] = 1
+        return True
+
+    def _seed_starter_actions(self) -> bool:
+        """Fill only untouched starter modes; never replace a user's action."""
+        changed = False
+        active_id = str(self.config.get("active_slot_preset") or "")
+        for key, _name, _glyph, _color, _sites, _programs in STARTER_PRESETS:
+            preset_id = f"starter-{key}"
+            preset = self.config.get("slot_presets", {}).get(preset_id)
+            if not isinstance(preset, dict) or preset.get("starter_actions_initialized"):
+                continue
+            existing = list(preset.get("slots") or [])
+            if not any(isinstance(slot, dict) and (slot.get("macro") or slot.get("action"))
+                       for slot in existing):
+                slots, icons = starter_action_pack(key)
+                preset["slots"] = slots
+                preset_icons = preset.setdefault("custom_icons", {})
+                for position, icon in icons.items():
+                    preset_icons.setdefault(position, icon)
+                if preset_id == active_id:
+                    hotkeys = self.repository.load_hotkeys()
+                    live_slots = list(hotkeys.get("slots") or [])
+                    if not any(isinstance(slot, dict) and (slot.get("macro") or slot.get("action"))
+                               for slot in live_slots):
+                        hotkeys["slots"] = copy.deepcopy(slots)
+                        self._save_preset_hotkeys(hotkeys)
+                        self.custom_icons = copy.deepcopy(preset_icons)
+            preset["starter_actions_initialized"] = True
+            changed = True
+        return changed
+
     def _capture_active_slot_preset(self) -> None:
         if self._applying_slot_preset:
             return
@@ -3211,7 +3987,43 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         active_id = str(self.config.get("active_slot_preset"))
         current = presets.get(active_id, {})
         name = str(current.get("name") or active_id)
-        presets[active_id] = self._build_slot_preset(name)
+        updated = self._build_slot_preset(name)
+        updated["pinned_slots"] = copy.deepcopy(dict(current.get("pinned_slots") or {}))
+        if current.get("starter_actions_initialized"):
+            updated["starter_actions_initialized"] = True
+        for visual_key in ("icon", "color"):
+            if visual_key in current:
+                updated[visual_key] = current[visual_key]
+        presets[active_id] = updated
+
+    def _active_pinned_slots(self) -> Dict[str, Any]:
+        self._ensure_slot_presets()
+        active_id = str(self.config.get("active_slot_preset") or "")
+        return self.config["slot_presets"][active_id].setdefault("pinned_slots", {})
+
+    def _remap_active_pins_for_grid(self, new_rows: int, new_cols: int) -> bool:
+        if (new_rows, new_cols) == (self.rows, self.cols):
+            return True
+        pins = self._active_pinned_slots()
+        remapped: Dict[str, Any] = {}
+        for local, entry in pins.items():
+            row, col = divmod(int(local), max(1, self.cols))
+            if row >= new_rows or col >= new_cols:
+                return False
+            remapped[str(row * new_cols + col)] = entry
+        slots = list(self.repository.load_hotkeys().get("slots") or [])
+        new_size = max(1, new_rows * new_cols)
+        for index, slot in enumerate(slots):
+            if str(index % new_size) in remapped and (slot.get("macro") or slot.get("action")):
+                return False
+        pins.clear(); pins.update(remapped)
+        return True
+
+    def _effective_slot(self, slot_index: int, slots: List[Dict[str, Any]]) -> Dict[str, Any]:
+        pin = self._active_pinned_slots().get(str(slot_index % max(1, self.rows * self.cols)))
+        if isinstance(pin, dict) and isinstance(pin.get("slot"), dict):
+            return pin["slot"]
+        return slots[slot_index] if 0 <= slot_index < len(slots) else {}
 
     def _save_preset_hotkeys(self, hotkeys: Dict[str, Any]) -> None:
         path = str(self.repository.hotkeys_path)
@@ -3225,19 +4037,29 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             if was_watched and os.path.exists(path):
                 watcher.addPath(path)
 
-    def _switch_slot_preset(self, preset_id: str) -> None:
+    def _switch_slot_preset(self, preset_id: str, *, automatic: bool = False) -> None:
         self._ensure_slot_presets()
         presets = self.config["slot_presets"]
         if preset_id not in presets:
             return
+        if not automatic and bool(self.config.get("auto_preset_enabled")):
+            self.config["auto_preset_manual_lock"] = True
         if preset_id == str(self.config.get("active_slot_preset")):
+            if not automatic:
+                self._update_preset_badge()
+                self._save_config()
             return
 
         self._capture_active_slot_preset()
         preset = copy.deepcopy(presets[preset_id])
+        old_layout = (
+            self.rows, self.cols, self.config.get("tile_scale"),
+            self.config.get("tile_gap"), self.config.get("show_empty_slots"),
+        )
         self._applying_slot_preset = True
         try:
-            self.stop_all_macros()
+            if not automatic:
+                self.stop_all_macros()
             hotkeys = self.repository.load_hotkeys()
             hotkeys["slots"] = copy.deepcopy(list(preset.get("slots") or []))
             hotkeys["deck_page_count"] = max(1, int(preset.get("deck_page_count") or 1))
@@ -3253,10 +4075,19 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.config["active_slot_preset"] = preset_id
             self.current_page = 0
             self._apply_theme()
-            self.refresh_slots()
+            new_layout = (
+                self.rows, self.cols, self.config.get("tile_scale"),
+                self.config.get("tile_gap"), self.config.get("show_empty_slots"),
+            )
+            if not (automatic and old_layout == new_layout and self._refresh_slots_fast()):
+                self.refresh_slots()
         finally:
             self._applying_slot_preset = False
-        self._save_config()
+        self._update_preset_badge()
+        if automatic:
+            self._auto_config_save.start(700)
+        else:
+            self._save_config()
 
     def _init_ui(self) -> None:
         self.setMinimumSize(64, 64)
@@ -3283,6 +4114,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.grid_layout.setSpacing(10)
 
         main_layout.addWidget(self.swipe_container, 1)
+        self.preset_badge = QtWidgets.QLabel(central)
+        self.preset_badge.setAlignment(QtCore.Qt.AlignCenter)
+        self.preset_badge.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.preset_badge.setFixedHeight(21)
+        self._update_preset_badge()
+        self.preset_badge.show()
+        self.preset_badge.raise_()
         self.resize_grip = DeckResizeGrip(self)
         self.resize_grip.setToolTip("드래그하여 덱 크기 조절")
         self.resize_grip.move(self.width() - self.resize_grip.width(), self.height() - self.resize_grip.height())
@@ -3295,6 +4133,41 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if grip is not None:
             grip.move(self.width() - grip.width(), self.height() - grip.height())
             grip.raise_()
+        self._update_preset_badge()
+
+    def _position_preset_badge(self) -> None:
+        badge = getattr(self, "preset_badge", None)
+        central = self.centralWidget()
+        if badge is None or central is None:
+            return
+        badge.move(max(2, (central.width() - badge.width()) // 2), 2)
+        badge.raise_()
+
+    def _update_preset_badge(self) -> None:
+        badge = getattr(self, "preset_badge", None)
+        if badge is None:
+            return
+        self._ensure_slot_presets()
+        preset_id = str(self.config.get("active_slot_preset") or "default")
+        preset = dict(self.config["slot_presets"].get(preset_id) or {})
+        icon, color = preset_visual(preset_id, preset)
+        name = str(preset.get("name") or preset_id)
+        suffix = (" · 고정" if self.config.get("auto_preset_manual_lock") else " · 자동") if self.config.get("auto_preset_enabled") else ""
+        full_text = f"{icon}  {name}{suffix}"
+        width_limit = max(48, self.width() - 20)
+        font = badge.font()
+        font.setPointSize(8)
+        font.setBold(True)
+        badge.setFont(font)
+        display_text = QtGui.QFontMetrics(font).elidedText(full_text, QtCore.Qt.ElideRight, width_limit - 16)
+        badge.setText(display_text)
+        badge.setToolTip(f"현재 프리셋: {name}" + (" (수동 고정 중)" if suffix == " · 고정" else ""))
+        badge.setFixedWidth(min(width_limit, max(48, QtGui.QFontMetrics(font).horizontalAdvance(display_text) + 17)))
+        badge.setStyleSheet(
+            f"QLabel {{ color: #F8FAFC; background: rgba(18, 24, 36, 220); "
+            f"border: 1px solid {color}; border-radius: 10px; padding: 0 4px; }}"
+        )
+        self._position_preset_badge()
 
     def _apply_theme(self) -> None:
         theme_idx = int(self.config.get("theme_index", 0))
@@ -3481,6 +4354,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 preset_id,
                 ("● " if preset_id == str(self.config.get("active_slot_preset")) else "")
                 + str(preset.get("name") or preset_id),
+                *preset_visual(preset_id, preset),
             )
             for preset_id, preset in self.config["slot_presets"].items()
         ]
@@ -3500,8 +4374,27 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         position_dialog_beside(self, dialog)
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
+        if self.config.get("auto_preset_enabled"):
+            self.config["auto_preset_manual_lock"] = True
         target_id = dialog.selected_preset_id()
         self.config["slot_presets"] = copy.deepcopy(dialog.presets)
+        for starter_id, sites, programs in dialog.starter_rules:
+            if starter_id not in self.config["slot_presets"]:
+                continue
+            site_rules = self.config.setdefault("auto_preset_rules", [])
+            program_rules = self.config.setdefault("auto_program_rules", [])
+            for site in sites:
+                if not any(isinstance(rule, dict) and str(rule.get("site") or "").casefold() == site
+                           for rule in site_rules):
+                    site_rules.append({"site": site, "preset_id": starter_id})
+            for executable in programs:
+                if not any(isinstance(rule, dict) and str(rule.get("exe") or "").casefold() == executable
+                           for rule in program_rules):
+                    program_rules.append({"exe": executable, "preset_id": starter_id})
+        valid_ids = set(self.config["slot_presets"])
+        for rule_key in ("auto_preset_rules", "auto_program_rules"):
+            self.config[rule_key] = [rule for rule in self.config.get(rule_key, [])
+                                     if isinstance(rule, dict) and rule.get("preset_id") in valid_ids]
         if target_id not in self.config["slot_presets"]:
             target_id = next(iter(self.config["slot_presets"]))
         preset = copy.deepcopy(self.config["slot_presets"][target_id])
@@ -3527,6 +4420,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         finally:
             self._applying_slot_preset = False
         self._refresh_preset_radial_menu()
+        self._update_preset_badge()
+        self._sync_browser_bridge()
         self._save_config()
 
     def _handle_radial_action(self, key: str) -> None:
@@ -3556,6 +4451,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self._add_slot_from_radial()
         elif key == "preset_settings":
             self._open_hold_preset_dialog()
+        elif key == "auto_resume":
+            self._resume_auto_preset()
         elif key in ("close_app", "close", "exit"):
             self.close()
         elif key == "minimize":
@@ -3749,8 +4646,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         payload = self.repository.load_hotkeys()
         slots = list(payload.get("slots") or [])
         new_slot = {"macro": str(macro_name), "hotkey": "", "mode": "hybrid"}
-        empty_index = next((i for i, slot in enumerate(slots) if not str(slot.get("macro") or "").strip()), None)
+        pinned_positions = {int(local) for local in self._active_pinned_slots()}
+        page_size = max(1, self.rows * self.cols)
+        empty_index = next((i for i, slot in enumerate(slots)
+                            if i % page_size not in pinned_positions and not str(slot.get("macro") or "").strip()), None)
         if empty_index is None:
+            while len(slots) % page_size in pinned_positions:
+                slots.append({"macro": "", "hotkey": "", "mode": "hybrid"})
             slots.append(new_slot)
             inserted_index = len(slots) - 1
         else:
@@ -3767,7 +4669,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if slot_idx < 0:
             # Reset icon request
             real_idx = -1 - slot_idx
-            self.custom_icons.pop(str(real_idx), None)
+            pin = self._active_pinned_slots().get(str(real_idx % max(1, self.rows * self.cols)))
+            if isinstance(pin, dict):
+                pin["icon"] = {}
+            else:
+                self.custom_icons.pop(str(real_idx), None)
             self._capture_active_slot_preset()
             self._save_config()
             self.refresh_slots()
@@ -3776,16 +4682,20 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         hotkeys_data = self.repository.load_hotkeys()
         slots = list(hotkeys_data.get("slots") or [])
         macro_name = ""
-        if slot_idx < len(slots):
-            macro_name = str(slots[slot_idx].get("macro") or "").strip()
+        if slot_idx >= 0:
+            macro_name = str(self._effective_slot(slot_idx, slots).get("macro") or "").strip()
 
-        current_cfg = self.custom_icons.get(str(slot_idx), {})
+        pin = self._active_pinned_slots().get(str(slot_idx % max(1, self.rows * self.cols)))
+        current_cfg = pin.get("icon", {}) if isinstance(pin, dict) else self.custom_icons.get(str(slot_idx), {})
         dlg = SlotIconEditDialog(slot_idx, macro_name, current_cfg, self)
         dlg.live_config_changed.connect(self._preview_slot_icon)
         position_dialog_beside(self, dlg)
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             new_cfg = dlg.get_config()
-            self.custom_icons[str(slot_idx)] = new_cfg
+            if isinstance(pin, dict):
+                pin["icon"] = new_cfg
+            else:
+                self.custom_icons[str(slot_idx)] = new_cfg
             self._capture_active_slot_preset()
             self._save_config()
             self._preview_slot_icon(slot_idx, new_cfg)
@@ -3804,6 +4714,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
     def _remove_slot(self, slot_idx: int) -> None:
         payload = self.repository.load_hotkeys()
         slots = list(payload.get("slots") or [])
+        pin_key = str(slot_idx % max(1, self.rows * self.cols))
+        if pin_key in self._active_pinned_slots():
+            self._active_pinned_slots().pop(pin_key, None)
+            self._capture_active_slot_preset()
+            self._save_config()
+            self.refresh_slots()
+            return
         if not (0 <= slot_idx < len(slots)):
             return
         macro_name = str(slots[slot_idx].get("macro") or "").strip()
@@ -3816,6 +4733,61 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._capture_active_slot_preset()
         self._save_config()
         self.refresh_slots()
+
+    def _refresh_slots_fast(self) -> bool:
+        """Reuse visible tile widgets when auto-switching between equal grids."""
+        if not self.buttons:
+            return False
+        hotkeys = self.repository.load_hotkeys()
+        slots = list(hotkeys.get("slots") or [])
+        page_size = max(1, self.rows * self.cols)
+        page_slots = list(slots[:page_size])
+        page_slots.extend({"macro": "", "hotkey": "", "mode": "hybrid"} for _ in range(max(0, page_size - len(page_slots))))
+        pins = self._active_pinned_slots()
+        for local, entry in pins.items():
+            try:
+                position = int(local)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= position < page_size and isinstance(entry, dict) and isinstance(entry.get("slot"), dict):
+                page_slots[position] = entry["slot"]
+        visible = [(index, slot) for index, slot in enumerate(page_slots)
+                   if self.config.get("show_empty_slots") or str(slot.get("macro") or "").strip()]
+        visible_cols = min(self.cols, max(1, len(visible)))
+        if (len(visible) != len(self.buttons) or visible_cols != self._visible_cols
+                or any(button.slot_index != index for button, (index, _slot) in zip(self.buttons, visible))):
+            return False
+        total_pages = max(1, int(hotkeys.get("deck_page_count") or 1), math.ceil(len(slots) / page_size))
+        if hasattr(self, "page_label") and self.page_label:
+            self.page_label.setText(f"1/{total_pages}")
+        if hasattr(self, "btn_prev_page") and self.btn_prev_page:
+            self.btn_prev_page.setEnabled(False)
+        if hasattr(self, "btn_next_page") and self.btn_next_page:
+            self.btn_next_page.setEnabled(total_pages > 1)
+        if hasattr(self, "dots_label") and self.dots_label:
+            self.dots_label.setText("   ".join(
+                "<span style='color: #1E90FF; font-size: 11pt;'>●</span>" if page == 0
+                else "<span style='color: #2B364A; font-size: 9pt;'>●</span>"
+                for page in range(min(total_pages, 5))
+            ))
+        self.grid_layout.setSpacing(int(self.config.get("tile_gap", 10)))
+        for button, (index, slot) in zip(self.buttons, visible):
+            action = slot.get("action") if isinstance(slot.get("action"), dict) else None
+            pin = pins.get(str(index))
+            icon = dict((pin.get("icon") if isinstance(pin, dict) else None)
+                        or self.custom_icons.get(str(index), {}) or {})
+            if deck_action_needs_program_icon(action, icon) or manual_executable_icon_needs_upgrade(icon):
+                return False
+            button.set_custom_icon_config(icon)
+            macro_name = str(slot.get("macro") or "").strip()
+            button.set_slot_data(
+                macro_name, str(slot.get("hotkey") or ""), str(slot.get("mode") or "hybrid"),
+                self._is_macro_running(macro_name),
+                display_title=str(action.get("label") or "") if action else macro_name,
+            )
+            button.set_feedback(self._slot_feedback.get(self._feedback_key(index), ""))
+        self.refresh_states()
+        return True
 
     def refresh_slots(self) -> None:
         gap = int(self.config.get("tile_gap", 10))
@@ -3857,6 +4829,18 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         start_idx = self.current_page * pageSize
         show_empty_slots = bool(self.config.get("show_empty_slots", False))
         current_page_slots = list(slots[start_idx:start_idx + pageSize])
+        current_page_slots.extend(
+            {"macro": "", "hotkey": "", "mode": "hybrid"}
+            for _ in range(max(0, pageSize - len(current_page_slots)))
+        )
+        pinned = self._active_pinned_slots()
+        for local, entry in pinned.items():
+            try:
+                position = int(local)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= position < pageSize and isinstance(entry, dict) and isinstance(entry.get("slot"), dict):
+                current_page_slots[position] = entry["slot"]
         if show_empty_slots:
             current_page_slots.extend(
                 {"macro": "", "hotkey": "", "mode": "hybrid"}
@@ -3887,17 +4871,27 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
             macro_name = str(slot_info.get("macro") or "").strip()
             action = slot_info.get("action") if isinstance(slot_info.get("action"), dict) else None
-            icon_cfg = dict(self.custom_icons.get(str(slot_idx), {}) or {})
-            if (
-                action is not None
-                and str(action.get("kind") or "") == "open_target"
-                and str(icon_cfg.get("icon_source") or "") != "manual"
-                and not icon_config_has_visual(icon_cfg)
-            ):
-                extracted = extract_program_icon_config(str(action.get("target") or ""))
+            pin = pinned.get(str(slot_idx % pageSize))
+            icon_cfg = dict(
+                (pin.get("icon") if isinstance(pin, dict) else None)
+                or self.custom_icons.get(str(slot_idx), {}) or {}
+            )
+            upgraded_icon = upgrade_manual_executable_icon(icon_cfg)
+            if upgraded_icon is not icon_cfg:
+                icon_cfg = upgraded_icon
+                if isinstance(pin, dict):
+                    pin["icon"] = upgraded_icon
+                else:
+                    self.custom_icons[str(slot_idx)] = upgraded_icon
+                repaired_program_icons = True
+            if deck_action_needs_program_icon(action, icon_cfg):
+                extracted = deck_action_program_icon(self.repository, action)
                 if extracted:
                     icon_cfg = extracted
-                    self.custom_icons[str(slot_idx)] = extracted
+                    if isinstance(pin, dict):
+                        pin["icon"] = extracted
+                    else:
+                        self.custom_icons[str(slot_idx)] = extracted
                     repaired_program_icons = True
 
             # Apply custom icon config if present
@@ -3908,6 +4902,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             mode = str(slot_info.get("mode") or "hybrid")
             is_running = self._is_macro_running(macro_name)
             btn.set_slot_data(macro_name, hotkey, mode, is_running, display_title=display_title)
+            btn.set_feedback(self._slot_feedback.get(self._feedback_key(slot_idx), ""))
 
             btn.slot_triggered.connect(self._run_slot_macro)
             btn.slot_stopped.connect(self._stop_slot_macro)
@@ -3974,18 +4969,58 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             return False
         return any(name == macro_name and proc.poll() is None for name, proc in self.active_processes.values())
 
+    def _feedback_key(self, slot_index: int, preset_id: str = "") -> tuple[str, int]:
+        preset_id = preset_id or str(self.config.get("active_slot_preset") or "")
+        preset = self.config.get("slot_presets", {}).get(preset_id, {})
+        page_size = max(1, int(preset.get("rows") or self.rows) * int(preset.get("cols") or self.cols))
+        local = slot_index % page_size
+        if str(local) in dict(preset.get("pinned_slots") or {}):
+            return preset_id, local
+        return preset_id, slot_index
+
+    def _mark_slot_status(self, slot_index: int, state: str, detail: str = "", *, preset_id: str = "") -> None:
+        if slot_index < 0:
+            return
+        key = self._feedback_key(slot_index, preset_id)
+        self._slot_feedback[key] = state
+        sequence = self._feedback_sequence.get(key, 0) + 1
+        self._feedback_sequence[key] = sequence
+        self.execution_history.append({
+            "time": QtCore.QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss"),
+            "preset": key[0], "slot": str(slot_index + 1), "state": state,
+            "detail": str(detail)[:300],
+        })
+        self.execution_history = self.execution_history[-100:]
+        for button in self.buttons:
+            if self._feedback_key(button.slot_index) == key:
+                button.set_feedback(state)
+                button.setToolTip(detail)
+
+        def clear() -> None:
+            if self._feedback_sequence.get(key) != sequence:
+                return
+            self._slot_feedback.pop(key, None)
+            for button in self.buttons:
+                if self._feedback_key(button.slot_index) == key:
+                    button.set_feedback("")
+
+        if state != "started":
+            QtCore.QTimer.singleShot(1800, clear)
+
     def _run_slot_macro(self, slot_index: int, macro_name: str) -> None:
         if not macro_name:
             return
         slots = list(self.repository.load_hotkeys().get("slots") or [])
-        if 0 <= slot_index < len(slots):
-            action = slots[slot_index].get("action")
+        if slot_index >= 0:
+            action = self._effective_slot(slot_index, slots).get("action")
             if isinstance(action, dict) and action.get("kind"):
-                self._execute_deck_action(action)
+                self._execute_deck_action(action, slot_index=slot_index)
                 return
         try:
             proc = self.repository.run_macro(macro_name)
             self.active_processes[int(proc.pid)] = (macro_name, proc)
+            self._process_slot_map[int(proc.pid)] = (str(self.config.get("active_slot_preset") or ""), slot_index)
+            self._mark_slot_status(slot_index, "started", f"{macro_name} 실행 중")
             if hasattr(self, "status_title") and self.status_title:
                 self.status_title.setText("▶ 실행 중")
                 self.status_title.setStyleSheet("font-size: 10pt; font-weight: 700; color: #26D07C;")
@@ -3993,7 +5028,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 self.status_sub.setText(f"'{macro_name}' 실행 중...")
             self.refresh_states()
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "실행 오류", f"매크로 '{macro_name}' 실행 중 오류 발생:\n{exc}")
+            self._mark_slot_status(slot_index, "failed", str(exc))
+            self._set_deck_status("실행 실패", str(exc), error=True)
 
     def _set_deck_status(self, title: str, detail: str = "", error: bool = False) -> None:
         color = "#E85566" if error else "#26D07C"
@@ -4272,12 +5308,15 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         for _ in range(clicks):
             user32.mouse_event(down, 0, 0, 0, 0); user32.mouse_event(up, 0, 0, 0, 0)
 
-    def _start_registered_macro(self, macro_name: str) -> subprocess.Popen[Any]:
-        proc = self.repository.run_macro(macro_name)
+    def _start_registered_macro(self, macro_name: str, slot_index: int = -1, *, entry_name: str = "") -> subprocess.Popen[Any]:
+        proc = (self.repository.run_macro_entry(macro_name, entry_name)
+                if entry_name else self.repository.run_macro(macro_name))
         self.active_processes[int(proc.pid)] = (macro_name, proc)
+        if slot_index >= 0:
+            self._process_slot_map[int(proc.pid)] = (str(self.config.get("active_slot_preset") or ""), slot_index)
         return proc
 
-    def _run_macro_batch(self, action: Dict[str, Any]) -> None:
+    def _run_macro_batch(self, action: Dict[str, Any], slot_index: int = -1) -> None:
         names = [str(value).strip() for value in list(action.get("macros") or []) if str(value).strip()]
         if not names:
             raise ValueError("실행할 매크로가 선택되지 않았습니다.")
@@ -4288,7 +5327,10 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             failures = []
             for name in names:
                 try:
-                    self._start_registered_macro(name)
+                    if slot_index >= 0:
+                        self._start_registered_macro(name, slot_index)
+                    else:
+                        self._start_registered_macro(name)
                 except Exception as exc:
                     failures.append(f"{name}: {exc}")
                     if not continue_on_error:
@@ -4302,7 +5344,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 self.refresh_states()
                 return
             try:
-                proc = self._start_registered_macro(names[index])
+                proc = self._start_registered_macro(names[index], slot_index) if slot_index >= 0 else self._start_registered_macro(names[index])
             except Exception as exc:
                 self._set_deck_status("다중 작업 실패", f"{names[index]}: {exc}", error=True)
                 if not continue_on_error:
@@ -4324,9 +5366,10 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
         run_at(0)
 
-    def _execute_deck_action(self, action: Dict[str, Any]) -> None:
+    def _execute_deck_action(self, action: Dict[str, Any], *, slot_index: int = -1) -> None:
         kind = str(action.get("kind") or "")
         label = str(action.get("label") or kind)
+        source_preset = str(self.config.get("active_slot_preset") or "")
         try:
             if kind == "open_target":
                 target = str(action.get("target") or "").strip()
@@ -4388,7 +5431,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             elif kind == "wait":
                 wait_ms = max(10, int(action.get("ms") or 1000))
                 self._set_deck_status("대기 중", f"{wait_ms}ms")
-                QtCore.QTimer.singleShot(wait_ms, lambda: self._set_deck_status("준비 완료", "Deck 액션 대기 완료"))
+                self._mark_slot_status(slot_index, "started", f"{wait_ms}ms 대기")
+                def finish_wait() -> None:
+                    self._set_deck_status("준비 완료", "Deck 액션 대기 완료")
+                    self._mark_slot_status(slot_index, "completed", "대기 완료", preset_id=source_preset)
+                QtCore.QTimer.singleShot(wait_ms, finish_wait)
                 return
             elif kind == "studio":
                 self._open_studio()
@@ -4398,9 +5445,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 macro_name = str(action.get("macro") or "").strip()
                 if not macro_name:
                     raise ValueError("실행할 매크로가 선택되지 않았습니다.")
-                self._start_registered_macro(macro_name)
+                entry_name = str(action.get("entry_name") or "").strip()
+                if slot_index >= 0:
+                    self._start_registered_macro(macro_name, slot_index, entry_name=entry_name)
+                else:
+                    self._start_registered_macro(macro_name, entry_name=entry_name)
             elif kind == "multi_macros":
-                self._run_macro_batch(action)
+                self._run_macro_batch(action, slot_index)
             elif kind == "switch_preset":
                 self._switch_slot_preset(str(action.get("preset_id") or ""))
             elif kind == "page_prev":
@@ -4418,16 +5469,19 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             else:
                 raise ValueError(f"지원하지 않는 Deck 액션: {kind}")
             self._set_deck_status("Deck 액션 실행", label)
+            self._mark_slot_status(slot_index, "started" if kind in {"run_macro", "multi_macros"} else "completed", label, preset_id=source_preset)
             self.refresh_states()
         except Exception as exc:
             self._set_deck_status("Deck 액션 실패", str(exc), error=True)
-            QtWidgets.QMessageBox.warning(self, "Deck 액션 오류", f"'{label}' 실행 중 오류가 발생했습니다.\n{exc}")
+            self._mark_slot_status(slot_index, "failed", str(exc), preset_id=source_preset)
 
     def _stop_slot_macro(self, slot_index: int, macro_name: str) -> None:
         for pid, (name, proc) in list(self.active_processes.items()):
             if name == macro_name:
                 self._terminate_process_tree(proc)
                 self.active_processes.pop(pid, None)
+                self._process_slot_map.pop(pid, None)
+        self._mark_slot_status(slot_index, "failed", "사용자가 매크로를 중지했습니다.")
         if hasattr(self, "status_title") and self.status_title:
             self.status_title.setText("🛑 중지됨")
             self.status_title.setStyleSheet("font-size: 10pt; font-weight: 700; color: #E85566;")
@@ -4441,6 +5495,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self._terminate_process_tree(proc)
             count += 1
         self.active_processes.clear()
+        self._process_slot_map.clear()
         if hasattr(self, "status_title") and self.status_title:
             self.status_title.setText("🛑 전체 중지")
             self.status_title.setStyleSheet("font-size: 10pt; font-weight: 700; color: #E85566;")
@@ -4453,6 +5508,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         finished = [pid for pid, (_name, proc) in self.active_processes.items() if proc.poll() is not None]
         for pid in finished:
             _name, proc = self.active_processes.pop(pid)
+            source = self._process_slot_map.pop(pid, None)
+            if source is not None:
+                preset_id, slot_index = source
+                state = "completed" if proc.returncode == 0 else "failed"
+                self._mark_slot_status(slot_index, state, f"{_name} 종료 코드 {proc.returncode}", preset_id=preset_id)
             self.repository.release_macro_process(proc)
 
         running_count = len(self.active_processes)
@@ -4512,6 +5572,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.repository.release_macro_process(proc)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._browser_bridge is not None:
+            self._browser_bridge.close()
+            self._browser_bridge = None
         self.stop_all_macros()
         self._capture_active_slot_preset()
         self._save_config()

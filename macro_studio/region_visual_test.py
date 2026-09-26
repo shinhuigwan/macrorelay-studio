@@ -722,7 +722,7 @@ class InteractiveCanvas(QtWidgets.QWidget):
             r = QtCore.QRect(self._drag_start, self._drag_current).normalized()
             self._drag_start = None
             self._drag_current = None
-            if r.width() >= 6 and r.height() >= 6 and self._active_alias:
+            if r.width() >= 6 and r.height() >= 6:
                 s = self._scale
                 l = int(r.x() / s)
                 t = int(r.y() / s)
@@ -808,6 +808,10 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._base_x: int = 0
         self._base_y: int = 0
         self._capture_desc: str = ""
+        self._crop_snapshot_for_image = False
+        self._delayed_capture_timer = QtCore.QTimer(self)
+        self._delayed_capture_timer.setSingleShot(True)
+        self._delayed_capture_timer.timeout.connect(self._finish_delayed_capture)
         self._test_results: dict[str, dict[str, Any]] = {}
         self._click_preflight: dict[str, Any] = {}
         self._required_count: int = int(step.get("required_count") or len(self._aliases))
@@ -869,14 +873,31 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         title_box.addWidget(title_lbl)
         btn_refresh = QtWidgets.QPushButton("🔄 다시 캡처")
         btn_refresh.setStyleSheet("background: #1E293B; border: 1px solid #3B4A6B; color: #70C5FF; font-weight: 700; padding: 4px 8px; border-radius: 5px;")
+        btn_refresh.setToolTip("즉시 다시 캡처 (F5)")
         btn_refresh.clicked.connect(self._do_capture_and_test)
         title_box.addWidget(btn_refresh)
+
+        btn_delayed_capture = QtWidgets.QPushButton("⏱ 3초 캡처")
+        btn_delayed_capture.setToolTip(
+            "검사기를 잠시 최소화합니다. 3초 안에 브라우저로 돌아가 입력칸을 클릭해 "
+            "자동완성 목록을 열어 두세요. 캡처 후 검사기가 자동으로 돌아옵니다. (Ctrl+Shift+F5)"
+        )
+        btn_delayed_capture.setStyleSheet(
+            "background: #173329; border: 1px solid #2E7D5C; color: #8BF0BC; "
+            "font-weight: 700; padding: 4px 8px; border-radius: 5px;"
+        )
+        btn_delayed_capture.clicked.connect(lambda: self._start_delayed_capture(3000))
+        self._refresh_shortcut = QtGui.QShortcut(QtGui.QKeySequence("F5"), self)
+        self._refresh_shortcut.activated.connect(self._do_capture_and_test)
+        self._delayed_capture_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+F5"), self)
+        self._delayed_capture_shortcut.activated.connect(lambda: self._start_delayed_capture(3000))
 
         self.btn_toggle_mode = QtWidgets.QPushButton("🎯 대상 전환")
         self.btn_toggle_mode.setStyleSheet("background: #1E293B; border: 1px solid #38BDF8; color: #38BDF8; font-weight: 700; padding: 4px 8px; border-radius: 5px;")
         self.btn_toggle_mode.clicked.connect(self._toggle_target_mode)
         title_box.addWidget(self.btn_toggle_mode)
         left_layout.addLayout(title_box)
+        left_layout.addWidget(btn_delayed_capture)
 
         self.lbl_target_info = QtWidgets.QLabel("대상: 확인 중…")
         self.lbl_target_info.setStyleSheet("color: #8A98B0; font-size: 9pt;")
@@ -915,6 +936,19 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             btn_add_capture.setToolTip("화면에서 원하는 이미지 영역을 마우스로 드래그 캡처하여 즉시 멀티 이미지 서치 목록에 추가합니다.")
             btn_add_capture.clicked.connect(self._add_image_via_capture)
 
+            btn_add_snapshot = QtWidgets.QPushButton("➕ 캡처된 화면에서 새 이미지 추가")
+            btn_add_snapshot.setToolTip(
+                "3초 캡처 후 오른쪽 화면에서 대상을 드래그해 새 검색 이미지로 저장합니다. "
+                "브라우저 자동완성처럼 포커스를 잃으면 사라지는 UI에 사용하세요."
+            )
+            btn_add_snapshot.clicked.connect(self._prepare_snapshot_image_crop)
+            self.btn_add_snapshot = btn_add_snapshot
+
+            btn_edit_active = QtWidgets.QPushButton("🎨 선택 이미지 상세 편집")
+            btn_edit_active.setToolTip("현재 선택한 검색 이미지를 상세 편집합니다. 저장하면 동결 화면에서 즉시 재검사합니다.")
+            btn_edit_active.clicked.connect(self._edit_active_image)
+            self.btn_edit_active = btn_edit_active
+
             btn_add_asset = QtWidgets.QPushButton("📂 보관함에서 추가")
             btn_add_asset.setStyleSheet("""
                 QPushButton {
@@ -937,6 +971,8 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             add_btn_row.addWidget(btn_add_capture, 3)
             add_btn_row.addWidget(btn_add_asset, 2)
             img_tools_layout.addLayout(add_btn_row)
+            img_tools_layout.addWidget(btn_add_snapshot)
+            img_tools_layout.addWidget(btn_edit_active)
 
             # Row 2: Condition & Required Count
             cond_row = QtWidgets.QHBoxLayout()
@@ -1221,6 +1257,23 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self.canvas.set_frame(frame)
         self._evaluate_all_regions()
         self._refresh_ui()
+
+    def _start_delayed_capture(self, delay_ms: int = 3000) -> None:
+        if self._delayed_capture_timer.isActive():
+            return
+        self._delayed_capture_timer.start(max(1000, int(delay_ms)))
+        # The source application's popup disappears when Studio owns focus.
+        # Minimize only this inspector so the user can reactivate the browser,
+        # open the popup and leave it visible until the timer captures it.
+        self.showMinimized()
+
+    def _finish_delayed_capture(self) -> None:
+        try:
+            self._do_capture_and_test()
+        finally:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
 
     def _uses_screen_coordinates(self) -> bool:
         mode = str(self.step.get("region_mode") or "screen").casefold()
@@ -1567,6 +1620,72 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             self.raise_()
             self.activateWindow()
 
+    def _prepare_snapshot_image_crop(self) -> None:
+        if self._crop_snapshot_for_image:
+            self._crop_snapshot_for_image = False
+            self.btn_add_snapshot.setText("➕ 캡처된 화면에서 새 이미지 추가")
+            return
+        if self._bgr_frame is None or self._bgr_frame.size == 0:
+            QtWidgets.QMessageBox.information(self, "동결 화면 없음", "먼저 3초 캡처로 대상 화면을 촬영해 주세요.")
+            return
+        self._crop_snapshot_for_image = True
+        self.btn_add_snapshot.setText("취소 · 동결 화면 선택 중")
+        self.lbl_banner_sub.setText("오른쪽 동결 화면에서 이미지로 저장할 부분을 드래그하세요. 다음 드래그 한 번만 이미지로 저장합니다.")
+
+    def _add_image_from_snapshot_region(self, reg: list[int]) -> None:
+        self._crop_snapshot_for_image = False
+        self.btn_add_snapshot.setText("➕ 캡처된 화면에서 새 이미지 추가")
+        frame = self._bgr_frame
+        if frame is None or len(reg) < 4:
+            return
+        height, width = frame.shape[:2]
+        left, top = max(0, int(reg[0])), max(0, int(reg[1]))
+        right, bottom = min(width, int(reg[2])), min(height, int(reg[3]))
+        if right - left < 4 or bottom - top < 4:
+            return
+        crop = frame[top:bottom, left:right].copy()
+        image = QtGui.QImage(
+            crop.data, crop.shape[1], crop.shape[0], crop.strides[0], QtGui.QImage.Format_BGR888
+        ).copy()
+        alias = f"snapshot-img-{len(self._aliases) + 1}-{datetime.now():%H%M%S%f}"
+        try:
+            alias = self.repository.add_asset_image(image, alias)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "이미지 저장 실패", str(exc))
+            return
+        stored_region = self._region_from_frame([
+            max(0, left - 20), max(0, top - 20),
+            min(width, right + 20), min(height, bottom + 20),
+        ])
+        if alias not in self._aliases:
+            self._aliases.append(alias)
+        self._asset_regions[alias] = stored_region
+        self._asset_offsets[alias] = [0, 0]
+        self.canvas.set_active_alias(alias)
+        if hasattr(self, "spin_req_count"):
+            self.spin_req_count.setMaximum(max(1, len(self._aliases)))
+        # Keep the frozen popup in view; recapturing here would lose it.
+        self._evaluate_all_regions()
+        self._refresh_ui()
+
+    def _edit_active_image(self) -> None:
+        alias = self.canvas._active_alias or (self._aliases[0] if self._aliases else "")
+        if alias:
+            self._open_image_editor(alias)
+
+    def _open_image_editor(self, alias: str) -> None:
+        path = self.repository.asset_path(alias)
+        if not path or not Path(path).is_file():
+            QtWidgets.QMessageBox.warning(self, "이미지 없음", f"'{alias}' 이미지 파일을 찾을 수 없습니다.")
+            return
+        from .image_editor import ImageEditorDialog
+        editor = ImageEditorDialog(Path(path), alias, self.repository.history_dir, self)
+        if editor.exec() == QtWidgets.QDialog.Accepted:
+            self.repository.refresh_asset_metadata(alias)
+            # Keep the captured popup visible while reflecting edits immediately.
+            self._evaluate_all_regions()
+            self._refresh_ui()
+
     def _add_image_from_assets(self) -> None:
         assets = self.repository.load_assets()
         existing = set(self._aliases)
@@ -1859,6 +1978,8 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
             self.lbl_banner_sub.setStyleSheet("font-size: 9pt; color: #FECACA;")
 
     def _refresh_ui(self) -> None:
+        if not self._is_color_mode:
+            self.btn_edit_active.setEnabled(bool(self._aliases))
         active = self.canvas._active_alias or (self._aliases[0] if self._aliases else "")
         self.canvas.set_data(
             self._canvas_regions(),
@@ -2151,6 +2272,12 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         btn_sel.clicked.connect(lambda _, a=alias: self._select_active_alias(a))
         btn_box.addWidget(btn_sel)
 
+        btn_edit = QtWidgets.QPushButton("🎨 상세 편집")
+        btn_edit.setToolTip("이 이미지를 편집하고 현재 캡처 화면에서 다시 검사합니다.")
+        btn_edit.setStyleSheet("background: #1E293B; border: 1px solid #5264A3; color: #C7D2FE; padding: 3px 6px; border-radius: 4px; font-size: 8.5pt;")
+        btn_edit.clicked.connect(lambda _, a=alias: self._open_image_editor(a))
+        btn_box.addWidget(btn_edit)
+
         if not found and res.get("full_found"):
             btn_snap = QtWidgets.QPushButton("🎯 실제 위치로 맞춤")
             btn_snap.setStyleSheet("background: #065F46; border: 1px solid #059669; color: #A7F3D0; font-weight: 700; padding: 3px 6px; border-radius: 4px; font-size: 8.5pt;")
@@ -2237,6 +2364,11 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         self._refresh_ui()
 
     def _on_canvas_region_dragged(self, alias: str, reg: list[int]) -> None:
+        if self._crop_snapshot_for_image and not self._is_color_mode:
+            self._add_image_from_snapshot_region(reg)
+            return
+        if not alias:
+            return
         # A drag on the full-desktop canvas also identifies the real program
         # underneath that area and rebases all regions to its client origin.
         if self._uses_screen_coordinates() and len(reg) >= 4:
@@ -2409,6 +2541,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         super().accept()
 
     def reject(self) -> None:
+        self._delayed_capture_timer.stop()
         self.setWindowOpacity(1.0)
         p = self.parent()
         if p is not None and hasattr(p, "setEnabled"):
@@ -2418,6 +2551,7 @@ class RegionVisualTestDialog(QtWidgets.QDialog):
         super().reject()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._delayed_capture_timer.stop()
         self.setWindowOpacity(1.0)
         p = self.parent()
         if p is not None and hasattr(p, "setEnabled"):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -580,6 +582,29 @@ class QuickSlotDeckTests(unittest.TestCase):
                 dialog.close()
             window.close()
 
+    def test_deck_macro_action_can_select_a_named_entry(self) -> None:
+        from macro_studio.deck_dock import DeckActionConfigDialog, action_title
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("네이버")
+            macro = repository.load_macro("네이버")
+            macro["steps"] = [{"action": "wait", "duration": 1, "entry_name": "A 로그인"},
+                              {"action": "wait", "duration": 1, "entry_name": "B 로그인"}]
+            repository.save_macro("네이버", macro)
+            window = QuickSlotDeckWindow(repository)
+            dialog = DeckActionConfigDialog("run_macro", {"macro": "네이버", "entry_name": "B 로그인"}, window)
+            self.assertEqual("B 로그인", dialog.widgets["entry_name"].currentData())
+            action = dialog.result_action()
+            self.assertEqual("B 로그인", action_title(action))
+            with mock.patch.object(window, "_start_registered_macro") as start:
+                window._execute_deck_action(action)
+            start.assert_called_once_with("네이버", entry_name="B 로그인")
+            dialog.close()
+            window.close()
+
     def test_deck_input_actions_offer_target_mode_icon_and_test_controls(self) -> None:
         from macro_studio.deck_dock import DeckActionConfigDialog
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
@@ -634,6 +659,7 @@ class QuickSlotDeckTests(unittest.TestCase):
         from macro_studio.deck_dock import DeckActionConfigDialog
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository
+        from PySide6 import QtGui
 
         with tempfile.TemporaryDirectory() as directory:
             window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
@@ -644,7 +670,66 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertTrue(icon_config.get("full_stretch"))
             self.assertFalse(icon_config.get("text_show"))
             self.assertEqual("program_auto", icon_config.get("icon_source"))
+            if os.name == "nt":
+                image = QtGui.QImage.fromData(base64.b64decode(icon_config["image_data"]))
+                self.assertEqual((256, 256), (image.width(), image.height()))
+                self.assertEqual("native", icon_config.get("icon_quality"))
             dialog.close(); window.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows shortcut icon extraction")
+    def test_shortcut_icon_uses_target_executable_without_shortcut_thumbnail(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.quickslot_deck import extract_program_icon_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            shortcut = Path(directory) / "program.lnk"
+            shortcut.write_bytes(b"shortcut test")
+            resolved = subprocess.CompletedProcess([], 0, f"{sys.executable},0\n{sys.executable}\n", "")
+            with mock.patch("macro_studio.quickslot_deck.subprocess.run", return_value=resolved):
+                icon = extract_program_icon_config(str(shortcut))
+            image = QtGui.QImage.fromData(base64.b64decode(icon["image_data"]))
+            self.assertEqual((256, 256), (image.width(), image.height()))
+            self.assertEqual("native", icon["icon_quality"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows executable icon extraction")
+    def test_existing_manual_executable_icon_upgrades_without_changing_layout(self) -> None:
+        from macro_studio.quickslot_deck import upgrade_manual_executable_icon
+
+        previous = {"icon_source": "manual", "image_path": sys.executable,
+                    "image_data": "AA==", "full_stretch": False, "text_show": True}
+        upgraded = upgrade_manual_executable_icon(previous)
+        self.assertNotEqual("AA==", upgraded["image_data"])
+        self.assertEqual(2, upgraded["icon_extractor_version"])
+        self.assertFalse(upgraded["full_stretch"])
+        self.assertTrue(upgraded["text_show"])
+
+    def test_macro_action_uses_program_icon_from_selected_entry(self) -> None:
+        from macro_studio.deck_dock import DeckActionConfigDialog
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow, macro_program_icon_target
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_macro("실행 테스트", {"steps": [
+                {"action": "wait", "duration": 100},
+                {"action": "run_program", "command": sys.executable, "entry_name": "프로그램 시작"},
+            ]})
+            self.assertEqual(sys.executable, macro_program_icon_target(repository, "실행 테스트", "프로그램 시작"))
+            window = QuickSlotDeckWindow(repository)
+            dialog = DeckActionConfigDialog(
+                "run_macro", {"kind": "run_macro", "macro": "실행 테스트", "entry_name": "프로그램 시작"},
+                window, slot_index=0,
+            )
+            icon = dialog.result_icon_config()
+            self.assertTrue(icon.get("image_data"))
+            self.assertEqual("program_auto", icon.get("icon_source"))
+            dialog.close()
+            legacy = DeckActionConfigDialog(
+                "run_macro", {"kind": "run_macro", "macro": "실행 테스트", "entry_name": "프로그램 시작"},
+                window, slot_index=0, icon_config={"emoji": "▶", "icon_size": 58},
+            )
+            self.assertTrue(legacy.result_icon_config().get("image_data"))
+            legacy.close(); window.close()
 
     def test_program_action_repairs_layout_only_icon_config(self) -> None:
         from macro_studio.deck_dock import DeckActionConfigDialog
@@ -818,8 +903,11 @@ class QuickSlotDeckTests(unittest.TestCase):
             window._refresh_preset_radial_menu()
 
             self.assertIn("preset_settings", [item.key for item in window.radial_menu.items])
-            self.assertEqual(["deck:default", "deck:browser"], [item.key for item in window.preset_radial_menu.items])
-            self.assertEqual("브라우저 모드", window.preset_radial_menu.items[1].title)
+            self.assertEqual("close_app", window.radial_menu.items[-1].key)
+            preset_items = {item.key: item for item in window.preset_radial_menu.items}
+            self.assertIn("deck:default", preset_items)
+            self.assertIn("deck:browser", preset_items)
+            self.assertEqual("브라우저 모드", preset_items["deck:browser"].title)
 
             window._handle_preset_radial_action("deck:browser")
             self.assertEqual("browser", window.config["active_slot_preset"])

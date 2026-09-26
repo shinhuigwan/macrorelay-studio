@@ -445,7 +445,7 @@ class QuickNodeDragTests(unittest.TestCase):
             editor.close()
         app.processEvents()
 
-    def test_inactive_image_click_uses_short_pulse_and_clears_drag_state(self) -> None:
+    def test_inactive_image_click_waits_for_browser_release(self) -> None:
         from macro_tool import render_inactive_click_from_hit
 
         script = "\n".join(render_inactive_click_from_hit({
@@ -455,11 +455,27 @@ class QuickNodeDragTests(unittest.TestCase):
             "button": "left",
             "count": 1,
         }))
-        down = script.index("PostMessage, %DownMessage%")
-        release = script.index("PostMessage, %UpMessage%")
-        cleanup = script.index("PostMessage, 0x200, 0, %lParam%", release)
-        self.assertIn("Sleep, 8", script[down:release])
+        self.assertIn('UseSynchronousClick := 1', script)
+        down = script.index('DownOk := DllCall("SendMessageTimeoutW"')
+        release = script.index('UpOk := DllCall("SendMessageTimeoutW"')
+        cleanup = script.index('DllCall("SendMessageTimeoutW", "Ptr", ClickHwnd, "UInt", 0x200', release)
+        self.assertNotIn("Sleep,", script[down:release])
         self.assertGreater(cleanup, release)
+        self.assertIn("ClickOk := DownOk && UpOk", script)
+        self.assertIn("if (ClickOk && !RetryPost)", script)
+
+    def test_explicit_postmessage_click_remains_available(self) -> None:
+        from macro_tool import render_inactive_click_from_hit
+
+        script = "\n".join(render_inactive_click_from_hit({
+            "mode": "inactive",
+            "method": "postmessage",
+            "window_exe": "whale.exe",
+            "button": "left",
+        }))
+        self.assertIn('if ("postmessage" != "auto")', script)
+        self.assertIn("UseSynchronousClick := 0", script)
+        self.assertIn("PostMessage, %DownMessage%", script)
 
 
 if __name__ == "__main__":

@@ -303,6 +303,8 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                 act_align_right = None
                 act_align_dh = None
                 act_align_dv = None
+                act_compact_h = None
+                act_compact_v = None
                 if len(selected_nodes) >= 2:
                     act_branch = menu.addAction(f"🔀 선택 노드 {len(selected_nodes)}개를 순차 분기로 연결")
                     align_sub = menu.addMenu(f"📐 선택 노드 {len(selected_nodes)}개 일괄 정렬")
@@ -313,6 +315,9 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                     align_sub.addSeparator()
                     act_align_dh = align_sub.addAction("↔ 가로 간격 균등 분배")
                     act_align_dv = align_sub.addAction("↕ 세로 간격 균등 분배")
+                    align_sub.addSeparator()
+                    act_compact_h = align_sub.addAction("↔ 앞의 두 노드 간격으로 가로 정렬")
+                    act_compact_v = align_sub.addAction("↕ 앞의 두 노드 간격으로 세로 정렬")
                     menu.addSeparator()
                 act_collapse_nodes = menu.addAction(f"⊟ 선택 노드 {len(selected_nodes)}개 접기") if selected_nodes else None
                 act_expand_nodes = menu.addAction(f"⊞ 선택 노드 {len(selected_nodes)}개 펼치기") if selected_nodes else None
@@ -322,6 +327,8 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                 act_archive = menu.addAction("📦 노드 보관함 열기...")
                 act_auto = menu.addAction("자동 정렬")
                 act_fit = menu.addAction("전체 보기")
+                act_routes = menu.addAction("개별 분기선 표시/숨기기")
+                act_minimap = menu.addAction("미니맵 열기/닫기")
                 chosen = menu.exec(event.globalPos())
                 if not chosen:
                     event.accept()
@@ -344,6 +351,10 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                     canvas.align_selected_nodes("distribute_h")
                 elif chosen == act_align_dv:
                     canvas.align_selected_nodes("distribute_v")
+                elif chosen == act_compact_h:
+                    canvas.align_selected_nodes("compact_h")
+                elif chosen == act_compact_v:
+                    canvas.align_selected_nodes("compact_v")
                 elif chosen == act_group:
                     canvas.add_comment_box(self.mapToScene(event.pos()), "새 노드 그룹", "yellow", 440.0, 260.0)
                 elif chosen == act_archive:
@@ -352,6 +363,10 @@ class NodeGraphView(QtWidgets.QGraphicsView):
                     canvas.auto_layout()
                 elif chosen == act_fit:
                     canvas.fit_all()
+                elif chosen == act_routes:
+                    canvas.set_asset_route_edges_visible(not canvas.asset_route_toggle.isChecked())
+                elif chosen == act_minimap:
+                    canvas.minimap_btn.setChecked(not canvas.minimap_btn.isChecked())
                 event.accept()
                 return
         super().contextMenuEvent(event)
@@ -955,6 +970,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
             if str(step.get("action") or "") == "call_submacro"
             else ACTION_TITLES.get(str(step.get("action") or "step"), str(step.get("action") or "step"))
         )
+        if entry_name := str(step.get("entry_name") or "").strip():
+            self.display_title = f"▶ {entry_name} · {self.display_title}"
         self.setFlags(
             QtWidgets.QGraphicsItem.ItemIsMovable
             | QtWidgets.QGraphicsItem.ItemIsSelectable
@@ -1449,13 +1466,21 @@ class NodeItem(QtWidgets.QGraphicsObject):
         painter.setPen(QtGui.QColor("#FFFFFF"))
         title_metrics = QtGui.QFontMetrics(title_font)
         raw_tw = title_metrics.horizontalAdvance(action_title)
-        max_tw = w - 46
+        folded_count = self.canvas.chain_fold_counts.get(self.index, 0)
+        max_tw = w - (76 if folded_count else 46)
         title_w = min(raw_tw, max_tw)
         painter.drawText(
             QtCore.QRectF(31, 2, title_w, 24),
             QtCore.Qt.AlignVCenter,
             title_metrics.elidedText(action_title, QtCore.Qt.ElideRight, int(title_w)),
         )
+        if folded_count:
+            painter.setPen(QtGui.QPen(QtGui.QColor("#34D9BE"), 1))
+            painter.setBrush(QtGui.QColor("#10352F"))
+            painter.drawRoundedRect(QtCore.QRectF(w - 50, 5, 24, 18), 6, 6)
+            painter.setPen(QtGui.QColor("#D8FFF7"))
+            painter.setFont(QtGui.QFont("Segoe UI", 8, QtGui.QFont.Bold))
+            painter.drawText(QtCore.QRectF(w - 50, 5, 24, 18), QtCore.Qt.AlignCenter, f"+{folded_count}")
 
         # Collapse Button Arrow
         if self.collapsed:
@@ -1464,7 +1489,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
             painter.setPen(QtGui.QColor("#5ED9FF"))
             painter.drawText(QtCore.QRectF(w - 22, 2, 18, 24), QtCore.Qt.AlignCenter, "▸")
         else:
-            collapse_x = 31 + title_w + 3
+            collapse_x = w - 22 if folded_count else 31 + title_w + 3
             collapse_font = QtGui.QFont("Segoe UI Symbol", max(9, int(9.5 * font_boost)), QtGui.QFont.Bold)
             painter.setFont(collapse_font)
             painter.setPen(QtGui.QColor("#B8C0D0"))
@@ -1695,7 +1720,7 @@ class NodeItem(QtWidgets.QGraphicsObject):
                 title_font = QtGui.QFont("Malgun Gothic", 9, QtGui.QFont.Bold)
                 title_metrics = QtGui.QFontMetrics(title_font)
                 title_w = min(title_metrics.horizontalAdvance(action_title), w - 60)
-                collapse_x = 31 + title_w + 3
+                collapse_x = w - 22 if self.canvas.chain_fold_counts.get(self.index) else 31 + title_w + 3
                 if collapse_x - 6 <= point.x() <= collapse_x + 22:
                     should_toggle = True
             if should_toggle:
@@ -1731,6 +1756,11 @@ class NodeItem(QtWidgets.QGraphicsObject):
         menu.addSeparator()
         act_expand = menu.addAction(f"⊞ 선택 노드 {len(selected_indexes)}개 펼치기")
         act_collapse = menu.addAction(f"⊟ 선택 노드 {len(selected_indexes)}개 접기")
+        chain_folded = self.index in self.canvas.chain_fold_roots
+        chain_tail = self.canvas.connected_chain_tail(self.index) if len(selected_indexes) == 1 else []
+        act_chain = menu.addAction(
+            "⛓ 연결된 노드 펼치기" if chain_folded else f"⛓ 연결된 노드 접기 · 뒤의 {len(chain_tail)}개 숨김"
+        ) if chain_folded or chain_tail else None
         act_box = menu.addAction(f"🗂️ 선택 노드 {len(selected_indexes)}개로 노드 그룹 묶기")
 
         current_group = None
@@ -1775,6 +1805,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
         act_al_bottom = None
         act_dist_h = None
         act_dist_v = None
+        act_compact_h = None
+        act_compact_v = None
         if len(selected_indexes) >= 2:
             align_sub = menu.addMenu(f"📐 선택 노드 {len(selected_indexes)}개 일괄 정렬")
             act_al_left = align_sub.addAction("↓ 첫 노드 기준 세로 일렬")
@@ -1784,6 +1816,9 @@ class NodeItem(QtWidgets.QGraphicsObject):
             align_sub.addSeparator()
             act_dist_h = align_sub.addAction("↔ 가로 간격 균등 분배")
             act_dist_v = align_sub.addAction("↕ 세로 간격 균등 분배")
+            align_sub.addSeparator()
+            act_compact_h = align_sub.addAction("↔ 앞의 두 노드 간격으로 가로 정렬")
+            act_compact_v = align_sub.addAction("↕ 앞의 두 노드 간격으로 세로 정렬")
 
         selected_image_nodes = [
             index
@@ -1838,6 +1873,8 @@ class NodeItem(QtWidgets.QGraphicsObject):
             self.canvas.set_nodes_collapsed(selected_indexes, False)
         elif chosen == act_collapse:
             self.canvas.set_nodes_collapsed(selected_indexes, True)
+        elif act_chain is not None and chosen == act_chain:
+            self.canvas.set_chain_folded(self.index, not chain_folded)
         elif chosen == act_box:
             self.canvas.add_comment_box_for_selection()
         elif act_leave_group and chosen == act_leave_group:
@@ -1872,6 +1909,10 @@ class NodeItem(QtWidgets.QGraphicsObject):
             self.canvas.align_selected_nodes("distribute_h")
         elif chosen == act_dist_v:
             self.canvas.align_selected_nodes("distribute_v")
+        elif chosen == act_compact_h:
+            self.canvas.align_selected_nodes("compact_h")
+        elif chosen == act_compact_v:
+            self.canvas.align_selected_nodes("compact_v")
         elif chosen == act_branch:
             if len(selected_indexes) >= 2:
                 self.canvas.branch_chain_requested.emit(selected_indexes)
@@ -3587,11 +3628,13 @@ class NodeCanvas(QtWidgets.QWidget):
     wait_duration_requested = QtCore.Signal(list)
     all_wait_duration_requested = QtCore.Signal()
     start_search_group_requested = QtCore.Signal(list)
+    deck_entry_requested = QtCore.Signal(int)
     image_edit_requested = QtCore.Signal(int)
     color_visual_test_requested = QtCore.Signal(int)
     image_visual_test_requested = QtCore.Signal(int)
     multi_pixel_visual_test_requested = QtCore.Signal(int)
     collapsed_changed = QtCore.Signal(list)
+    chain_folds_changed = QtCore.Signal(list)
     multi_image_merge_requested = QtCore.Signal(list)
     multi_color_merge_requested = QtCore.Signal(list)
     log_requested = QtCore.Signal()
@@ -3609,6 +3652,8 @@ class NodeCanvas(QtWidgets.QWidget):
     workflow_rename_requested = QtCore.Signal(str)
     node_target_picked = QtCore.Signal(int)
     asset_route_edit_requested = QtCore.Signal(int, str)
+    nodes_copy_requested = QtCore.Signal(list)
+    nodes_paste_requested = QtCore.Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -3628,6 +3673,9 @@ class NodeCanvas(QtWidgets.QWidget):
         self.active_step = 0
         self.execution_states: dict[int, dict[str, Any]] = {}
         self.collapsed_nodes: set[int] = set()
+        self.chain_fold_roots: set[int] = set()
+        self.chain_fold_counts: dict[int, int] = {}
+        self.chain_hidden_indexes: set[int] = set()
         self._submacro_links: dict[int, dict[str, Any]] = {}
         self._temp_edge: QtWidgets.QGraphicsPathItem | None = None
         self._temp_start = QtCore.QPointF()
@@ -3673,34 +3721,19 @@ class NodeCanvas(QtWidgets.QWidget):
         toolbar_layout.setSpacing(7)
         self.flow_label = QtWidgets.QLabel("FLOW CANVAS")
         self.flow_label.setStyleSheet(f"font-weight:800; color:{COLORS['accent']}; letter-spacing:1px;")
-        auto = QtWidgets.QPushButton("자동 정렬")
-        auto.setToolTip("<b>자동 정렬</b><br>모든 노드를 100px 최적 간격으로 깔끔하게 자동 재배치합니다.")
-        auto.clicked.connect(self.auto_layout)
         start_group = QtWidgets.QPushButton("시작 검색 묶기")
         start_group.setToolTip("<b>시작 검색 그룹 묶기</b><br>선택한 이미지 서치/OCR 노드 중 화면에 먼저 발견된 대상부터 자동 시작합니다.")
         start_group.clicked.connect(lambda: self.start_search_group_requested.emit(self.selected_indexes()))
-        fit = QtWidgets.QPushButton("전체 보기")
-        fit.setToolTip("<b>전체 보기</b><br>모든 노드가 한 화면에 쏙 들어오도록 시점과 배율을 맞춥니다.")
-        fit.clicked.connect(self.fit_all)
         reset = QtWidgets.QPushButton("100%")
         reset.setToolTip("<b>줌 100% 초기화</b><br>캔버스 확대/축소 배율을 100% 표준 크기로 되돌립니다.")
         reset.clicked.connect(self.view_reset_zoom)
         self.zoom_label = QtWidgets.QLabel("100%")
         self.zoom_label.setObjectName("Muted")
-        self.asset_route_toggle = QtWidgets.QPushButton("개별 분기선")
+        self.asset_route_toggle = QtWidgets.QPushButton("개별 분기선", self)
         self.asset_route_toggle.setCheckable(True)
         self.asset_route_toggle.setChecked(True)
-        self.asset_route_toggle.setToolTip(
-            "멀티 이미지 서치에서 특정 이미지에 지정한 True/Fail 보조 분기선을 표시하거나 숨깁니다."
-        )
         self.asset_route_toggle.toggled.connect(self.set_asset_route_edges_visible)
-        canvas_log_btn = QtWidgets.QPushButton("📋 성공·실패 로그")
-        canvas_log_btn.setToolTip("<b>성공·실패 실행 로그</b><br>각 노드의 성공/실패 여부, 실패 시 쉬운 원인 분석과 개선 가이드를 실시간 확인합니다.")
-        canvas_log_btn.clicked.connect(self.log_requested.emit)
-        canvas_help_btn = QtWidgets.QPushButton("❓ 도움말")
-        canvas_help_btn.setToolTip("<b>전체 사용 가이드 & 도움말 (F1)</b><br>노드 조작, 이미지 서치, 분기, 비활성 클릭, 단축키 등 모든 기능의 상세 설명서를 엽니다.")
-        canvas_help_btn.setStyleSheet("font-weight: 700; color: #4ADE80; border-color: #2F4D3C;")
-        canvas_help_btn.clicked.connect(self.help_requested.emit)
+        self.asset_route_toggle.hide()
         legend = QtWidgets.QLabel(
             f"<span style='color:{COLORS['success']}'>● 성공</span>  "
             f"<span style='color:{COLORS['danger']}'>● 실패</span>  "
@@ -3716,9 +3749,10 @@ class NodeCanvas(QtWidgets.QWidget):
         self.archive_btn.setToolTip("<b>노드 보관함 (📦)</b><br>삭제하거나 보관 처리한 노드 목록을 확인하고, 캔버스로 즉시 복원합니다.")
         self.archive_btn.clicked.connect(self.archive_requested.emit)
         toolbar_layout.addWidget(self.archive_btn)
-        toolbar_layout.addWidget(self.asset_route_toggle)
-        toolbar_layout.addWidget(canvas_log_btn)
-        toolbar_layout.addWidget(canvas_help_btn)
+        self.deck_entry_btn = QtWidgets.QPushButton("▶ 덱 시작 지점")
+        self.deck_entry_btn.setToolTip("노드 하나를 선택한 뒤 덱덱 버튼에서 실행할 시작 지점 이름을 지정하거나 해제합니다.")
+        self.deck_entry_btn.clicked.connect(lambda: self.deck_entry_requested.emit(self.selected_index()))
+        toolbar_layout.addWidget(self.deck_entry_btn)
         self.branch_btn = QtWidgets.QPushButton("🔀 순차 분기 묶기")
         self.branch_btn.setToolTip("<b>순차 분기 묶기 (스마트 분기)</b><br>선택한 노드들을 순차 분기 체인으로 연결합니다.<br>1번 실패 시 2번 실행 → 2번 실패 시 3번 실행<br>💡 <b>Zero-Wire</b>: 분기끼리는 실패선을 잇지 않아도 자동으로 다음 분기 첫 노드로 전환됩니다!")
         self.branch_btn.clicked.connect(lambda: self.branch_chain_requested.emit(self.selected_indexes()))
@@ -3735,12 +3769,17 @@ class NodeCanvas(QtWidgets.QWidget):
         align_menu.addSeparator()
         act_dist_h = align_menu.addAction("↔ 가로 간격 균등 분배")
         act_dist_v = align_menu.addAction("↕ 세로 간격 균등 분배")
+        align_menu.addSeparator()
+        act_compact_h = align_menu.addAction("↔ 앞의 두 노드 간격으로 가로 정렬")
+        act_compact_v = align_menu.addAction("↕ 앞의 두 노드 간격으로 세로 정렬")
         act_a_top.triggered.connect(lambda: self.align_selected_nodes("top"))
         act_a_bottom.triggered.connect(lambda: self.align_selected_nodes("bottom"))
         act_a_left.triggered.connect(lambda: self.align_selected_nodes("left"))
         act_a_right.triggered.connect(lambda: self.align_selected_nodes("right"))
         act_dist_h.triggered.connect(lambda: self.align_selected_nodes("distribute_h"))
         act_dist_v.triggered.connect(lambda: self.align_selected_nodes("distribute_v"))
+        act_compact_h.triggered.connect(lambda: self.align_selected_nodes("compact_h"))
+        act_compact_v.triggered.connect(lambda: self.align_selected_nodes("compact_v"))
         self.align_btn.setMenu(align_menu)
         toolbar_layout.addWidget(self.align_btn)
 
@@ -3774,19 +3813,22 @@ class NodeCanvas(QtWidgets.QWidget):
         toolbar_layout.addWidget(self.node_group_btn)
         self.comment_box_btn = self.node_group_btn
 
-        self.minimap_btn = QtWidgets.QPushButton("🗺️ 미니맵")
+        self.minimap_btn = QtWidgets.QPushButton("🗺️ 미니맵", self)
         self.minimap_btn.setCheckable(True)
-        self.minimap_btn.setToolTip("<b>🗺️ 플로팅 미니맵 열기/닫기</b><br>캔버스 밖 독립 플로팅 창으로 전체 노드 맵을 표시합니다. 원하는 위치로 자유롭게 이동 및 접기가 가능합니다.")
         self.minimap_btn.toggled.connect(self._toggle_minimap)
-        toolbar_layout.addWidget(self.minimap_btn)
+        self.minimap_btn.hide()
 
-        toolbar_layout.addWidget(auto)
-        toolbar_layout.addWidget(fit)
         toolbar_layout.addWidget(reset)
         toolbar_layout.addWidget(self.zoom_label)
         self.scene = NodeGraphScene(self)
         self.scene.selectionChanged.connect(self._on_scene_selection_changed)
         self.view = NodeGraphView(self.scene, self)
+        self.copy_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Copy, self.view)
+        self.copy_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.copy_shortcut.activated.connect(lambda: self.nodes_copy_requested.emit(self.selected_indexes()))
+        self.paste_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Paste, self.view)
+        self.paste_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.paste_shortcut.activated.connect(self._request_paste_at_cursor)
         self.view.zoom_changed.connect(lambda value: self.zoom_label.setText(f"{value}%"))
         layout.addWidget(toolbar)
         layout.addWidget(self.view, 1)
@@ -4103,7 +4145,8 @@ class NodeCanvas(QtWidgets.QWidget):
         for edge in self.edges:
             # A folded workflow is the top-level container. Do not let the
             # collapsed-node-group proxy pass re-enable any of its real edges.
-            if edge.source in folded_nodes or edge.target in folded_nodes:
+            if (edge.source in folded_nodes or edge.target in folded_nodes
+                    or edge.source in self.chain_hidden_indexes or edge.target in self.chain_hidden_indexes):
                 edge.setVisible(False)
                 continue
             source_group = self.group_for_node(edge.source, collapsed_only=True)
@@ -4381,6 +4424,9 @@ class NodeCanvas(QtWidgets.QWidget):
                 return f"숫자 조건 · {labels.get(str(step.get('number_condition') or 'gte'), '?')} {step.get('number_value', 0)}"
             return f"텍스트 추출 · {step.get('profile') or '자동'}"
         if action == "type_text":
+            segments = step.get("text_segments")
+            if isinstance(segments, list):
+                return "".join("🔒" if isinstance(item, dict) and item.get("kind") == "vault" else str(item.get("text") or "") for item in segments if isinstance(item, dict)) or "텍스트 입력"
             return str(step.get("text") or "텍스트 입력")
         if action == "browser_action":
             return str(step.get("selector") or step.get("title") or "브라우저 액션")
@@ -4428,6 +4474,13 @@ class NodeCanvas(QtWidgets.QWidget):
             for value in raw_collapsed
             if str(value).lstrip("-").isdigit() and 0 < int(value) <= len(self.steps)
         } if isinstance(raw_collapsed, list) else set()
+        raw_chain_folds = self.macro.get("graph_chain_folds") or []
+        self.chain_fold_roots = {
+            int(value) for value in raw_chain_folds
+            if str(value).isdigit() and 0 < int(value) <= len(self.steps)
+        } if isinstance(raw_chain_folds, list) else set()
+        self.chain_fold_counts = {}
+        self.chain_hidden_indexes = set()
         self.start_step = int(self.macro.get("graph_start_step") or 0)
         raw_candidates = self.macro.get("start_search_candidates") or []
         self.start_candidates = []
@@ -4461,6 +4514,7 @@ class NodeCanvas(QtWidgets.QWidget):
         self._load_comment_boxes()
         if any(group.next_group_id for group in self.comments):
             self.apply_group_flow_routes()
+        self._refresh_hierarchy_visibility()
         self._refresh_display_numbers()
         rect = self.scene.itemsBoundingRect()
         if rect.isEmpty():
@@ -4628,6 +4682,9 @@ class NodeCanvas(QtWidgets.QWidget):
         total = len(self.steps)
         if not total:
             return {}
+        ordered_indexes = list(range(1, total + 1))
+        if len(self.nodes) == total and all(index in self._display_numbers for index in ordered_indexes):
+            ordered_indexes.sort(key=lambda index: (self.display_number(index), index))
         workflow_groups: list[tuple[str, list[int]]] = []
         workflow_lookup: dict[str, int] = {}
         for index, step in enumerate(self.steps, start=1):
@@ -4638,7 +4695,8 @@ class NodeCanvas(QtWidgets.QWidget):
                 workflow_lookup[workflow_id] = len(workflow_groups)
                 workflow_groups.append((workflow_id, []))
             workflow_groups[workflow_lookup[workflow_id]][1].append(index)
-        if workflow_groups and sum(len(indexes) for _identifier, indexes in workflow_groups) == total:
+        workflow_order = [index for _identifier, indexes in workflow_groups for index in indexes]
+        if workflow_groups and workflow_order == ordered_indexes:
             positions: dict[int, QtCore.QPointF] = {}
             MAX_PER_ROW = 10
             current_row = 0
@@ -4652,61 +4710,11 @@ class NodeCanvas(QtWidgets.QWidget):
                         current_x += col_width + 100.0
                     current_row += 1
             return positions
-        outgoing: dict[int, list[int]] = {index: [] for index in range(1, total + 1)}
-        indegree = {index: 0 for index in range(1, total + 1)}
-        for index, step in enumerate(self.steps, start=1):
-            targets: list[int] = []
-            success_candidates = step.get("success_candidates") or []
-            if isinstance(success_candidates, list) and success_candidates:
-                targets.extend(int(value) for value in success_candidates if str(value).lstrip("-").isdigit())
-            elif index < total and not bool(step.get("stop_on_success")):
-                success = int(step.get("on_success") or 0)
-                targets.append(success if success else index + 1)
-            else:
-                success = int(step.get("on_success") or 0)
-                if success:
-                    targets.append(success)
-            failure = int(step.get("on_fail") or 0)
-            if failure:
-                targets.append(failure)
-            for rule in step.get("edge_conditions") or []:
-                if isinstance(rule, dict):
-                    target = int(rule.get("target") or 0)
-                    if target:
-                        targets.append(target)
-            asset_routes = step.get("asset_routes")
-            if isinstance(asset_routes, dict):
-                for route in asset_routes.values():
-                    if not isinstance(route, dict):
-                        continue
-                    for outcome in ("true", "fail"):
-                        target = int(route.get(outcome) or 0)
-                        if target:
-                            targets.append(target)
-            for target in targets:
-                if 0 < target <= total and target not in outgoing[index]:
-                    outgoing[index].append(target)
-                    indegree[target] += 1
-
-        preferred_start = int(self.macro.get("graph_start_step") or 0)
-        roots = ([preferred_start] if 0 < preferred_start <= total else []) + [
-            index for index in range(1, total + 1) if indegree[index] == 0 and index != preferred_start
-        ]
-        ranks: dict[int, int] = {}
-        pending: list[int] = []
-        for root in roots:
-            if root not in ranks:
-                ranks[root] = 0
-                pending.append(root)
-        while pending:
-            source = pending.pop(0)
-            for target in outgoing[source]:
-                if target not in ranks:
-                    ranks[target] = ranks[source] + 1
-                    pending.append(target)
-        for index in range(1, total + 1):
-            if index not in ranks:
-                ranks[index] = 0
+        # Auto-layout is a visual ordering command. Cycles and return edges can
+        # assign an earlier numbered node a later BFS rank, visibly shuffling
+        # 1-2-3-4 into 2-1-3-4. Keep the user's stable node order here; the
+        # connections themselves remain unchanged.
+        ranks = {index: rank for rank, index in enumerate(ordered_indexes)}
 
         columns: dict[int, list[int]] = {}
         for index in range(1, total + 1):
@@ -4741,6 +4749,7 @@ class NodeCanvas(QtWidgets.QWidget):
             self.collapsed_nodes.discard(int(index))
         self._compact_row_spacing()
         self._route_edges()
+        self._refresh_hierarchy_visibility()
         self._sync_workflow_lanes()
         self.collapsed_changed.emit(sorted(self.collapsed_nodes))
         self.positions_changed.emit(self.positions())
@@ -4875,6 +4884,45 @@ class NodeCanvas(QtWidgets.QWidget):
                 members.update(int(index) for index in getattr(group, "node_indexes", []))
         return members
 
+    def connected_chain_tail(self, root: int) -> list[int]:
+        """Only fold an unambiguous, linear success path with no external links."""
+        result: list[int] = []
+        seen = {int(root)}
+        current = int(root)
+        while current in self.nodes:
+            outgoing = [edge for edge in self.edges if edge.source == current]
+            if len(outgoing) != 1:
+                break
+            edge = outgoing[0]
+            target = edge.target
+            if edge.kind != "success" or edge.is_condition or edge.is_asset_route or target in seen:
+                break
+            if len([item for item in self.edges if item.target == target]) != 1:
+                break
+            target_outgoing = [item for item in self.edges if item.source == target]
+            if len(target_outgoing) > 1 or any(
+                item.kind != "success" or item.is_condition or item.is_asset_route
+                for item in target_outgoing
+            ):
+                break
+            result.append(target)
+            seen.add(target)
+            current = target
+        return result
+
+    def set_chain_folded(self, root: int, folded: bool) -> None:
+        root = int(root)
+        if folded and not self.connected_chain_tail(root):
+            return
+        if folded:
+            self.chain_fold_roots.add(root)
+        else:
+            self.chain_fold_roots.discard(root)
+        self._refresh_hierarchy_visibility()
+        self._route_edges()
+        self._update_scene_bounds()
+        self.chain_folds_changed.emit(sorted(self.chain_fold_roots))
+
     def _workflow_fold_scope(self, lane: WorkflowLaneItem) -> tuple[set[int], set[NodeGroupItem]]:
         """Return branch nodes plus connected child node-groups.
 
@@ -4937,9 +4985,22 @@ class NodeCanvas(QtWidgets.QWidget):
 
     def _refresh_hierarchy_visibility(self) -> None:
         workflow_hidden, hidden_groups = self._folded_workflow_scope()
-        hidden_indexes = workflow_hidden | self._collapsed_group_members()
+        chain_hidden: set[int] = set()
+        self.chain_fold_counts = {}
+        for root in sorted(self.chain_fold_roots):
+            if root in chain_hidden:
+                continue
+            tail = self.connected_chain_tail(root)
+            if tail:
+                self.chain_fold_counts[root] = len(tail)
+                chain_hidden.update(tail)
+        self.chain_hidden_indexes = chain_hidden
+        hidden_indexes = workflow_hidden | self._collapsed_group_members() | chain_hidden
         for index, node in self.nodes.items():
             node.setVisible(index not in hidden_indexes)
+            if index in self.chain_fold_roots:
+                node.setToolTip(f"연결된 뒤 노드 {self.chain_fold_counts.get(index, 0)}개 접힘 · 우클릭하여 펼치기")
+            node.update()
         for group in self.comments:
             group.setVisible(group not in hidden_groups)
         for edge in self.edges:
@@ -5138,6 +5199,7 @@ class NodeCanvas(QtWidgets.QWidget):
                         )
                         self.scene.addItem(edge)
                         self.edges.append(edge)
+        self._refresh_hierarchy_visibility()
         self._route_edges()
 
     def set_asset_route_edges_visible(self, visible: bool) -> None:
@@ -5164,6 +5226,8 @@ class NodeCanvas(QtWidgets.QWidget):
             edge.target_offset_y = 0.0
 
         for edge in self.edges:
+            if edge.source in self.chain_hidden_indexes or edge.target in self.chain_hidden_indexes:
+                continue
             if edge.manual_points:
                 continue
             source = self.nodes.get(edge.source)
@@ -5367,6 +5431,12 @@ class NodeCanvas(QtWidgets.QWidget):
     def selected_indexes(self) -> list[int]:
         return sorted(item.index for item in self.scene.selectedItems() if isinstance(item, NodeItem))
 
+    def _request_paste_at_cursor(self) -> None:
+        cursor = self.view.mapFromGlobal(QtGui.QCursor.pos())
+        if not self.view.viewport().rect().contains(cursor):
+            cursor = self.view.viewport().rect().center()
+        self.nodes_paste_requested.emit(self.view.mapToScene(cursor))
+
     def _highlight_connected_edges(self, selected_index: int) -> None:
         if not self.edges:
             return
@@ -5451,52 +5521,63 @@ class NodeCanvas(QtWidgets.QWidget):
         selected_indexes = self.selected_indexes()
         if len(selected_indexes) < 2:
             return
-        selected_nodes = [self.nodes[i] for i in selected_indexes if i in self.nodes]
+        # Graph coordinates can cross during a drag; execution/node order must not.
+        selected_nodes = [self.nodes[i] for i in sorted(selected_indexes, key=lambda index: (self.display_number(index), index)) if i in self.nodes]
         if len(selected_nodes) < 2:
             return
 
         gap_y = 50.0
         gap_x = 72.0
-        anchor = self.nodes.get(self._selection_anchor_index)
-        if anchor not in selected_nodes:
-            anchor = min(selected_nodes, key=lambda node: (node.pos().x(), node.pos().y(), node.index))
-            self._selection_anchor_index = anchor.index
-        others = [node for node in selected_nodes if node is not anchor]
+        anchor = selected_nodes[0]
+        others = selected_nodes[1:]
+        first_follower = others[0]
+        compact_gap_x = max(12.0, first_follower.pos().x() - anchor.pos().x() - anchor.current_width())
+        compact_gap_y = max(12.0, first_follower.pos().y() - anchor.pos().y() - anchor.boundingRect().height())
 
         self.suspended = True
         try:
             if mode == "top":
                 cursor_x = anchor.pos().x() + anchor.current_width() + gap_x
-                for node in sorted(others, key=lambda item: (item.pos().x(), item.pos().y(), item.index)):
+                for node in others:
                     node.setPos(cursor_x, anchor.pos().y())
                     cursor_x += node.current_width() + gap_x
             elif mode == "bottom":
                 cursor_x = anchor.pos().x()
                 target_y = anchor.pos().y() + anchor.boundingRect().height() + gap_y
-                for node in sorted(others, key=lambda item: (item.pos().x(), item.pos().y(), item.index)):
+                for node in others:
                     node.setPos(cursor_x, target_y)
                     cursor_x += node.current_width() + gap_x
             elif mode == "left":
                 cursor_y = anchor.pos().y() + anchor.boundingRect().height() + gap_y
-                for node in sorted(others, key=lambda item: (item.pos().y(), item.pos().x(), item.index)):
+                for node in others:
                     node.setPos(anchor.pos().x(), cursor_y)
                     cursor_y += node.boundingRect().height() + gap_y
             elif mode == "right":
                 target_x = anchor.pos().x() + anchor.current_width() + gap_x
                 cursor_y = anchor.pos().y()
-                for node in sorted(others, key=lambda item: (item.pos().y(), item.pos().x(), item.index)):
+                for node in others:
                     node.setPos(target_x, cursor_y)
                     cursor_y += node.boundingRect().height() + gap_y
             elif mode == "distribute_h":
                 cursor_x = anchor.pos().x() + anchor.current_width() + gap_x
-                for node in sorted(others, key=lambda item: (item.pos().x(), item.index)):
+                for node in others:
                     node.setPos(cursor_x, node.pos().y())
                     cursor_x += node.current_width() + gap_x
             elif mode == "distribute_v":
                 cursor_y = anchor.pos().y() + anchor.boundingRect().height() + gap_y
-                for node in sorted(others, key=lambda item: (item.pos().y(), item.index)):
+                for node in others:
                     node.setPos(node.pos().x(), cursor_y)
                     cursor_y += node.boundingRect().height() + gap_y
+            elif mode == "compact_h":
+                cursor_x = anchor.pos().x() + anchor.current_width() + compact_gap_x
+                for node in others:
+                    node.setPos(cursor_x, anchor.pos().y())
+                    cursor_x += node.current_width() + compact_gap_x
+            elif mode == "compact_v":
+                cursor_y = anchor.pos().y() + anchor.boundingRect().height() + compact_gap_y
+                for node in others:
+                    node.setPos(anchor.pos().x(), cursor_y)
+                    cursor_y += node.boundingRect().height() + compact_gap_y
         finally:
             self.suspended = False
 

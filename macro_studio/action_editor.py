@@ -6,18 +6,45 @@ import ctypes
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .color_widgets import ColorToleranceBarWidget
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop, virtual_desktop_geometry
 from .repository import MacroRepository
-from .screen_coordinates import display_coordinate_maps, logical_point_to_native, rect_to_exclusive_list
+from .screen_coordinates import display_coordinate_maps, logical_point_to_native, native_rect_to_logical, rect_to_exclusive_list
 from .widgets import WheelSafeSpinBox
 
 
 KOREAN_INITIALS = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
 _ASSET_THUMBNAIL_CACHE: dict[tuple[str, int, int, int], QtGui.QPixmap] = {}
+_SECURE_TEXT_PROPERTY = int(QtGui.QTextFormat.UserProperty) + 81
+
+
+def type_text_display(step: dict[str, Any], vault: Any = None) -> str:
+    """Build an in-memory preview; secure content never enters macro JSON."""
+    if str(step.get("text_source") or "fixed") == "variable":
+        return f"변수: {step.get('text_variable') or '미선택'}"
+    if str(step.get("text_source") or "fixed") == "result":
+        return f"결과: {step.get('text_result') or '미선택'}"
+    segments = step.get("text_segments")
+    if not isinstance(segments, list):
+        return str(step.get("text") or "")
+    parts: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        if segment.get("kind") != "vault":
+            parts.append(str(segment.get("text") or ""))
+        elif vault is None:
+            parts.append("🔒")
+        else:
+            try:
+                parts.append(vault.get(str(segment.get("secret") or "")))
+            except (KeyError, OSError, ValueError):
+                parts.append("[보안 값 없음]")
+    return "".join(parts)
 
 
 def _asset_thumbnail(path: Path | None, width: int, height: int) -> QtGui.QPixmap:
@@ -491,12 +518,23 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("y", "Y 좌표", "int", 0, -100_000, 100_000),
         FieldSpec("button", "마우스 버튼", "choice", "Left", options=choice(("왼쪽", "Left"), ("오른쪽", "Right"), ("가운데", "Middle"), ("휠 위", "WheelUp"), ("휠 아래", "WheelDown"))),
         FieldSpec("count", "클릭 횟수", "int", 1, 1, 50),
+        FieldSpec(
+            "press_duration", "Down → Up 간격", "duration", 0, 0, 10_000,
+            tooltip="클릭 버튼을 누른 뒤 떼기까지 유지할 시간(ms)입니다. 0ms는 기존 클릭 방식이며, 휠·드래그에는 적용되지 않습니다.",
+        ),
         FieldSpec("action_type", "동작", "choice", "click", options=choice(("클릭", "click"), ("드래그", "drag"))),
         FieldSpec("drag_to.0", "드래그 끝 X", "int", 0, -100_000, 100_000, section="드래그"),
         FieldSpec("drag_to.1", "드래그 끝 Y", "int", 0, -100_000, 100_000, section="드래그"),
         FieldSpec("sleep_after", "클릭 후 대기", "duration", 0, 0, 600_000),
     ],
     "inactive_click": [
+        FieldSpec("coordinate_source", "클릭 위치 가져오기", "choice", "fixed", options=choice(("직접 지정한 좌표", "fixed"), ("최근 서치의 대표 발견 위치", "last_image_search"), ("저장된 X/Y 변수", "saved_variables")), tooltip="서치 결과나 저장된 좌표 변수를 선택해 비활성 클릭에 사용할 수 있습니다."),
+        FieldSpec("coordinate_scope", "직접 지정 좌표 기준", "choice", "client", options=choice(("대상 창 클라이언트 좌표", "client"), ("전체 화면 절대 좌표", "screen")), tooltip="좌표 선택 버튼은 전체 화면 좌표로, 프로그램 기준 좌표 버튼은 창 내부 좌표로 저장합니다."),
+        FieldSpec("result_offset_x", "발견 위치 보정 X", "int", 0, -100_000, 100_000, tooltip="최근 이미지 서치의 발견 중심에서 가로로 이동할 픽셀 수입니다. 클릭 위치 가져오기가 켜졌을 때만 적용됩니다."),
+        FieldSpec("result_offset_y", "발견 위치 보정 Y", "int", 0, -100_000, 100_000, tooltip="최근 이미지 서치의 발견 중심에서 세로로 이동할 픽셀 수입니다. 클릭 위치 가져오기가 켜졌을 때만 적용됩니다."),
+        FieldSpec("x_var", "X 변수 이름", "text", "", placeholder="예: HitX"),
+        FieldSpec("y_var", "Y 변수 이름", "text", "", placeholder="예: HitY"),
+        FieldSpec("variable_coord_mode", "변수 좌표 기준", "choice", "screen", options=choice(("전체 화면 좌표", "screen"), ("대상 창 클라이언트 좌표", "client"))),
         FieldSpec("window", "대상 창", "text", "A", placeholder="ahk_id 0x... 또는 창 제목"),
         FieldSpec("window_exe", "대상 프로그램", "text", "", placeholder="예: whale.exe"),
         FieldSpec("control", "컨트롤", "text", "", placeholder="선택 사항"),
@@ -508,11 +546,12 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("options", "클릭 옵션", "text", "NA", placeholder="예: NA"),
         FieldSpec("action_type", "클릭 동작", "choice", "click", options=choice(
             ("좌클릭 (기본)", "click"),
+            ("더블클릭", "double_click"),
             ("우클릭", "right_click"),
             ("드래그", "drag"),
             ("마우스 누름 (Down 상태 유지)", "down"),
             ("마우스 뗌 (Up 상태)", "up"),
-        ), tooltip="• 좌/우클릭: 누름 유지 시간 후 손을 뗍니다.\n• 마우스 누름: 버튼을 누른 상태로 유지합니다 (길게 누르기 시작).\n• 마우스 뗌: 누르고 있던 버튼을 뗍니다 (길게 누르기 종료).\n• 드래그: 끝 좌표까지 부드럽게 끕니다."),
+        ), tooltip="• 좌/우클릭: 누름 유지 시간 후 손을 뗍니다.\n• 더블클릭: 같은 위치를 빠르게 두 번 클릭합니다.\n• 마우스 누름: 버튼을 누른 상태로 유지합니다 (길게 누르기 시작).\n• 마우스 뗌: 누르고 있던 버튼을 뗍니다 (길게 누르기 종료).\n• 드래그: 끝 좌표까지 부드럽게 끕니다."),
         FieldSpec("press_duration", "누름 유지 시간", "duration", 60, 0, 10_000, tooltip="마우스를 누르고 있을 시간(ms)입니다. 앱플레이어/모바일 게임은 0ms 즉시 뗌 대신 50~80ms 이상 눌러야 게임 내 터치 입력이 100% 안정적으로 인식됩니다."),
         FieldSpec("drag_to.0", "드래그 끝 X", "int", 0, -100_000, 100_000, section="드래그·재시도"),
         FieldSpec("drag_to.1", "드래그 끝 Y", "int", 0, -100_000, 100_000, section="드래그·재시도"),
@@ -583,6 +622,7 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("click.offset", "오프셋 위치", "offset", [0, 0], section="검색 성공 후 동작"),
         FieldSpec("click.between_click_delay", "중심→오프셋 간격", "duration", 80, 0, 10_000, section="검색 성공 후 동작", tooltip="두 위치를 모두 클릭할 때 첫 클릭과 두 번째 클릭 사이의 대기 시간입니다."),
         FieldSpec("click.count", "각 위치 클릭 횟수", "int", 1, 1, 20, section="검색 성공 후 동작"),
+        FieldSpec("click.press_duration", "Down → Up 간격", "duration", 0, 0, 10_000, section="검색 성공 후 동작", tooltip="이미지 클릭 시 누른 뒤 떼기까지의 시간(ms)입니다. 0ms는 기존 동작을 유지합니다."),
         FieldSpec("click.window", "대상 창", "text", "", section="검색 성공 후 동작"),
         FieldSpec("click.window_exe", "대상 프로그램", "text", "", section="검색 성공 후 동작"),
         FieldSpec("click.keys", "클릭 후 키 입력", "text", "", section="검색 성공 후 동작"),
@@ -714,6 +754,7 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("click.mode", "클릭 모드", "choice", "inactive", options=choice(("비활성 클릭 (권장)", "inactive"), ("활성 클릭", "active")), section="클릭 & 후속 동작"),
         FieldSpec("click.method", "비활성 방식", "choice", "auto", options=choice(("자동 · 앱에 맞춤", "auto"), ("최상위 창 직접 메시지", "direct_postmessage"), ("ControlClick", "controlclick"), ("PostMessage", "postmessage")), section="클릭 & 후속 동작"),
         FieldSpec("click.count", "클릭 횟수", "int", 1, 1, 20, section="클릭 & 후속 동작"),
+        FieldSpec("click.press_duration", "Down → Up 간격", "duration", 0, 0, 10_000, section="클릭 & 후속 동작", tooltip="발견된 이미지 클릭 시 누른 뒤 떼기까지의 시간(ms)입니다. 0ms는 기존 동작을 유지합니다."),
         FieldSpec("click.offset", "공통 기본 오프셋", "offset", [0, 0], section="클릭 & 후속 동작"),
         FieldSpec("region_mode", "범위 기준", "choice", "client", options=choice(("대상 프로그램", "client"), ("전체 화면", "screen"), ("창 전체", "window")), section="검색 대상 창 & 범위"),
         FieldSpec("region_coords", "좌표 해석", "choice", "relative", options=choice(("대상 기준", "relative"), ("화면 절대 좌표", "screen")), section="검색 대상 창 & 범위"),
@@ -740,7 +781,10 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("engine", "검색 엔진", "choice", "opencv", options=choice(("OpenCV · 크기 변화 대응", "opencv"), ("AutoHotkey · 단순 일치", "ahk"))),
         FieldSpec("search_profile", "검색 품질", "choice", "fast", options=choice(("빠름 · 권장", "fast"), ("균형", "balanced"), ("정밀 · 배율 대응", "precise"))),
         FieldSpec("confidence", "일치 신뢰도", "int", 86, 50, 99),
-        FieldSpec("timeout", "확인 제한 시간", "duration", 800, 0, 600_000),
+        FieldSpec("timeout", "한 번의 확인 제한 시간", "duration", 800, 0, 600_000,
+                  tooltip="일반 모드에서는 여기까지 찾고 실패합니다. '이미지 나타날 때까지 대기'를 켜면 매번 이 시간만큼 확인하고, 못 찾으면 다음 확인을 계속합니다."),
+        FieldSpec("wait_until_appear", "이미지 나타날 때까지 대기", "bool", False,
+                  tooltip="정해진 반복 횟수 없이 이미지를 찾을 때까지 같은 화면 조건을 재확인합니다. 실행 중지 버튼으로 언제든 끝낼 수 있습니다. 이미지 파일·검색 엔진 오류는 반복하지 않습니다."),
         FieldSpec("poll_delay", "반복 확인 간격", "duration", 40, 10, 60_000),
         FieldSpec("region_mode", "범위 기준", "choice", "client", options=choice(("대상 프로그램", "client"), ("전체 화면", "screen"), ("창 전체", "window")), section="검색 범위"),
         FieldSpec("region_coords", "좌표 해석", "choice", "relative", options=choice(("대상 기준", "relative"), ("화면 절대 좌표", "screen")), section="검색 범위"),
@@ -754,11 +798,16 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("sleep_after", "판정 후 대기", "duration", 0, 0, 600_000),
     ],
     "type_text": [
-        FieldSpec("text", "입력 내용", "multiline", ""),
-        FieldSpec("send_mode", "전송 방식", "choice", "input", options=choice(("빠른 입력", "input"), ("이벤트 입력", "event"), ("원문 입력", "raw"))),
-        FieldSpec("mode", "대상 방식", "choice", "active", options=choice(("현재 활성 창", "active"), ("비활성 창", "inactive"))),
-        FieldSpec("window", "비활성 대상 창", "text", ""),
-        FieldSpec("delay", "입력 후 대기", "duration", 0, 0, 600_000),
+        FieldSpec("text_source", "입력값 가져오기", "choice", "fixed", options=choice(("고정 텍스트", "fixed"), ("앞 노드의 결과", "result"), ("저장된 변수", "variable")), tooltip="직접 입력하거나 OCR·클립보드 결과 및 앞에서 저장한 변수를 사용할 수 있습니다."),
+        FieldSpec("text", "입력 내용", "multiline", "", tooltip="한글·영문·대소문자·!@#$ 등은 보이는 그대로 입력합니다. {Enter}/{Tab} 기능키와 (대기1초), (대기500ms) 같은 중간 대기를 넣을 수 있습니다."),
+        FieldSpec("text_result", "가져올 결과", "choice", "ocr_text", options=choice(("마지막 OCR 텍스트", "ocr_text"), ("클립보드", "clipboard"))),
+        FieldSpec("text_variable", "가져올 변수 이름", "text", "", placeholder="예: SelectedSymbol"),
+        FieldSpec("send_mode", "전송 방식", "choice", "input", options=choice(("빠른 문자 입력", "input"), ("호환 이벤트 입력", "event"), ("모든 문자 그대로", "raw")), tooltip="빠른 입력은 유니코드 문자를 그대로 보냅니다. 호환 입력은 일부 앱에서 더 안정적입니다. '모든 문자 그대로'에서는 {Enter}도 텍스트로 입력합니다."),
+        FieldSpec("mode", "대상 방식", "choice", "inactive", options=choice(("비활성 창 · 선택한 프로그램", "inactive"), ("현재 활성 창", "active")), tooltip="비활성 창은 대상 프로그램의 창을 활성화하지 않고 입력을 시도합니다. 웹 페이지나 게임 등은 비활성 입력을 막을 수 있으므로 대상 앱에서 테스트하세요."),
+        FieldSpec("window", "비활성 대상 창", "text", "", tooltip="화면에서 대상 창을 선택하세요. 현재 창이 닫혀도 대상 프로그램 이름으로 다시 찾습니다."),
+        FieldSpec("window_exe", "대상 프로그램", "text", "", placeholder="예: whale.exe", tooltip="창 제목이나 핸들이 바뀔 때 동일한 실행 파일 이름으로 창을 다시 찾습니다."),
+        FieldSpec("char_interval", "글자 사이 간격", "duration", 0, 0, 5000, tooltip="0ms는 전체 문자열을 빠르게 입력합니다. 값이 있으면 글자마다 해당 시간만큼 기다립니다."),
+        FieldSpec("delay", "입력 후 대기", "duration", 0, 0, 600_000, tooltip="모든 글자 입력이 끝난 다음 다음 노드로 넘어가기 전 기다리는 시간입니다."),
     ],
     "wait": [FieldSpec("duration", "대기 시간", "duration", 500, 0, 3_600_000)],
     "datetime_condition": [
@@ -1103,13 +1152,26 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
     ],
     "table_excel_read": [],
     "table_excel_write": [],
-    "set_var": [FieldSpec("name", "변수 이름", "text", "value"), FieldSpec("value", "값", "text", "")],
+    "set_var": [
+        FieldSpec("name", "저장할 이름", "text", "value", placeholder="예: RetryCount"),
+        FieldSpec("value_source", "값 가져오기", "choice", "fixed", options=choice(("고정값", "fixed"), ("앞 노드의 결과", "result"), ("저장된 변수", "variable"))),
+        FieldSpec("value", "고정값", "text", ""),
+        FieldSpec("value_kind", "고정값 종류", "choice", "text", options=choice(("텍스트", "text"), ("숫자", "number"), ("참/거짓", "boolean"))),
+        FieldSpec("result_key", "가져올 결과", "choice", "image_x", options=choice(("최근 이미지 발견 X", "image_x"), ("최근 이미지 발견 Y", "image_y"), ("최근 이미지 발견 창", "image_hwnd"), ("마지막 OCR 텍스트", "ocr_text"), ("마지막 OCR 숫자", "ocr_number"), ("클립보드", "clipboard"), ("현재 타이머(ms)", "tick_count"))),
+        FieldSpec("source_var", "가져올 변수 이름", "text", "", placeholder="예: RetryCount"),
+        FieldSpec("scope", "값 유지", "choice", "run", options=choice(("이번 실행만", "run"), ("다음 실행에도 저장", "stored")), tooltip="저장값은 사용자 AppData의 매크로 전용 INI 파일에 평문으로 보관됩니다. 비밀번호는 보안 보관함을 사용하세요."),
+    ],
     "vault_get": [
         FieldSpec("name", "저장할 변수 이름", "text", "secret_value"),
         FieldSpec("secret", "보관함 항목 이름", "text", "", placeholder="설정 > 보안 보관함에 저장한 이름"),
     ],
     "calc_var": [
         FieldSpec("name", "결과 변수", "text", "value"),
+        FieldSpec("quick_operation", "간단 작업", "choice", "advanced", options=choice(("고급 수식 사용", "advanced"), ("숫자 더하기", "add"), ("숫자 빼기", "subtract"), ("텍스트 바꾸기", "replace"), ("텍스트 뒤에 붙이기", "append"), ("목록에 추가", "list_append"))),
+        FieldSpec("operand_source", "작업 값 가져오기", "choice", "fixed", options=choice(("고정값", "fixed"), ("다른 변수", "variable"))),
+        FieldSpec("operand", "작업 값", "text", "", placeholder="숫자 또는 텍스트"),
+        FieldSpec("find_text", "바꿀 원문", "text", "", placeholder="텍스트 바꾸기에서 사용"),
+        FieldSpec("scope", "값 유지", "choice", "run", options=choice(("이번 실행만", "run"), ("다음 실행에도 저장", "stored"))),
         FieldSpec("expr", "수식", "text", "", placeholder="예: price * 1.1"),
         FieldSpec("op", "간단 연산", "choice", "", options=choice(("사용 안 함", ""), ("더하기", "+"), ("빼기", "-"), ("곱하기", "*"), ("나누기", "/"))),
         FieldSpec("value", "연산 값", "text", ""),
@@ -1151,8 +1213,9 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("counter_key", "공유 카운터 이름", "text", ""),
     ],
     "text_condition": [
-        FieldSpec("source", "비교 대상", "choice", "ocr", options=choice(("마지막 OCR 텍스트", "ocr"), ("클립보드", "clipboard"))),
-        FieldSpec("mode", "비교 방식", "choice", "contains", options=choice(("포함", "contains"), ("완전히 같음", "equals"))),
+        FieldSpec("source", "비교 대상", "choice", "ocr", options=choice(("마지막 OCR 텍스트", "ocr"), ("클립보드", "clipboard"), ("저장된 변수", "variable"))),
+        FieldSpec("variable", "비교할 변수 이름", "text", "", placeholder="예: RetryCount"),
+        FieldSpec("mode", "비교 방식", "choice", "contains", options=choice(("포함", "contains"), ("완전히 같음", "equals"), ("숫자보다 큼", "greater"), ("숫자 이상", "greater_equal"), ("숫자보다 작음", "less"), ("숫자 이하", "less_equal"))),
         FieldSpec("needle", "단일 조건값", "text", ""),
         FieldSpec("needles_text", "복수 조건값", "text", "", placeholder="쉼표로 구분"),
         FieldSpec("on_match", "일치 시 노드", "int", 0, 0, 999_999),
@@ -1312,13 +1375,14 @@ class WindowPickerDialog(QtWidgets.QDialog):
             self.reject()
 
     def selected_screen_point(self) -> QtCore.QPoint:
-        return QtCore.QPoint(self._point)
+        return logical_point_to_native(self._point)
 
     def selected_client_point(self) -> QtCore.QPoint | None:
         if not self.window_hwnd:
             return None
         try:
-            point = wintypes.POINT(self._point.x(), self._point.y())
+            native_point = logical_point_to_native(self._point)
+            point = wintypes.POINT(native_point.x(), native_point.y())
             if ctypes.windll.user32.ScreenToClient(self.window_hwnd, ctypes.byref(point)):
                 return QtCore.QPoint(int(point.x), int(point.y))
         except Exception:
@@ -1328,6 +1392,7 @@ class WindowPickerDialog(QtWidgets.QDialog):
     def _window_under_point(self, position: QtCore.QPoint) -> tuple[int, QtCore.QRect]:
         try:
             user32 = ctypes.windll.user32
+            native_position = logical_point_to_native(position)
             own_root = int(user32.GetAncestor(int(self.winId()), 2) or int(self.winId()))
             candidate = int(user32.GetWindow(own_root, 2) or 0)  # GW_HWNDNEXT
             while candidate:
@@ -1338,10 +1403,11 @@ class WindowPickerDialog(QtWidgets.QDialog):
                     and candidate_root not in self._ignored_hwnds
                     and user32.IsWindowVisible(candidate_root)
                     and user32.GetWindowRect(candidate_root, ctypes.byref(rect))
-                    and rect.left <= position.x() < rect.right
-                    and rect.top <= position.y() < rect.bottom
+                    and rect.left <= native_position.x() < rect.right
+                    and rect.top <= native_position.y() < rect.bottom
                 ):
-                    return candidate_root, QtCore.QRect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+                    native_rect = QtCore.QRect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+                    return candidate_root, native_rect_to_logical(native_rect)
                 candidate = int(user32.GetWindow(candidate, 2) or 0)
         except Exception:
             pass
@@ -2336,6 +2402,10 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
                 st_reg = self.step["regions"][0]
             if _is_valid_reg(st_reg):
                 self._search_region = [int(x) for x in st_reg[:4]]
+        stored_regions = self.step.get("regions") if isinstance(self.step.get("regions"), list) else []
+        self._search_regions = [[int(x) for x in region[:4]] for region in stored_regions if _is_valid_reg(region)]
+        if not self._search_regions and self._search_region:
+            self._search_regions = [list(self._search_region)]
 
         self._asset_regions: dict[str, list[int]] = {}
         input_asset_regs = dict(asset_regions or {})
@@ -2418,13 +2488,25 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
                 btn_edit_img.clicked.connect(lambda: self._open_image_editor(alias))
                 card_layout.addWidget(btn_edit_img)
 
-            reg_text = f"[{self._search_region[0]}, {self._search_region[1]}, {self._search_region[2]}, {self._search_region[3]}]" if self._search_region else "전체/미지정"
+            reg_text = f"{len(self._search_regions)}개 · 첫 영역 {self._search_region}" if self._search_region else "전체/미지정"
             reg_btn_row = QtWidgets.QHBoxLayout()
             self.btn_pick_region = QtWidgets.QPushButton(f"📐 검색 영역 지정 (클라이언트 영역 드래그) · 현재: {reg_text}")
             self.btn_pick_region.setStyleSheet("background: #1B293A; border: 1px solid #2B5A8A; color: #70C5FF; padding: 6px; border-radius: 6px; font-weight: 600;")
             self.btn_pick_region.setToolTip("화면에서 원하는 범위를 마우스로 드래그하면 대상 창(앱플레이어 등) 기준 클라이언트 상대 좌표로 자동 변환 저장됩니다.")
             self.btn_pick_region.clicked.connect(self._pick_search_region)
             reg_btn_row.addWidget(self.btn_pick_region, 1)
+            btn_add_region = QtWidgets.QPushButton("＋ 영역")
+            btn_add_region.setToolTip("현재 검색 영역 뒤에 새 영역을 추가합니다.")
+            btn_add_region.clicked.connect(self._add_search_region)
+            reg_btn_row.addWidget(btn_add_region)
+            btn_remove_region = QtWidgets.QPushButton("－ 영역")
+            btn_remove_region.setToolTip("목록에서 검색 영역 하나를 제거합니다.")
+            btn_remove_region.clicked.connect(self._remove_search_region)
+            reg_btn_row.addWidget(btn_remove_region)
+            btn_order_region = QtWidgets.QPushButton("⇅ 순서")
+            btn_order_region.setToolTip("여러 검색 영역의 우선순위를 바꿉니다.")
+            btn_order_region.clicked.connect(self._reorder_search_region)
+            reg_btn_row.addWidget(btn_order_region)
 
             self.btn_quick_save = QtWidgets.QPushButton("⚡ 즉시 저장")
             self.btn_quick_save.setStyleSheet("background: #238636; color: white; padding: 6px 12px; border-radius: 6px; font-weight: 700;")
@@ -2877,14 +2959,57 @@ class ImageSearchConfidenceDialog(QtWidgets.QDialog):
         rel_region = self._capture_drag_region("검색 범위를 마우스로 드래그하세요 (완료 시 Enter, 취소 시 Esc)")
         if rel_region is not None:
             self._search_region = rel_region
+            if self._search_regions:
+                self._search_regions[0] = list(rel_region)
+            else:
+                self._search_regions = [list(rel_region)]
             w_text = f"[{rel_region[0]}, {rel_region[1]}, {rel_region[2]}, {rel_region[3]}]"
             if hasattr(self, "btn_pick_region"):
-                self.btn_pick_region.setText(f"📐 검색 영역 지정됨: {w_text} (재지정 가능)")
+                self.btn_pick_region.setText(f"📐 검색 영역 {len(self._search_regions)}개 · 첫 영역 {w_text}")
                 self.btn_pick_region.setStyleSheet("background: #143528; border: 1px solid #287A50; color: #4ADE80; padding: 6px; border-radius: 6px; font-weight: 700;")
             if hasattr(self, "notice_lbl"):
                 basis = "화면 절대" if self.step.get("region_mode") == "screen" else "대상 창 상대"
                 self.notice_lbl.setText(f"✔ {basis} 영역 {w_text} 지정 완료!\n창 아래쪽 [✔ 신뢰도 설정 저장] 또는 [⚡ 즉시 저장]을 누르면 완료됩니다.")
                 self.notice_lbl.setVisible(True)
+
+    def _add_search_region(self) -> None:
+        region = self._capture_drag_region("추가할 검색 영역을 드래그한 뒤 Enter · Esc 취소")
+        if region is None:
+            return
+        self._search_regions.append(list(region))
+        if not self._search_region:
+            self._search_region = list(region)
+        self.btn_pick_region.setText(f"📐 검색 영역 {len(self._search_regions)}개 지정됨")
+
+    def _remove_search_region(self) -> None:
+        if not self._search_regions:
+            return
+        choices = [f"{index}. {region}" for index, region in enumerate(self._search_regions, start=1)]
+        choice, accepted = QtWidgets.QInputDialog.getItem(self, "검색 영역 제거", "제거할 영역", choices, 0, False)
+        if not accepted:
+            return
+        self._search_regions.pop(choices.index(choice))
+        self._search_region = list(self._search_regions[0]) if self._search_regions else None
+        self.btn_pick_region.setText(f"📐 검색 영역 {len(self._search_regions)}개 지정됨" if self._search_regions else "📐 검색 영역 미지정")
+
+    def _reorder_search_region(self) -> None:
+        if len(self._search_regions) < 2:
+            return
+        choices = [f"{index}. {region}" for index, region in enumerate(self._search_regions, start=1)]
+        choice, accepted = QtWidgets.QInputDialog.getItem(self, "검색 우선순위", "이동할 영역", choices, 0, False)
+        if not accepted:
+            return
+        index = choices.index(choice)
+        direction, accepted = QtWidgets.QInputDialog.getItem(self, "검색 우선순위", "이동 방향", ["앞으로", "뒤로"], 0, False)
+        if not accepted:
+            return
+        target = index - 1 if direction == "앞으로" else index + 1
+        if 0 <= target < len(self._search_regions):
+            self._search_regions[index], self._search_regions[target] = self._search_regions[target], self._search_regions[index]
+            self._search_region = list(self._search_regions[0])
+
+    def search_regions(self) -> list[list[int]]:
+        return [list(region) for region in self._search_regions]
 
     def _pick_asset_search_region(self, alias: str, btn: QtWidgets.QPushButton) -> None:
         rel_region = self._capture_drag_region(f"[{alias}] 이미지의 개별 검색 범위를 마우스로 드래그하세요 (완료 시 Enter, 취소 시 Esc)")
@@ -3033,11 +3158,12 @@ SECTION_TOOLTIPS: dict[str, str] = {
 }
 
 ACTION_GUIDE_SUMMARIES: dict[str, str] = {
-    "image_search": "<b>💡 이미지 서치 핵심 가이드</b><br>• <b>엔진</b>: 배율/크기 변화 대응은 <b>OpenCV</b>, 가장 빠른 반응속도는 <b>AutoHotkey</b> 권장<br>• <b>프리셋</b>: 오탐 방지는 <b>🎯 정밀도 우선</b>, 연타/고속은 <b>⚡ 속도 우선</b> 선택<br>• <b>실패 시 대체 클릭</b>: 대상을 못 찾았을 때 닫기(X)나 다른 영역을 대신 클릭하도록 설정 가능",
+    "image_search": "<b>💡 이미지 서치 핵심 가이드</b><br>• <b>엔진</b>: 배율/크기 변화 대응은 <b>OpenCV</b>, 가장 빠른 반응속도는 <b>AutoHotkey</b> 권장<br>• <b>프리셋</b>: 오탐 방지는 <b>🎯 정밀도 우선</b>, 연타/고속은 <b>⚡ 속도 우선</b> 선택<br>• 찾은 위치는 다음 <b>비활성 클릭 → 클릭 위치 가져오기</b>에서 변수 입력 없이 사용할 수 있습니다.",
+    "multi_image_search": "<b>💡 멀티 이미지 서치 가이드</b><br>• 여러 이미지를 검색하고 일치 조건을 판정합니다.<br>• 발견 좌표는 다음 <b>비활성 클릭 → 클릭 위치 가져오기</b>에서 사용할 수 있습니다.<br>• <b>Down → Up 간격</b>은 찾은 이미지 클릭에 적용됩니다.",
     "animation_search": "<b>💡 애니메이션 서치 가이드</b><br>• 선택 영역을 약 1.2초 수집해 <b>고정된 아이콘 부분만 자동으로 남기고</b> 회전 효과·움직이는 배경은 투명 처리합니다.<br>• 생성된 대표 PNG 프레임 중 하나만 일치해도 성공하며, 실행 엔진은 항상 <b>OpenCV</b>입니다.<br>• 미리보기를 클릭하면 각 자동 마스크 이미지를 상세 편집할 수 있습니다.",
     "mouse_click": "<b>💡 마우스 클릭 가이드</b><br>• 실제 마우스 커서가 좌표로 이동하여 클릭합니다.<br>• 프로그램 창 위치가 바뀌어도 클릭되게 하려면 좌표 기준을 <b>'대상 프로그램 기준'</b>으로 설정하세요.",
-    "inactive_click": "<b>💡 비활성 클릭 가이드</b><br>• 창이 다른 창 뒤에 가려져 있어도 마우스 이동 없이 백그라운드로 클릭을 전송합니다.<br>• 전송 방식은 <b>'자동'</b>으로 두시면 PostMessage와 ControlClick을 결합하여 최적 전송합니다.",
-    "type_text": "<b>💡 텍스트 입력 가이드</b><br>• 한글, 영문, 특수문자, 줄바꿈을 대상 창에 타이핑합니다.<br>• 백그라운드 입력을 원하시면 방식을 <b>'비활성 창'</b>으로 설정하세요.",
+    "inactive_click": "<b>💡 비활성 클릭 가이드</b><br>• 앞 노드가 이미지를 찾은 위치로 클릭하려면 <b>클릭 위치 가져오기 → 최근 서치의 대표 발견 위치</b>를 선택하세요. X/Y 변수 입력은 필요 없습니다.<br>• 서치에 실패하면 오래된 좌표로 클릭하지 않습니다.<br>• 창이 가려져 있어도 백그라운드로 클릭합니다.",
+    "type_text": "<b>💡 텍스트 입력 가이드</b><br>• 기본값은 선택한 프로그램에 비활성 입력입니다. 문자는 한글·영문·대소문자·!@#$ 그대로 보냅니다.<br>• 텍스트 중간에 (대기1초) 또는 (대기500ms)를 넣으면 앞부분 입력 후 기다렸다가 나머지를 보냅니다. Enter·Tab은 아래 기능키 버튼으로 추가할 수 있습니다.<br>• 아이디·비밀번호는 입력 내용에서 드래그해 🔒 보안 저장하세요. 편집기에는 원문이 보이지만 매크로 파일에는 암호화 보관함 참조만 남습니다.",
     "wait": "<b>💡 대기 시간 가이드</b><br>• 다음 노드를 실행하기 전에 일정 시간(ms) 동안 대기합니다. (1000ms = 1초)",
     "pixel_search": "<b>💡 픽셀 색상 서치 가이드</b><br>• 화면의 특정 좌표나 범위에서 지정한 색상(#RRGGBB)을 초고속으로 검출합니다.<br>• 그라데이션이나 그림자가 있으면 허용 오차(Tolerance)를 15~25 정도로 늘려주세요.",
     "ocr_tracking": "<b>💡 OCR 추적 가이드</b><br>• 기준 이미지를 먼저 화면에서 찾은 후, 그 위치를 기준으로 오프셋 영역의 텍스트/숫자를 정밀 판독합니다.<br>• 골드량, 체력 수치, 변동성 UI 인식에 최적입니다.",
@@ -3131,9 +3257,11 @@ def exec_image_search_confidence_dialog(dialog: ImageSearchConfidenceDialog) -> 
 
 
 class ActionEditor(QtWidgets.QWidget):
-    def __init__(self, repository: MacroRepository, parent=None) -> None:
+    def __init__(self, repository: MacroRepository, parent=None, variable_choices: list[str] | None = None,
+                 preload_image_search: bool = True) -> None:
         super().__init__(parent)
         self.repository = repository
+        self.variable_choices = list(dict.fromkeys(variable_choices or []))
         self.original: dict[str, Any] = {}
         self.current_action = "mouse_click"
         self._last_capture_rect = QtCore.QRect()
@@ -3150,7 +3278,8 @@ class ActionEditor(QtWidgets.QWidget):
         layout.addWidget(self.stack)
         # Image search is the most frequently inspected page and several capture
         # helpers need its coordinate widgets before set_action() is called.
-        self._ensure_page("image_search")
+        if preload_image_search:
+            self._ensure_page("image_search")
 
     def _build_page(self, action: str) -> QtWidgets.QWidget:
         scroll = QtWidgets.QScrollArea()
@@ -3326,6 +3455,12 @@ class ActionEditor(QtWidgets.QWidget):
             tol_bar = self.widgets[action].get("tolerance")
             if isinstance(color_edit, QtWidgets.QLineEdit) and isinstance(tol_bar, ColorToleranceBarWidget):
                 color_edit.textChanged.connect(lambda txt, tb=tol_bar: tb.setColor(txt))
+        if action in {"set_var", "calc_var", "text_condition", "inactive_click", "type_text"}:
+            for key in ("value_source", "quick_operation", "operand_source", "source", "mode", "coordinate_source", "action_type", "text_source"):
+                selector = self.widgets[action].get(key)
+                if isinstance(selector, QtWidgets.QComboBox):
+                    selector.currentIndexChanged.connect(lambda _index, act=action: self._sync_variable_controls(act))
+            self._sync_variable_controls(action)
         if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
             engine = self.widgets[action].get("engine")
             if isinstance(engine, QtWidgets.QComboBox):
@@ -3333,6 +3468,56 @@ class ActionEditor(QtWidgets.QWidget):
         body_layout.addStretch(1)
         scroll.setWidget(body)
         return scroll
+
+    def _sync_variable_controls(self, action: str) -> None:
+        widgets = self.widgets.get(action, {})
+        def show(key: str, visible: bool) -> None:
+            widget = widgets.get(key)
+            if widget is not None:
+                widget.setVisible(visible)
+                if widget.parentWidget() is not None and isinstance(widget.parentWidget().layout(), QtWidgets.QFormLayout):
+                    form = widget.parentWidget().layout()
+                    label = form.labelForField(widget)
+                    if label is not None:
+                        label.setVisible(visible)
+
+        def selected(key: str, default: str) -> str:
+            widget = widgets.get(key)
+            return str(widget.currentData() or default) if isinstance(widget, QtWidgets.QComboBox) else default
+
+        if action == "set_var":
+            source = selected("value_source", "fixed")
+            show("value", source == "fixed")
+            show("value_kind", source == "fixed")
+            show("result_key", source == "result")
+            show("source_var", source == "variable")
+        elif action == "calc_var":
+            operation = selected("quick_operation", "advanced")
+            show("expr", operation == "advanced")
+            show("op", operation == "advanced")
+            show("value", operation == "advanced")
+            for key in ("operand_source", "operand"):
+                show(key, operation != "advanced")
+            show("find_text", operation == "replace")
+            show("scope", operation != "list_append")
+        elif action == "text_condition":
+            show("variable", selected("source", "ocr") == "variable")
+        elif action == "inactive_click":
+            source = selected("coordinate_source", "fixed")
+            for key in ("x", "y", "coordinate_scope"):
+                show(key, source == "fixed")
+            for key in ("result_offset_x", "result_offset_y"):
+                show(key, source == "last_image_search")
+            for key in ("x_var", "y_var", "variable_coord_mode"):
+                show(key, source == "saved_variables")
+            clicks_widget = widgets.get("clicks")
+            if clicks_widget is not None:
+                clicks_widget.setEnabled(selected("action_type", "click") != "double_click")
+        elif action == "type_text":
+            source = selected("text_source", "fixed")
+            show("text", source == "fixed")
+            show("text_result", source == "result")
+            show("text_variable", source == "variable")
 
     def _update_engine_controls_state(self, action: str) -> None:
         if action not in {"image_search", "screen_condition", "multi_image_search", "animation_search"}:
@@ -3614,7 +3799,7 @@ class ActionEditor(QtWidgets.QWidget):
     def _build_helpers(self, action: str) -> QtWidgets.QWidget | None:
         buttons: list[tuple[str, Any]] = []
         if action in {"mouse_click", "inactive_click"}:
-            buttons.append(("⌖ 좌표 선택 · 클릭/F4 저장", lambda: self._capture_cursor(action)))
+            buttons.append(("⌖ 화면 좌표 선택 · 클릭/F4 저장", lambda: self._capture_cursor(action)))
             buttons.append(("◎ 프로그램 기준 좌표 · 대상 위치 클릭", lambda: self._capture_program_cursor(action)))
         if action == "image_search":
             buttons.extend(
@@ -3691,8 +3876,11 @@ class ActionEditor(QtWidgets.QWidget):
         if action == "type_text":
             buttons.extend(
                 [
+                    ("🔒 선택한 글자 보안 저장", self._secure_selected_type_text),
+                    ("🔓 선택한 글자 보안 해제", self._unsecure_selected_type_text),
                     ("↵ Enter 추가", lambda: self._append_type_text_key("{Enter}")),
                     ("⇥ Tab 추가", lambda: self._append_type_text_key("{Tab}")),
+                    ("⏱ 1초 대기 추가", lambda: self._append_type_text_key("(대기1초)")),
                     ("Esc 추가", lambda: self._append_type_text_key("{Esc}")),
                     ("⌨ 기능키 선택", self._choose_type_text_key),
                 ]
@@ -3773,8 +3961,132 @@ class ActionEditor(QtWidgets.QWidget):
             if index >= 0:
                 mode.setCurrentIndex(index)
         if isinstance(editor, QtWidgets.QPlainTextEdit):
-            editor.textCursor().insertText(token)
+            cursor = editor.textCursor()
+            cursor.insertText(token, QtGui.QTextCharFormat())
+            editor.setTextCursor(cursor)
             editor.setFocus(QtCore.Qt.OtherFocusReason)
+
+    def _secure_selected_type_text(self) -> None:
+        editor = self.widgets.get("type_text", {}).get("text")
+        if not isinstance(editor, QtWidgets.QPlainTextEdit):
+            return
+        cursor = editor.textCursor()
+        selection = cursor.selectedText()
+        if not selection:
+            QtWidgets.QMessageBox.information(self, "보안 입력", "먼저 입력 내용에서 보호할 글자를 드래그해 선택하세요.")
+            return
+        if "\u2029" in selection or "\n" in selection:
+            QtWidgets.QMessageBox.information(self, "보안 입력", "보안 값은 한 줄씩 선택해 저장하세요.")
+            return
+        fmt = QtGui.QTextCharFormat()
+        fmt.setProperty(_SECURE_TEXT_PROPERTY, f"type_text_{uuid4().hex}")
+        fmt.setBackground(QtGui.QColor("#214D56"))
+        fmt.setForeground(QtGui.QColor("#F2FFFD"))
+        cursor.mergeCharFormat(fmt)
+        cursor.clearSelection()
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+
+    def _unsecure_selected_type_text(self) -> None:
+        editor = self.widgets.get("type_text", {}).get("text")
+        if not isinstance(editor, QtWidgets.QPlainTextEdit):
+            return
+        cursor = editor.textCursor()
+        if not cursor.hasSelection():
+            return
+        fmt = QtGui.QTextCharFormat()
+        fmt.setProperty(_SECURE_TEXT_PROPERTY, "")
+        fmt.setBackground(QtGui.QBrush())
+        fmt.setForeground(QtGui.QBrush())
+        cursor.mergeCharFormat(fmt)
+        editor.setTextCursor(cursor)
+
+    def _load_secure_type_text(self, step: dict[str, Any]) -> None:
+        segments = step.get("text_segments")
+        editor = self.widgets.get("type_text", {}).get("text")
+        if not isinstance(segments, list) or not isinstance(editor, QtWidgets.QPlainTextEdit):
+            return
+        editor.clear()
+        cursor = editor.textCursor()
+        self._secure_text_unavailable = set()
+        vault = self.repository.credential_vault()
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            fmt = QtGui.QTextCharFormat()
+            if segment.get("kind") == "vault":
+                name = str(segment.get("secret") or "")
+                try:
+                    text = vault.get(name)
+                except (KeyError, OSError, ValueError):
+                    text = f"[보안 값 없음: {name}]"
+                    self._secure_text_unavailable.add(name)
+                fmt.setProperty(_SECURE_TEXT_PROPERTY, name)
+                fmt.setBackground(QtGui.QColor("#214D56"))
+                fmt.setForeground(QtGui.QColor("#F2FFFD"))
+            else:
+                text = str(segment.get("text") or "")
+            cursor.insertText(text, fmt)
+        editor.setTextCursor(cursor)
+
+    def _type_text_segments(self) -> list[dict[str, str]]:
+        editor = self.widgets.get("type_text", {}).get("text")
+        if not isinstance(editor, QtWidgets.QPlainTextEdit):
+            return []
+        segments: list[dict[str, str]] = []
+        block = editor.document().firstBlock()
+        first = True
+        while block.isValid():
+            if not first:
+                if segments and segments[-1].get("kind") == "text":
+                    segments[-1]["text"] += "\n"
+                else:
+                    segments.append({"kind": "text", "text": "\n"})
+            first = False
+            fragment_iterator = block.begin()
+            while not fragment_iterator.atEnd():
+                fragment = fragment_iterator.fragment()
+                if fragment.isValid():
+                    value = fragment.text()
+                    secret = str(fragment.charFormat().property(_SECURE_TEXT_PROPERTY) or "")
+                    kind = "vault" if secret else "text"
+                    if segments and segments[-1].get("kind") == kind and (kind == "text" or segments[-1].get("secret") == secret):
+                        if kind == "text":
+                            segments[-1]["text"] += value
+                        else:
+                            segments[-1]["_visible"] += value
+                    elif kind == "text":
+                        segments.append({"kind": "text", "text": value})
+                    else:
+                        segments.append({"kind": "vault", "secret": secret, "_visible": value})
+                fragment_iterator += 1
+            block = block.next()
+        return segments
+
+    def commit_secure_text(self) -> bool:
+        if self.current_action != "type_text":
+            return True
+        source = self.widgets.get("type_text", {}).get("text_source")
+        if isinstance(source, QtWidgets.QComboBox) and source.currentData() != "fixed":
+            return True
+        segments = self._type_text_segments()
+        protected = [segment for segment in segments if segment.get("kind") == "vault"]
+        names = [segment["secret"] for segment in protected]
+        if len(names) != len(set(names)):
+            QtWidgets.QMessageBox.warning(self, "보안 입력", "하나의 보안 선택 영역이 나뉘었습니다. 해당 부분을 다시 한 번에 선택해 보안 저장하세요.")
+            return False
+        unavailable = getattr(self, "_secure_text_unavailable", set())
+        if any(name in unavailable for name in names):
+            QtWidgets.QMessageBox.warning(self, "보안 입력", "찾을 수 없는 보안 값이 있습니다. 보관함을 복구하거나 해당 선택 영역의 보안을 해제하세요.")
+            return False
+        try:
+            vault = self.repository.credential_vault()
+            for segment in protected:
+                vault.set(segment["secret"], segment["_visible"])
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "보안 입력 저장 실패", str(exc))
+            return False
+        return True
 
     def _choose_type_text_key(self) -> None:
         choices = [
@@ -3844,10 +4156,15 @@ class ActionEditor(QtWidgets.QWidget):
         accepted = picker.exec() == QtWidgets.QDialog.Accepted
         self._restore_host_windows(hosts)
         if accepted:
-            self._set_field_value(action, "x", picker.point.x())
-            self._set_field_value(action, "y", picker.point.y())
+            point = logical_point_to_native(picker.point)
+            self._set_field_value(action, "x", point.x())
+            self._set_field_value(action, "y", point.y())
             if action == "mouse_click":
                 self._set_field_value(action, "coordinate_scope", "screen")
+            else:
+                self._set_field_value(action, "coordinate_source", "fixed")
+                self._set_field_value(action, "coordinate_scope", "screen")
+                self._coordinate_scope_picked = True
 
     def _capture_program_cursor(self, action: str) -> None:
         """Bind one clicked point to its target application's client area."""
@@ -3867,6 +4184,10 @@ class ActionEditor(QtWidgets.QWidget):
         if action == "mouse_click":
             self._set_field_value(action, "coordinate_scope", "client")
             self._set_field_value(action, "window_hwnd", picker.window_hwnd)
+        else:
+            self._set_field_value(action, "coordinate_source", "fixed")
+            self._set_field_value(action, "coordinate_scope", "client")
+            self._coordinate_scope_picked = True
         QtWidgets.QToolTip.showText(
             QtGui.QCursor.pos(),
             f"{picker.exe_name or picker.window_token} 기준 X {client_point.x()}, Y {client_point.y()} 저장",
@@ -4479,7 +4800,7 @@ class ActionEditor(QtWidgets.QWidget):
 
         btn_time = QtWidgets.QPushButton("⏱ StartTime = %A_TickCount%")
         btn_time.setToolTip("현재 밀리초 시각을 저장해 매크로 경과 시간을 측정할 수 있도록 합니다.")
-        btn_time.clicked.connect(lambda: self._set_var_fields("StartTime", "%A_TickCount%"))
+        btn_time.clicked.connect(lambda: self._set_var_result_fields("StartTime", "tick_count"))
 
         btn_flag = QtWidgets.QPushButton("🚩 IsSuccess = 1 (성공 플래그)")
         btn_flag.setToolTip("작업 성공 여부를 나타내는 플래그 변수를 1로 설정합니다.")
@@ -4518,7 +4839,13 @@ class ActionEditor(QtWidgets.QWidget):
 
     def _set_var_fields(self, name: str, value: str) -> None:
         self._set_field_value("set_var", "name", name)
+        self._set_field_value("set_var", "value_source", "fixed")
         self._set_field_value("set_var", "value", value)
+
+    def _set_var_result_fields(self, name: str, result_key: str) -> None:
+        self._set_field_value("set_var", "name", name)
+        self._set_field_value("set_var", "value_source", "result")
+        self._set_field_value("set_var", "result_key", result_key)
 
     def _set_var_name_field(self, name: str) -> None:
         if self.current_action in {"set_var", "calc_var"}:
@@ -5306,6 +5633,11 @@ class ActionEditor(QtWidgets.QWidget):
             target.setPlaceholderText(spec.placeholder)
         elif spec.placeholder and isinstance(target, QtWidgets.QPlainTextEdit):
             target.setPlaceholderText(spec.placeholder)
+        if isinstance(target, QtWidgets.QLineEdit) and spec.key in {"source_var", "operand", "variable", "x_var", "y_var", "text_variable"} and self.variable_choices:
+            completer = QtWidgets.QCompleter(self.variable_choices, target)
+            completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+            completer.setFilterMode(QtCore.Qt.MatchContains)
+            target.setCompleter(completer)
         return widget
 
     @staticmethod
@@ -5328,8 +5660,9 @@ class ActionEditor(QtWidgets.QWidget):
 
     def _get_sources(self):
         if not hasattr(self, "_cached_assets") or self._cached_assets is None:
-            self._cached_assets = list(self.repository.load_assets())
-            self._cached_asset_paths = {alias: self.repository.asset_path(alias) for alias in self._cached_assets}
+            asset_index = self.repository.load_assets()
+            self._cached_assets = list(asset_index)
+            self._cached_asset_paths = {alias: self.repository.asset_path(alias, asset_index) for alias in self._cached_assets}
             self._cached_macros = [summary.name for summary in self.repository.list_macros()]
             self._cached_tables = list(self.repository.load_tables())
         return self._cached_assets, self._cached_asset_paths, self._cached_macros, self._cached_tables
@@ -5344,6 +5677,9 @@ class ActionEditor(QtWidgets.QWidget):
 
     def _refresh_sources_for_action(self, action: str) -> None:
         if action not in self.widgets:
+            return
+        if not any(spec.kind in {"asset", "assets", "macro", "table"} for spec in ACTION_FIELDS.get(action, [])
+                   if spec.key not in COMMON_FIELD_KEYS):
             return
         assets, asset_paths, macros, tables = self._get_sources()
         for spec in ACTION_FIELDS.get(action, []):
@@ -5379,6 +5715,7 @@ class ActionEditor(QtWidgets.QWidget):
 
     def load_step(self, step: dict[str, Any]) -> None:
         self.original = deepcopy(step)
+        self._coordinate_scope_picked = False
         action = str(step.get("action") or "mouse_click")
         self.set_action(action)
         normalized = deepcopy(step)
@@ -5436,6 +5773,9 @@ class ActionEditor(QtWidgets.QWidget):
                 continue
             value = get_path(normalized, spec.key, spec.default)
             self._set_widget_value(self.widgets[action][spec.key], spec, value)
+        if action == "type_text":
+            self._secure_text_unavailable = set()
+            self._load_secure_type_text(normalized)
         if action in {"image_search", "multi_image_search", "animation_search"}:
             picker = self.widgets[action].get("assets")
             offset_editor = self.widgets[action].get("click.offset")
@@ -5475,6 +5815,8 @@ class ActionEditor(QtWidgets.QWidget):
             }
             self._update_engine_controls_state(action)
         self._current_search_preset = normalized.get("search_preset", "")
+        if action in {"set_var", "calc_var", "text_condition", "inactive_click", "type_text"}:
+            self._sync_variable_controls(action)
 
     def build_step(self) -> dict[str, Any]:
         action = self.current_action
@@ -5492,6 +5834,27 @@ class ActionEditor(QtWidgets.QWidget):
                 remove_path(payload, spec.key)
             else:
                 set_path(payload, spec.key, value)
+        if (action == "inactive_click" and "coordinate_scope" not in self.original
+                and not getattr(self, "_coordinate_scope_picked", False)
+                and payload.get("coordinate_scope") == "client"):
+            # Keep old steps unmarked so the runtime can recover unmistakable
+            # screen coordinates written by the former unlabeled picker.
+            payload.pop("coordinate_scope", None)
+        if action == "type_text":
+            if str(payload.get("text_source") or "fixed") == "fixed":
+                segments = self._type_text_segments()
+                if any(segment.get("kind") == "vault" for segment in segments):
+                    payload["text_segments"] = [
+                        {"kind": "vault", "secret": segment["secret"]}
+                        if segment.get("kind") == "vault" else {"kind": "text", "text": segment.get("text", "")}
+                        for segment in segments
+                    ]
+                    payload.pop("text", None)
+                else:
+                    payload.pop("text_segments", None)
+            else:
+                payload.pop("text_segments", None)
+                payload.pop("text", None)
         if action in {"image_search", "multi_image_search", "animation_search"}:
             # Always respect the user's chosen engine from the combobox
             engine_widget = self.widgets[action].get("engine")
@@ -5634,11 +5997,13 @@ class ActionEditor(QtWidgets.QWidget):
 
             has_region = valid_region(region)
             has_region2 = valid_region(region2)
+            saved_regions = self.original.get("regions") if isinstance(self.original.get("regions"), list) else []
+            remaining_regions = [list(value[:4]) for value in saved_regions[2:] if valid_region(value)]
             if has_region and has_region2:
-                payload["regions"] = [region, region2]
+                payload["regions"] = [region, region2, *remaining_regions]
                 payload.pop("region", None)
             elif has_region:
-                payload["regions"] = [region]
+                payload["regions"] = [region, *remaining_regions]
                 payload.pop("region", None)
             else:
                 payload.pop("regions", None)
@@ -5664,7 +6029,8 @@ class ActionEditor(QtWidgets.QWidget):
                 return right > left and bottom > top
 
             if valid_region(region):
-                payload["regions"] = [region]
+                saved_regions = self.original.get("regions") if isinstance(self.original.get("regions"), list) else []
+                payload["regions"] = [region, *[list(value[:4]) for value in saved_regions[1:] if valid_region(value)]]
                 payload["region"] = region
             else:
                 payload.pop("regions", None)
@@ -5915,8 +6281,25 @@ class ActionEditorDialog(QtWidgets.QDialog):
         layout.addWidget(hint)
 
         self.repository = repository
-        self.editor = ActionEditor(repository)
-        self.editor.refresh_sources()
+        variable_names = {"FoundX", "FoundY", "FoundCount", "OCR_LastText", "OCR_LastNumber"}
+        current_macro = getattr(parent, "current_macro", None)
+        if isinstance(current_macro, dict):
+            for candidate in current_macro.get("steps") or []:
+                if not isinstance(candidate, dict):
+                    continue
+                action_name = str(candidate.get("action") or "")
+                keys = ["result_var"]
+                if action_name in {"set_var", "calc_var", "vault_get"}:
+                    keys.append("name")
+                if action_name in {"ocr", "ocr_tracking"}:
+                    keys.append("store_var")
+                if action_name in {"image_search", "multi_image_search", "multi_pixel_check"}:
+                    keys.append("store_count_var")
+                for key in keys:
+                    value = str(candidate.get(key) or "").strip()
+                    if value and value.isascii() and value.replace("_", "a").isalnum() and not value[0].isdigit():
+                        variable_names.add(value)
+        self.editor = ActionEditor(repository, variable_choices=sorted(variable_names), preload_image_search=False)
         self.editor.load_step(step)
 
         self.multi_color_card: QtWidgets.QFrame | None = None
@@ -6186,6 +6569,11 @@ class ActionEditorDialog(QtWidgets.QDialog):
         except Exception:
             pass
         super().done(r)
+
+    def accept(self) -> None:
+        if not self.editor.commit_secure_text():
+            return
+        super().accept()
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)

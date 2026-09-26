@@ -48,6 +48,24 @@ class SingleFileExportResult:
     notes: tuple[str, ...]
 
 
+def macro_entry_points(macro: dict[str, Any]) -> list[tuple[str, int]]:
+    """Return named deck entry nodes with their current one-based positions."""
+    return [
+        (name, index)
+        for index, step in enumerate(macro.get("steps") or [], 1)
+        if isinstance(step, dict) and (name := str(step.get("entry_name") or "").strip())
+    ]
+
+
+def resolve_macro_entry(macro: dict[str, Any], entry_name: str) -> int:
+    requested = str(entry_name or "").strip()
+    matches = [index for name, index in macro_entry_points(macro) if name.casefold() == requested.casefold()]
+    if len(matches) != 1:
+        reason = "중복되어" if matches else "없어서"
+        raise ValueError(f"시작 지점 '{requested}'이(가) {reason} 실행할 수 없습니다. 빌더에서 시작 지점을 확인하세요.")
+    return matches[0]
+
+
 class MacroRepository:
     """Single data gateway for macros, assets, tables, hotkeys and exports."""
 
@@ -586,14 +604,90 @@ class MacroRepository:
 
     def duplicate_macro(self, source: str, target: str) -> Path:
         payload = self.load_macro(source)
-        payload["name"] = target
         payload["created_at"] = _utc_now_iso()
         path = self.macro_path(target)
         if path.exists():
             raise FileExistsError(f"'{path.stem}' 매크로가 이미 있습니다.")
+        payload["name"] = path.stem
         self._write_json(path, payload)
         self._append_macro_order(path.stem)
+        group = self.load_macro_tags().get(source)
+        if group:
+            self.assign_macro_group([path.stem], group)
         return path
+
+    def rename_macro(self, source: str, target: str) -> Path:
+        source_path = self.macro_path(source)
+        target_name = self.safe_name(target)
+        target_path = self.macro_path(target_name)
+        if not source_path.is_file():
+            raise FileNotFoundError(source_path)
+        if target_path.exists() and source_path != target_path:
+            raise FileExistsError(f"'{target_name}' 매크로가 이미 있습니다.")
+        if source_path == target_path:
+            return source_path
+        payload = self.load_macro(source)
+        payload["name"] = target_name
+        for step in payload.get("steps") or []:
+            if isinstance(step, dict) and step.get("action") == "call_submacro" and step.get("macro") == source:
+                step["macro"] = target_name
+        meta = payload.get("meta")
+        if isinstance(meta, dict) and isinstance(meta.get("bundle_items"), list):
+            meta["bundle_items"] = [target_name if name == source else name for name in meta["bundle_items"]]
+        # Keep the original file until the renamed copy is safely written.
+        self._write_json(target_path, payload)
+        for other_path in self.macros_dir.glob("*.json"):
+            if other_path in (source_path, target_path):
+                continue
+            other = self._read_json(other_path, {})
+            if not isinstance(other, dict):
+                continue
+            changed = False
+            for step in other.get("steps") or []:
+                if isinstance(step, dict) and step.get("action") == "call_submacro" and step.get("macro") == source:
+                    step["macro"] = target_name
+                    changed = True
+            meta = other.get("meta")
+            if isinstance(meta, dict) and isinstance(meta.get("bundle_items"), list):
+                items = [target_name if name == source else name for name in meta["bundle_items"]]
+                if items != meta["bundle_items"]:
+                    meta["bundle_items"] = items
+                    changed = True
+            if changed:
+                self._write_json(other_path, other)
+        hotkeys = self.load_hotkeys()
+        def update_refs(value: Any) -> bool:
+            changed = False
+            if isinstance(value, dict):
+                if value.get("macro") == source:
+                    value["macro"] = target_name
+                    changed = True
+                if isinstance(value.get("macros"), list):
+                    renamed = [target_name if name == source else name for name in value["macros"]]
+                    if renamed != value["macros"]:
+                        value["macros"] = renamed
+                        changed = True
+                for nested in value.values():
+                    if isinstance(nested, (dict, list)):
+                        changed = update_refs(nested) or changed
+            elif isinstance(value, list):
+                for nested in value:
+                    changed = update_refs(nested) or changed
+            return changed
+        if update_refs(hotkeys):
+            self.save_hotkeys(hotkeys)
+        deck_config_path = self.root / ".quickslot_deck_config.json"
+        if deck_config_path.is_file():
+            deck_config = self._read_json(deck_config_path, {})
+            if isinstance(deck_config, dict) and update_refs(deck_config):
+                self._write_json(deck_config_path, deck_config)
+        self.save_macro_order([target_name if name == source else name for name in self.load_macro_order()])
+        tags = self.load_macro_tags()
+        if source in tags:
+            tags[target_name] = tags.pop(source)
+            self.save_macro_tags(tags)
+        source_path.unlink()
+        return target_path
 
     def archive_macro(self, name: str) -> Path:
         source = self.macro_path(name)
@@ -1439,7 +1533,11 @@ internal static class Program
         excel_file = bool(excel_steps) or any(str(step.get("excel_mode") or "none").casefold() == "file" for step in ocr_steps)
         excel_com = any(str(step.get("excel_mode") or "").casefold() in {"active", "com"} for step in excel_steps + ocr_steps)
         remote_notify = "remote_notify" in actions
-        vault = "vault_get" in actions
+        vault = "vault_get" in actions or any(
+            step.get("action") == "type_text"
+            and any(isinstance(segment, dict) and segment.get("kind") == "vault" for segment in step.get("text_segments") or [])
+            for step in steps if isinstance(step, dict)
+        )
         python_needed = opencv or bool(ocr_steps) or browser or bool(excel_steps) or remote_notify or vault
         packages: set[str] = set()
         imports: set[str] = set()
@@ -1542,6 +1640,12 @@ internal static class Program
             for step in steps
             if isinstance(step, dict) and step.get("action") == "vault_get" and str(step.get("secret") or "").strip()
         }
+        names.update(
+            str(segment.get("secret") or "").strip()
+            for step in steps if isinstance(step, dict) and step.get("action") == "type_text"
+            for segment in step.get("text_segments") or []
+            if isinstance(segment, dict) and segment.get("kind") == "vault" and str(segment.get("secret") or "").strip()
+        )
         try:
             index = self._read_json(self.root / ".vault" / "index.json", {})
         except (OSError, ValueError):
@@ -1800,6 +1904,11 @@ internal static class Program
         script = self.exports_dir / f".{self.safe_name(name)}-resume-{int(step_index)}.ahk"
         engine.export_macro_payload(payload, script)
         return self._launch_macro_payload(name, payload, script, checkpoint_name=name, resume=False, turbo=turbo)
+
+    def run_macro_entry(self, name: str, entry_name: str, turbo: bool = False) -> subprocess.Popen[Any]:
+        """Resolve a stable named entry each run, so node reordering cannot retarget a deck slot."""
+        step_index = resolve_macro_entry(self.load_macro(name), entry_name)
+        return self.run_macro_from_step(name, step_index, turbo=turbo)
 
     def run_macro_dry_run(self, name: str) -> subprocess.Popen[Any]:
         payload = deepcopy(self.load_macro(name))

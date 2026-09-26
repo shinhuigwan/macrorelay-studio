@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<title>MacroRelay Deck 연결</title>
+<style>
+  body { font: 15px/1.55 system-ui, sans-serif; max-width: 520px; margin: 48px auto; color: #e8ecf3; background: #181a1f; }
+  input, button { font: inherit; padding: 10px; border-radius: 8px; }
+  input { width: 100%; box-sizing: border-box; background: #24272d; color: white; border: 1px solid #555b66; }
+  button { margin-top: 12px; color: #07110f; background: #18ddc0; border: 0; cursor: pointer; }
+</style>
+<h1>MacroRelay Deck 연결</h1>
+<p>덱덱 환경 설정 → 프리셋 자동 전환에서 연결 코드를 복사해 붙여넣으세요. 활성 탭 주소만 로컬 덱덱에 전달하며 방문 기록은 저장하지 않습니다.</p>
+<label for="token">연결 코드</label>
+<input id="token" type="password" autocomplete="off" spellcheck="false">
+<button id="save">저장</button>
+<p id="status" role="status"></p>
+<script src="options.js"></script>
+</html>

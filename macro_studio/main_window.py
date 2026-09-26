@@ -326,6 +326,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "action_quick_automation": lambda: self._invoke_page_method("builder", "_quick_action_wizard"),
             "action_diagnose_automation": lambda: self._invoke_page_method("builder", "_diagnose_automation"),
             "action_test_selected_step": lambda: self._invoke_page_method("builder", "_test_selected_step"),
+            "action_run_from_selected_node": lambda: self._invoke_page_method("builder", "_run_from_selected_step"),
             "action_add_asset": lambda: self._invoke_page_method("assets", "_add"),
             "action_capture_asset": lambda: self._invoke_page_method("assets", "_capture"),
             "action_edit_asset": lambda: self._invoke_page_method("assets", "_edit"),

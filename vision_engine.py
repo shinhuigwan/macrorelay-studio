@@ -674,11 +674,44 @@ class VisionState:
                             break
                 seen: set[tuple[int, int, int, int]] = set()
                 cycle_hits: list[tuple[float, int, int, int, int]] = []
+                # Nearby ROIs are cheaper to capture together. Widely separated
+                # ROIs keep their small individual captures instead of grabbing
+                # a mostly empty full-desktop rectangle.
+                shared_region = None
+                shared_frame = None
+                if len(candidates) > 1:
+                    unique_candidates = list(dict.fromkeys(candidates))
+                    union = (
+                        min(r[0] for r in unique_candidates),
+                        min(r[1] for r in unique_candidates),
+                        max(r[2] for r in unique_candidates),
+                        max(r[3] for r in unique_candidates),
+                    )
+                    union_area = (union[2] - union[0]) * (union[3] - union[1])
+                    roi_area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in unique_candidates)
+                    if union_area <= 3_000_000 and union_area <= roi_area * 1.5:
+                        shared_frame, _ = self._capture(union, context, cache_ms)
+                        if shared_frame is not None:
+                            shared_region = union
                 for region in candidates:
                     if region in seen:
                         continue
                     seen.add(region)
-                    match, score = self._search_region(region, prepared, threshold, profile, context, cache_ms)
+                    if shared_region is not None:
+                        left, top, right, bottom = region
+                        frame = shared_frame[
+                            top - shared_region[1]:bottom - shared_region[1],
+                            left - shared_region[0]:right - shared_region[0],
+                        ]
+                        match, score = self._match(frame, prepared, threshold, profile)
+                        if match is not None:
+                            confidence, location, width, height = match
+                            match = (
+                                float(confidence), left + int(location[0]) + int(width) // 2,
+                                top + int(location[1]) + int(height) // 2, int(width), int(height),
+                            )
+                    else:
+                        match, score = self._search_region(region, prepared, threshold, profile, context, cache_ms)
                     best_score = max(best_score, score)
                     if match is not None:
                         confidence, center_x, center_y, width, height = match

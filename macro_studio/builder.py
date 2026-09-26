@@ -4413,7 +4413,7 @@ class BuilderPage(QtWidgets.QWidget):
         act_step = menu.addAction("▷ 선택 단계만 테스트 (Alt+Shift+S)")
         act_step.triggered.connect(self._test_selected_step)
         act_from = menu.addAction("▶ 선택 노드부터 이어서 실행")
-        act_from.triggered.connect(self._resume_from_selected_node)
+        act_from.triggered.connect(self._run_from_selected_step)
         menu.exec(self.step_test_toolbar_btn.mapToGlobal(pos))
 
     def show_click_preview_pending(self, step_index: int) -> None:

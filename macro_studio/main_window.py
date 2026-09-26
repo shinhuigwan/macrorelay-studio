@@ -363,7 +363,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pages["settings"].open_shortcut_settings()
 
     def _invoke_page_method(self, page: str, method_path: str) -> None:
-        self.switch_page(page)
+        # Shortcuts can target the page that is already visible. Re-running
+        # switch_page() refreshes BuilderPage and replaces the selected node
+        # with the first one before the action receives it.
+        if self.stack.currentWidget() is not self.pages[page]:
+            self.switch_page(page)
         target = self.pages[page]
         for part in method_path.split("."):
             target = getattr(target, part)

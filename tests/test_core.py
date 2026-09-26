@@ -2577,6 +2577,30 @@ class UiSmokeTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+    def test_selected_node_shortcut_keeps_canvas_selection(self) -> None:
+        from macro_studio.app import create_app
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = MacroRepository(root)
+            repository.create_macro("shortcut-start")
+            macro = repository.load_macro("shortcut-start")
+            macro["steps"] = [{"action": "wait", "duration": 10} for _ in range(3)]
+            repository.save_macro("shortcut-start", macro)
+            app, window = create_app(root, start_remote_runtime=False)
+            try:
+                builder = window.pages["builder"]
+                builder.refresh("shortcut-start")
+                builder.node_canvas.select_node(2)
+                app.processEvents()
+                self.assertEqual(2, builder.node_canvas.selected_index())
+                with mock.patch.object(window.repository, "run_macro_from_step", return_value=SimpleNamespace(pid=0)) as run:
+                    window._invoke_page_method("builder", "_run_from_selected_step")
+                run.assert_called_once_with("shortcut-start", 2)
+            finally:
+                window.close()
+
     def test_all_pages_construct_and_refresh(self) -> None:
         from macro_studio.app import create_app
 

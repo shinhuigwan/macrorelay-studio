@@ -12,7 +12,7 @@ import re
 import shutil
 import sys
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Iterable, List, Optional
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2607,6 +2607,32 @@ def render_run(step: Dict[str, Any]) -> List[str]:
     command = step.get("command") or step.get("program")
     if not command:
         return ["; run_program skipped, no command provided"]
+    # Launching Whale's bare executable opens another browser window on some
+    # installations. An existing browser window should receive a new tab.
+    raw = str(command).strip()
+    executable = raw[1:-1] if raw.startswith('"') and raw.endswith('"') else raw
+    if PureWindowsPath(executable).name.casefold() == "whale.exe":
+        return [
+            "DetectHiddenWindows, Off",
+            '__MRWhaleHwnd := WinExist("ahk_class Chrome_WidgetWin_1 ahk_exe whale.exe")',
+            "DetectHiddenWindows, On",
+            "if (__MRWhaleHwnd)",
+            "{",
+            "    WinGet, __MRWhaleMinMax, MinMax, ahk_id %__MRWhaleHwnd%",
+            "    if (__MRWhaleMinMax = -1)",
+            "        WinRestore, ahk_id %__MRWhaleHwnd%",
+            "    WinActivate, ahk_id %__MRWhaleHwnd%",
+            "    WinWaitActive, ahk_id %__MRWhaleHwnd%,, 2",
+            '    if (!WinActive("ahk_id " . __MRWhaleHwnd))',
+            "    {",
+            '        SetRunResult("FAILED", "WHALE_ACTIVATE_FAILED", "열린 웨일 창을 활성화하지 못했습니다.")',
+            "        ExitApp, 1",
+            "    }",
+            "    SendInput, ^t",
+            "}",
+            "else",
+            f"    Run, {command}",
+        ]
     return [f'Run, {command}']
 
 
@@ -3958,8 +3984,14 @@ def render_image_search(
 def render_browser_action(step: Dict[str, Any], browser_fast: bool = False) -> List[str]:
     selector = str(step.get("selector") or "")
     if not selector:
-        return ["; browser_action skipped, no selector"]
+        return [
+            "BrowserActionOK := 0",
+            'BrowserActionError := "CSS 선택자가 비어 있습니다."',
+            'SetRunResult("FAILED", "BROWSER_ACTION_FAILED", BrowserActionError)',
+        ]
     title = str(step.get("title") or "")
+    browser = str(step.get("browser") or "auto")
+    page_url = str(step.get("page_url") or "")
     action = str(step.get("browser_action") or step.get("action_type") or "click")
     value = str(step.get("value") or "")
     port = int(step.get("port", 9222) or 9222)
@@ -3978,45 +4010,108 @@ def render_browser_action(step: Dict[str, Any], browser_fast: bool = False) -> L
         "cmd": "action",
         "port": port,
         "title": title,
+        "browser": browser,
+        "page_url": page_url,
         "selector": selector,
         "action": action,
         "value": value,
         "timeout": timeout,
         "poll": poll_delay,
     }
+    # A picker-created step has a page URL. Use the same extension transport as
+    # the dialog's successful test, even when a separate CDP session is present.
+    prefer_extension = bool(step.get("prefer_extension", bool(page_url and browser in {"whale", "chrome", "edge"})))
+    if prefer_extension:
+        payload["prefer_extension"] = True
     if step.get("prefer_active"):
         payload["prefer_active"] = True
     payload_text = ahk_quote(json.dumps(payload, ensure_ascii=False))
-    server_cmd = f'{python_cmd_part} "{script_path}" --server --port {port} --server-port %BrowserServerPort%'
+    server_cmd = f'{python_cmd_part} "{script_path}" --server --port {port} --server-port %BrowserServerPort% --browser {browser}'
     lines: List[str] = []
-    if not browser_fast and not step.get("no_server_check"):
-        lines.extend(
-            [
-                "if (BrowserServerStarted != 1)",
-                "{",
-                f"    BrowserServerPort := {server_port}",
-                f"    Run, {server_cmd}, , Hide",
-                "    Sleep, 300",
-                "    BrowserServerStarted := 1",
-                "}",
-            ]
-        )
+    lines.extend([
+        "BrowserActionOK := 0",
+        'BrowserActionError := ""',
+        'BrowserResp := ""',
+        f"BrowserServerPort := {server_port}",
+        f'Log("browser_action start: {action}")',
+        f'BrowserPayload := "{payload_text}"',
+    ])
+    if prefer_extension:
+        # The Studio test already uses the extension directly. Do not spin up
+        # a separate socket server for this identical action: failed WinSock
+        # connects can cost seconds apiece on Windows.
+        lines.extend([
+            'BrowserRequestFile := A_Temp . "\\macrorelay-browser-" . DllCall("GetCurrentProcessId") . "-" . A_TickCount . ".json"',
+            'BrowserResultFile := BrowserRequestFile . ".result"',
+            'BrowserErrorFile := BrowserResultFile . ".error"',
+            'FileDelete, %BrowserRequestFile%',
+            'FileDelete, %BrowserResultFile%',
+            'FileDelete, %BrowserErrorFile%',
+            'FileAppend, %BrowserPayload%, %BrowserRequestFile%, UTF-8',
+            'if (ErrorLevel)',
+            '    BrowserActionError := "브라우저 요청 파일을 만들지 못했습니다."',
+            'else',
+            '{',
+            f'    RunWait, {python_cmd_part} "{script_path}" --request-file "%BrowserRequestFile%" --result-file "%BrowserResultFile%", , Hide UseErrorLevel',
+            '    BrowserExitCode := ErrorLevel',
+            '    FileRead, BrowserResp, *P65001 %BrowserResultFile%',
+            '    if (BrowserResp != "" && !InStr(BrowserResp, """ok"": true"))',
+            '        FileRead, BrowserActionError, *P65001 %BrowserErrorFile%',
+            '    if (BrowserResp = "")',
+            '        BrowserActionError := "브라우저 도우미가 결과를 반환하지 않았습니다 (종료 코드: " . BrowserExitCode . ")"',
+            '}',
+            'FileDelete, %BrowserRequestFile%',
+            'FileDelete, %BrowserResultFile%',
+            'FileDelete, %BrowserErrorFile%',
+        ])
+    elif not browser_fast and not step.get("no_server_check"):
+        lines.extend([
+            'BrowserPing := BrowserAction_Send("{""cmd"":""ping""}", BrowserServerPort)',
+            'if (!InStr(BrowserPing, """protocol"": 2"))',
+            "{",
+            '    if (InStr(BrowserPing, """ok"":true") or InStr(BrowserPing, """ok"": true"))',
+            '        BrowserAction_Send("{""cmd"":""shutdown""}", BrowserServerPort)',
+            '    Sleep, 150',
+            f"    Run, {server_cmd}, , Hide",
+            "    Loop, 4",
+            "    {",
+            "        Sleep, 500",
+            '        BrowserPing := BrowserAction_Send("{""cmd"":""ping""}", BrowserServerPort)',
+            '        if (InStr(BrowserPing, """protocol"": 2"))',
+            "            break",
+            "    }",
+            "}",
+            'BrowserServerStarted := InStr(BrowserPing, """protocol"": 2") ? 1 : 0',
+        ])
+    elif not prefer_extension:
+        lines.append('BrowserPing := BrowserAction_Send("{""cmd"":""ping""}", BrowserServerPort)')
+    if not prefer_extension:
+        lines.extend([
+            'if (InStr(BrowserPing, """protocol"": 2"))',
+            '    BrowserResp := BrowserAction_Send(BrowserPayload, BrowserServerPort)',
+            'else',
+            '    BrowserResp := ""',
+        ])
     lines.extend(
         [
-             f'Log("browser_action start: {action}")',
-             f'BrowserPayload := "{payload_text}"',
-             "BrowserResp := BrowserAction_Send(BrowserPayload, BrowserServerPort)",
              "if (BrowserResp = \"\")",
              "{",
-             "    Log(\"browser_action failed: no response\")",
+             '    if (BrowserActionError = "")',
+             '        BrowserActionError := "브라우저 도우미가 응답하지 않습니다. Python 실행 경로와 확장앱 연결을 확인해 주세요."',
              "}",
             "else if (InStr(BrowserResp, \"\"\"ok\"\":true\") or InStr(BrowserResp, \"\"\"ok\"\": true\"))",
             "{",
-            "    ; ok",
+            "    BrowserActionOK := 1",
             "}",
             "else",
             "{",
-            "    Log(\"browser_action failed: \" . BrowserResp)",
+            '    if (BrowserActionError = "")',
+            "        BrowserActionError := BrowserResp",
+            "}",
+            "if (!BrowserActionOK)",
+            "{",
+            '    Log("browser_action failed: " . BrowserActionError)',
+            '    SetRunResult("FAILED", "BROWSER_ACTION_FAILED", BrowserActionError)',
             "}",
             f'Log("browser_action end: {action}")',
         ]
@@ -5870,6 +5965,8 @@ def render_dry_run_preview(step: Dict[str, Any], step_index: int, total_steps: i
         scope = str(step.get("coordinate_scope") or "screen")
         lines.append(f'SetLastClick({x}, {y}, "dry-run-{ahk_quote(scope)}")')
         lines.append(f'Log("dry-run predicted click: {x},{y} scope={ahk_quote(scope)}")')
+    elif action == "browser_action":
+        lines.append("BrowserActionOK := 1")
     return lines
 
 
@@ -5989,7 +6086,7 @@ def _expand_macro_steps(
                 has_internal_fail = int(prepared.get(child_fail_field) or 0) > 0
             except (TypeError, ValueError):
                 has_internal_fail = False
-            if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "text_condition", "multi_image_search", "animation_search", "multi_pixel_check"} and not has_internal_fail:
+            if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "text_condition", "multi_image_search", "animation_search", "multi_pixel_check", "browser_action"} and not has_internal_fail:
                 if fail_target:
                     prepared[child_fail_field] = fail_target
                 else:
@@ -6282,7 +6379,7 @@ def render_macro_script(
         else:
             lines.extend(render_step(step, assets, count, browser_fast))
         if end_step and count == end_step:
-            if action not in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search", "multi_pixel_check"}:
+            if action not in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search", "multi_pixel_check", "browser_action"}:
                 lines.append("Return")
                 lines.append("")
                 continue
@@ -6291,7 +6388,7 @@ def render_macro_script(
             lines.append("")
             continue
 
-        if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search", "multi_pixel_check"}:
+        if action in {"image_search", "screen_condition", "ocr", "datetime_condition", "pixel_search", "multi_image_search", "animation_search", "multi_pixel_check", "browser_action"}:
             found_var = (
                 f"__step_found_{count}"
                 if action in {"image_search", "screen_condition", "multi_image_search", "animation_search"}
@@ -6301,6 +6398,8 @@ def render_macro_script(
                 if action == "multi_pixel_check"
                 else f"__time_condition_success_{count}"
                 if action == "datetime_condition"
+                else "BrowserActionOK"
+                if action == "browser_action"
                 else "__ocr_success"
             )
             lines.append(f"if ({found_var})")
@@ -6336,6 +6435,10 @@ def render_macro_script(
                 variable_detail = f' . "; var:{store_var}=" . {store_var}' if store_var else ""
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "text=" . OCR_LastText . "; confidence=" . OCR_LastConfidence . "; engine=" . OCR_LastEngine{variable_detail})'
+                )
+            elif action == "browser_action":
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "selector={ahk_quote(str(step.get("selector") or ""))}; action={ahk_quote(str(step.get("browser_action") or step.get("action_type") or "click"))}; result=dispatched")'
                 )
             if asset_true_routes:
                 lines.append(f"    if ({route_var})")
@@ -6407,6 +6510,10 @@ def render_macro_script(
                 lines.append(
                     f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", "text=" . OCR_LastText . "; confidence=" . OCR_LastConfidence . "; engine=" . OCR_LastEngine)'
                 )
+            elif action == "browser_action":
+                lines.append(
+                    f'    TraceStep({count}, "{ahk_quote(str(label))}", "DETAIL", BrowserActionError)'
+                )
             if node_retry_count:
                 lines.append(f"    if (__node_retry_{count} < {node_retry_count})")
                 lines.append("    {")
@@ -6437,7 +6544,8 @@ def render_macro_script(
                     lines.append(f"    __rep_limit{count} := \"\"")
             lines.extend(render_edge_conditions(step, count, "fail", "    "))
             if end_step and count == end_step:
-                lines.append('    SetRunResult("FAILED", "CONDITION_UNMET", "단계 테스트 실패 (조건 미충족)")')
+                if action != "browser_action":
+                    lines.append('    SetRunResult("FAILED", "CONDITION_UNMET", "단계 테스트 실패 (조건 미충족)")')
                 lines.append("    Return")
             elif on_fail:
                 if on_fail_delay > 0:

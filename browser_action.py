@@ -7,11 +7,21 @@ import socket
 import socketserver
 import subprocess
 import threading
+import queue
 from typing import Optional
-
-from playwright.sync_api import sync_playwright
+from urllib.parse import urlsplit
+from pathlib import Path
 
 os.environ.setdefault("NODE_NO_WARNINGS", "1")
+
+
+def sync_playwright():
+    """Load Playwright only for CDP actions; extension actions need no package."""
+    try:
+        from playwright.sync_api import sync_playwright as factory
+    except ImportError as exc:
+        raise RuntimeError("CDP 방식에는 Playwright가 필요합니다. 확장앱 방식을 사용하거나 Playwright를 설치해 주세요.") from exc
+    return factory()
 
 
 def _browser_hint(browser: str, port: int) -> str:
@@ -33,6 +43,56 @@ def _connect_over_cdp(playwright, port: int, browser: str):
         raise RuntimeError(_browser_hint(browser, port)) from exc
 
 
+def extension_project_root() -> Path:
+    """Find the live Deck config when this helper is copied into exports/."""
+    helper_dir = Path(__file__).resolve().parent
+    configured = os.environ.get("MACRORELAY_HOME", "").strip()
+    candidates = ([Path(configured)] if configured else []) + [helper_dir, helper_dir.parent]
+    for root in candidates:
+        if ((root / ".quickslot_deck_config.json").is_file()
+                and (root / "macro_studio" / "browser_element_bridge.py").is_file()):
+            if str(root) not in sys.path:
+                sys.path.insert(0, str(root))
+            return root
+    raise RuntimeError("브라우저 요소 연결 설정을 찾지 못했습니다. 덕덱 프로젝트에서 매크로를 실행해 주세요.")
+
+
+def run_extension_action(args: argparse.Namespace):
+    """Use the installed extension when an ordinary browser has no CDP port."""
+    root = extension_project_root()
+    from macro_studio.browser_element_bridge import RUNTIME_ELEMENT_PORT, focus_browser, open_studio_bridge
+
+    browser = str(getattr(args, "browser", "") or "").lower()
+    if browser not in {"whale", "chrome", "edge"}:
+        raise RuntimeError("브라우저를 웨일·크롬·엣지 중 하나로 지정해 주세요.")
+    bridge = open_studio_bridge(root, port=RUNTIME_ELEMENT_PORT)
+    command_id = ""
+    try:
+        command_id = bridge.request_element_command(
+            "run_element_action", browser, selector=str(args.selector or ""),
+            page_url=str(getattr(args, "page_url", "") or ""),
+            action=str(args.action or "click"), value=str(getattr(args, "value", "") or ""))
+        focus_browser(browser)
+        deadline = time.monotonic() + max(6.0, int(getattr(args, "timeout", 2000) or 2000) / 1000 + 3.0)
+        while time.monotonic() < deadline:
+            try:
+                result = bridge.command_results.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if result.get("id") != command_id:
+                continue
+            if result.get("status") != "ok":
+                raise RuntimeError(str(result.get("error") or "브라우저 요소 실행에 실패했습니다."))
+            details = result.get("result") or {}
+            if args.action in {"click", "double_click", "hover"} and details.get("input_method") != "browser_debugger":
+                raise RuntimeError("브라우저 확장앱이 구버전입니다. 확장앱을 다시 로드하고 디버거 권한을 승인해 주세요.")
+            return str(details.get("text") or "") if args.action == "extract_text" else None
+        bridge.cancel_command(command_id)
+        raise RuntimeError("브라우저 확장앱 응답이 없습니다. 확장앱을 다시 로드하고 연결 코드를 확인해 주세요.")
+    finally:
+        bridge.close()
+
+
 def list_pages(port: int, browser: str) -> None:
     with sync_playwright() as p:
         browser_obj = _connect_over_cdp(p, port, browser)
@@ -48,7 +108,20 @@ def list_pages(port: int, browser: str) -> None:
     print(json.dumps(pages, ensure_ascii=False))
 
 
-def find_page(browser, title: str, prefer_active: bool = False):
+def find_page(browser, title: str, prefer_active: bool = False, page_url: str = ""):
+    target_host = urlsplit(page_url).hostname if page_url else ""
+    if target_host:
+        matches = [page for context in browser.contexts for page in context.pages
+                   if urlsplit(page.url).hostname == target_host]
+        if matches:
+            if prefer_active:
+                for page in matches:
+                    try:
+                        if page.evaluate("document.hasFocus()"):
+                            return page
+                    except Exception:
+                        pass
+            return matches[0]
     if prefer_active:
         for context in browser.contexts:
             for page in context.pages:
@@ -137,9 +210,16 @@ def _extract_text_from_element(element):
 
 
 def run_action(args: argparse.Namespace):
+    if bool(getattr(args, "prefer_extension", False)):
+        return run_extension_action(args)
     with sync_playwright() as p:
-        browser_obj = _connect_over_cdp(p, args.port, args.browser)
-        page = find_page(browser_obj, args.title or "", bool(args.prefer_active))
+        try:
+            browser_obj = _connect_over_cdp(p, args.port, args.browser)
+        except RuntimeError as exc:
+            if "--remote-debugging-port=" in str(exc) and args.browser in {"whale", "chrome", "edge"}:
+                return run_extension_action(args)
+            raise
+        page = find_page(browser_obj, args.title or "", bool(args.prefer_active), getattr(args, "page_url", ""))
         if page is None and args.title:
             page = find_page(browser_obj, "", bool(args.prefer_active))
         if page is None:
@@ -464,10 +544,14 @@ class BrowserSession:
         return pages
 
     def run_action(self, args: argparse.Namespace) -> None:
+        if bool(getattr(args, "prefer_extension", False)):
+            return run_extension_action(args)
         try:
             return self._run_action_once(args)
         except Exception as exc:
             message = str(exc)
+            if "--remote-debugging-port=" in message and getattr(args, "browser", "") in {"whale", "chrome", "edge"}:
+                return run_extension_action(args)
             if "different thread" not in message:
                 raise
             self.close()
@@ -475,7 +559,7 @@ class BrowserSession:
 
     def _run_action_once(self, args: argparse.Namespace) -> None:
         browser = self.ensure(args.port, getattr(args, "browser", None))
-        page = find_page(browser, args.title or "", bool(getattr(args, "prefer_active", False)))
+        page = find_page(browser, args.title or "", bool(getattr(args, "prefer_active", False)), getattr(args, "page_url", ""))
         if page is None and args.title:
             page = find_page(browser, "", bool(getattr(args, "prefer_active", False)))
         if page is None:
@@ -527,7 +611,7 @@ def run_server(args: argparse.Namespace) -> None:
                 payload = json.loads(text)
                 cmd = payload.get("cmd")
                 if cmd == "ping":
-                    reply = {"ok": True}
+                    reply = {"ok": True, "protocol": 2}
                 elif cmd == "shutdown":
                     reply = {"ok": True}
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -574,6 +658,7 @@ def run_client(args: argparse.Namespace):
         "cmd": "action",
         "port": args.port,
         "title": args.title,
+        "page_url": args.page_url,
         "selector": args.selector,
         "action": args.action,
         "value": args.value,
@@ -649,6 +734,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9222)
     parser.add_argument("--title", default="")
+    parser.add_argument("--page-url", default="")
     parser.add_argument("--title-file", default="")
     parser.add_argument("--selector", default="")
     parser.add_argument("--selector-file", default="")
@@ -665,28 +751,47 @@ def main() -> None:
     parser.add_argument("--no-fallback", action="store_true")
     parser.add_argument("--output", default="")
     parser.add_argument("--log", default="")
+    parser.add_argument("--request-file", default="")
+    parser.add_argument("--result-file", default="")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--pick", action="store_true")
     args = parser.parse_args()
-    if not args.title and args.title_file:
-        try:
-            with open(args.title_file, "r", encoding="utf-8-sig") as handle:
-                args.title = handle.read().strip()
-        except Exception:
-            args.title = ""
-    if not args.selector and args.selector_file:
-        try:
-            with open(args.selector_file, "r", encoding="utf-8-sig") as handle:
-                args.selector = handle.read().strip()
-        except Exception:
-            args.selector = ""
     fallback = not args.no_fallback
     log_handle = None
+    def save_result(ok: bool, *, result=None, error: str = "") -> None:
+        if args.result_file:
+            Path(args.result_file).write_text(
+                json.dumps({"ok": ok, "result": result, "error": error}, ensure_ascii=False),
+                encoding="utf-8-sig")
+            if not ok:
+                Path(args.result_file + ".error").write_text(error, encoding="utf-8-sig")
     try:
+        if args.request_file:
+            with open(args.request_file, "r", encoding="utf-8-sig") as handle:
+                request = json.load(handle)
+            if not isinstance(request, dict):
+                raise ValueError("브라우저 요청 형식이 올바르지 않습니다.")
+            for key in ("port", "title", "browser", "page_url", "selector", "action", "value",
+                        "timeout", "poll", "prefer_active", "prefer_extension"):
+                if key in request:
+                    setattr(args, key, request[key])
+        if not args.title and args.title_file:
+            try:
+                with open(args.title_file, "r", encoding="utf-8-sig") as handle:
+                    args.title = handle.read().strip()
+            except Exception:
+                args.title = ""
+        if not args.selector and args.selector_file:
+            try:
+                with open(args.selector_file, "r", encoding="utf-8-sig") as handle:
+                    args.selector = handle.read().strip()
+            except Exception:
+                args.selector = ""
         if args.log:
             log_handle = open(args.log, "w", encoding="utf-8")
             sys.stdout = log_handle
             sys.stderr = log_handle
+        result = None
         if args.server:
             run_server(args)
         elif args.shutdown:
@@ -709,7 +814,9 @@ def main() -> None:
             result = run_action(args)
             if args.action == "extract_text":
                 _emit_extract_text(result, args.output)
+        save_result(True, result=result)
     except Exception as exc:
+        save_result(False, error=str(exc))
         print(str(exc), file=sys.stderr)
         sys.exit(1)
     finally:

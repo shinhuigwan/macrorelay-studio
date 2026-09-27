@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import time
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
@@ -832,10 +833,12 @@ ACTION_FIELDS: dict[str, list[FieldSpec]] = {
         FieldSpec("poll_delay", "대기 중 확인 간격", "duration", 500, 100, 60_000, section="판정 방식"),
     ],
     "browser_action": [
+        FieldSpec("browser", "대상 브라우저", "choice", "whale", options=choice(("네이버 웨일", "whale"), ("Google Chrome", "chrome"), ("Microsoft Edge", "edge"))),
         FieldSpec("selector", "CSS 선택자", "text", "", placeholder="#button 또는 div.item"),
         FieldSpec("browser_action", "브라우저 동작", "choice", "click", options=choice(("클릭", "click"), ("더블 클릭", "double_click"), ("텍스트 입력", "type_text"), ("텍스트 추출", "extract_text"), ("마우스 올리기", "hover"))),
         FieldSpec("value", "입력 값", "text", ""),
         FieldSpec("title", "브라우저 창 제목", "text", ""),
+        FieldSpec("page_url", "선택한 페이지 주소", "text", "", tooltip="요소 선택 시 자동 기록됩니다. 검사할 때 같은 사이트의 열린 탭을 찾습니다."),
         FieldSpec("prefer_active", "활성 탭 우선", "bool", True),
         FieldSpec("timeout", "제한 시간", "duration", 2000, 0, 600_000, section="연결 설정"),
         FieldSpec("poll_delay", "반복 확인 간격", "duration", 50, 0, 60_000, section="연결 설정"),
@@ -3256,6 +3259,219 @@ def exec_image_search_confidence_dialog(dialog: ImageSearchConfidenceDialog) -> 
             dialog.set_asset_route(request[0], request[1], target)
 
 
+class BrowserElementPickerDialog(QtWidgets.QDialog):
+    """Choose a browser, pick a DOM element, and safely inspect its selector."""
+
+    def __init__(self, repository: MacroRepository, parent=None, *, browser: str = "whale",
+                 selector: str = "", page_url: str = "", action: str = "click",
+                 value: str = "") -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.selected: dict[str, Any] = {}
+        self._bridge = None
+        self._pending_id = ""
+        self._pending_kind = ""
+        self._deadline = 0.0
+        self._delivery_deadline = 0.0
+        self._page_url = page_url
+        self._page_title = ""
+        self._action = action
+        self._value = value
+        self.setWindowTitle("브라우저 요소 선택 및 검사")
+        self.resize(680, 370)
+        layout = QtWidgets.QVBoxLayout(self)
+        hint = QtWidgets.QLabel("브라우저를 고른 뒤 ‘요소 선택’을 누르세요. 열린 탭이 앞으로 오면 원하는 요소에 커서를 올리고 테두리를 확인한 다음 좌클릭하세요. Esc는 취소입니다.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        form = QtWidgets.QFormLayout()
+        self.browser_combo = QtWidgets.QComboBox()
+        for label, value in (("네이버 웨일", "whale"), ("Google Chrome", "chrome"), ("Microsoft Edge", "edge")):
+            self.browser_combo.addItem(label, value)
+        self.browser_combo.setCurrentIndex(max(0, self.browser_combo.findData(browser)))
+        self.browser_combo.currentIndexChanged.connect(self._browser_changed)
+        form.addRow("브라우저", self.browser_combo)
+        self.selector_edit = QtWidgets.QLineEdit(selector)
+        self.selector_edit.setPlaceholderText("클릭하면 CSS 선택자가 자동 입력됩니다")
+        form.addRow("CSS 선택자", self.selector_edit)
+        layout.addLayout(form)
+        controls = QtWidgets.QHBoxLayout()
+        self.pick_button = QtWidgets.QPushButton("🎯 요소 선택 · 윤곽선 표시")
+        self.probe_button = QtWidgets.QPushButton("🔍 이 선택자 검사 · 위치 표시")
+        self.test_button = QtWidgets.QPushButton("▶ 현재 동작 테스트" if action != "click" else "▶ 실제 클릭 테스트")
+        self.pick_button.clicked.connect(lambda: self._request("pick_element"))
+        self.probe_button.clicked.connect(lambda: self._request("probe_element"))
+        self.test_button.clicked.connect(lambda: self._request("test_element_action"))
+        controls.addWidget(self.pick_button)
+        controls.addWidget(self.probe_button)
+        controls.addWidget(self.test_button)
+        layout.addLayout(controls)
+        self.status_label = QtWidgets.QLabel("요소 선택은 페이지의 원래 클릭 동작을 실행하지 않습니다.")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.result_label = QtWidgets.QLabel("선택 후 일치 개수·표시 여부·텍스트 샘플을 여기서 확인합니다.")
+        self.result_label.setWordWrap(True)
+        self.result_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(self.result_label)
+        layout.addStretch(1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Save).setText("선택자 적용")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(100)
+        self._timer.timeout.connect(self._poll_result)
+
+    def _browser_changed(self) -> None:
+        self._page_url = ""
+        self._page_title = ""
+        self.result_label.setText("브라우저가 변경됐습니다. 이 브라우저에서 요소를 다시 선택하거나 검사해 주세요.")
+
+    def _status(self, message: str, *, error: bool = False) -> None:
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet("color: #FB7185;" if error else "color: #38E7FF;")
+
+    def _request(self, kind: str) -> None:
+        from .browser_element_bridge import focus_browser, open_studio_bridge
+
+        if self._pending_id:
+            return
+        browser = str(self.browser_combo.currentData() or "whale")
+        selector = self.selector_edit.text().strip()
+        if kind in {"probe_element", "test_element_action"} and not selector:
+            self._status("검사할 CSS 선택자가 비어 있습니다.", error=True)
+            return
+        try:
+            if self._bridge is None:
+                self._bridge = open_studio_bridge(self.repository.root)
+            self._pending_id = self._bridge.request_element_command(
+                "run_element_action" if kind == "test_element_action" else kind,
+                browser, selector=selector,
+                page_url=self._page_url if kind != "pick_element" else "",
+                action=self._action if kind == "test_element_action" else "",
+                value=self._value if kind == "test_element_action" else "",
+                **({"test_mode": True} if kind == "test_element_action" else {}))
+            self._pending_kind = kind
+        except (RuntimeError, ValueError, OSError) as exc:
+            self._status(str(exc), error=True)
+            return
+        self._deadline = time.monotonic() + (50 if kind == "pick_element" else 12)
+        self._delivery_deadline = time.monotonic() + 5
+        self.pick_button.setEnabled(False)
+        self.probe_button.setEnabled(False)
+        self.test_button.setEnabled(False)
+        self._timer.start()
+        if focus_browser(browser):
+            self._status("브라우저에서 요소를 선택하세요. 윤곽선을 확인한 뒤 좌클릭, 취소는 Esc입니다." if kind == "pick_element" else
+                         "기존 브라우저 탭에서 요소를 확인합니다. 테스트는 실제 동작을 실행합니다." if kind == "test_element_action" else
+                         "기존 브라우저 탭에서 일치 요소를 약 1.5초간 강조합니다.")
+        else:
+            self._status("브라우저 창을 자동 활성화하지 못했습니다. 해당 브라우저의 웹페이지 탭을 직접 앞으로 가져와 주세요.")
+
+    def _poll_result(self) -> None:
+        if self._bridge is None or not self._pending_id:
+            return
+        while not self._bridge.command_results.empty():
+            result = self._bridge.command_results.get_nowait()
+            if result.get("id") != self._pending_id:
+                continue
+            self._pending_id = ""
+            kind = self._pending_kind
+            self._pending_kind = ""
+            self._timer.stop()
+            self.pick_button.setEnabled(True)
+            self.probe_button.setEnabled(True)
+            self.test_button.setEnabled(True)
+            if result.get("status") != "ok":
+                error = str(result.get("error") or "요소를 찾지 못했습니다.")
+                if "Unsupported Studio browser command" in error:
+                    error = "실행 중인 확장앱이 구버전입니다. 확장앱 관리에서 다시 로드해 주세요."
+                if kind == "test_element_action":
+                    self.result_label.setText(
+                        f"CSS 선택자: {self.selector_edit.text().strip()}\n"
+                        f"실제 동작 테스트: 실패 · {error}\n사이트 반응: 확인되지 않음")
+                self._status(error, error=True)
+                return
+            details = result.get("result") or {}
+            tag = str(details.get("tag") or "-").lower()
+            page_background = tag in {"html", "body"}
+            if kind != "pick_element" or not page_background:
+                self.selector_edit.setText(str(details.get("selector") or self.selector_edit.text()))
+            self._page_url = str(details.get("url") or self._page_url)
+            self._page_title = str(details.get("title") or self._page_title)
+            count = int(details.get("count") or 0)
+            sample = str(details.get("text") or "(텍스트 없음)")
+            visible = bool(details.get("visible"))
+            interactive = bool(details.get("interactive"))
+            report = (
+                f"일치 {count}개 · 첫 요소 <{tag}> · {'화면에 표시됨' if visible else '숨김/화면 밖'}\n"
+                f"클릭 대상: {'페이지 전체라 지정 불가' if page_background else '가능성 높음' if interactive else '목록/배경 등 비대상일 수 있음'}\n"
+                f"내용: {sample}\n페이지: {self._page_title or self._page_url}")
+            if kind == "test_element_action":
+                dispatched = details.get("input_method") == "browser_debugger"
+                report += (
+                    "\n테스트 단계: CSS 일치 " + ("확인" if count == 1 else "재검사 필요")
+                    + " → 화면 표시 " + ("확인" if visible else "실패")
+                    + " → 실제 입력 " + ("전송 확인" if dispatched else "확인 실패")
+                    + "\n사이트 반응: 자동 검증하지 않음 · 화면에서 직접 확인")
+            self.result_label.setText(report)
+            precise = count == 1 and visible and tag not in {"html", "body"} and (
+                self._action not in {"click", "double_click"} or interactive)
+            if kind == "test_element_action":
+                if self._action in {"click", "double_click", "hover"} and details.get("input_method") != "browser_debugger":
+                    self._status("확장앱이 구버전이거나 디버거 권한이 적용되지 않았습니다. 확장앱을 다시 로드하고 권한을 승인해 주세요.", error=True)
+                    self.raise_()
+                    self.activateWindow()
+                    return
+                method = "브라우저 실제 마우스 입력" if details.get("input_method") == "browser_debugger" else "브라우저 요소 동작"
+                self._status(f"{method}을(를) 전송했습니다. 사이트의 실제 반응을 확인해 주세요." if precise else
+                             "동작은 전송했지만 선택자가 넓거나 여러 요소와 일치합니다. 대상 요소를 다시 검사해 주세요.", error=not precise)
+            else:
+                self._status("선택자가 확인됐습니다." if precise else
+                             "페이지 배경(<body>)은 클릭 대상으로 저장하지 않았습니다. 실제 버튼/아이콘을 다시 선택하세요. 확장앱을 다시 로드해야 할 수도 있습니다."
+                             if page_background else
+                             "선택자는 추출됐지만 클릭할 항목이 불명확합니다. 실제 버튼/목록 항목을 다시 선택하세요.",
+                             error=not precise)
+            self.raise_()
+            self.activateWindow()
+            return
+        dispatched = getattr(self._bridge, "command_dispatched_at", None)
+        waiting_for_delivery = isinstance(dispatched, dict) and self._pending_id not in dispatched
+        delivery_timed_out = waiting_for_delivery and time.monotonic() >= self._delivery_deadline
+        if delivery_timed_out or time.monotonic() >= self._deadline:
+            self._bridge.cancel_command(self._pending_id)
+            self._pending_id = ""
+            self._pending_kind = ""
+            self._timer.stop()
+            self.pick_button.setEnabled(True)
+            self.probe_button.setEnabled(True)
+            self.test_button.setEnabled(True)
+            self._status(
+                "확장앱이 명령을 받지 않았습니다. 확장앱을 다시 로드하고 연결 코드를 확인해 주세요."
+                if delivery_timed_out else
+                "확장앱이 명령을 받았지만 응답하지 않았습니다. 대상 탭과 확장앱 상태를 확인해 주세요.",
+                error=True)
+
+    def accept(self) -> None:
+        selector = self.selector_edit.text().strip()
+        if not selector:
+            self._status("요소를 선택하거나 CSS 선택자를 입력해 주세요.", error=True)
+            return
+        self.selected = {"browser": str(self.browser_combo.currentData() or "whale"),
+                         "selector": selector, "title": self._page_title,
+                         "page_url": self._page_url}
+        super().accept()
+
+    def done(self, result: int) -> None:
+        self._timer.stop()
+        if self._bridge is not None:
+            if self._pending_id:
+                self._bridge.cancel_command(self._pending_id)
+            self._bridge.close()
+            self._bridge = None
+        super().done(result)
+
+
 class ActionEditor(QtWidgets.QWidget):
     def __init__(self, repository: MacroRepository, parent=None, variable_choices: list[str] | None = None,
                  preload_image_search: bool = True) -> None:
@@ -3844,6 +4060,10 @@ class ActionEditor(QtWidgets.QWidget):
             buttons.append(("▣ OCR 인식 범위 잡기", lambda: self._pick_region(action, "region")))
             buttons.append(("▶ OCR 테스트", lambda: self._test_ocr(action)))
             buttons.append(("🎨 OCR 필터 튜닝", lambda: self._open_ocr_filter_tuner(action)))
+        elif action == "browser_action":
+            buttons.append(("🎯 브라우저에서 요소 선택", self._pick_browser_element))
+            buttons.append(("🔍 선택자 검사 · 일치 요소 표시", self._test_browser_element))
+            buttons.append(("▶ 실제 동작 테스트", self._run_browser_element_test))
         elif action == "pixel_search":
             buttons.append(("🔍 색상 검색 영역 검증 및 실시간 검사", self._open_region_visual_test))
             buttons.append(("🎯 색상 스포이트 (돋보기 좌클릭)", lambda: self._pick_pixel_color(action)))
@@ -3895,6 +4115,44 @@ class ActionEditor(QtWidgets.QWidget):
             button.clicked.connect(callback)
             layout.addWidget(button, index // 3, index % 3)
         return group
+
+    def _browser_element_dialog(self, *, probe: bool = False, test: bool = False) -> None:
+        widgets = self.widgets.get("browser_action", {})
+        browser_widget = widgets.get("browser")
+        selector_widget = widgets.get("selector")
+        page_widget = widgets.get("page_url")
+        action_widget = widgets.get("browser_action")
+        value_widget = widgets.get("value")
+        browser = str(browser_widget.currentData() or "whale") if isinstance(browser_widget, QtWidgets.QComboBox) else "whale"
+        selector = selector_widget.text().strip() if isinstance(selector_widget, QtWidgets.QLineEdit) else ""
+        page_url = page_widget.text().strip() if isinstance(page_widget, QtWidgets.QLineEdit) else ""
+        selected_action = str(action_widget.currentData() or "click") if isinstance(action_widget, QtWidgets.QComboBox) else "click"
+        value = value_widget.text() if isinstance(value_widget, QtWidgets.QLineEdit) else ""
+        dialog = BrowserElementPickerDialog(self.repository, self.window(), browser=browser,
+                                            selector=selector, page_url=page_url,
+                                            action=selected_action, value=value)
+        if probe or test:
+            QtCore.QTimer.singleShot(0, lambda: dialog._request("test_element_action" if test else "probe_element"))
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        selected = dialog.selected
+        if isinstance(browser_widget, QtWidgets.QComboBox):
+            browser_widget.setCurrentIndex(max(0, browser_widget.findData(selected["browser"])))
+        if isinstance(selector_widget, QtWidgets.QLineEdit):
+            selector_widget.setText(selected["selector"])
+        for key in ("title", "page_url"):
+            widget = widgets.get(key)
+            if isinstance(widget, QtWidgets.QLineEdit) and selected.get(key):
+                widget.setText(str(selected[key]))
+
+    def _pick_browser_element(self) -> None:
+        self._browser_element_dialog()
+
+    def _test_browser_element(self) -> None:
+        self._browser_element_dialog(probe=True)
+
+    def _run_browser_element_test(self) -> None:
+        self._browser_element_dialog(test=True)
 
     def _test_remote_notify(self) -> None:
         action = "remote_notify"

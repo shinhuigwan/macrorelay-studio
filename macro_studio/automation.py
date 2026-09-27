@@ -16,7 +16,7 @@ from typing import Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .action_editor import ActionEditor, ActionEditorDialog, CoordinatePickerDialog, WindowPickerDialog, action_template
+from .action_editor import ActionEditor, ActionEditorDialog, BrowserElementPickerDialog, CoordinatePickerDialog, WindowPickerDialog, action_template
 from .image_editor import ImageEditorDialog, ScreenCaptureDialog, capture_virtual_desktop
 from .node_editor import ACTION_TITLES
 from .screen_coordinates import display_coordinate_maps, logical_point_to_native, logical_rect_to_native, native_point_to_logical, native_rect_to_logical, rect_to_exclusive_list
@@ -5894,6 +5894,14 @@ class QuickActionWizard:
     @staticmethod
     def build(action: str, repository, parent=None) -> dict[str, Any] | None:
         step = action_template(action)
+        if action == "browser_action":
+            dialog = BrowserElementPickerDialog(repository, parent)
+            if dialog.exec() != QtWidgets.QDialog.Accepted:
+                return None
+            step.update(dialog.selected)
+            step["prefer_active"] = True
+            step["label"] = f"브라우저 요소 ({dialog.selected['selector'][:28]})"
+            return step
         if action == "mouse_click":
             picker = CoordinatePickerDialog(parent)
             if picker.exec() != QtWidgets.QDialog.Accepted:

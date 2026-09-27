@@ -15,17 +15,33 @@ from typing import Any
 from PySide6 import QtCore, QtGui
 
 
-@lru_cache(maxsize=128)
-def _tile_png_data(glyph: str, background: str) -> str:
+STARTER_TILE_CAPTIONS = {
+    "YouTube 홈": "YouTube", "시청 기록": "기록",
+    "재생·일시정지": "재생/정지", "10초 뒤로": "-10초", "10초 앞으로": "+10초",
+    "네이버 홈": "네이버", "새로고침": "새로고침",
+    "LDPlayer 실행": "LD 실행", "전체 화면": "전체화면", "미니 모드": "미니모드",
+    "파일 탐색기": "탐색기", "메모장 실행": "메모장",
+    "Windows 설정": "설정", "계산기 실행": "계산기",
+}
+
+
+def compact_starter_caption(label: str) -> str:
+    """Use a short, unambiguous caption on small generated Deck tiles."""
+    return STARTER_TILE_CAPTIONS.get(label, label)
+
+
+@lru_cache(maxsize=256)
+def _tile_png_data(glyph: str, background: str, legacy_border: bool = False) -> str:
     """Render each portable starter image only once per process."""
     pixmap = QtGui.QPixmap(128, 128)
-    pixmap.fill(QtCore.Qt.transparent)
+    pixmap.fill(QtCore.Qt.transparent if legacy_border else QtGui.QColor(background))
     painter = QtGui.QPainter(pixmap)
     painter.setRenderHint(QtGui.QPainter.Antialiasing)
-    rect = QtCore.QRectF(4, 4, 120, 120)
-    painter.setBrush(QtGui.QColor(background))
-    painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 3))
-    painter.drawRoundedRect(rect, 24, 24)
+    rect = QtCore.QRectF(4, 4, 120, 120) if legacy_border else QtCore.QRectF(0, 0, 128, 128)
+    if legacy_border:
+        painter.setBrush(QtGui.QColor(background))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 3))
+        painter.drawRoundedRect(rect, 24, 24)
     painter.setBrush(QtGui.QColor(255, 255, 255, 32))
     painter.setPen(QtCore.Qt.NoPen)
     painter.drawRoundedRect(QtCore.QRectF(13, 13, 102, 48), 18, 18)
@@ -45,12 +61,12 @@ def _tile_png_data(glyph: str, background: str) -> str:
     return bytes(encoded.toBase64()).decode("ascii")
 
 
-def _tile_icon(glyph: str, background: str) -> dict[str, Any]:
+def _tile_icon(glyph: str, background: str, *, legacy_border: bool = False) -> dict[str, Any]:
     return {
-        "image_data": _tile_png_data(glyph, background),
+        "image_data": _tile_png_data(glyph, background, legacy_border),
         "image_path": "", "emoji": "", "icon_size": 56,
         "full_stretch": True, "text_show": True,
-        "text_position": "bottom", "font_size": 10, "spacing": 3,
+        "text_position": "bottom", "font_size": 12, "spacing": 3,
         "icon_source": "starter_pack",
     }
 
@@ -68,6 +84,10 @@ def _key(label: str, keys: str, executable: str, glyph: str, color: str) -> tupl
                    target_exe=executable, input_mode="active")
 
 
+def _navigate(label: str, target: str, glyph: str, color: str) -> tuple[dict[str, Any], str, str]:
+    return _action(label, "navigate_browser_tab", glyph, color, url=target, match="domain")
+
+
 def _installed_ldplayer() -> str:
     candidates = (
         Path("D:/LDPlayer/LDPlayer9/dnplayer.exe"),
@@ -79,11 +99,11 @@ def _installed_ldplayer() -> str:
     return next((str(path) for path in candidates if path.is_file()), "")
 
 
-def starter_action_pack(key: str) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+def starter_action_pack(key: str, *, legacy_icons: bool = False) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Return editable Deck actions and their generated icons for one mode."""
     if key == "youtube":
         entries = [
-            _open("YouTube 홈", "https://www.youtube.com/", "▶", "#EF3340"),
+            _navigate("YouTube 홈", "https://www.youtube.com/", "▶", "#EF3340"),
             _open("구독", "https://www.youtube.com/feed/subscriptions", "★", "#DE3D48"),
             _open("시청 기록", "https://www.youtube.com/feed/history", "◷", "#C83F52"),
             _key("재생·일시정지", "K", "whale.exe", "Ⅱ", "#E34952"),
@@ -138,5 +158,27 @@ def starter_action_pack(key: str) -> tuple[list[dict[str, Any]], dict[str, dict[
     for index, (action, glyph, color) in enumerate(entries):
         slots.append({"macro": action["label"], "hotkey": "", "mode": "deck_action",
                       "action": copy.deepcopy(action)})
-        icons[str(index)] = _tile_icon(glyph, color)
+        icons[str(index)] = _tile_icon(glyph, color, legacy_border=legacy_icons)
+        if not legacy_icons:
+            icons[str(index)]["text_override"] = compact_starter_caption(action["label"])
     return slots, icons
+
+
+def default_home_slot() -> tuple[dict[str, Any], dict[str, Any]]:
+    """A normal editable tile that returns a non-default Deck to its home preset."""
+    action = {"kind": "switch_preset", "label": "홈", "preset_id": "default"}
+    slot = {"macro": "홈", "hotkey": "", "mode": "deck_action", "action": action}
+    icon = _tile_icon("⌂", "#174D49")
+    icon["icon_source"] = "home_button"
+    return slot, icon
+
+
+def browser_site_slot(label: str, url: str, preset_id: str, glyph: str,
+                      color: str, match: str = "domain") -> tuple[dict[str, Any], dict[str, Any]]:
+    """Portable, editable shortcut with an embedded full-tile site icon."""
+    action = {"kind": "activate_browser_tab", "label": label, "url": url,
+              "preset_id": preset_id, "match": match}
+    slot = {"macro": label, "hotkey": "", "mode": "deck_action", "action": action}
+    icon = _tile_icon(glyph, color)
+    icon["icon_source"] = "browser_site_shortcut"
+    return slot, icon

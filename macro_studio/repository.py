@@ -1958,6 +1958,7 @@ internal static class Program
         turbo: bool = False,
     ) -> subprocess.Popen[Any]:
         environment = os.environ.copy()
+        environment["MACRORELAY_HOME"] = str(self.root)
         if turbo:
             environment["MACRORELAY_TURBO_MODE"] = "1"
         has_opencv = any(

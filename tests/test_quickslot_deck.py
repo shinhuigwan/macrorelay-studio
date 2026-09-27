@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -11,6 +12,13 @@ from unittest import mock
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+def _use_legacy_compact_default(repository) -> None:
+    (repository.root / ".quickslot_deck_config.json").write_text(
+        json.dumps({"config": {"browser_shortcuts_version": 1,
+                               "starter_presets_version": 1,
+                               "show_empty_slots": False}}), encoding="utf-8")
 
 
 class QuickSlotDeckTests(unittest.TestCase):
@@ -35,13 +43,14 @@ class QuickSlotDeckTests(unittest.TestCase):
                     {"macro": "두 번째", "hotkey": "Alt+2", "mode": "hybrid"},
                 ],
             })
+            _use_legacy_compact_default(repository)
             window = QuickSlotDeckWindow(repository)
             self.app.processEvents()
 
             self.assertEqual(["첫 번째", "두 번째"], [button.macro_name for button in window.buttons])
             self.assertEqual(2, window.grid_layout.count())
             self.assertLessEqual(window.width(), 430)
-            repository.save_hotkeys({"slots": [{"macro": "첫 번째", "hotkey": "", "mode": "hybrid"}]})
+            window._save_preset_hotkeys({"slots": [{"macro": "첫 번째", "hotkey": "", "mode": "hybrid"}]})
             window.refresh_slots()
             self.assertEqual(1, window.grid_layout.count())
             window.close()
@@ -81,6 +90,7 @@ class QuickSlotDeckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repository = MacroRepository(Path(directory))
             repository.save_hotkeys({"slots": [{"macro": "첫 번째", "hotkey": "", "mode": "hybrid"}]})
+            _use_legacy_compact_default(repository)
             window = QuickSlotDeckWindow(repository)
             dialog = QuickSlotDeckSettingsDialog(window)
 
@@ -90,6 +100,25 @@ class QuickSlotDeckTests(unittest.TestCase):
             window.config["tile_scale"] = 0.25
             window.refresh_slots()
             self.assertEqual((64, 64), (window.width(), window.height()))
+            dialog.close()
+            window.close()
+
+    def test_browser_settings_explain_optional_debugger_notice_flag(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dialog = QuickSlotDeckSettingsDialog(window)
+            hint = dialog.tab_browser.findChild(QtWidgets.QLabel, "whale_debugger_launch_hint")
+            self.assertIsNotNone(hint)
+            self.assertIn('"C:\\Program Files\\Naver\\Naver Whale\\Application\\whale.exe" --silent-debugger-extension-api', hint.text())
+            self.assertIn("다른 디버깅 확장앱의 경고도 숨깁니다", hint.text())
+            dialog.tabs.setCurrentWidget(dialog.tab_browser)
+            dialog.show()
+            self.app.processEvents()
+            self.assertTrue(dialog.tab_browser.rect().contains(hint.geometry().bottomRight()))
             dialog.close()
             window.close()
 
@@ -203,6 +232,7 @@ class QuickSlotDeckTests(unittest.TestCase):
             repository = MacroRepository(Path(directory))
             repository.create_macro("추가할 매크로")
             repository.save_hotkeys({"slots": [{"macro": "", "hotkey": "", "mode": "hybrid"}]})
+            _use_legacy_compact_default(repository)
             window = QuickSlotDeckWindow(repository)
             with mock.patch.object(QtWidgets.QInputDialog, "getItem", return_value=("추가할 매크로", True)):
                 window._add_slot_from_radial()
@@ -225,7 +255,7 @@ class QuickSlotDeckTests(unittest.TestCase):
         self.assertEqual(1, run_spy.count())
         button.close()
 
-    def test_slot_double_click_also_opens_sticky_preset_radial(self) -> None:
+    def test_slot_double_click_does_not_open_preset_radial(self) -> None:
         from PySide6 import QtCore, QtTest
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository
@@ -238,9 +268,90 @@ class QuickSlotDeckTests(unittest.TestCase):
             with mock.patch.object(window, "_show_preset_radial") as show_radial:
                 QtTest.QTest.mouseDClick(window.buttons[0], QtCore.Qt.LeftButton)
 
-            self.assertEqual(1, show_radial.call_count)
-            self.assertTrue(show_radial.call_args.kwargs["sticky"])
+            show_radial.assert_not_called()
             window.close()
+
+    def test_two_rapid_separate_slot_taps_trigger_only_once(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import StreamDeckButton, SLOT_ACCIDENTAL_REPEAT_MS
+
+        button = StreamDeckButton(0)
+        button.set_slot_data("테스트")
+        button.show()
+        run_spy = QtTest.QSignalSpy(button.slot_triggered)
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        self.assertEqual(1, run_spy.count())
+        button._last_activation_at -= SLOT_ACCIDENTAL_REPEAT_MS / 1000 + 0.01
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        self.assertEqual(2, run_spy.count())
+        self.assertTrue(button.title_label.testAttribute(QtCore.Qt.WA_TransparentForMouseEvents))
+        button.close()
+
+    def test_rapid_preset_switch_taps_are_not_debounced(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import StreamDeckButton
+
+        button = StreamDeckButton(0)
+        button.set_slot_data("프리셋 전환")
+        button.action_kind = "switch_preset"
+        button.show()
+        run_spy = QtTest.QSignalSpy(button.slot_triggered)
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseDClick(button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(button, QtCore.Qt.LeftButton)
+        self.assertEqual(3, run_spy.count())
+        button.close()
+
+    def test_repeat_at_same_screen_position_is_suppressed_across_preset_rebuild(self) -> None:
+        from PySide6 import QtCore
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow, SLOT_ACCIDENTAL_REPEAT_MS
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            point = QtCore.QPoint(100, 100)
+            self.assertTrue(window._accept_slot_tap(point))
+            window.refresh_slots()
+            self.assertFalse(window._accept_slot_tap(point))
+            self.assertTrue(window._accept_slot_tap(point, preset_switch=True))
+            self.assertTrue(window._accept_slot_tap(point, preset_switch=True))
+            self.assertFalse(window._accept_slot_tap(point))
+            self.assertTrue(window._accept_slot_tap(QtCore.QPoint(190, 100)))
+            window._last_slot_tap_at -= SLOT_ACCIDENTAL_REPEAT_MS / 1000 + 0.01
+            self.assertTrue(window._accept_slot_tap(QtCore.QPoint(190, 100)))
+            window.close()
+
+    def test_editor_text_and_zoom_match_compact_tile(self) -> None:
+        from PySide6 import QtCore
+        from macro_studio.quickslot_deck import SlotIconEditDialog
+
+        dialog = SlotIconEditDialog(0, "416 로그인", {
+            "full_stretch": True, "text_show": True, "text_override": "416 로그인",
+            "font_size": 12, "image_zoom_percent": 125,
+        })
+        dialog.show()
+        self.app.processEvents()
+        self.assertEqual(160, dialog.preview_card.width())
+        self.assertEqual(90, dialog.actual_preview_card.width())
+        self.assertEqual(125, dialog.zoom_spin.value())
+        self.assertEqual("416 로그인", dialog.actual_preview_card.title_label.text())
+        self.assertFalse(dialog.preview_card.title_label.testAttribute(QtCore.Qt.WA_TransparentForMouseEvents))
+        self.assertTrue(dialog.actual_preview_card.title_label.testAttribute(QtCore.Qt.WA_TransparentForMouseEvents))
+        dialog._on_preview_zoom_requested(1)
+        self.assertEqual(130, dialog.zoom_spin.value())
+        dialog.text_override_edit.setText("더 긴 로그인 표시 문구")
+        self.assertEqual("더 긴 로그인 표시 문구", dialog.get_config()["text_override"])
+        dialog.text_override_edit.setText("416 로그인")
+        dialog.preview_card._move_preview_text_to(QtCore.QPoint(50, 60))
+        self.assertEqual("custom", dialog.get_config()["text_position"])
+        self.assertNotEqual(50, dialog.get_config()["text_x_percent"])
+        self.assertLessEqual(dialog.actual_preview_card.title_label.width(), dialog.actual_preview_card.width())
+        self.assertLessEqual(dialog.actual_preview_card.title_label.height(), dialog.actual_preview_card.height())
+        self.assertEqual(dialog.actual_preview_card.title_label.font().pixelSize(),
+                         dialog.preview_card.title_label.font().pixelSize())
+        dialog.close()
 
     def test_single_click_runs_immediately(self) -> None:
         from PySide6 import QtCore, QtTest
@@ -270,6 +381,59 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertTrue(show_radial.call_args.kwargs["sticky"])
             window.close()
 
+    def test_preset_badge_tap_and_empty_tile_double_click_open_radial(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            window.show()
+            empty_button = next(button for button in window.buttons if not button.macro_name)
+            with mock.patch.object(window, "_show_preset_radial") as show_radial:
+                window.preset_badge.click()
+                QtTest.QTest.mouseDClick(empty_button, QtCore.Qt.LeftButton)
+            self.assertEqual(2, show_radial.call_count)
+            self.assertTrue(all(call.kwargs["sticky"] for call in show_radial.call_args_list))
+            window.close()
+
+    def test_starter_icon_caption_fits_small_saved_tile(self) -> None:
+        from macro_studio.deck_starter_actions import compact_starter_caption, starter_action_pack
+        from macro_studio.quickslot_deck import StreamDeckButton
+
+        for pack in ("youtube", "naver", "ldplayer", "explorer", "notepad", "calculator", "settings"):
+            slots, old_icons = starter_action_pack(pack, legacy_icons=True)
+            for index, slot in enumerate(slots):
+                button = StreamDeckButton(index)
+                button.resize(80, 80)
+                button.set_custom_icon_config(old_icons[str(index)])
+                button.set_slot_data(slot["macro"])
+                button.show()
+                self.app.processEvents()
+                self.assertEqual(compact_starter_caption(slot["macro"]), button.title_label.text())
+                self.assertTrue(button.rect().contains(button.title_label.geometry()))
+                button.close()
+
+    def test_starter_caption_uses_full_text_width_on_short_tile(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.deck_starter_actions import starter_action_pack
+        from macro_studio.quickslot_deck import StreamDeckButton
+
+        slots, icons = starter_action_pack("youtube")
+        for index, slot in enumerate(slots):
+            button = StreamDeckButton(index)
+            button.resize(86, 55)
+            button.set_custom_icon_config(icons[str(index)])
+            button.set_slot_data(slot["macro"], display_title=slot["action"]["label"])
+            button.show()
+            self.app.processEvents()
+            label = button.title_label
+            text_width = QtGui.QFontMetrics(label.font()).horizontalAdvance(label.text())
+            self.assertEqual(button.display_title, label.text())
+            self.assertGreaterEqual(label.contentsRect().width(), text_width + 4)
+            self.assertTrue(button.rect().contains(label.geometry()))
+            button.close()
+
     def test_sticky_radial_stays_open_until_outside_click(self) -> None:
         from PySide6 import QtCore, QtTest, QtWidgets
         from macro_studio.quickslot_deck import RadialPieMenuWidget
@@ -289,6 +453,25 @@ class QuickSlotDeckTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(menu.isVisible())
         host.close()
+
+    def test_sticky_preset_radial_near_screen_edge_is_visible_and_selectable(self) -> None:
+        from PySide6 import QtCore, QtGui, QtTest
+        from macro_studio.quickslot_deck import RadialPieMenuWidget
+
+        available = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        menu = RadialPieMenuWidget()
+        menu.load_deck_presets([("default", "기본 모드"), ("youtube", "유튜브")])
+        selected = []
+        menu.action_triggered.connect(selected.append)
+        menu.popup_at(available.topLeft() + QtCore.QPoint(3, 3), sticky=True)
+        self.app.processEvents()
+        self.assertTrue(available.contains(menu.geometry()))
+        QtTest.QTest.qWait(260)
+        QtTest.QTest.mouseClick(menu, QtCore.Qt.LeftButton,
+                                pos=menu._get_item_center(1).toPoint())
+        self.app.processEvents()
+        self.assertEqual(["deck:youtube"], selected)
+        menu.close()
 
     def test_radial_hides_before_dispatching_modal_action(self) -> None:
         from PySide6 import QtCore, QtTest
@@ -340,7 +523,7 @@ class QuickSlotDeckTests(unittest.TestCase):
             window = QuickSlotDeckWindow(repository)
             dock = DeckDockWindow(window)
             self.assertEqual(window.rows * window.cols, dock.grid.count())
-            self.assertEqual(15, len(dock.action_buttons))
+            self.assertEqual(16, len(dock.action_buttons))
 
             dock.payload["slots"][0] = dock._slot_from_action({"kind": "page_next", "label": "다음"})
             dock.add_page()
@@ -455,7 +638,8 @@ class QuickSlotDeckTests(unittest.TestCase):
             }
             window.restore_deck_backup_payload(legacy)
             restored = repository.load_hotkeys()
-            self.assertEqual(350, restored["slots"][0]["action"]["ms"])
+            self.assertEqual("switch_preset", restored["slots"][0]["action"]["kind"])
+            self.assertEqual(350, restored["slots"][1]["action"]["ms"])
             self.assertEqual("트레이딩", restored["deck_page_names"][0])
             window.close()
 
@@ -882,6 +1066,59 @@ class QuickSlotDeckTests(unittest.TestCase):
                 open_studio.assert_called_once()
             window.close()
 
+    def test_whale_deck_launch_opens_tab_in_existing_window(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow, is_plain_whale_launch
+        from macro_studio.repository import MacroRepository
+
+        self.assertTrue(is_plain_whale_launch(r'C:\Program Files\Naver\Whale\whale.exe'))
+        self.assertFalse(is_plain_whale_launch('whale.exe --new-window'))
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            action = {"kind": "open_target", "target": r'C:\Program Files\Naver\Whale\whale.exe'}
+            try:
+                with mock.patch.object(window, "_open_whale_tab_if_running", return_value=True) as open_tab, \
+                     mock.patch("macro_studio.quickslot_deck.os.startfile") as startfile:
+                    window._execute_deck_action(action)
+                    open_tab.assert_called_once_with()
+                    startfile.assert_not_called()
+                with mock.patch.object(window, "_open_whale_tab_if_running", return_value=False), \
+                     mock.patch("macro_studio.quickslot_deck.subprocess.Popen") as launch:
+                    window._execute_deck_action(action)
+                    launch.assert_called_once_with([action["target"], "--silent-debugger-extension-api"])
+                quoted = {**action, "target": f'"{action["target"]}"'}
+                with mock.patch.object(window, "_open_whale_tab_if_running", return_value=False), \
+                     mock.patch("macro_studio.quickslot_deck.subprocess.Popen") as launch:
+                    window._execute_deck_action(quoted)
+                    launch.assert_called_once_with([action["target"], "--silent-debugger-extension-api"])
+            finally:
+                window.close()
+
+    def test_whale_tab_is_sent_only_after_its_window_is_foreground(self) -> None:
+        import ctypes
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            user32 = mock.Mock()
+            user32.IsIconic.return_value = False
+            try:
+                with mock.patch.object(window, "_resolve_action_window", return_value=42) as resolve, \
+                     mock.patch.object(window, "_send_windows_hotkey") as send, \
+                     mock.patch.object(ctypes.windll, "user32", user32):
+                    user32.GetForegroundWindow.return_value = 42
+                    self.assertTrue(window._open_whale_tab_if_running())
+                    resolve.assert_called_once_with({
+                        "target_exe": "whale.exe", "target_class": "Chrome_WidgetWin_1",
+                    })
+                    send.assert_called_once_with("Ctrl+T")
+                    user32.GetForegroundWindow.return_value = 7
+                    with self.assertRaisesRegex(RuntimeError, "활성화하지 못했습니다"):
+                        window._open_whale_tab_if_running()
+                    send.assert_called_once()
+            finally:
+                window.close()
+
     def test_right_click_and_hold_radials_have_separate_content(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository
@@ -899,6 +1136,7 @@ class QuickSlotDeckTests(unittest.TestCase):
             browser["slots"] = [{"macro": "두 번째", "hotkey": "", "mode": "hybrid"}]
             browser["custom_icons"] = {"0": {"emoji": "B"}}
             browser["style"]["theme_index"] = 2
+            browser["style"]["show_empty_slots"] = False
             window.config["slot_presets"]["browser"] = browser
             window._refresh_preset_radial_menu()
 
@@ -911,13 +1149,13 @@ class QuickSlotDeckTests(unittest.TestCase):
 
             window._handle_preset_radial_action("deck:browser")
             self.assertEqual("browser", window.config["active_slot_preset"])
-            self.assertEqual(["두 번째"], [button.macro_name for button in window.buttons])
-            self.assertEqual("B", window.custom_icons["0"]["emoji"])
+            self.assertEqual(["홈", "두 번째"], [button.macro_name for button in window.buttons])
+            self.assertEqual("B", window.custom_icons["1"]["emoji"])
             self.assertEqual(2, window.config["theme_index"])
 
             window._handle_preset_radial_action("deck:default")
             self.assertEqual("default", window.config["active_slot_preset"])
-            self.assertEqual(["첫 번째", "두 번째"], [button.macro_name for button in window.buttons])
+            self.assertEqual(["첫 번째", "두 번째"], [button.macro_name for button in window.buttons[:2]])
             self.assertEqual(0, window.config["theme_index"])
             window.close()
 
@@ -968,6 +1206,7 @@ class QuickSlotDeckTests(unittest.TestCase):
             repository.save_hotkeys({"slots": [{"macro": "하나", "hotkey": "", "mode": "hybrid"}]})
             window = QuickSlotDeckWindow(repository)
             window.rows, window.cols = 2, 3
+            window.config["empty_slot_opacity"] = 100
             dialog = QuickSlotDeckSettingsDialog(window)
             dialog._on_theme_live_changed(5)
             dialog.show_empty_slots_check.setChecked(True)
@@ -1075,6 +1314,7 @@ class QuickSlotDeckTests(unittest.TestCase):
                     {"macro": "두 번째", "hotkey": "Alt+2", "mode": "hybrid"},
                 ]
             })
+            _use_legacy_compact_default(repository)
             window = QuickSlotDeckWindow(repository)
             window.custom_icons["1"] = {"emoji": "★"}
             window._remove_slot(1)
@@ -1101,6 +1341,52 @@ class QuickSlotDeckTests(unittest.TestCase):
         self.assertTrue(config["full_stretch"])
         dialog.close()
 
+    def test_icon_editor_pastes_clipboard_bitmap_and_preserves_it_without_path(self) -> None:
+        from PySide6 import QtCore, QtGui
+        from macro_studio.quickslot_deck import SlotIconEditDialog, load_pixmap_from_config
+
+        image = QtGui.QImage(24, 24, QtGui.QImage.Format_ARGB32)
+        image.fill(QtGui.QColor("#36BDF8"))
+        mime = QtCore.QMimeData()
+        mime.setImageData(image)
+        clipboard = mock.Mock()
+        clipboard.mimeData.return_value = mime
+        clipboard.image.return_value = image
+
+        dialog = SlotIconEditDialog(0, "테스트")
+        dialog._paste_image_from_clipboard(clipboard)
+        config = dialog.get_config()
+        self.assertEqual("", config["image_path"])
+        self.assertTrue(config["image_data"].startswith("data:image/png;base64,"))
+        self.assertTrue(config["full_stretch"])
+        self.assertFalse(load_pixmap_from_config(config).isNull())
+        dialog.close()
+
+        reopened = SlotIconEditDialog(0, "테스트", config)
+        self.assertEqual(config["image_data"], reopened.get_config()["image_data"])
+        reopened.close()
+
+    def test_icon_editor_pastes_copied_image_file(self) -> None:
+        from PySide6 import QtCore, QtGui
+        from macro_studio.quickslot_deck import SlotIconEditDialog
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "copied.png"
+            image = QtGui.QImage(16, 16, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#8B5CF6"))
+            self.assertTrue(image.save(str(path)))
+            mime = QtCore.QMimeData()
+            mime.setUrls([QtCore.QUrl.fromLocalFile(str(path))])
+            clipboard = mock.Mock()
+            clipboard.mimeData.return_value = mime
+
+            dialog = SlotIconEditDialog(0, "테스트")
+            dialog._paste_image_from_clipboard(clipboard)
+            config = dialog.get_config()
+            self.assertEqual(path, Path(config["image_path"]))
+            self.assertTrue(config["image_data"].startswith("data:image/png;base64,"))
+            dialog.close()
+
     def test_multiple_user_icons_are_saved_and_reloaded(self) -> None:
         from PySide6 import QtGui
         from macro_studio.quickslot_deck import quickslot_user_icon_paths, save_quickslot_user_icons
@@ -1123,6 +1409,41 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual(saved, quickslot_user_icon_paths(root))
             self.assertTrue(all(path.parent.name == "quickslot-user-icons" for path in saved))
 
+    def test_full_stretch_icon_has_visible_rounded_default_frame(self) -> None:
+        from PySide6 import QtGui, QtWidgets
+        from macro_studio.quickslot_deck import StreamDeckButton, encode_image_file_to_base64
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "flat-icon.png"
+            image = QtGui.QImage(32, 32, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#00A050"))
+            self.assertTrue(image.save(str(path)))
+
+            for theme_index in (0, 5):
+                with self.subTest(theme_index=theme_index):
+                    parent = QtWidgets.QWidget()
+                    parent.config = {"theme_index": theme_index, "tile_radius": 6}
+                    parent.setFixedSize(90, 90)
+                    button = StreamDeckButton(0, parent)
+                    button.setFixedSize(90, 90)
+                    button.set_custom_icon_config({
+                        "image_data": encode_image_file_to_base64(str(path)),
+                        "full_stretch": True,
+                        "text_show": False,
+                    })
+                    button.set_slot_data("테스트")
+                    parent.show()
+                    self.app.processEvents()
+                    rendered = button.grab().toImage()
+                    center = rendered.pixelColor(45, 45)
+                    border = rendered.pixelColor(1, 45)
+                    corner = rendered.pixelColor(0, 0)
+
+                    self.assertEqual(QtGui.QColor("#00A050").rgb(), center.rgb())
+                    self.assertGreater(border.red(), center.red() + 100)
+                    self.assertNotEqual(center.rgb(), corner.rgb())
+                    parent.close()
+
     def test_full_stretch_resizes_to_card_without_cropping_edges(self) -> None:
         from PySide6 import QtCore, QtGui
         from macro_studio.quickslot_deck import StreamDeckButton
@@ -1140,6 +1461,33 @@ class QuickSlotDeckTests(unittest.TestCase):
         scaled_image = scaled.toImage()
         self.assertEqual(QtGui.QColor("#EF4444"), scaled_image.pixelColor(90, 0))
         self.assertEqual(QtGui.QColor("#3B82F6"), scaled_image.pixelColor(90, 39))
+
+    def test_full_stretch_zoom_and_position_select_image_detail(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.quickslot_deck import StreamDeckButton
+
+        image = QtGui.QImage(20, 20, QtGui.QImage.Format_ARGB32)
+        for x in range(20):
+            for y in range(20):
+                image.setPixelColor(x, y, QtGui.QColor("#EF4444" if x < 10 else "#3B82F6"))
+        data = QtCore.QByteArray()
+        buffer = QtCore.QBuffer(data)
+        buffer.open(QtCore.QIODevice.WriteOnly)
+        self.assertTrue(image.save(buffer, "PNG"))
+        buffer.close()
+        parent = QtWidgets.QWidget()
+        parent.config = {"theme_index": 0}
+        button = StreamDeckButton(0, parent)
+        button.setFixedSize(100, 100)
+        parent.show()
+        for position, expected in ((0, "#EF4444"), (100, "#3B82F6")):
+            button.set_custom_icon_config({"image_data": bytes(data.toBase64()).decode("ascii"),
+                                           "full_stretch": True, "text_show": False,
+                                           "image_zoom_percent": 200, "image_x_percent": position})
+            button.set_slot_data("테스트")
+            self.app.processEvents()
+            self.assertEqual(QtGui.QColor(expected).rgb(), button.grab().toImage().pixelColor(50, 50).rgb())
+        parent.close()
 
 
 if __name__ == "__main__":

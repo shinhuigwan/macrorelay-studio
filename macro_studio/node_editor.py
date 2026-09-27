@@ -215,6 +215,12 @@ class NodeGraphView(QtWidgets.QGraphicsView):
         if hasattr(canvas, "minimap") and canvas.minimap:
             canvas.minimap.update_position()
 
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        canvas = self.parent()
+        if isinstance(canvas, NodeCanvas):
+            canvas.hide_node_tooltip()
+        super().leaveEvent(event)
+
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
         factor = 1.14 if event.angleDelta().y() > 0 else 1 / 1.14
         next_zoom = max(35, min(220, int(self._zoom * factor)))
@@ -225,6 +231,9 @@ class NodeGraphView(QtWidgets.QGraphicsView):
         event.accept()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        canvas = self.parent()
+        if isinstance(canvas, NodeCanvas):
+            canvas.hide_node_tooltip()
         if event.button() == QtCore.Qt.MiddleButton:
             self._panning = True
             self._pan_start = event.position().toPoint()
@@ -416,6 +425,18 @@ class NodeToolTipPopup(QtWidgets.QFrame):
         layout.addWidget(self.header)
         layout.addWidget(self.summary)
         layout.addWidget(self.detail)
+        self._dismiss_timer = QtCore.QTimer(self)
+        self._dismiss_timer.setSingleShot(True)
+        self._dismiss_timer.setInterval(4000)
+        self._dismiss_timer.timeout.connect(self.hide)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._dismiss_timer.start()
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        self._dismiss_timer.stop()
+        super().hideEvent(event)
 
     def set_step_info(self, index: int, action_title: str, summary: str, details: str) -> None:
         self.header.setText(f"[ {index} ]  {action_title}")
@@ -4287,6 +4308,7 @@ class NodeCanvas(QtWidgets.QWidget):
             pass
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        self.hide_node_tooltip()
         super().hideEvent(event)
         try:
             if hasattr(self, "minimap") and self.minimap:
@@ -4295,6 +4317,7 @@ class NodeCanvas(QtWidgets.QWidget):
             pass
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.hide_node_tooltip()
         super().closeEvent(event)
         try:
             if hasattr(self, "minimap") and self.minimap:
@@ -4445,6 +4468,7 @@ class NodeCanvas(QtWidgets.QWidget):
 
     def set_macro(self, macro: dict[str, Any] | None, selected: int = 0) -> None:
         self.suspended = True
+        self.hide_node_tooltip()
         self.clear_quick_node_preview()
         self.hide_image_preview()
         self.active_step = 0
@@ -4626,6 +4650,11 @@ class NodeCanvas(QtWidgets.QWidget):
 
     def show_image_preview(self, entries: list[tuple[str, Path]], screen_pos: QtCore.QPoint) -> None:
         self._preview_popup.show_images(entries, screen_pos)
+
+    def hide_node_tooltip(self) -> None:
+        popup = getattr(self, "_tooltip_popup", None)
+        if popup is not None:
+            popup.hide()
 
     def hide_image_preview(self) -> None:
         self._preview_popup.hide()

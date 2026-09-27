@@ -3404,7 +3404,7 @@ class BuilderPage(QtWidgets.QWidget):
         interactive_actions = {
             "image_search", "screen_condition", "inactive_click", "mouse_click",
             "pixel_search", "ocr", "ocr_tracking", "multi_pixel_check", "wait_color", "color_ratio",
-            "animation_search", "type_text",
+            "animation_search", "type_text", "browser_action",
         }
 
         step = None

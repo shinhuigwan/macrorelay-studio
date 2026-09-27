@@ -28,6 +28,22 @@ class EngineBehaviorTests(unittest.TestCase):
 
         self.engine = macro_tool
 
+    def test_whale_launch_reuses_existing_window_as_new_tab(self) -> None:
+        lines = self.engine.render_run({
+            "action": "run_program",
+            "command": r"C:\Program Files\Naver\Naver Whale\Application\whale.exe",
+        })
+        script = "\n".join(lines)
+        self.assertIn('WinExist("ahk_class Chrome_WidgetWin_1 ahk_exe whale.exe")', script)
+        self.assertLess(script.index("DetectHiddenWindows, Off"), script.index("WinExist("))
+        self.assertLess(script.index("WinExist("), script.index("DetectHiddenWindows, On"))
+        self.assertIn("SendInput, ^t", script)
+        self.assertIn("else\n    Run, ", script)
+        self.assertEqual(
+            ["Run, whale.exe --new-window"],
+            self.engine.render_run({"action": "run_program", "command": "whale.exe --new-window"}),
+        )
+
     def test_guided_set_var_supports_fixed_result_and_existing_variable(self) -> None:
         self.assertEqual(self.engine.render_set_var({"action": "set_var", "name": "Old", "value": "hello"}), ['Old := "hello"'])
         self.assertEqual(self.engine.render_set_var({"name": "Count", "value": "3", "value_kind": "number"}), ["Count := 3.0"])

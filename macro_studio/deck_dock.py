@@ -16,6 +16,7 @@ from .repository import macro_entry_points
 ACTION_LIBRARY: Dict[str, list[tuple[str, str, str]]] = {
     "시스템": [
         ("open_target", "실행", "프로그램·파일·폴더·웹사이트 실행"),
+        ("activate_browser_tab", "웨일 사이트 탭", "실행 중인 탭 우선 선택·프리셋 전환"),
         ("terminate_program", "프로그램 종료", "지정 프로세스 종료"),
         ("hotkey", "단축키", "키 조합 보내기"),
         ("text", "텍스트 입력", "클립보드 기반 텍스트 입력"),
@@ -44,7 +45,7 @@ ACTION_TITLES = {
 }
 
 ACTION_ICONS = {
-    "open_target": "↗", "terminate_program": "■", "hotkey": "⌨", "text": "T", "mouse_click": "🖱",
+    "open_target": "↗", "activate_browser_tab": "◉", "terminate_program": "■", "hotkey": "⌨", "text": "T", "mouse_click": "🖱",
     "wait": "◷", "studio": "M", "stop_all": "⬛", "run_macro": "▶",
     "multi_macros": "≡", "switch_preset": "★", "page_prev": "◀",
     "page_next": "▶", "page_goto": "▦", "page_first": "Ⅰ",
@@ -341,6 +342,21 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
             edit.editingFinished.connect(lambda: self._set_icon_from_program(edit.text()))
             row = QtWidgets.QHBoxLayout(); row.addWidget(edit, 1); row.addWidget(browse)
             self.widgets["target"] = edit; form.addRow("대상", row)
+        elif kind == "activate_browser_tab":
+            url = QtWidgets.QLineEdit(str(self.action.get("url") or ""))
+            url.setPlaceholderText("https://www.example.com/")
+            match = QtWidgets.QComboBox()
+            match.addItem("같은 도메인의 열린 탭", "domain")
+            match.addItem("같은 주소 경로의 열린 탭", "origin_path")
+            match.setCurrentIndex(max(0, match.findData(str(self.action.get("match") or "domain"))))
+            preset = QtWidgets.QComboBox()
+            for preset_id, entry in self.main_window.config.get("slot_presets", {}).items():
+                preset.addItem(str(entry.get("name") or preset_id), preset_id)
+            preset.setCurrentIndex(max(0, preset.findData(str(self.action.get("preset_id") or ""))))
+            self.widgets.update(url=url, match=match, preset_id=preset)
+            form.addRow("사이트 주소", url)
+            form.addRow("열린 탭 찾기", match)
+            form.addRow("전환할 프리셋", preset)
         elif kind == "terminate_program":
             edit = QtWidgets.QLineEdit(str(self.action.get("process") or ""))
             edit.setPlaceholderText("예: notepad.exe")

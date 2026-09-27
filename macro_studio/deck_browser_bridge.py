@@ -7,13 +7,14 @@ import ctypes
 import json
 import os
 import queue
+import secrets
 import threading
 import time
 from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import PureWindowsPath
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 BRIDGE_PORT = 18773
@@ -132,6 +133,12 @@ class DeckBrowserBridge:
     def __init__(self, token: str, port: int = BRIDGE_PORT):
         self.token = token
         self.events: queue.Queue[tuple[int, str]] = queue.Queue(maxsize=32)
+        self.commands: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=16)
+        self.command_results: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=16)
+        self.cancelled_commands: set[str] = set()
+        self.command_dispatched_at: dict[str, float] = {}
+        self.last_command_poll_at = 0.0
+        self.last_active_tab_at = 0.0
         bridge = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -141,32 +148,73 @@ class DeckBrowserBridge:
             def do_OPTIONS(self) -> None:
                 self._reply(204)
 
-            def _reply(self, status: int) -> None:
+            def _reply(self, status: int, payload: bytes = b"") -> None:
                 origin = self.headers.get("Origin", "")
                 self.send_response(status)
                 if origin.startswith("chrome-extension://"):
                     self.send_header("Access-Control-Allow-Origin", origin)
                     self.send_header("Access-Control-Allow-Headers", "Content-Type, X-MacroRelay-Token")
-                    self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-                self.send_header("Content-Length", "0")
+                    self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                if payload:
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
+                if payload:
+                    self.wfile.write(payload)
+
+            def _authorized(self) -> bool:
+                origin = self.headers.get("Origin", "")
+                return (not origin or origin.startswith("chrome-extension://")) and self.headers.get("X-MacroRelay-Token") == bridge.token
+
+            def do_GET(self) -> None:
+                parsed_path = urlsplit(self.path)
+                if parsed_path.path != "/next-command" or not self._authorized():
+                    self._reply(403)
+                    return
+                bridge.last_command_poll_at = time.monotonic()
+                requester = parse_qs(parsed_path.query).get("browser", [""])[0]
+                while True:
+                    try:
+                        command = bridge.commands.get_nowait()
+                    except queue.Empty:
+                        self._reply(204)
+                        return
+                    if command["id"] not in bridge.cancelled_commands:
+                        break
+                    bridge.cancelled_commands.discard(command["id"])
+                if command.get("browser") and command["browser"] != requester:
+                    bridge.commands.put_nowait(command)
+                    self._reply(204)
+                    return
+                bridge.command_dispatched_at[command["id"]] = time.monotonic()
+                self._reply(200, json.dumps(command).encode("utf-8"))
 
             def do_POST(self) -> None:
-                origin = self.headers.get("Origin", "")
-                if (self.path != "/active-tab" or
-                        (origin and not origin.startswith("chrome-extension://")) or
-                        self.headers.get("X-MacroRelay-Token") != bridge.token):
+                if self.path not in {"/active-tab", "/command-result"} or not self._authorized():
                     self._reply(403)
                     return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < length <= 4096:
+                    if not 0 < length <= 16384:
                         raise ValueError("invalid length")
                     payload = json.loads(self.rfile.read(length))
+                    if self.path == "/command-result":
+                        result = {"id": str(payload.get("id") or ""),
+                                  "status": str(payload.get("status") or ""),
+                                  "url": str(payload.get("url") or ""),
+                                  "error": str(payload.get("error") or "")[:300],
+                                  "result": payload.get("result") if isinstance(payload.get("result"), dict) else {}}
+                        if not result["id"] or result["status"] not in {"ok", "error"}:
+                            raise ValueError("invalid result")
+                        bridge.command_results.put_nowait(result)
+                        bridge.command_dispatched_at.pop(result["id"], None)
+                        self._reply(204)
+                        return
                     url = str(payload.get("url") or "")
                     if urlsplit(url).scheme not in {"http", "https"}:
                         raise ValueError("invalid URL")
                     observed_at = int(payload.get("observedAt") or int(time.time() * 1000))
+                    bridge.last_active_tab_at = time.monotonic()
                     try:
                         bridge.events.put_nowait((observed_at, url))
                     except queue.Full:
@@ -176,13 +224,53 @@ class DeckBrowserBridge:
                             pass
                         bridge.events.put_nowait((observed_at, url))
                     self._reply(204)
-                except (ValueError, TypeError, json.JSONDecodeError):
+                except (ValueError, TypeError, json.JSONDecodeError, queue.Full):
                     self._reply(400)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, name="DeckBrowserBridge", daemon=True)
         self.thread.start()
+
+    def request_tab(self, url: str, match: str = "origin_path") -> str:
+        return self._queue_tab_command("activate_tab", url, match)
+
+    def request_navigation(self, url: str, match: str = "domain") -> str:
+        """Navigate an existing site tab without creating another tab."""
+        return self._queue_tab_command("navigate_tab", url, match)
+
+    def request_element_command(self, kind: str, browser: str, *, selector: str = "",
+                                page_url: str = "", action: str = "", value: str = "",
+                                test_mode: bool = False) -> str:
+        if kind not in {"pick_element", "probe_element", "test_element_action", "run_element_action"}:
+            raise ValueError("지원하지 않는 브라우저 요소 명령입니다.")
+        if browser not in {"whale", "chrome", "edge"}:
+            raise ValueError("브라우저를 선택해 주세요.")
+        if kind in {"probe_element", "test_element_action", "run_element_action"} and not str(selector).strip():
+            raise ValueError("검사할 CSS 선택자가 비어 있습니다.")
+        if len(selector) > 2048 or len(page_url) > 2048 or len(value) > 4096:
+            raise ValueError("선택자 또는 페이지 주소가 너무 깁니다.")
+        if kind in {"test_element_action", "run_element_action"} and action not in {"click", "double_click", "type_text", "extract_text", "hover"}:
+            raise ValueError("지원하지 않는 브라우저 요소 동작입니다.")
+        command_id = secrets.token_urlsafe(12)
+        self.commands.put_nowait({"id": command_id, "kind": kind, "browser": browser,
+                                  "selector": selector, "page_url": page_url,
+                                  "action": action, "value": value, "test_mode": test_mode})
+        return command_id
+
+    def _queue_tab_command(self, kind: str, url: str, match: str) -> str:
+        parsed = urlsplit(str(url or ""))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or len(url) > 2048:
+            raise ValueError("브라우저 주소는 http 또는 https URL이어야 합니다.")
+        if match not in {"domain", "origin_path"}:
+            raise ValueError("지원하지 않는 탭 일치 방식입니다.")
+        command_id = secrets.token_urlsafe(12)
+        self.commands.put_nowait({"id": command_id, "kind": kind, "url": url, "match": match})
+        return command_id
+
+    def cancel_command(self, command_id: str) -> None:
+        self.cancelled_commands.add(str(command_id))
+        self.command_dispatched_at.pop(str(command_id), None)
 
     def close(self) -> None:
         self.server.shutdown()

@@ -16,7 +16,7 @@ from .repository import macro_entry_points
 ACTION_LIBRARY: Dict[str, list[tuple[str, str, str]]] = {
     "시스템": [
         ("open_target", "실행", "프로그램·파일·폴더·웹사이트 실행"),
-        ("activate_browser_tab", "웨일 사이트 탭", "실행 중인 탭 우선 선택·프리셋 전환"),
+        ("activate_browser_tab", "브라우저 사이트 탭", "선택한 브라우저의 탭 선택·프리셋 전환"),
         ("terminate_program", "프로그램 종료", "지정 프로세스 종료"),
         ("hotkey", "단축키", "키 조합 보내기"),
         ("text", "텍스트 입력", "클립보드 기반 텍스트 입력"),
@@ -43,13 +43,38 @@ ACTION_TITLES = {
     for entries in ACTION_LIBRARY.values()
     for kind, title, _description in entries
 }
+ACTION_TITLES["navigate_browser_tab"] = "브라우저 홈 탭"
 
 ACTION_ICONS = {
-    "open_target": "↗", "activate_browser_tab": "◉", "terminate_program": "■", "hotkey": "⌨", "text": "T", "mouse_click": "🖱",
+    "open_target": "↗", "activate_browser_tab": "◉", "navigate_browser_tab": "⌂", "terminate_program": "■", "hotkey": "⌨", "text": "T", "mouse_click": "🖱",
     "wait": "◷", "studio": "M", "stop_all": "⬛", "run_macro": "▶",
     "multi_macros": "≡", "switch_preset": "★", "page_prev": "◀",
     "page_next": "▶", "page_goto": "▦", "page_first": "Ⅰ",
 }
+
+BROWSER_EXECUTABLES = (
+    ("네이버 웨일", "whale.exe"),
+    ("Microsoft Edge", "msedge.exe"),
+    ("Google Chrome", "chrome.exe"),
+)
+
+
+def browser_choice_button(on_selected, parent: Optional[QtWidgets.QWidget] = None) -> QtWidgets.QPushButton:
+    button = QtWidgets.QPushButton("브라우저 선택 ▾", parent)
+    menu = QtWidgets.QMenu(button)
+    for title, executable in BROWSER_EXECUTABLES:
+        item = menu.addAction(title)
+        item.triggered.connect(lambda _checked=False, name=executable: on_selected(name))
+    button.setMenu(menu)
+    return button
+
+
+def browse_executable_name(parent: QtWidgets.QWidget) -> str:
+    path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        parent, "실행 파일 찾기", "", "실행 파일 (*.exe);;모든 파일 (*)"
+    )
+    # Window matching compares the process name, not its installation path.
+    return Path(path).name if path else ""
 
 
 def action_title(action: Dict[str, Any]) -> str:
@@ -137,6 +162,9 @@ class DeckSlotButton(QtWidgets.QFrame):
     clear_requested = QtCore.Signal(int)
     duplicate_requested = QtCore.Signal(int)
     selection_requested = QtCore.Signal(int)
+    selection_drag_started = QtCore.Signal(QtCore.QPoint, QtCore.QPoint, bool)
+    selection_drag_moved = QtCore.Signal(QtCore.QPoint)
+    selection_drag_released = QtCore.Signal(QtCore.QPoint)
     pin_requested = QtCore.Signal(int)
     unpin_requested = QtCore.Signal(int)
 
@@ -148,6 +176,9 @@ class DeckSlotButton(QtWidgets.QFrame):
         self.selected = selected
         self.pinned = pinned
         self._press_pos: Optional[QtCore.QPoint] = None
+        self._press_global: Optional[QtCore.QPoint] = None
+        self._selection_dragging = False
+        self._selection_additive = False
         self.setAcceptDrops(True)
         self.setMinimumSize(92, 82)
         self.setCursor(QtCore.Qt.PointingHandCursor)
@@ -195,10 +226,20 @@ class DeckSlotButton(QtWidgets.QFrame):
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
             self._press_pos = event.pos()
+            self._press_global = event.globalPosition().toPoint()
+            self._selection_dragging = False
+            self._selection_additive = bool(event.modifiers() & QtCore.Qt.ControlModifier)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         if self.selection_mode:
+            if self._press_global is not None and event.buttons() & QtCore.Qt.LeftButton:
+                current = event.globalPosition().toPoint()
+                if not self._selection_dragging and (current - self._press_global).manhattanLength() >= QtWidgets.QApplication.startDragDistance():
+                    self._selection_dragging = True
+                    self.selection_drag_started.emit(self._press_global, current, self._selection_additive)
+                elif self._selection_dragging:
+                    self.selection_drag_moved.emit(current)
             return
         if self._press_pos is not None and event.buttons() & QtCore.Qt.LeftButton:
             if (event.pos() - self._press_pos).manhattanLength() >= QtWidgets.QApplication.startDragDistance():
@@ -214,10 +255,15 @@ class DeckSlotButton(QtWidgets.QFrame):
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton and self._press_pos is not None:
             if self.selection_mode:
-                self.selection_requested.emit(self.slot_index)
+                if self._selection_dragging:
+                    self.selection_drag_released.emit(event.globalPosition().toPoint())
+                else:
+                    self.selection_requested.emit(self.slot_index)
             else:
                 self.edit_requested.emit(self.slot_index)
         self._press_pos = None
+        self._press_global = None
+        self._selection_dragging = False
         super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
@@ -270,6 +316,52 @@ class DeckSlotButton(QtWidgets.QFrame):
             (self.unpin_requested if self.pinned else self.pin_requested).emit(self.slot_index)
         elif selected is clear:
             self.clear_requested.emit(self.slot_index)
+
+
+class DeckSelectionGrid(QtWidgets.QWidget):
+    """Allow a marquee to start in the space between slot cards."""
+
+    selection_drag_started = QtCore.Signal(QtCore.QPoint, QtCore.QPoint, bool)
+    selection_drag_moved = QtCore.Signal(QtCore.QPoint)
+    selection_drag_released = QtCore.Signal(QtCore.QPoint)
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.selection_mode = False
+        self._press_global: Optional[QtCore.QPoint] = None
+        self._dragging = False
+        self._additive = False
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self.selection_mode and event.button() == QtCore.Qt.LeftButton:
+            self._press_global = event.globalPosition().toPoint()
+            self._dragging = False
+            self._additive = bool(event.modifiers() & QtCore.Qt.ControlModifier)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._press_global is not None and event.buttons() & QtCore.Qt.LeftButton:
+            current = event.globalPosition().toPoint()
+            if not self._dragging and (current - self._press_global).manhattanLength() >= QtWidgets.QApplication.startDragDistance():
+                self._dragging = True
+                self.selection_drag_started.emit(self._press_global, current, self._additive)
+            elif self._dragging:
+                self.selection_drag_moved.emit(current)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._press_global is not None and event.button() == QtCore.Qt.LeftButton:
+            if self._dragging:
+                self.selection_drag_released.emit(event.globalPosition().toPoint())
+            self._press_global = None
+            self._dragging = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class DeckActionConfigDialog(QtWidgets.QDialog):
@@ -342,7 +434,11 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
             edit.editingFinished.connect(lambda: self._set_icon_from_program(edit.text()))
             row = QtWidgets.QHBoxLayout(); row.addWidget(edit, 1); row.addWidget(browse)
             self.widgets["target"] = edit; form.addRow("대상", row)
-        elif kind == "activate_browser_tab":
+        elif kind in {"activate_browser_tab", "navigate_browser_tab"}:
+            browser = QtWidgets.QComboBox()
+            for title, name in (("네이버 웨일", "whale"), ("Microsoft Edge", "edge"), ("Google Chrome", "chrome")):
+                browser.addItem(title, name)
+            browser.setCurrentIndex(max(0, browser.findData(str(self.action.get("browser") or "whale"))))
             url = QtWidgets.QLineEdit(str(self.action.get("url") or ""))
             url.setPlaceholderText("https://www.example.com/")
             match = QtWidgets.QComboBox()
@@ -353,7 +449,8 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
             for preset_id, entry in self.main_window.config.get("slot_presets", {}).items():
                 preset.addItem(str(entry.get("name") or preset_id), preset_id)
             preset.setCurrentIndex(max(0, preset.findData(str(self.action.get("preset_id") or ""))))
-            self.widgets.update(url=url, match=match, preset_id=preset)
+            self.widgets.update(browser=browser, url=url, match=match, preset_id=preset)
+            form.addRow("브라우저", browser)
             form.addRow("사이트 주소", url)
             form.addRow("열린 탭 찾기", match)
             form.addRow("전환할 프리셋", preset)
@@ -455,12 +552,26 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         target = QtWidgets.QLineEdit(str(self.action.get("target_title") or self.action.get("target_window") or ""))
         target.setPlaceholderText("오른쪽 버튼으로 화면에서 프로그램을 선택하세요")
         target_window = QtWidgets.QLineEdit(str(self.action.get("target_window") or "")); target_window.setVisible(False)
-        target_exe = QtWidgets.QLineEdit(str(self.action.get("target_exe") or "")); target_exe.setReadOnly(True)
+        target_exe = QtWidgets.QLineEdit(str(self.action.get("target_exe") or ""))
+        target_exe.setPlaceholderText("예: msedge.exe")
+        target_exe.textEdited.connect(lambda _text: (target.clear(), target_window.clear()))
+        def set_executable(name: str) -> None:
+            if name:
+                target_exe.setText(name)
+                target.clear()
+                target_window.clear()
+        browser_button = browser_choice_button(set_executable, self)
+        find_button = QtWidgets.QPushButton("찾기…")
+        find_button.clicked.connect(lambda: set_executable(browse_executable_name(self)))
+        exe_row = QtWidgets.QHBoxLayout()
+        exe_row.addWidget(target_exe, 1)
+        exe_row.addWidget(browser_button)
+        exe_row.addWidget(find_button)
         pick = QtWidgets.QPushButton("⌖ 화면에서 선택")
         pick.clicked.connect(lambda: self._pick_target(include_point))
         row = QtWidgets.QHBoxLayout(); row.addWidget(target, 1); row.addWidget(pick)
         self.widgets.update(input_mode=mode, target_title=target, target_window=target_window, target_exe=target_exe)
-        form.addRow("실행 방식", mode); form.addRow("대상 창", row); form.addRow("대상 프로그램", target_exe)
+        form.addRow("실행 방식", mode); form.addRow("대상 창", row); form.addRow("대상 프로그램", exe_row)
         if include_point:
             x = QtWidgets.QSpinBox(); x.setRange(-100000, 100000); x.setValue(int(self.action.get("x") or 0))
             y = QtWidgets.QSpinBox(); y.setRange(-100000, 100000); y.setValue(int(self.action.get("y") or 0))
@@ -579,11 +690,13 @@ class DeckBulkEditDialog(QtWidgets.QDialog):
     """Edits only explicitly enabled fields across actions of one kind."""
 
     FIELD_SPECS = {
-        "text": [("text", "입력할 텍스트", "text"), ("text_method", "입력 엔진", "text_method"), ("key_interval_ms", "글자 입력 간격", "ms"), ("press_enter", "입력 후 Enter", "bool"), ("input_mode", "실행 방식", "input_mode")],
+        "text": [("text", "입력할 텍스트", "text"), ("text_method", "입력 엔진", "text_method"), ("key_interval_ms", "글자 입력 간격", "ms"), ("press_enter", "입력 후 Enter", "bool"), ("input_mode", "실행 방식", "input_mode"), ("target_exe", "대상 프로그램 / 브라우저", "target_exe")],
         "wait": [("ms", "대기 시간", "ms")],
         "multi_macros": [("delay_ms", "작업 간격", "ms"), ("continue_on_error", "실패해도 계속", "bool")],
-        "mouse_click": [("button", "마우스 버튼", "button"), ("clicks", "클릭 횟수", "clicks"), ("input_mode", "실행 방식", "input_mode")],
-        "hotkey": [("keys", "키 조합", "line"), ("input_mode", "실행 방식", "input_mode")],
+        "mouse_click": [("button", "마우스 버튼", "button"), ("clicks", "클릭 횟수", "clicks"), ("input_mode", "실행 방식", "input_mode"), ("target_exe", "대상 프로그램 / 브라우저", "target_exe")],
+        "hotkey": [("keys", "키 조합", "line"), ("input_mode", "실행 방식", "input_mode"), ("target_exe", "대상 프로그램 / 브라우저", "target_exe")],
+        "activate_browser_tab": [("browser", "브라우저", "browser")],
+        "navigate_browser_tab": [("browser", "브라우저", "browser")],
         "open_target": [("target", "실행 대상", "line")],
         "terminate_program": [("process", "프로세스 이름", "line")],
         "page_goto": [("page", "이동할 페이지", "page")],
@@ -605,9 +718,31 @@ class DeckBulkEditDialog(QtWidgets.QDialog):
             enabled = QtWidgets.QCheckBox(title)
             widget = self._make_widget(widget_kind, sample.get(key))
             widget.setEnabled(False); enabled.toggled.connect(widget.setEnabled)
-            form.addRow(enabled, widget); self.controls[key] = (enabled, widget)
+            if key == "target_exe":
+                def set_executable(name: str, *, combo=widget, check=enabled) -> None:
+                    if not name:
+                        return
+                    index = combo.findData(name)
+                    if index >= 0:
+                        combo.setCurrentIndex(index)
+                    else:
+                        combo.setEditText(name)
+                    check.setChecked(True)
+                browser_button = browser_choice_button(set_executable, self)
+                find_button = QtWidgets.QPushButton("찾기…")
+                find_button.clicked.connect(lambda _checked=False, setter=set_executable: setter(browse_executable_name(self)))
+                row = QtWidgets.QHBoxLayout()
+                row.addWidget(widget, 1)
+                row.addWidget(browser_button)
+                row.addWidget(find_button)
+                form.addRow(enabled, row)
+            else:
+                form.addRow(enabled, widget)
+            self.controls[key] = (enabled, widget)
         root.addLayout(form)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Apply | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Save).setText("저장")
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("취소")
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); root.addWidget(buttons)
 
     def _make_widget(self, kind: str, value: Any) -> QtWidgets.QWidget:
@@ -617,12 +752,24 @@ class DeckBulkEditDialog(QtWidgets.QDialog):
             widget = QtWidgets.QSpinBox(); widget.setRange(0 if kind == "ms" else 1, 600000 if kind == "ms" else 99); widget.setValue(int(value or (1 if kind != "ms" else 0))); return widget
         if kind == "bool":
             widget = QtWidgets.QCheckBox("사용"); widget.setChecked(bool(value)); return widget
-        if kind in {"text_method", "input_mode", "button"}:
+        if kind == "target_exe":
+            widget = QtWidgets.QComboBox()
+            widget.setEditable(True)
+            for title, executable in BROWSER_EXECUTABLES:
+                widget.addItem(f"{title} · {executable}", executable)
+            current = str(value or "").strip()
+            index = widget.findData(current)
+            widget.setCurrentIndex(index if index >= 0 else -1)
+            if index < 0:
+                widget.setEditText(current)
+            return widget
+        if kind in {"text_method", "input_mode", "button", "browser"}:
             widget = QtWidgets.QComboBox()
             choices = {
                 "text_method": [("자동", "auto"), ("클립보드", "clipboard"), ("글자별 입력", "type"), ("WM_CHAR", "wm_char"), ("WM_SETTEXT", "set_text")],
                 "input_mode": [("비활성", "inactive"), ("활성", "active")],
                 "button": [("좌클릭", "left"), ("우클릭", "right"), ("가운데 클릭", "middle")],
+                "browser": [("네이버 웨일", "whale"), ("Microsoft Edge", "edge"), ("Google Chrome", "chrome")],
             }[kind]
             for label, data in choices: widget.addItem(label, data)
             widget.setCurrentIndex(max(0, widget.findData(str(value or choices[0][1])))); return widget
@@ -636,7 +783,13 @@ class DeckBulkEditDialog(QtWidgets.QDialog):
             elif isinstance(widget, QtWidgets.QLineEdit): result[key] = widget.text()
             elif isinstance(widget, QtWidgets.QSpinBox): result[key] = widget.value()
             elif isinstance(widget, QtWidgets.QCheckBox): result[key] = widget.isChecked()
-            elif isinstance(widget, QtWidgets.QComboBox): result[key] = widget.currentData()
+            elif isinstance(widget, QtWidgets.QComboBox):
+                if key == "target_exe":
+                    index = widget.currentIndex()
+                    result[key] = (widget.itemData(index) if index >= 0 and widget.currentText() == widget.itemText(index)
+                                   else widget.currentText().strip())
+                else:
+                    result[key] = widget.currentData()
         return result
 
 
@@ -650,6 +803,8 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self.current_page = int(main_window.current_page)
         self._saving = False
         self.selected_slots: set[int] = set()
+        self._selection_drag_origin: Optional[QtCore.QPoint] = None
+        self._selection_drag_base: set[int] = set()
         self._undo_stack: list[Dict[str, Any]] = []
         self._redo_stack: list[Dict[str, Any]] = []
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
@@ -695,6 +850,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         selection_bar = QtWidgets.QHBoxLayout()
         self.selection_toggle = QtWidgets.QPushButton("다중 선택")
         self.selection_toggle.setCheckable(True); self.selection_toggle.toggled.connect(self._selection_mode_changed)
+        self.selection_toggle.setToolTip("켜면 슬롯이나 빈 바닥에서 드래그해 여러 슬롯을 선택할 수 있습니다. Ctrl+드래그는 기존 선택에 추가합니다.")
         self.selection_label = QtWidgets.QLabel("선택 0개")
         self.select_page_btn = QtWidgets.QPushButton("현재 페이지 전체 선택"); self.select_page_btn.clicked.connect(self._select_current_page)
         self.target_page_combo = QtWidgets.QComboBox(); self.target_page_combo.setMinimumWidth(120)
@@ -705,7 +861,11 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         selection_bar.addStretch(1); selection_bar.addWidget(QtWidgets.QLabel("이동할 페이지")); selection_bar.addWidget(self.target_page_combo)
         selection_bar.addWidget(self.move_selected_btn); selection_bar.addWidget(self.bulk_edit_btn); selection_bar.addWidget(self.clear_selection_btn)
         center_layout.addLayout(selection_bar)
-        self.grid_host = QtWidgets.QWidget(); self.grid = QtWidgets.QGridLayout(self.grid_host); self.grid.setSpacing(9)
+        self.grid_host = DeckSelectionGrid(); self.grid = QtWidgets.QGridLayout(self.grid_host); self.grid.setSpacing(9)
+        self.grid_host.selection_drag_started.connect(self._start_selection_drag)
+        self.grid_host.selection_drag_moved.connect(self._move_selection_drag)
+        self.grid_host.selection_drag_released.connect(self._finish_selection_drag)
+        self.selection_band = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self.grid_host)
         center_layout.addWidget(self.grid_host, 1)
         pager = QtWidgets.QGridLayout(); self.prev_btn = QtWidgets.QPushButton("◀"); self.next_btn = QtWidgets.QPushButton("▶"); self.add_page_btn = QtWidgets.QPushButton("＋ 페이지"); self.delete_page_btn = QtWidgets.QPushButton("－ 페이지")
         self.page_label = QtWidgets.QLabel(); self.page_label.setAlignment(QtCore.Qt.AlignCenter); self.page_label.setMinimumWidth(120)
@@ -864,6 +1024,7 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self._update_history_buttons()
 
     def _render_page(self) -> None:
+        self.grid_host.selection_mode = self.selection_toggle.isChecked()
         while self.grid.count():
             item = self.grid.takeAt(0)
             if item.widget(): item.widget().deleteLater()
@@ -879,6 +1040,9 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             button = DeckSlotButton(index, slot, icon, self.grid_host, selection_mode=self.selection_toggle.isChecked(), selected=index in self.selected_slots, pinned=pinned)
             button.setMinimumSize(max(48, min(92, 760 // max(1, cols))), max(44, min(82, 500 // max(1, rows))))
             button.action_dropped.connect(self._configure_new_action); button.slot_dropped.connect(self._move_slot); button.image_dropped.connect(self._apply_dropped_icon); button.edit_requested.connect(self._edit_slot); button.clear_requested.connect(self._clear_slot); button.duplicate_requested.connect(self._duplicate_slot); button.selection_requested.connect(self._toggle_slot_selection); button.pin_requested.connect(self._pin_slot); button.unpin_requested.connect(self._unpin_slot)
+            button.selection_drag_started.connect(self._start_selection_drag)
+            button.selection_drag_moved.connect(self._move_selection_drag)
+            button.selection_drag_released.connect(self._finish_selection_drag)
             self.grid.addWidget(button, local // cols, local % cols)
         page_name = self.payload["deck_page_names"][self.current_page]
         self.deck_title.setText(page_name)
@@ -893,7 +1057,40 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         self._update_selection_controls()
 
     def _selection_mode_changed(self, enabled: bool) -> None:
+        self._selection_drag_origin = None
+        self.selection_band.hide()
         if not enabled: self.selected_slots.clear()
+        self._render_page()
+
+    def _start_selection_drag(self, origin: QtCore.QPoint, current: QtCore.QPoint, additive: bool) -> None:
+        if not self.selection_toggle.isChecked():
+            return
+        self._selection_drag_origin = self.grid_host.mapFromGlobal(origin)
+        self._selection_drag_base = set(self.selected_slots) if additive else set()
+        self._move_selection_drag(current)
+        self.selection_band.show()
+
+    def _move_selection_drag(self, current: QtCore.QPoint) -> None:
+        if self._selection_drag_origin is None:
+            return
+        end = self.grid_host.mapFromGlobal(current)
+        self.selection_band.setGeometry(QtCore.QRect(self._selection_drag_origin, end).normalized())
+        self.selection_band.raise_()
+
+    def _finish_selection_drag(self, current: QtCore.QPoint) -> None:
+        if self._selection_drag_origin is None:
+            return
+        self._move_selection_drag(current)
+        rect = self.selection_band.geometry()
+        self.selection_band.hide()
+        self._selection_drag_origin = None
+        selected = set(self._selection_drag_base)
+        for local in range(self._page_size()):
+            item = self.grid.itemAt(local)
+            button = item.widget() if item is not None else None
+            if button is not None and rect.intersects(button.geometry()):
+                selected.add(button.slot_index)
+        self.selected_slots = selected
         self._render_page()
 
     def _toggle_slot_selection(self, index: int) -> None:
@@ -998,6 +1195,9 @@ class DeckDockWindow(QtWidgets.QMainWindow):
         for index in indexes:
             slot = self.payload["slots"][index]; action = copy.deepcopy(slot.get("action") or {})
             if not action: continue
+            if "target_exe" in patch and str(action.get("target_exe") or "").casefold() != str(patch["target_exe"] or "").casefold():
+                action.pop("target_window", None)
+                action.pop("target_title", None)
             action.update(copy.deepcopy(patch)); self.payload["slots"][index] = self._slot_from_action(action); changed += 1
         return changed
 

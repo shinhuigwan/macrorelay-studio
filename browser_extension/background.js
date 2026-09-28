@@ -149,9 +149,9 @@ async function activateRequestedTab(command) {
         current.pathname.replace(/\/$/, "") === target.pathname.replace(/\/$/, "");
     } catch (_error) { return false; }
   });
-  const whaleWindow = await chrome.windows.getLastFocused();
-  const existing = matches.find((tab) => tab.windowId === whaleWindow?.id && tab.active) ||
-    matches.find((tab) => tab.windowId === whaleWindow?.id) || matches[0];
+  const browserWindow = await chrome.windows.getLastFocused();
+  const existing = matches.find((tab) => tab.windowId === browserWindow?.id && tab.active) ||
+    matches.find((tab) => tab.windowId === browserWindow?.id) || matches[0];
   let tab;
   if (existing) {
     tab = await chrome.tabs.update(existing.id, command.kind === "navigate_tab"
@@ -162,7 +162,7 @@ async function activateRequestedTab(command) {
       throw new Error("이 사이트의 열린 탭을 찾지 못했습니다. 새 탭은 열지 않았습니다.");
     }
     tab = await chrome.tabs.create({url: command.url, active: true,
-      ...(whaleWindow?.id >= 0 ? {windowId: whaleWindow.id} : {})});
+      ...(browserWindow?.id >= 0 ? {windowId: browserWindow.id} : {})});
     await chrome.windows.update(tab.windowId, {focused: true});
   }
   await reportFocusedTab(true);
@@ -176,13 +176,16 @@ async function checkDeckCommands() {
     const {token = ""} = await chrome.storage.local.get("token");
     if (!token) return;
     const headers = {"X-MacroRelay-Token": token};
-    const response = await fetch("http://127.0.0.1:18773/next-command", {headers});
+    const response = await fetch(`http://127.0.0.1:18773/next-command?browser=${encodeURIComponent(browserKind())}`, {headers});
     if (response.status !== 200) return;
     const command = await response.json();
     let result = {id: command.id, status: "ok", url: ""};
     try {
       if (command.kind !== "activate_tab" && command.kind !== "navigate_tab") {
         throw new Error("Unsupported Deck command");
+      }
+      if (command.browser && command.browser !== browserKind()) {
+        throw new Error("선택한 브라우저의 확장앱이 아닙니다.");
       }
       result.url = await activateRequestedTab(command);
     } catch (error) {

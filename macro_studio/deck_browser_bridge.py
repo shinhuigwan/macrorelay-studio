@@ -138,6 +138,7 @@ class DeckBrowserBridge:
         self.cancelled_commands: set[str] = set()
         self.command_dispatched_at: dict[str, float] = {}
         self.last_command_poll_at = 0.0
+        self.last_command_poll_by_browser: dict[str, float] = {}
         self.last_active_tab_at = 0.0
         bridge = self
 
@@ -173,6 +174,7 @@ class DeckBrowserBridge:
                     return
                 bridge.last_command_poll_at = time.monotonic()
                 requester = parse_qs(parsed_path.query).get("browser", [""])[0]
+                bridge.last_command_poll_by_browser[requester or "whale"] = bridge.last_command_poll_at
                 while True:
                     try:
                         command = bridge.commands.get_nowait()
@@ -182,7 +184,9 @@ class DeckBrowserBridge:
                     if command["id"] not in bridge.cancelled_commands:
                         break
                     bridge.cancelled_commands.discard(command["id"])
-                if command.get("browser") and command["browser"] != requester:
+                if command.get("browser") and command["browser"] != requester and not (
+                    command["browser"] == "whale" and not requester
+                ):
                     bridge.commands.put_nowait(command)
                     self._reply(204)
                     return
@@ -232,12 +236,12 @@ class DeckBrowserBridge:
         self.thread = threading.Thread(target=self.server.serve_forever, name="DeckBrowserBridge", daemon=True)
         self.thread.start()
 
-    def request_tab(self, url: str, match: str = "origin_path") -> str:
-        return self._queue_tab_command("activate_tab", url, match)
+    def request_tab(self, url: str, match: str = "origin_path", *, browser: str = "") -> str:
+        return self._queue_tab_command("activate_tab", url, match, browser)
 
-    def request_navigation(self, url: str, match: str = "domain") -> str:
+    def request_navigation(self, url: str, match: str = "domain", *, browser: str = "") -> str:
         """Navigate an existing site tab without creating another tab."""
-        return self._queue_tab_command("navigate_tab", url, match)
+        return self._queue_tab_command("navigate_tab", url, match, browser)
 
     def request_element_command(self, kind: str, browser: str, *, selector: str = "",
                                 page_url: str = "", action: str = "", value: str = "",
@@ -258,14 +262,17 @@ class DeckBrowserBridge:
                                   "action": action, "value": value, "test_mode": test_mode})
         return command_id
 
-    def _queue_tab_command(self, kind: str, url: str, match: str) -> str:
+    def _queue_tab_command(self, kind: str, url: str, match: str, browser: str = "") -> str:
         parsed = urlsplit(str(url or ""))
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or len(url) > 2048:
             raise ValueError("브라우저 주소는 http 또는 https URL이어야 합니다.")
         if match not in {"domain", "origin_path"}:
             raise ValueError("지원하지 않는 탭 일치 방식입니다.")
+        if browser not in {"", "whale", "chrome", "edge"}:
+            raise ValueError("지원하지 않는 브라우저입니다.")
         command_id = secrets.token_urlsafe(12)
-        self.commands.put_nowait({"id": command_id, "kind": kind, "url": url, "match": match})
+        self.commands.put_nowait({"id": command_id, "kind": kind, "url": url, "match": match,
+                                  "browser": browser})
         return command_id
 
     def cancel_command(self, command_id: str) -> None:

@@ -3298,7 +3298,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
     def _init_browser_tab(self) -> None:
         layout = QtWidgets.QVBoxLayout(self.tab_browser)
         layout.setSpacing(12)
-        self.browser_auto_check = QtWidgets.QCheckBox("활성 프로그램·Whale 탭 주소에 따라 프리셋 자동 전환")
+        self.browser_auto_check = QtWidgets.QCheckBox("활성 프로그램·브라우저 탭 주소에 따라 프리셋 자동 전환")
         layout.addWidget(self.browser_auto_check)
         hint = QtWidgets.QLabel("확실히 일치하는 주소만 전환합니다. 일치하지 않거나 연결이 끊기면 현재 프리셋을 유지합니다. 실행 중 매크로는 중지하지 않습니다.")
         hint.setWordWrap(True)
@@ -3335,14 +3335,14 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         self.browser_token_edit.setReadOnly(True)
         copy_button = QtWidgets.QPushButton("연결 코드 복사")
         copy_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.browser_token_edit.text()))
-        token_row.addWidget(QtWidgets.QLabel("Whale 확장앱 연결 코드"))
+        token_row.addWidget(QtWidgets.QLabel("브라우저 확장앱 연결 코드"))
         token_row.addWidget(self.browser_token_edit, 1)
         token_row.addWidget(copy_button)
         layout.addLayout(token_row)
         self.browser_bridge_label = QtWidgets.QLabel()
         layout.addWidget(self.browser_bridge_label)
         extension_path = Path(__file__).resolve().parent.parent / "browser_extension"
-        help_label = QtWidgets.QLabel(f"Whale 확장앱 관리 → 개발자 모드 → 압축해제된 확장앱 로드: {extension_path}\n확장앱 옵션에서 연결 코드를 붙여넣은 뒤 이 설정을 저장하세요.")
+        help_label = QtWidgets.QLabel(f"웨일·엣지·크롬에서 사용할 브라우저마다 확장앱 관리 → 개발자 모드 → 압축해제된 확장앱 로드: {extension_path}\n각 브라우저의 확장앱 옵션에 같은 연결 코드를 붙여넣은 뒤 이 설정을 저장하세요.")
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
         open_extension = QtWidgets.QPushButton("확장앱 폴더 열기")
@@ -3496,7 +3496,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             )
             self.browser_bridge_label.setText(
                 f"로컬 연결 실패: {self.main_window._browser_bridge_error}" if self.main_window._browser_bridge_error
-                else ("Whale 확장앱 연결 대기 중 (127.0.0.1:18773)" if self.main_window._browser_bridge
+                else ("브라우저 확장앱 연결 대기 중 (127.0.0.1:18773)" if self.main_window._browser_bridge
                       else ("프로그램 규칙만 사용 중" if self.main_window.config.get("auto_preset_enabled") else "자동 전환 꺼짐"))
             )
             self.browser_rules_table.setRowCount(0)
@@ -3921,6 +3921,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._pending_browser_actions: Dict[str, tuple[str, int, str, float]] = {}
         self._browser_action_requested_at: Dict[str, float] = {}
         self._browser_action_hwnds: Dict[str, int] = {}
+        self._browser_action_names: Dict[str, str] = {}
         self._browser_action_notice = ""
         self._browser_notice_sequence = 0
         self._browser_yielded_topmost = False
@@ -4256,6 +4257,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 continue
             self._browser_action_requested_at.pop(str(result.get("id") or ""), None)
             hwnd = self._browser_action_hwnds.pop(str(result.get("id") or ""), 0)
+            browser_name = self._browser_action_names.pop(str(result.get("id") or ""), "웨일")
             preset_id, slot_index, label, _deadline = pending
             source_preset = str(self.config.get("active_slot_preset") or "default")
             if result.get("status") == "ok":
@@ -4268,29 +4270,34 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 message = str(result.get("error") or "탭 활성화 실패")
                 self._set_deck_status("브라우저 전환 실패", message, error=True)
                 self._mark_slot_status(slot_index, "failed", message, preset_id=source_preset)
-                self._show_browser_action_notice("웨일 탭 선택 실패")
+                self._show_browser_action_notice(f"{browser_name} 탭 선택 실패")
         for command_id, (preset_id, slot_index, label, deadline) in list(self._pending_browser_actions.items()):
             requested_at = self._browser_action_requested_at.get(command_id, deadline - 10.0)
-            if time.monotonic() >= requested_at + 2.5 and bridge.last_command_poll_at < requested_at:
+            browser_name = self._browser_action_names.get(command_id, "웨일")
+            browser_kind = {"웨일": "whale", "엣지": "edge", "크롬": "chrome"}[browser_name]
+            last_poll = bridge.last_command_poll_by_browser.get(browser_kind, bridge.last_command_poll_at if browser_kind == "whale" else 0.0)
+            if time.monotonic() >= requested_at + 2.5 and last_poll < requested_at:
                 self._pending_browser_actions.pop(command_id, None)
                 bridge.cancel_command(command_id)
                 self._browser_action_requested_at.pop(command_id, None)
                 self._browser_action_hwnds.pop(command_id, None)
+                self._browser_action_names.pop(command_id, None)
                 stale_extension = bridge.last_active_tab_at >= requested_at
-                message = ("웨일 확장앱을 다시 로드해 주세요." if stale_extension else
-                           "웨일 확장앱 연결 코드와 실행 상태를 확인해 주세요.")
+                message = (f"{browser_name} 확장앱을 다시 로드해 주세요." if stale_extension else
+                           f"{browser_name} 확장앱 연결 코드와 실행 상태를 확인해 주세요.")
                 self._set_deck_status("브라우저 연결 실패", message, error=True)
                 self._mark_slot_status(slot_index, "failed", message, preset_id="default")
-                self._show_browser_action_notice("확장앱 다시 로드 필요" if stale_extension else "웨일 연결 확인 필요")
+                self._show_browser_action_notice("확장앱 다시 로드 필요" if stale_extension else f"{browser_name} 연결 확인 필요")
                 continue
             if time.monotonic() >= deadline:
                 self._pending_browser_actions.pop(command_id, None)
                 bridge.cancel_command(command_id)
                 self._browser_action_requested_at.pop(command_id, None)
                 self._browser_action_hwnds.pop(command_id, None)
-                self._set_deck_status("브라우저 연결 대기 초과", "웨일 확장앱 연결을 확인해 주세요.", error=True)
-                self._mark_slot_status(slot_index, "failed", "웨일 확장앱 응답 없음", preset_id="default")
-                self._show_browser_action_notice("웨일 탭 응답 없음")
+                self._browser_action_names.pop(command_id, None)
+                self._set_deck_status("브라우저 연결 대기 초과", f"{browser_name} 확장앱 연결을 확인해 주세요.", error=True)
+                self._mark_slot_status(slot_index, "failed", f"{browser_name} 확장앱 응답 없음", preset_id="default")
+                self._show_browser_action_notice(f"{browser_name} 탭 응답 없음")
         if suppress_auto_switch:
             while not bridge.events.empty():
                 try:
@@ -4338,8 +4345,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self._update_preset_badge()
         if not self.config.get("auto_program_rules"):
             return
-        # The focused Whale tab's site rule wins over a generic whale.exe rule.
-        if executable == "whale.exe" and self.config.get("auto_preset_rules"):
+        # A focused browser tab's site rule wins over a generic program rule.
+        if executable in {"whale.exe", "msedge.exe", "chrome.exe"} and self.config.get("auto_preset_rules"):
             return
         target = preset_for_program(executable, list(self.config.get("auto_program_rules") or []))
         if target in self.config.get("slot_presets", {}):
@@ -5759,7 +5766,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         user32.EnumWindows(callback_type(enum_callback), 0)
         if not matches:
             raise ValueError(f"대상 창을 찾지 못했습니다: {title_fragment}")
-        user32.ShowWindow(matches[0], 9)
+        if user32.IsIconic(matches[0]):
+            user32.ShowWindow(matches[0], 9)
         user32.SetForegroundWindow(matches[0])
         QtCore.QThread.msleep(80)
 
@@ -5895,7 +5903,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         hwnd = self._resolve_action_window(action)
         if hwnd:
             user32 = ctypes.windll.user32
-            user32.ShowWindow(hwnd, 9)
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)
             user32.SetForegroundWindow(hwnd)
             QtCore.QThread.msleep(80)
         return hwnd
@@ -5920,14 +5929,23 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def _find_whale_window(self) -> int:
         """Find a running Whale window even when process-image lookup is denied."""
+        return self._find_browser_window("whale")
+
+    def _find_browser_window(self, browser: str) -> int:
+        targets = {"whale": ("whale.exe", "- Whale"),
+                   "edge": ("msedge.exe", "- Microsoft Edge"),
+                   "chrome": ("chrome.exe", "- Google Chrome")}
+        if browser not in targets:
+            raise ValueError("지원하지 않는 브라우저입니다.")
+        executable, title = targets[browser]
         try:
             return self._resolve_action_window({
-                "target_exe": "whale.exe", "target_class": "Chrome_WidgetWin_1",
+                "target_exe": executable, "target_class": "Chrome_WidgetWin_1",
             })
         except ValueError:
             try:
                 return self._resolve_action_window({
-                    "target_title": "- Whale", "target_class": "Chrome_WidgetWin_1",
+                    "target_title": title, "target_class": "Chrome_WidgetWin_1",
                 })
             except ValueError:
                 return 0
@@ -5951,7 +5969,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if self.always_on_top:
             user32.SetWindowPos(int(self.winId()), -2, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
             self._browser_yielded_topmost = True
-        user32.ShowWindow(hwnd, 9)
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)
         user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
 
@@ -5973,6 +5992,35 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                      os.environ.get("PROGRAMFILES(X86)")):
             if base:
                 path = Path(base) / "Naver" / "Naver Whale" / "Application" / "whale.exe"
+                if path.is_file():
+                    return str(path)
+        return ""
+
+    @staticmethod
+    def _browser_executable(browser: str) -> str:
+        if browser == "whale":
+            return QuickSlotDeckWindow._whale_executable()
+        names = {"edge": ("msedge.exe", "Microsoft", "Edge"),
+                 "chrome": ("chrome.exe", "Google", "Chrome")}
+        if browser not in names:
+            raise ValueError("지원하지 않는 브라우저입니다.")
+        executable, vendor, product = names[browser]
+        found = shutil.which(executable)
+        if found:
+            return found
+        if winreg is not None:
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable}") as key:
+                        path, _ = winreg.QueryValueEx(key, "")
+                    if Path(path).is_file():
+                        return path
+                except (OSError, ValueError):
+                    pass
+        for base in (os.environ.get("PROGRAMFILES(X86)"), os.environ.get("PROGRAMFILES"),
+                     os.environ.get("LOCALAPPDATA")):
+            if base:
+                path = Path(base) / vendor / product / "Application" / executable
                 if path.is_file():
                     return str(path)
         return ""
@@ -6121,23 +6169,28 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         try:
             if kind in {"activate_browser_tab", "navigate_browser_tab"}:
                 url = str(action.get("url") or "")
+                browser = str(action.get("browser") or "whale").strip().casefold()
+                browser_name = {"whale": "웨일", "edge": "엣지", "chrome": "크롬"}.get(browser)
+                if not browser_name:
+                    raise ValueError("지원하지 않는 브라우저입니다.")
                 preset_id = str(action.get("preset_id") or source_preset)
                 if preset_id not in self.config.get("slot_presets", {}):
                     raise ValueError("연결된 프리셋을 찾을 수 없습니다.")
-                hwnd = self._find_whale_window()
+                hwnd = self._find_whale_window() if browser == "whale" else self._find_browser_window(browser)
                 if hwnd:
                     self._sync_browser_bridge()
                     if self._browser_bridge is None:
-                        raise RuntimeError("웨일 탭 연결을 열지 못했습니다. 확장앱 설정을 확인해 주세요.")
+                        raise RuntimeError(f"{browser_name} 탭 연결을 열지 못했습니다. 확장앱 설정을 확인해 주세요.")
                     match = str(action.get("match") or "domain")
-                    command_id = (self._browser_bridge.request_navigation(url, match)
+                    command_id = (self._browser_bridge.request_navigation(url, match, browser=browser)
                                   if kind == "navigate_browser_tab"
-                                  else self._browser_bridge.request_tab(url, match))
+                                  else self._browser_bridge.request_tab(url, match, browser=browser))
                     requested_at = time.monotonic()
                     self._pending_browser_actions[command_id] = (
                         preset_id, slot_index, label, requested_at + 10.0)
                     self._browser_action_requested_at[command_id] = requested_at
                     self._browser_action_hwnds[command_id] = hwnd
+                    self._browser_action_names[command_id] = browser_name
                     self._browser_action_notice = ""
                     self._update_preset_badge()
                     self._focus_whale_for_shortcut(hwnd)
@@ -6145,11 +6198,14 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                     self._mark_slot_status(slot_index, "started", label, preset_id=source_preset)
                 else:
                     if kind == "navigate_browser_tab":
-                        raise RuntimeError("실행 중인 웨일 창을 찾지 못했습니다. 새 탭은 열지 않았습니다.")
-                    executable = self._whale_executable()
+                        raise RuntimeError(f"실행 중인 {browser_name} 창을 찾지 못했습니다. 새 탭은 열지 않았습니다.")
+                    executable = self._browser_executable(browser)
                     if not executable:
-                        raise RuntimeError("웨일 실행 파일을 찾을 수 없습니다.")
-                    subprocess.Popen([executable, "--silent-debugger-extension-api", url])
+                        raise RuntimeError(f"{browser_name} 실행 파일을 찾을 수 없습니다.")
+                    arguments = [executable]
+                    if browser == "whale":
+                        arguments.append("--silent-debugger-extension-api")
+                    subprocess.Popen([*arguments, url])
                     self._switch_slot_preset(preset_id, automatic=True)
                     self._set_deck_status("브라우저 실행", label)
                     self._mark_slot_status(slot_index, "completed", label, preset_id=source_preset)

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MacroRelay Deck URL Presets",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Connects Deck presets and Studio element actions with open browser tabs.",
   "permissions": ["tabs", "webNavigation", "storage", "alarms", "scripting", "debugger"],
   "host_permissions": ["http://127.0.0.1:18773/*", "http://127.0.0.1:18774/*", "http://127.0.0.1:18775/*", "http://*/*", "https://*/*"],

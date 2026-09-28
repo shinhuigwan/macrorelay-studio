@@ -138,6 +138,23 @@ class DeckAutoFeaturesTests(unittest.TestCase):
         finally:
             bridge.close()
 
+    def test_browser_command_is_dispatched_only_to_selected_browser(self) -> None:
+        from macro_studio.deck_browser_bridge import DeckBrowserBridge
+
+        bridge = DeckBrowserBridge("secret", port=0)
+        port = bridge.server.server_address[1]
+        try:
+            command_id = bridge.request_tab("https://example.com/", "domain", browser="edge")
+            headers = {"X-MacroRelay-Token": "secret"}
+            whale = Request(f"http://127.0.0.1:{port}/next-command?browser=whale", headers=headers)
+            edge = Request(f"http://127.0.0.1:{port}/next-command?browser=edge", headers=headers)
+            self.assertEqual(204, urlopen(whale, timeout=2).status)
+            payload = json.loads(urlopen(edge, timeout=2).read())
+            self.assertEqual(command_id, payload["id"])
+            self.assertEqual("edge", payload["browser"])
+        finally:
+            bridge.close()
+
     def test_browser_shortcut_switches_only_after_extension_ack(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository
@@ -162,6 +179,23 @@ class DeckAutoFeaturesTests(unittest.TestCase):
             window._poll_browser_events()
             self.assertEqual("starter-naver", window.config["active_slot_preset"])
             self.assertFalse(window._pending_browser_actions)
+            window.close()
+
+    def test_edge_site_shortcut_queues_edge_only_command(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            action = dict(window.config["slot_presets"]["default"]["slots"][12]["action"])
+            action["browser"] = "edge"
+            with mock.patch.object(window, "_find_browser_window", return_value=123) as find_window, \
+                    mock.patch.object(window, "_focus_whale_for_shortcut", return_value=True):
+                window._execute_deck_action(action, slot_index=12)
+            find_window.assert_called_once_with("edge")
+            command = window._browser_bridge.commands.get_nowait()
+            self.assertEqual("edge", command["browser"])
+            self.assertEqual("activate_tab", command["kind"])
             window.close()
 
     def test_whale_window_title_fallback_when_exe_lookup_fails(self) -> None:

@@ -585,6 +585,169 @@ class QuickSlotDeckTests(unittest.TestCase):
                 self.assertEqual("whale.exe", action["target_exe"])
             dock.close(); window.close()
 
+    def test_deck_dock_bulk_browser_switch_clears_stale_window_identity(self) -> None:
+        from macro_studio.deck_dock import DeckBulkEditDialog, DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dock = DeckDockWindow(window)
+            for index in (0, 1):
+                dock.payload["slots"][index] = dock._slot_from_action({
+                    "kind": "hotkey", "keys": "Ctrl+R", "target_exe": "whale.exe",
+                    "target_title": "TradingView - Whale", "target_window": "ahk_id 0x1234",
+                })
+            dialog = DeckBulkEditDialog("hotkey", dock.payload["slots"][0]["action"], 2, dock)
+            enabled, browser = dialog.controls["target_exe"]
+            enabled.setChecked(True)
+            browser.setCurrentIndex(browser.findData("msedge.exe"))
+            self.assertEqual({"target_exe": "msedge.exe"}, dialog.patch())
+            dock._apply_bulk_patch([0, 1], dialog.patch())
+            for index in (0, 1):
+                action = dock.payload["slots"][index]["action"]
+                self.assertEqual("msedge.exe", action["target_exe"])
+                self.assertNotIn("target_window", action)
+                self.assertNotIn("target_title", action)
+                self.assertEqual("Ctrl+R", action["keys"])
+            dialog.close(); dock.close(); window.close()
+
+    def test_deck_dock_bulk_site_tab_can_select_edge(self) -> None:
+        from macro_studio.deck_dock import DeckBulkEditDialog
+
+        dialog = DeckBulkEditDialog("activate_browser_tab", {"browser": "whale"}, 3)
+        enabled, browser = dialog.controls["browser"]
+        enabled.setChecked(True)
+        browser.setCurrentIndex(browser.findData("edge"))
+        self.assertEqual({"browser": "edge"}, dialog.patch())
+        dialog.close()
+
+    def test_deck_dock_bulk_browser_buttons_select_and_find_executable(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.deck_dock import DeckBulkEditDialog
+
+        dialog = DeckBulkEditDialog("hotkey", {"target_exe": "whale.exe"}, 2)
+        buttons = {button.text(): button for button in dialog.findChildren(QtWidgets.QPushButton)}
+        browser_menu = buttons["브라우저 선택 ▾"].menu()
+        next(action for action in browser_menu.actions() if action.text() == "Microsoft Edge").trigger()
+        self.assertEqual({"target_exe": "msedge.exe"}, dialog.patch())
+
+        with mock.patch("macro_studio.deck_dock.QtWidgets.QFileDialog.getOpenFileName",
+                        return_value=("C:/Apps/custom-browser.exe", "")):
+            buttons["찾기…"].click()
+        self.assertEqual({"target_exe": "custom-browser.exe"}, dialog.patch())
+        dialog.close()
+
+    def test_deck_dock_bulk_save_button_accepts_and_persists_changes(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.deck_dock import DeckBulkEditDialog, DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        class SaveDialog(DeckBulkEditDialog):
+            def exec(self) -> int:
+                enabled, browser = self.controls["target_exe"]
+                enabled.setChecked(True)
+                browser.setCurrentIndex(browser.findData("msedge.exe"))
+                buttons = self.findChild(QtWidgets.QDialogButtonBox)
+                buttons.button(QtWidgets.QDialogButtonBox.Save).click()
+                return self.result()
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            window = QuickSlotDeckWindow(repository)
+            dock = DeckDockWindow(window)
+            for index in (0, 1):
+                dock.payload["slots"][index] = dock._slot_from_action({
+                    "kind": "text", "text": "old", "target_exe": "whale.exe",
+                })
+            dock.selected_slots = {0, 1}
+            with mock.patch("macro_studio.deck_dock.DeckBulkEditDialog", SaveDialog):
+                dock._bulk_edit_selected()
+            actions = [slot["action"] for slot in repository.load_hotkeys()["slots"][:2]]
+            self.assertEqual(["msedge.exe", "msedge.exe"], [action["target_exe"] for action in actions])
+            dock.close(); window.close()
+
+    def test_deck_text_activation_preserves_maximized_browser_size(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            with mock.patch.object(window, "_resolve_action_window", return_value=1234), \
+                    mock.patch("macro_studio.quickslot_deck.ctypes.windll.user32") as user32:
+                user32.IsIconic.return_value = False
+                window._activate_action_window({"target_exe": "msedge.exe"})
+                user32.ShowWindow.assert_not_called()
+                user32.SetForegroundWindow.assert_called_with(1234)
+
+                user32.IsIconic.return_value = True
+                window._activate_action_window({"target_exe": "msedge.exe"})
+                user32.ShowWindow.assert_called_once_with(1234, 9)
+            window.close()
+
+    def test_deck_dock_single_browser_buttons_clear_old_window(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.deck_dock import DeckActionConfigDialog
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dialog = DeckActionConfigDialog("hotkey", {
+                "target_exe": "whale.exe", "target_title": "Old Whale",
+                "target_window": "ahk_id 0x1234",
+            }, window)
+            buttons = {button.text(): button for button in dialog.findChildren(QtWidgets.QPushButton)}
+            browser_menu = buttons["브라우저 선택 ▾"].menu()
+            next(action for action in browser_menu.actions() if action.text() == "Microsoft Edge").trigger()
+            action = dialog.result_action()
+            self.assertEqual("msedge.exe", action["target_exe"])
+            self.assertEqual("", action["target_title"])
+            self.assertEqual("", action["target_window"])
+
+            with mock.patch("macro_studio.deck_dock.QtWidgets.QFileDialog.getOpenFileName",
+                            return_value=("C:/Apps/custom-browser.exe", "")):
+                buttons["찾기…"].click()
+            self.assertEqual("custom-browser.exe", dialog.result_action()["target_exe"])
+            dialog.close(); window.close()
+
+    def test_deck_dock_drag_selects_rectangle_and_ctrl_drag_adds(self) -> None:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        from macro_studio.deck_dock import DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dock = DeckDockWindow(window)
+            dock.show()
+            self.app.processEvents()
+            dock.selection_toggle.setChecked(True)
+            self.app.processEvents()
+            first = dock.grid.itemAt(0).widget()
+            second = dock.grid.itemAt(1).widget()
+            origin_local = first.rect().topLeft() + QtCore.QPoint(8, 8)
+            origin = first.mapToGlobal(origin_local)
+            end = second.mapToGlobal(second.rect().bottomRight() - QtCore.QPoint(8, 8))
+            for event_type, local, global_pos, button, buttons in (
+                (QtCore.QEvent.MouseButtonPress, origin_local, origin, QtCore.Qt.LeftButton, QtCore.Qt.LeftButton),
+                (QtCore.QEvent.MouseMove, first.mapFromGlobal(end), end, QtCore.Qt.NoButton, QtCore.Qt.LeftButton),
+                (QtCore.QEvent.MouseButtonRelease, first.mapFromGlobal(end), end, QtCore.Qt.LeftButton, QtCore.Qt.NoButton),
+            ):
+                event = QtGui.QMouseEvent(event_type, QtCore.QPointF(local), QtCore.QPointF(global_pos), button, buttons, QtCore.Qt.NoModifier)
+                QtWidgets.QApplication.sendEvent(first, event)
+            self.assertTrue({0, 1}.issubset(dock.selected_slots))
+            before = set(dock.selected_slots)
+            third = dock.grid.itemAt(3).widget()
+            origin = third.mapToGlobal(third.rect().topLeft())
+            end = third.mapToGlobal(third.rect().bottomRight())
+            dock._start_selection_drag(origin, end, True)
+            dock._finish_selection_drag(end)
+            self.assertTrue(before.issubset(dock.selected_slots))
+            self.assertIn(3, dock.selected_slots)
+            dock.close(); window.close()
+
     def test_deck_backup_restores_slots_actions_pages_and_icons(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository

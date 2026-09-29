@@ -21,7 +21,7 @@ jobs:
           $name = "MacroRelay-Studio-${{ github.ref_name }}"
           $root = Join-Path $env:RUNNER_TEMP $name
           New-Item -ItemType Directory -Path $root | Out-Null
-          git ls-files | ForEach-Object {
+          git -c core.quotepath=false ls-files | ForEach-Object {
             $destination = Join-Path $root $_
             New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
             Copy-Item -LiteralPath $_ -Destination $destination

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -173,7 +174,7 @@ class DeckSlotButton(QtWidgets.QFrame):
         self.slot_index = slot_index
         self.slot = copy.deepcopy(slot)
         self.selection_mode = selection_mode
-        self.selected = selected
+        self.selected: Optional[bool] = None
         self.pinned = pinned
         self._press_pos: Optional[QtCore.QPoint] = None
         self._press_global: Optional[QtCore.QPoint] = None
@@ -182,7 +183,8 @@ class DeckSlotButton(QtWidgets.QFrame):
         self.setAcceptDrops(True)
         self.setMinimumSize(92, 82)
         self.setCursor(QtCore.Qt.PointingHandCursor)
-        self.setStyleSheet("QFrame { background:#111318; border:1px solid #08090B; border-radius:9px; } QFrame:hover { border:2px solid #18DDC0; background:#171A20; }")
+        self._base_style = "QFrame { background:#111318; border:1px solid #08090B; border-radius:9px; } QFrame:hover { border:2px solid #18DDC0; background:#171A20; }"
+        self.setStyleSheet(self._base_style)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(3)
@@ -209,19 +211,30 @@ class DeckSlotButton(QtWidgets.QFrame):
         layout.addWidget(icon, 1)
         layout.addWidget(title)
         if not macro:
-            self.setStyleSheet("QFrame { background:#202329; border:1px dashed #555B66; border-radius:9px; } QFrame:hover { border:2px solid #18DDC0; }")
-        if selected:
-            self.setStyleSheet("QFrame { background:#173B38; border:3px solid #18DDC0; border-radius:9px; }")
-            badge = QtWidgets.QLabel("✓", self)
-            badge.setAlignment(QtCore.Qt.AlignCenter)
-            badge.setFixedSize(22, 22)
-            badge.move(5, 5)
-            badge.setStyleSheet("background:#18DDC0;color:#07110F;border:none;border-radius:11px;font-weight:900;")
+            self._base_style = "QFrame { background:#202329; border:1px dashed #555B66; border-radius:9px; } QFrame:hover { border:2px solid #18DDC0; }"
+            self.setStyleSheet(self._base_style)
+        self.selection_badge = QtWidgets.QLabel("✓", self)
+        self.selection_badge.setAlignment(QtCore.Qt.AlignCenter)
+        self.selection_badge.setFixedSize(22, 22)
+        self.selection_badge.move(5, 5)
+        self.selection_badge.setStyleSheet("background:#18DDC0;color:#07110F;border:none;border-radius:11px;font-weight:900;")
+        self.set_selected(selected)
         if pinned:
             pin_badge = QtWidgets.QLabel("📌", self)
             pin_badge.setToolTip("모든 페이지에 고정된 슬롯")
             pin_badge.move(6, 5)
             pin_badge.setStyleSheet("background:transparent;border:none;")
+
+    def set_selected(self, selected: bool) -> None:
+        selected = bool(selected)
+        if self.selected == selected:
+            return
+        self.selected = selected
+        self.setStyleSheet(
+            "QFrame { background:#173B38; border:3px solid #18DDC0; border-radius:9px; }"
+            if selected else self._base_style
+        )
+        self.selection_badge.setVisible(selected)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
@@ -362,6 +375,615 @@ class DeckSelectionGrid(QtWidgets.QWidget):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+
+class DeckMacroMiniCanvas(QtWidgets.QGraphicsView):
+    """Compact, read-only map of a macro's saved node layout and branches."""
+
+    node_selected = QtCore.Signal(int)
+    NODE_WIDTH = 138
+    NODE_HEIGHT = 48
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.setScene(QtWidgets.QGraphicsScene(self))
+        self.scene().setBackgroundBrush(QtGui.QColor("#171C25"))
+        self.setRenderHint(QtGui.QPainter.Antialiasing)
+        self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setStyleSheet("QGraphicsView { border:1px solid #4B5563; border-radius:8px; background:#171C25; }")
+        self.setMinimumWidth(290)
+        self.nodes: dict[int, QtWidgets.QGraphicsRectItem] = {}
+        self.selected_index = 0
+
+    @staticmethod
+    def _targets(step: dict[str, Any], index: int, total: int) -> list[tuple[int, str]]:
+        def valid(raw: Any) -> list[int]:
+            values = raw if isinstance(raw, list) else []
+            return [int(value) for value in values if str(value).isdigit() and 0 < int(value) <= total]
+
+        edges: list[tuple[int, str]] = []
+        success = valid(step.get("success_candidates"))
+        if not success:
+            value = step.get("on_success")
+            if str(value).isdigit() and 0 < int(value) <= total:
+                success = [int(value)]
+            elif index < total and not step.get("stop_on_success"):
+                success = [index + 1]
+        edges.extend((target, "success") for target in success)
+        failure = valid(step.get("fail_candidates"))
+        if not failure:
+            value = step.get("on_fail")
+            if str(value).isdigit() and 0 < int(value) <= total:
+                failure = [int(value)]
+        edges.extend((target, "fail") for target in failure)
+        for condition in step.get("edge_conditions") or []:
+            if isinstance(condition, dict):
+                value = condition.get("target")
+                if str(value).isdigit() and 0 < int(value) <= total:
+                    edges.append((int(value), "fail" if condition.get("kind") == "fail" else "success"))
+        return list(dict.fromkeys(edges))
+
+    def set_macro(self, macro: dict[str, Any]) -> None:
+        from .action_editor import ACTION_LABELS
+
+        scene = self.scene()
+        scene.clear()
+        self.nodes.clear()
+        steps = macro.get("steps") or []
+        saved = macro.get("graph_positions") or {}
+        positions: dict[int, QtCore.QPointF] = {}
+        for index in range(1, len(steps) + 1):
+            raw = saved.get(str(index)) if isinstance(saved, dict) else None
+            if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                try:
+                    positions[index] = QtCore.QPointF(float(raw[0]) * 0.62, float(raw[1]) * 0.40)
+                except (TypeError, ValueError):
+                    pass
+            if index not in positions:
+                positions[index] = QtCore.QPointF(20, 18 + (index - 1) * 88)
+        font = QtGui.QFont("Malgun Gothic", 9)
+        metrics = QtGui.QFontMetrics(font)
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                continue
+            position = positions[index]
+            node = scene.addRect(0, 0, self.NODE_WIDTH, self.NODE_HEIGHT)
+            node.setPos(position)
+            node.setBrush(QtGui.QColor("#293445"))
+            node.setPen(QtGui.QPen(QtGui.QColor("#708198"), 1.4))
+            node.setData(0, index)
+            node.setZValue(2)
+            title = str(step.get("label") or step.get("entry_name") or ACTION_LABELS.get(str(step.get("action") or ""), "단계"))
+            number = scene.addSimpleText(f"{index}. {metrics.elidedText(title, QtCore.Qt.ElideRight, self.NODE_WIDTH - 15)}", font)
+            number.setBrush(QtGui.QColor("#F4F6FA"))
+            number.setParentItem(node)
+            number.setPos(7, 5)
+            action_name = ACTION_LABELS.get(str(step.get("action") or ""), str(step.get("action") or ""))
+            type_text = scene.addSimpleText(metrics.elidedText(action_name, QtCore.Qt.ElideRight, self.NODE_WIDTH - 15), font)
+            type_text.setBrush(QtGui.QColor("#AFC1D8"))
+            type_text.setParentItem(node)
+            type_text.setPos(7, 25)
+            node.setToolTip(f"{index}. {title}\n{action_name}")
+            self.nodes[index] = node
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict) or index not in self.nodes:
+                continue
+            source = self.nodes[index].sceneBoundingRect().center()
+            for target, kind in self._targets(step, index, len(steps)):
+                if target not in self.nodes:
+                    continue
+                destination = self.nodes[target].sceneBoundingRect().center()
+                path = QtGui.QPainterPath(source)
+                distance = max(30.0, abs(destination.x() - source.x()) / 2)
+                path.cubicTo(source.x() + distance, source.y(), destination.x() - distance, destination.y(), destination.x(), destination.y())
+                edge = scene.addPath(path, QtGui.QPen(QtGui.QColor("#48CDA4" if kind == "success" else "#F28C8C"), 2))
+                edge.setZValue(0)
+                edge.setToolTip("성공 연결" if kind == "success" else "실패 연결")
+        bounds = scene.itemsBoundingRect()
+        scene.setSceneRect(bounds.adjusted(-30, -30, 30, 30))
+        self.select_step(self.selected_index if self.selected_index in self.nodes else 1, center=False)
+        self.fit_all()
+
+    def select_step(self, index: int, *, center: bool = True) -> None:
+        self.selected_index = index
+        for number, node in self.nodes.items():
+            selected = number == index
+            node.setBrush(QtGui.QColor("#15566B" if selected else "#293445"))
+            node.setPen(QtGui.QPen(QtGui.QColor("#26E0C3" if selected else "#708198"), 2.5 if selected else 1.4))
+        if center and index in self.nodes:
+            if self.transform().m11() < 0.75:
+                self.resetTransform()
+                self.scale(0.85, 0.85)
+            self.centerOn(self.nodes[index])
+
+    def fit_all(self) -> None:
+        if self.nodes and self.viewport().width() > 0 and self.viewport().height() > 0:
+            self.fitInView(self.scene().sceneRect(), QtCore.Qt.KeepAspectRatio)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        item = self.itemAt(event.pos())
+        while item is not None:
+            index = item.data(0)
+            if isinstance(index, int) and index in self.nodes:
+                self.node_selected.emit(index)
+                break
+            item = item.parentItem()
+        super().mousePressEvent(event)
+
+
+MACRO_IMAGE_ACTIONS = {"image_search", "screen_condition", "multi_image_search", "animation_search"}
+MACRO_REGION_ACTIONS = MACRO_IMAGE_ACTIONS | {"pixel_search", "ocr", "ocr_tracking", "wait_color", "color_ratio", "multi_pixel_check"}
+MACRO_WINDOW_ACTIONS = {"mouse_click", "inactive_click", "type_text"}
+
+
+def set_macro_step_target_program(step: dict[str, Any], executable: str) -> bool:
+    """Change only process bindings, discarding stale window identities."""
+    action = str(step.get("action") or "")
+    changed = False
+    if action in MACRO_REGION_ACTIONS or "region_window_exe" in step:
+        if str(step.get("region_window_exe") or "").casefold() != executable.casefold():
+            step["region_window_exe"] = executable
+            step.pop("region_window", None)
+            step.pop("region_window_hwnd", None)
+            changed = True
+    if action in MACRO_WINDOW_ACTIONS or "window_exe" in step:
+        if str(step.get("window_exe") or "").casefold() != executable.casefold():
+            step["window_exe"] = executable
+            step.pop("window", None)
+            step.pop("window_hwnd", None)
+            changed = True
+    if "target_exe" in step and str(step.get("target_exe") or "").casefold() != executable.casefold():
+        step["target_exe"] = executable
+        step.pop("target_window", None)
+        changed = True
+    click = step.get("click")
+    if isinstance(click, dict) and ("window_exe" in click or action in MACRO_IMAGE_ACTIONS):
+        if str(click.get("window_exe") or "").casefold() != executable.casefold():
+            click["window_exe"] = executable
+            click.pop("window", None)
+            click.pop("window_hwnd", None)
+            changed = True
+    return changed
+
+
+def merge_macro_visual_edit(step: dict[str, Any], visual: Any) -> dict[str, Any]:
+    """Apply the Studio visual editor's image and region result to one step."""
+    updated = copy.deepcopy(visual.step)
+    aliases = visual.get_aliases()
+    updated["assets"] = aliases
+    if aliases:
+        updated["asset"] = aliases[0]
+    else:
+        updated.pop("asset", None)
+    for key, value in (("asset_regions", visual.get_asset_regions()),
+                       ("asset_offsets", visual.get_asset_offsets())):
+        if value:
+            updated[key] = value
+        else:
+            updated.pop(key, None)
+    click_target = visual.get_click_target()
+    if click_target:
+        updated["click_target"] = click_target
+        updated["click_enabled"] = click_target != "none"
+        if click_target == "custom_coord":
+            updated["custom_click_x"], updated["custom_click_y"] = visual.get_custom_click_coords()
+    condition = visual.get_match_condition()
+    if condition:
+        updated["match_condition"] = condition
+    required = visual.get_required_count()
+    if required >= 0:
+        updated["required_count"] = required
+    bounding = visual.get_bounding_region()
+    if bounding:
+        updated["search_region"] = bounding
+        updated["region"] = bounding
+        updated["regions"] = [bounding]
+    elif not aliases:
+        for key in ("search_region", "region", "regions"):
+            updated.pop(key, None)
+    for key in ("asset_confidences", "asset_routes"):
+        mapping = updated.get(key)
+        if isinstance(mapping, dict):
+            remaining = {alias: value for alias, value in mapping.items() if alias in aliases}
+            if remaining:
+                updated[key] = remaining
+            else:
+                updated.pop(key, None)
+    automation = updated.get("_automation")
+    if isinstance(automation, dict):
+        automation["image_count"] = len(aliases)
+    return updated
+
+
+class DeckTargetProgramDialog(QtWidgets.QDialog):
+    def __init__(self, count: int, current: str = "", parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{count}개 단계 · 대상 프로그램 변경")
+        self.setMinimumWidth(510)
+        self.setStyleSheet(deck_dock_stylesheet())
+        layout = QtWidgets.QVBoxLayout(self)
+        hint = QtWidgets.QLabel("브라우저를 고르거나, 화면의 대상 창을 마우스로 클릭하세요. 선택한 단계에 한 번에 적용됩니다.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.executable = QtWidgets.QLineEdit(current)
+        self.executable.setPlaceholderText("예: msedge.exe")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.executable, 1)
+        row.addWidget(browser_choice_button(self.executable.setText, self))
+        browse = QtWidgets.QPushButton("파일 찾기…")
+        browse.clicked.connect(self._browse)
+        row.addWidget(browse)
+        layout.addLayout(row)
+        pick = QtWidgets.QPushButton("⌖ 화면의 프로그램을 클릭해 선택")
+        pick.clicked.connect(self._pick_on_screen)
+        layout.addWidget(pick)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Save).setText("선택 단계에 적용")
+        buttons.accepted.connect(self._accept_executable)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse(self) -> None:
+        name = browse_executable_name(self)
+        if name:
+            self.executable.setText(name)
+
+    def _pick_on_screen(self) -> None:
+        from .action_editor import WindowPickerDialog
+
+        ignored = {int(self.winId())}
+        parent = self.parentWidget()
+        if parent is not None:
+            ignored.add(int(parent.winId()))
+        picker = WindowPickerDialog(self, ignored_hwnds=ignored, hint_text="대상 프로그램 창을 클릭하세요 · Esc 취소")
+        if picker.exec() == QtWidgets.QDialog.Accepted and picker.exe_name:
+            self.executable.setText(picker.exe_name)
+        self.raise_()
+        self.activateWindow()
+
+    def _accept_executable(self) -> None:
+        if not self.executable.text().strip():
+            QtWidgets.QMessageBox.information(self, "대상 프로그램", "대상 프로그램을 먼저 선택해 주세요.")
+            return
+        self.accept()
+
+    def selected_executable(self) -> str:
+        return Path(self.executable.text().strip()).name
+
+
+class DeckMacroStepsDialog(QtWidgets.QDialog):
+    """Edit a referenced macro's steps without leaving the Deck."""
+
+    def __init__(self, repository: Any, macro_name: str, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.repository = repository
+        self.macro_name = macro_name
+        self.current_macro: Dict[str, Any] = {}
+        self.setWindowTitle(f"{macro_name} · 매크로 상세 편집")
+        self.setMinimumSize(850, 500)
+        self.setStyleSheet(deck_dock_stylesheet())
+        layout = QtWidgets.QVBoxLayout(self)
+        hint = QtWidgets.QLabel("행을 마우스로 클릭해 여러 단계를 선택·해제할 수 있습니다. 저장한 내용은 이 매크로를 사용하는 모든 슬롯에 적용됩니다.")
+        hint.setWordWrap(True)
+        hint.setObjectName("Hint")
+        layout.addWidget(hint)
+        content = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        preview = QtWidgets.QWidget()
+        preview_layout = QtWidgets.QVBoxLayout(preview)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_title = QtWidgets.QLabel("매크로 흐름 미리보기")
+        preview_title.setStyleSheet("font-weight:800; color:#F4F6FA;")
+        preview_layout.addWidget(preview_title)
+        self.mini_canvas = DeckMacroMiniCanvas(preview)
+        self.mini_canvas.node_selected.connect(self._select_step_from_canvas)
+        preview_layout.addWidget(self.mini_canvas, 1)
+        preview_controls = QtWidgets.QHBoxLayout()
+        legend = QtWidgets.QLabel("● 성공   ● 실패")
+        legend.setStyleSheet("color:#AFC1D8;")
+        preview_controls.addWidget(legend)
+        preview_controls.addStretch(1)
+        fit_button = QtWidgets.QPushButton("전체 보기")
+        fit_button.clicked.connect(self.mini_canvas.fit_all)
+        preview_controls.addWidget(fit_button)
+        preview_layout.addLayout(preview_controls)
+        content.addWidget(preview)
+        self.steps_list = QtWidgets.QTreeWidget()
+        self.steps_list.setObjectName("MacroStepsList")
+        self.steps_list.setStyleSheet("""
+            QTreeWidget#MacroStepsList { background:#202329; color:#F4F6FA; border:1px solid #555B66;
+                alternate-background-color:#202329; selection-background-color:#15566B; selection-color:#FFFFFF; }
+            QTreeWidget#MacroStepsList::item { color:#F4F6FA; padding:4px 3px; }
+            QTreeWidget#MacroStepsList::item:selected { background:#15566B; color:#FFFFFF; }
+            QTreeWidget#MacroStepsList QHeaderView::section { background:#30343B; color:#F4F6FA;
+                border:1px solid #555B66; padding:5px; }
+        """)
+        self.steps_list.setHeaderLabels(["번호", "단계", "대상 프로그램"])
+        self.steps_list.setRootIsDecorated(False)
+        self.steps_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        self.steps_list.setAlternatingRowColors(False)
+        self.steps_list.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        self.steps_list.header().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.steps_list.header().setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
+        self.steps_list.header().resizeSection(2, 145)
+        self.steps_list.itemDoubleClicked.connect(lambda item, _column: self._edit_double_clicked_step(item))
+        self.steps_list.itemSelectionChanged.connect(self._sync_canvas_selection)
+        content.addWidget(self.steps_list)
+        content.setSizes([350, 500])
+        layout.addWidget(content, 1)
+        quick_actions = QtWidgets.QHBoxLayout()
+        self.target_button = QtWidgets.QPushButton("선택 단계 대상 프로그램 변경…")
+        self.target_button.clicked.connect(self._change_selected_targets)
+        quick_actions.addWidget(self.target_button)
+        self.visual_button = QtWidgets.QPushButton("이미지·영역 미리보기…")
+        self.visual_button.clicked.connect(self._edit_selected_image_visually)
+        quick_actions.addWidget(self.visual_button)
+        self.replace_image_button = QtWidgets.QPushButton("이미지만 교체…")
+        self.replace_image_button.clicked.connect(self._replace_selected_image)
+        quick_actions.addWidget(self.replace_image_button)
+        self.click_button = QtWidgets.QPushButton("클릭 위치 다시 찍기…")
+        self.click_button.clicked.connect(self._repick_selected_click)
+        quick_actions.addWidget(self.click_button)
+        quick_actions.addStretch(1)
+        layout.addLayout(quick_actions)
+        buttons = QtWidgets.QHBoxLayout()
+        self.edit_button = QtWidgets.QPushButton("선택 단계 상세 설정…")
+        self.edit_button.clicked.connect(self._edit_selected_step)
+        self.steps_list.itemSelectionChanged.connect(self._update_edit_buttons)
+        buttons.addWidget(self.edit_button)
+        buttons.addStretch(1)
+        close_button = QtWidgets.QPushButton("닫기")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        self._reload_steps()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, self.mini_canvas.fit_all)
+
+    def _select_step_from_canvas(self, index: int) -> None:
+        for row in range(self.steps_list.topLevelItemCount()):
+            item = self.steps_list.topLevelItem(row)
+            if item.data(0, QtCore.Qt.UserRole) == index - 1:
+                self.steps_list.setCurrentItem(item, 0, QtCore.QItemSelectionModel.NoUpdate)
+                item.setSelected(not item.isSelected())
+                self.steps_list.scrollToItem(item)
+                return
+
+    def _sync_canvas_selection(self) -> None:
+        selected = self.steps_list.selectedItems()
+        if selected:
+            current = self.steps_list.currentItem()
+            item = current if current in selected else selected[-1]
+            self.mini_canvas.select_step(int(item.data(0, QtCore.Qt.UserRole)) + 1)
+
+    def _selected_indexes(self) -> list[int]:
+        return sorted(int(item.data(0, QtCore.Qt.UserRole)) for item in self.steps_list.selectedItems())
+
+    def _update_edit_buttons(self) -> None:
+        indexes = self._selected_indexes()
+        steps = self.current_macro.get("steps") or []
+        self.target_button.setEnabled(any(
+            0 <= index < len(steps) and isinstance(steps[index], dict)
+            and (str(steps[index].get("action") or "") in MACRO_REGION_ACTIONS | MACRO_WINDOW_ACTIONS
+                 or any(key in steps[index] for key in ("region_window_exe", "window_exe", "target_exe")))
+            for index in indexes
+        ))
+        self.edit_button.setEnabled(len(indexes) == 1)
+        action = str(steps[indexes[0]].get("action") or "") if len(indexes) == 1 and isinstance(steps[indexes[0]], dict) else ""
+        self.visual_button.setEnabled(action in MACRO_IMAGE_ACTIONS)
+        image_step = steps[indexes[0]] if action in MACRO_IMAGE_ACTIONS else {}
+        aliases = image_step.get("assets") if isinstance(image_step.get("assets"), list) else []
+        self.replace_image_button.setEnabled(action in MACRO_IMAGE_ACTIONS and len(aliases) <= 1)
+        self.click_button.setEnabled(action in {"mouse_click", "inactive_click"})
+
+    def _edit_double_clicked_step(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        self.steps_list.clearSelection()
+        item.setSelected(True)
+        self._edit_selected_step()
+
+    def _save_one_step(self, index: int, original: dict[str, Any], updated: dict[str, Any]) -> bool:
+        try:
+            latest = self.repository.load_macro(self.macro_name)
+            latest_steps = latest.get("steps") or []
+            if not 0 <= index < len(latest_steps) or latest_steps[index] != original:
+                QtWidgets.QMessageBox.warning(self, "매크로가 변경됨", "다른 창에서 이 단계가 변경되었습니다. 목록을 다시 불러온 뒤 편집해 주세요.")
+                self._reload_steps(index)
+                return False
+            if updated != original:
+                latest_steps[index] = updated
+                self.repository.save_macro(self.macro_name, latest)
+            self._reload_steps(index, [index])
+            return True
+        except (OSError, ValueError, KeyError) as exc:
+            QtWidgets.QMessageBox.warning(self, "상세 설정 저장 실패", str(exc))
+            return False
+
+    def _change_selected_targets(self) -> None:
+        indexes = self._selected_indexes()
+        if not indexes:
+            return
+        steps = self.current_macro.get("steps") or []
+        existing = {self.steps_list.topLevelItem(index).text(2) for index in indexes}
+        current = next(iter(existing)) if len(existing) == 1 and "," not in next(iter(existing)) else ""
+        dialog = DeckTargetProgramDialog(len(indexes), current, self)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        executable = dialog.selected_executable()
+        try:
+            latest = self.repository.load_macro(self.macro_name)
+            latest_steps = latest.get("steps") or []
+            if any(not 0 <= index < len(latest_steps) or latest_steps[index] != steps[index] for index in indexes):
+                QtWidgets.QMessageBox.warning(self, "매크로가 변경됨", "다른 창에서 선택 단계가 변경되었습니다. 목록을 다시 불러온 뒤 다시 선택해 주세요.")
+                self._reload_steps()
+                return
+            changed = 0
+            for index in indexes:
+                if isinstance(latest_steps[index], dict) and set_macro_step_target_program(latest_steps[index], executable):
+                    changed += 1
+            if changed:
+                self.repository.save_macro(self.macro_name, latest)
+            self._reload_steps(indexes[0], indexes)
+            if changed < len(indexes):
+                QtWidgets.QMessageBox.information(self, "대상 프로그램 변경", f"{changed}개 단계에 적용했습니다. 대상 프로그램 설정이 없는 단계는 건너뛰었습니다.")
+        except (OSError, ValueError, KeyError) as exc:
+            QtWidgets.QMessageBox.warning(self, "대상 프로그램 변경 실패", str(exc))
+
+    def _edit_selected_image_visually(self) -> None:
+        from .region_visual_test import RegionVisualTestDialog
+
+        indexes = self._selected_indexes()
+        if len(indexes) != 1:
+            return
+        index = indexes[0]
+        original = copy.deepcopy(self.current_macro["steps"][index])
+        if str(original.get("action") or "") not in MACRO_IMAGE_ACTIONS:
+            return
+        visual = RegionVisualTestDialog(original, self.repository, parent=self)
+        try:
+            if visual.exec() == QtWidgets.QDialog.Accepted:
+                self._save_one_step(index, original, merge_macro_visual_edit(original, visual))
+        finally:
+            visual.deleteLater()
+            self.setEnabled(True)
+            self.raise_()
+            self.activateWindow()
+
+    def _replace_selected_image(self) -> None:
+        indexes = self._selected_indexes()
+        if len(indexes) != 1:
+            return
+        index = indexes[0]
+        original = copy.deepcopy(self.current_macro["steps"][index])
+        if str(original.get("action") or "") not in MACRO_IMAGE_ACTIONS:
+            return
+        aliases = original.get("assets") if isinstance(original.get("assets"), list) else []
+        if len(aliases) > 1:
+            QtWidgets.QMessageBox.information(self, "이미지 교체", "이미지가 여러 개인 단계는 '이미지·영역 미리보기'에서 원하는 이미지를 선택해 주세요.")
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "검색 이미지 교체", "", "이미지 (*.png *.jpg *.jpeg *.bmp *.webp)"
+        )
+        if not path:
+            return
+        if QtGui.QImage(path).isNull():
+            QtWidgets.QMessageBox.warning(self, "이미지 교체", "선택한 이미지 파일을 열 수 없습니다.")
+            return
+        try:
+            latest = self.repository.load_macro(self.macro_name)
+            latest_steps = latest.get("steps") or []
+            if not 0 <= index < len(latest_steps) or latest_steps[index] != original:
+                QtWidgets.QMessageBox.warning(self, "매크로가 변경됨", "다른 창에서 이 단계가 변경되었습니다. 다시 불러온 뒤 교체해 주세요.")
+                self._reload_steps(index)
+                return
+            source = Path(path)
+            alias = self.repository.add_asset(source, f"{source.stem}-deck-{uuid.uuid4().hex[:8]}")
+            updated = copy.deepcopy(original)
+            old_alias = str(updated.get("asset") or (aliases[0] if aliases else ""))
+            updated["asset"] = alias
+            updated["assets"] = [alias]
+            for key in ("asset_regions", "asset_offsets", "asset_confidences", "asset_routes"):
+                mapping = updated.get(key)
+                if isinstance(mapping, dict):
+                    old_value = mapping.get(old_alias)
+                    if old_value is not None:
+                        updated[key] = {alias: old_value}
+                    else:
+                        updated.pop(key, None)
+            if str(updated.get("label") or "").endswith(f"({old_alias})") and old_alias:
+                updated["label"] = str(updated["label"]).removesuffix(f"({old_alias})") + f"({alias})"
+            if "required_count" in updated:
+                updated["required_count"] = 1
+            latest_steps[index] = updated
+            self.repository.save_macro(self.macro_name, latest)
+            self._reload_steps(index, [index])
+        except (OSError, ValueError, KeyError) as exc:
+            QtWidgets.QMessageBox.warning(self, "이미지 교체 실패", str(exc))
+
+    def _repick_selected_click(self) -> None:
+        from .action_editor import WindowPickerDialog
+
+        indexes = self._selected_indexes()
+        if len(indexes) != 1:
+            return
+        index = indexes[0]
+        original = copy.deepcopy(self.current_macro["steps"][index])
+        action = str(original.get("action") or "")
+        if action not in {"mouse_click", "inactive_click"}:
+            return
+        ignored = {int(self.winId())}
+        if self.parentWidget() is not None:
+            ignored.add(int(self.parentWidget().winId()))
+        picker = WindowPickerDialog(self, ignored_hwnds=ignored,
+                                    hint_text="클릭할 위치를 대상 프로그램에서 클릭하세요 · Esc 취소")
+        accepted = picker.exec() == QtWidgets.QDialog.Accepted
+        point = picker.selected_client_point() if accepted else None
+        self.raise_()
+        self.activateWindow()
+        if not accepted or point is None:
+            return
+        updated = copy.deepcopy(original)
+        if picker.exe_name:
+            set_macro_step_target_program(updated, picker.exe_name)
+        updated["window"] = picker.window_token
+        updated["x"], updated["y"] = point.x(), point.y()
+        updated["coordinate_scope"] = "client"
+        if action == "mouse_click":
+            updated["window_hwnd"] = picker.window_hwnd
+        else:
+            updated["coordinate_source"] = "fixed"
+        self._save_one_step(index, original, updated)
+
+    def _reload_steps(self, selected_index: int = 0, selected_indexes: Optional[list[int]] = None) -> None:
+        from .action_editor import ACTION_LABELS
+
+        self.current_macro = self.repository.load_macro(self.macro_name)
+        steps = self.current_macro.get("steps") or []
+        self.steps_list.clear()
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            action = str(step.get("action") or "wait")
+            title = str(step.get("label") or step.get("entry_name") or ACTION_LABELS.get(action, action))
+            targets = [str(step.get(key) or "").strip() for key in ("window_exe", "region_window_exe", "target_exe")]
+            click = step.get("click")
+            if isinstance(click, dict):
+                targets.append(str(click.get("window_exe") or "").strip())
+            target_summary = ", ".join(dict.fromkeys(value for value in targets if value))
+            item = QtWidgets.QTreeWidgetItem([str(index + 1), title, target_summary])
+            item.setData(0, QtCore.Qt.UserRole, index)
+            for column in range(3):
+                item.setForeground(column, QtGui.QBrush(QtGui.QColor("#F4F6FA")))
+            item.setToolTip(1, ACTION_LABELS.get(action, action))
+            self.steps_list.addTopLevelItem(item)
+        self.mini_canvas.set_macro(self.current_macro)
+        self.steps_list.resizeColumnToContents(0)
+        if self.steps_list.topLevelItemCount():
+            self.steps_list.setCurrentItem(
+                self.steps_list.topLevelItem(min(selected_index, self.steps_list.topLevelItemCount() - 1)),
+                0, QtCore.QItemSelectionModel.NoUpdate,
+            )
+        for row in selected_indexes or []:
+            if 0 <= row < self.steps_list.topLevelItemCount():
+                self.steps_list.topLevelItem(row).setSelected(True)
+        self._update_edit_buttons()
+
+    def _edit_selected_step(self) -> None:
+        from .action_editor import ActionEditorDialog
+
+        selected = self.steps_list.selectedItems()
+        if len(selected) != 1:
+            return
+        index = int(selected[0].data(0, QtCore.Qt.UserRole))
+        steps = self.current_macro.get("steps") or []
+        if not 0 <= index < len(steps) or not isinstance(steps[index], dict):
+            return
+        original = copy.deepcopy(steps[index])
+        editor = ActionEditorDialog(self.repository, original, self)
+        if editor.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._save_one_step(index, original, editor.payload())
 
 
 class DeckActionConfigDialog(QtWidgets.QDialog):
@@ -516,6 +1138,10 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
             self.widgets["entry_name"] = entry_combo
             form.addRow("매크로", combo)
             form.addRow("시작 지점", entry_combo)
+            edit_macro = QtWidgets.QPushButton("매크로 내부 단계 상세 편집…")
+            edit_macro.setToolTip("Studio의 단계 상세 설정을 덕덱에서 열어 원본 매크로를 편집합니다.")
+            edit_macro.clicked.connect(lambda: self._edit_macro_steps(refresh_entries))
+            form.addRow("상세 설정", edit_macro)
         elif kind == "multi_macros":
             selected_order = [str(value) for value in list(self.action.get("macros") or [])]
             selected = set(selected_order)
@@ -543,6 +1169,18 @@ class DeckActionConfigDialog(QtWidgets.QDialog):
         elif kind == "page_goto":
             spin = QtWidgets.QSpinBox(); spin.setRange(1, 99); spin.setValue(int(self.action.get("page") or 1))
             self.widgets["page"] = spin; form.addRow("이동할 페이지", spin)
+
+    def _edit_macro_steps(self, refresh_entries: Any) -> None:
+        macro_name = self.widgets["macro"].currentText().strip()
+        if not macro_name or not self.repository.macro_path(macro_name).exists():
+            QtWidgets.QMessageBox.information(self, "매크로 선택", "편집할 매크로를 먼저 선택해 주세요.")
+            return
+        try:
+            dialog = DeckMacroStepsDialog(self.repository, macro_name, self)
+            dialog.exec()
+            refresh_entries(str(self.widgets["entry_name"].currentData() or ""))
+        except (OSError, ValueError, KeyError) as exc:
+            QtWidgets.QMessageBox.warning(self, "매크로 열기 실패", str(exc))
 
     def _add_target_fields(self, form: QtWidgets.QFormLayout, *, include_point: bool = False) -> None:
         mode = QtWidgets.QComboBox()
@@ -690,6 +1328,7 @@ class DeckBulkEditDialog(QtWidgets.QDialog):
     """Edits only explicitly enabled fields across actions of one kind."""
 
     FIELD_SPECS = {
+        "run_macro": [("macro", "매크로", "macro"), ("entry_name", "시작 지점", "entry_name")],
         "text": [("text", "입력할 텍스트", "text"), ("text_method", "입력 엔진", "text_method"), ("key_interval_ms", "글자 입력 간격", "ms"), ("press_enter", "입력 후 Enter", "bool"), ("input_mode", "실행 방식", "input_mode"), ("target_exe", "대상 프로그램 / 브라우저", "target_exe")],
         "wait": [("ms", "대기 시간", "ms")],
         "multi_macros": [("delay_ms", "작업 간격", "ms"), ("continue_on_error", "실패해도 계속", "bool")],
@@ -705,12 +1344,19 @@ class DeckBulkEditDialog(QtWidgets.QDialog):
     def __init__(self, kind: str, sample: Dict[str, Any], count: int, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.kind = kind
+        self.repository = getattr(parent, "repository", None)
         self.controls: Dict[str, tuple[QtWidgets.QCheckBox, QtWidgets.QWidget]] = {}
+        self._macro_combo: Optional[QtWidgets.QComboBox] = None
+        self._entry_combo: Optional[QtWidgets.QComboBox] = None
         self.setWindowTitle(f"{count}개 슬롯 일괄 편집")
         self.setMinimumWidth(520)
         self.setStyleSheet(deck_dock_stylesheet())
         root = QtWidgets.QVBoxLayout(self)
-        hint = QtWidgets.QLabel("체크한 항목만 선택한 모든 슬롯에 적용됩니다.")
+        hint_text = "체크한 항목만 선택한 모든 슬롯에 적용됩니다."
+        if kind == "run_macro":
+            hint_text += " 매크로를 바꾸고 시작 지점을 체크하지 않으면 기본 시작 지점으로 돌아갑니다."
+        hint = QtWidgets.QLabel(hint_text)
+        hint.setWordWrap(True)
         hint.setObjectName("Hint"); root.addWidget(hint)
         form = QtWidgets.QFormLayout(); form.setSpacing(10)
         specs = [("label", "슬롯 이름", "line")] + self.FIELD_SPECS.get(kind, [])
@@ -739,6 +1385,8 @@ class DeckBulkEditDialog(QtWidgets.QDialog):
             else:
                 form.addRow(enabled, widget)
             self.controls[key] = (enabled, widget)
+        if self._macro_combo is not None:
+            self._macro_combo.currentIndexChanged.connect(lambda _index: self._refresh_entry_choices(""))
         root.addLayout(form)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
         buttons.button(QtWidgets.QDialogButtonBox.Save).setText("저장")
@@ -746,6 +1394,21 @@ class DeckBulkEditDialog(QtWidgets.QDialog):
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); root.addWidget(buttons)
 
     def _make_widget(self, kind: str, value: Any) -> QtWidgets.QWidget:
+        if kind == "macro":
+            combo = QtWidgets.QComboBox()
+            names = [summary.name for summary in self.repository.list_macros()] if self.repository else []
+            current = str(value or "").strip()
+            if current and current not in names:
+                names.insert(0, current)
+            for name in names:
+                combo.addItem(name, name)
+            combo.setCurrentIndex(combo.findData(current))
+            self._macro_combo = combo
+            return combo
+        if kind == "entry_name":
+            self._entry_combo = QtWidgets.QComboBox()
+            self._refresh_entry_choices(str(value or ""))
+            return self._entry_combo
         if kind == "text":
             widget = QtWidgets.QPlainTextEdit(str(value or "")); widget.setMaximumHeight(110); return widget
         if kind in {"ms", "clicks", "page"}:
@@ -774,6 +1437,24 @@ class DeckBulkEditDialog(QtWidgets.QDialog):
             for label, data in choices: widget.addItem(label, data)
             widget.setCurrentIndex(max(0, widget.findData(str(value or choices[0][1])))); return widget
         return QtWidgets.QLineEdit(str(value or ""))
+
+    def _refresh_entry_choices(self, selected_entry: str) -> None:
+        combo = self._entry_combo
+        if combo is None:
+            return
+        macro_name = str(self._macro_combo.currentData() or "") if self._macro_combo else ""
+        with QtCore.QSignalBlocker(combo):
+            combo.clear()
+            combo.addItem("기본 시작 지점", "")
+            if self.repository and macro_name:
+                try:
+                    for name, index in macro_entry_points(self.repository.load_macro(macro_name)):
+                        combo.addItem(f"▶ {name} · {index}번 노드", name)
+                except (OSError, ValueError, KeyError):
+                    pass
+            if selected_entry and combo.findData(selected_entry) < 0:
+                combo.addItem(f"⚠ 찾을 수 없는 시작 지점: {selected_entry}", selected_entry)
+            combo.setCurrentIndex(max(0, combo.findData(selected_entry)))
 
     def patch(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
@@ -1059,8 +1740,22 @@ class DeckDockWindow(QtWidgets.QMainWindow):
     def _selection_mode_changed(self, enabled: bool) -> None:
         self._selection_drag_origin = None
         self.selection_band.hide()
-        if not enabled: self.selected_slots.clear()
-        self._render_page()
+        self.grid_host.selection_mode = enabled
+        for button in self._visible_slot_buttons():
+            button.selection_mode = enabled
+        if not enabled:
+            self.selected_slots.clear()
+        self._update_selection_visuals()
+
+    def _visible_slot_buttons(self) -> list[DeckSlotButton]:
+        return [item.widget() for index in range(self.grid.count())
+                if (item := self.grid.itemAt(index)) is not None
+                and isinstance(item.widget(), DeckSlotButton)]
+
+    def _update_selection_visuals(self) -> None:
+        for button in self._visible_slot_buttons():
+            button.set_selected(button.slot_index in self.selected_slots)
+        self._update_selection_controls()
 
     def _start_selection_drag(self, origin: QtCore.QPoint, current: QtCore.QPoint, additive: bool) -> None:
         if not self.selection_toggle.isChecked():
@@ -1091,12 +1786,12 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             if button is not None and rect.intersects(button.geometry()):
                 selected.add(button.slot_index)
         self.selected_slots = selected
-        self._render_page()
+        self._update_selection_visuals()
 
     def _toggle_slot_selection(self, index: int) -> None:
         if index in self.selected_slots: self.selected_slots.remove(index)
         else: self.selected_slots.add(index)
-        self._render_page()
+        self._update_selection_visuals()
 
     def _select_current_page(self) -> None:
         self.selection_toggle.setChecked(True)
@@ -1105,10 +1800,10 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             index for index in range(start, start + self._page_size())
             if self._is_filled_slot(self.payload["slots"][index])
         )
-        self._render_page()
+        self._update_selection_visuals()
 
     def _clear_selection(self) -> None:
-        self.selected_slots.clear(); self._render_page()
+        self.selected_slots.clear(); self._update_selection_visuals()
 
     def _update_selection_controls(self) -> None:
         count = len(self.selected_slots); self.selection_label.setText(f"선택 {count}개")
@@ -1198,8 +1893,32 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             if "target_exe" in patch and str(action.get("target_exe") or "").casefold() != str(patch["target_exe"] or "").casefold():
                 action.pop("target_window", None)
                 action.pop("target_title", None)
+            if ("macro" in patch and "entry_name" not in patch
+                    and str(action.get("macro") or "") != str(patch["macro"] or "")):
+                action["entry_name"] = ""
             action.update(copy.deepcopy(patch)); self.payload["slots"][index] = self._slot_from_action(action); changed += 1
         return changed
+
+    def _bulk_macro_patch_error(self, indexes: list[int], patch: Dict[str, Any]) -> str:
+        if not ({"macro", "entry_name"} & patch.keys()):
+            return ""
+        known_macros = {summary.name for summary in self.repository.list_macros()}
+        for index in indexes:
+            action = self.payload["slots"][index].get("action") or {}
+            macro_name = str(patch.get("macro") or action.get("macro") or "")
+            if macro_name not in known_macros:
+                return f"매크로를 찾을 수 없습니다: {macro_name or '(없음)'}"
+            if "entry_name" not in patch:
+                continue
+            entry_name = str(patch["entry_name"] or "")
+            if entry_name:
+                try:
+                    entries = {name for name, _number in macro_entry_points(self.repository.load_macro(macro_name))}
+                except (OSError, ValueError, KeyError):
+                    return f"시작 지점을 확인할 수 없습니다: {macro_name}"
+                if entry_name not in entries:
+                    return f"'{macro_name}' 매크로에는 '{entry_name}' 시작 지점이 없습니다."
+        return ""
 
     def _bulk_edit_selected(self) -> None:
         if any(self._pin_entry(index) for index in self.selected_slots):
@@ -1213,9 +1932,14 @@ class DeckDockWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "일괄 편집", "같은 종류의 액션 슬롯만 함께 편집할 수 있습니다."); return
         kind = next(iter(kinds)); sample = dict(self.payload["slots"][indexes[0]]["action"])
         dialog = DeckBulkEditDialog(kind, sample, len(indexes), self)
-        if dialog.exec() != QtWidgets.QDialog.Accepted: return
-        patch = dialog.patch()
-        if not patch: return
+        while True:
+            if dialog.exec() != QtWidgets.QDialog.Accepted: return
+            patch = dialog.patch()
+            if not patch: return
+            error = self._bulk_macro_patch_error(indexes, patch) if kind == "run_macro" else ""
+            if not error:
+                break
+            QtWidgets.QMessageBox.information(self, "일괄 편집", error)
         self._record_change()
         self._apply_bulk_patch(indexes, patch); self.save()
 

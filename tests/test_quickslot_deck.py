@@ -748,6 +748,80 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertIn(3, dock.selected_slots)
             dock.close(); window.close()
 
+    def test_deck_dock_selection_does_not_rebuild_icon_cards(self) -> None:
+        from PySide6 import QtCore
+        from macro_studio.deck_dock import DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dock = DeckDockWindow(window)
+            dock.show()
+            self.app.processEvents()
+            first = dock.grid.itemAt(0).widget()
+            second = dock.grid.itemAt(1).widget()
+            with mock.patch.object(dock, "_render_page", wraps=dock._render_page) as render:
+                dock.selection_toggle.setChecked(True)
+                dock._toggle_slot_selection(0)
+                self.assertTrue(first.selected)
+                origin = first.mapToGlobal(first.rect().topLeft() + QtCore.QPoint(8, 8))
+                end = second.mapToGlobal(second.rect().bottomRight() - QtCore.QPoint(8, 8))
+                dock._start_selection_drag(origin, end, False)
+                dock._finish_selection_drag(end)
+                self.assertTrue(second.selected)
+                dock._clear_selection()
+                self.assertFalse(first.selected)
+                render.assert_not_called()
+            self.assertIs(first, dock.grid.itemAt(0).widget())
+            dock.close(); window.close()
+
+    def test_deck_dock_bulk_edits_existing_macro_and_start_point(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.deck_dock import DeckBulkEditDialog, DeckDockWindow
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            for name, entry in (("네이버", "A 로그인"), ("엣지", "B 로그인")):
+                repository.create_macro(name)
+                macro = repository.load_macro(name)
+                macro["steps"] = [{"action": "wait", "duration": 1, "entry_name": entry}]
+                repository.save_macro(name, macro)
+            window = QuickSlotDeckWindow(repository)
+            dock = DeckDockWindow(window)
+            for index in (0, 1):
+                dock.payload["slots"][index] = dock._slot_from_action({
+                    "kind": "run_macro", "label": f"슬롯 {index}",
+                    "macro": "네이버", "entry_name": "A 로그인",
+                })
+            dock.selected_slots = {0, 1}
+
+            class SaveDialog(DeckBulkEditDialog):
+                def exec(self) -> int:
+                    macro_check, macro_combo = self.controls["macro"]
+                    entry_check, entry_combo = self.controls["entry_name"]
+                    macro_check.setChecked(True)
+                    macro_combo.setCurrentIndex(macro_combo.findData("엣지"))
+                    entry_check.setChecked(True)
+                    entry_combo.setCurrentIndex(entry_combo.findData("B 로그인"))
+                    self.findChild(QtWidgets.QDialogButtonBox).button(QtWidgets.QDialogButtonBox.Save).click()
+                    return self.result()
+
+            with mock.patch("macro_studio.deck_dock.DeckBulkEditDialog", SaveDialog):
+                dock._bulk_edit_selected()
+            actions = [slot["action"] for slot in repository.load_hotkeys()["slots"][:2]]
+            self.assertEqual(["엣지", "엣지"], [action["macro"] for action in actions])
+            self.assertEqual(["B 로그인", "B 로그인"], [action["entry_name"] for action in actions])
+            self.assertEqual(["슬롯 0", "슬롯 1"], [action["label"] for action in actions])
+
+            self.assertEqual("", dock._bulk_macro_patch_error([0, 1], {"macro": "네이버"}))
+            dock._apply_bulk_patch([0, 1], {"macro": "네이버"})
+            self.assertEqual(["", ""], [dock.payload["slots"][index]["action"]["entry_name"] for index in (0, 1)])
+            self.assertIn("시작 지점이 없습니다", dock._bulk_macro_patch_error([0, 1], {"entry_name": "B 로그인"}))
+            dock.close(); window.close()
+
     def test_deck_backup_restores_slots_actions_pages_and_icons(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository
@@ -951,6 +1025,249 @@ class QuickSlotDeckTests(unittest.TestCase):
             start.assert_called_once_with("네이버", entry_name="B 로그인")
             dialog.close()
             window.close()
+
+    def test_deck_opens_studio_step_settings_and_saves_the_underlying_macro(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.deck_dock import DeckActionConfigDialog, DeckMacroStepsDialog
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("네이버")
+            macro = repository.load_macro("네이버")
+            macro["steps"] = [
+                {"action": "mouse_click", "label": "로그인", "entry_name": "A 로그인",
+                 "window_exe": "whale.exe", "x": 10, "y": 20}
+            ]
+            repository.save_macro("네이버", macro)
+            window = QuickSlotDeckWindow(repository)
+            slot_dialog = DeckActionConfigDialog("run_macro", {"macro": "네이버", "entry_name": "A 로그인"}, window)
+            button = next(button for button in slot_dialog.findChildren(QtWidgets.QPushButton)
+                          if button.text() == "매크로 내부 단계 상세 편집…")
+            self.assertTrue(button.isEnabled())
+            steps_dialog = DeckMacroStepsDialog(repository, "네이버", slot_dialog)
+            self.assertEqual("whale.exe", steps_dialog.steps_list.topLevelItem(0).text(2))
+            steps_dialog.steps_list.topLevelItem(0).setSelected(True)
+
+            changed = dict(macro["steps"][0], window_exe="msedge.exe")
+            fake_editor = mock.Mock()
+            fake_editor.exec.return_value = QtWidgets.QDialog.Accepted
+            fake_editor.payload.return_value = changed
+            with mock.patch("macro_studio.action_editor.ActionEditorDialog", return_value=fake_editor) as editor_type:
+                steps_dialog._edit_selected_step()
+            editor_type.assert_called_once()
+            self.assertIs(steps_dialog, editor_type.call_args.args[2])
+            self.assertEqual("msedge.exe", repository.load_macro("네이버")["steps"][0]["window_exe"])
+            self.assertEqual("msedge.exe", steps_dialog.steps_list.topLevelItem(0).text(2))
+            self.assertEqual("A 로그인", slot_dialog.widgets["entry_name"].currentData())
+            steps_dialog.close(); slot_dialog.close(); window.close()
+
+    def test_deck_step_settings_cancel_keeps_macro_unchanged(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio.deck_dock import DeckMacroStepsDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("네이버")
+            macro = repository.load_macro("네이버")
+            macro["steps"] = [{"action": "wait", "duration": 100}]
+            repository.save_macro("네이버", macro)
+            dialog = DeckMacroStepsDialog(repository, "네이버")
+            dialog.steps_list.topLevelItem(0).setSelected(True)
+            fake_editor = mock.Mock()
+            fake_editor.exec.return_value = QtWidgets.QDialog.Rejected
+            with mock.patch("macro_studio.action_editor.ActionEditorDialog", return_value=fake_editor):
+                dialog._edit_selected_step()
+            fake_editor.payload.assert_not_called()
+            self.assertEqual(100, repository.load_macro("네이버")["steps"][0]["duration"])
+            dialog.close()
+
+    def test_studio_action_editor_can_load_a_deck_macro_step(self) -> None:
+        from macro_studio.action_editor import ActionEditorDialog
+        from macro_studio.deck_dock import DeckMacroStepsDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("네이버")
+            macro = repository.load_macro("네이버")
+            macro["steps"] = [{"action": "mouse_click", "window_exe": "whale.exe", "x": 10, "y": 20}]
+            repository.save_macro("네이버", macro)
+            parent = DeckMacroStepsDialog(repository, "네이버")
+            editor = ActionEditorDialog(repository, macro["steps"][0], parent)
+            self.assertEqual("whale.exe", editor.payload()["window_exe"])
+            editor.close(); parent.close()
+
+    def test_deck_macro_preview_shows_saved_flow_and_readable_unselected_rows(self) -> None:
+        from PySide6 import QtCore, QtGui
+        from macro_studio.deck_dock import DeckMacroMiniCanvas, DeckMacroStepsDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("네이버")
+            macro = repository.load_macro("네이버")
+            macro["steps"] = [
+                {"action": "image_search", "label": "로그인 화면 찾기", "on_success": 2, "on_fail": 3},
+                {"action": "mouse_click", "label": "로그인 클릭", "window_exe": "msedge.exe"},
+                {"action": "wait", "label": "실패 대기"},
+            ]
+            macro["graph_positions"] = {"1": [0, 0], "2": [320, 0], "3": [320, 240]}
+            repository.save_macro("네이버", macro)
+            dialog = DeckMacroStepsDialog(repository, "네이버")
+            dialog.show()
+            self.app.processEvents()
+            self.assertEqual([(2, "success"), (3, "fail")],
+                             DeckMacroMiniCanvas._targets(macro["steps"][0], 1, 3))
+            self.assertEqual(3, len(dialog.mini_canvas.nodes))
+            self.assertGreater(dialog.mini_canvas.nodes[3].pos().y(), dialog.mini_canvas.nodes[2].pos().y())
+            dialog.mini_canvas.node_selected.emit(3)
+            self.assertEqual(2, dialog.steps_list.currentItem().data(0, QtCore.Qt.UserRole))
+            self.assertFalse(dialog.steps_list.alternatingRowColors())
+            self.assertEqual(QtGui.QColor("#F4F6FA"), dialog.steps_list.topLevelItem(1).foreground(1).color())
+            row = dialog.steps_list.visualItemRect(dialog.steps_list.topLevelItem(1))
+            pixel = dialog.steps_list.viewport().grab().toImage().pixelColor(
+                dialog.steps_list.viewport().width() - 10, row.center().y())
+            self.assertLess(pixel.lightness(), 110)
+            dialog.close()
+
+    def test_deck_multi_click_selection_bulk_changes_only_targeted_steps(self) -> None:
+        from PySide6 import QtCore, QtTest, QtWidgets
+        from macro_studio.deck_dock import DeckMacroStepsDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("네이버")
+            macro = repository.load_macro("네이버")
+            macro["steps"] = [
+                {"action": "image_search", "region_window_exe": "whale.exe", "region_window": "Old",
+                 "click": {"window_exe": "whale.exe", "window": "Old"}, "asset": "logo"},
+                {"action": "inactive_click", "window_exe": "whale.exe", "window": "Old", "x": 12},
+                {"action": "wait", "duration": 100},
+            ]
+            repository.save_macro("네이버", macro)
+            dialog = DeckMacroStepsDialog(repository, "네이버")
+            dialog.show()
+            self.app.processEvents()
+            self.assertEqual(QtWidgets.QAbstractItemView.MultiSelection, dialog.steps_list.selectionMode())
+            for row in (0, 1):
+                item = dialog.steps_list.topLevelItem(row)
+                point = dialog.steps_list.visualItemRect(item).center()
+                QtTest.QTest.mouseClick(dialog.steps_list.viewport(), QtCore.Qt.LeftButton, pos=point)
+            self.assertEqual([0, 1], dialog._selected_indexes())
+            fake_picker = mock.Mock()
+            fake_picker.exec.return_value = QtWidgets.QDialog.Accepted
+            fake_picker.selected_executable.return_value = "msedge.exe"
+            with mock.patch("macro_studio.deck_dock.DeckTargetProgramDialog", return_value=fake_picker):
+                dialog._change_selected_targets()
+            steps = repository.load_macro("네이버")["steps"]
+            self.assertEqual("msedge.exe", steps[0]["region_window_exe"])
+            self.assertEqual("msedge.exe", steps[0]["click"]["window_exe"])
+            self.assertNotIn("region_window", steps[0])
+            self.assertNotIn("window", steps[0]["click"])
+            self.assertEqual("logo", steps[0]["asset"])
+            self.assertEqual("msedge.exe", steps[1]["window_exe"])
+            self.assertEqual(12, steps[1]["x"])
+            self.assertEqual(macro["steps"][2], steps[2])
+            dialog.close()
+
+    def test_deck_click_step_can_repick_client_position_directly(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.deck_dock import DeckMacroStepsDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("네이버")
+            macro = repository.load_macro("네이버")
+            macro["steps"] = [{"action": "inactive_click", "window_exe": "whale.exe", "window": "Old",
+                               "x": 1, "y": 2}]
+            repository.save_macro("네이버", macro)
+            dialog = DeckMacroStepsDialog(repository, "네이버")
+            dialog.steps_list.topLevelItem(0).setSelected(True)
+            picker = mock.Mock()
+            picker.exec.return_value = QtWidgets.QDialog.Accepted
+            picker.selected_client_point.return_value = QtCore.QPoint(25, 35)
+            picker.exe_name = "msedge.exe"
+            picker.window_token = "ahk_id 0x1234"
+            with mock.patch("macro_studio.action_editor.WindowPickerDialog", return_value=picker):
+                dialog._repick_selected_click()
+            step = repository.load_macro("네이버")["steps"][0]
+            self.assertEqual((25, 35), (step["x"], step["y"]))
+            self.assertEqual("msedge.exe", step["window_exe"])
+            self.assertEqual("ahk_id 0x1234", step["window"])
+            self.assertEqual("client", step["coordinate_scope"])
+            dialog.close()
+
+    def test_deck_visual_image_edit_saves_preview_result(self) -> None:
+        from PySide6 import QtWidgets
+        from macro_studio import region_visual_test
+        from macro_studio.deck_dock import DeckMacroStepsDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("네이버")
+            macro = repository.load_macro("네이버")
+            macro["steps"] = [{"action": "image_search", "asset": "old", "assets": ["old"],
+                               "region_window_exe": "whale.exe", "on_success": 2}]
+            repository.save_macro("네이버", macro)
+            dialog = DeckMacroStepsDialog(repository, "네이버")
+            dialog.steps_list.topLevelItem(0).setSelected(True)
+            visual = mock.Mock()
+            visual.exec.return_value = QtWidgets.QDialog.Accepted
+            visual.step = macro["steps"][0]
+            visual.get_aliases.return_value = ["new"]
+            visual.get_asset_regions.return_value = {"new": [1, 2, 30, 40]}
+            visual.get_asset_offsets.return_value = {"new": [3, 4]}
+            visual.get_click_target.return_value = "first_image"
+            visual.get_match_condition.return_value = "all_matched"
+            visual.get_required_count.return_value = 1
+            visual.get_bounding_region.return_value = [1, 2, 30, 40]
+            with mock.patch.object(region_visual_test, "RegionVisualTestDialog", return_value=visual):
+                dialog._edit_selected_image_visually()
+            step = repository.load_macro("네이버")["steps"][0]
+            self.assertEqual("new", step["asset"])
+            self.assertEqual(["new"], step["assets"])
+            self.assertEqual("whale.exe", step["region_window_exe"])
+            self.assertEqual(2, step["on_success"])
+            dialog.close()
+
+    def test_deck_can_replace_one_search_image_without_changing_other_steps(self) -> None:
+        from PySide6 import QtGui
+        from macro_studio.deck_dock import DeckMacroStepsDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("네이버")
+            replacement = Path(directory) / "replacement.png"
+            image = QtGui.QImage(8, 8, QtGui.QImage.Format_ARGB32)
+            image.fill(QtGui.QColor("#33AA77"))
+            self.assertTrue(image.save(str(replacement)))
+            macro = repository.load_macro("네이버")
+            macro["steps"] = [
+                {"action": "image_search", "asset": "old", "assets": ["old"],
+                 "asset_regions": {"old": [1, 2, 30, 40]}, "on_success": 2},
+                {"action": "image_search", "asset": "old", "assets": ["old"]},
+            ]
+            repository.save_macro("네이버", macro)
+            dialog = DeckMacroStepsDialog(repository, "네이버")
+            dialog.steps_list.topLevelItem(0).setSelected(True)
+            self.assertTrue(dialog.replace_image_button.isEnabled())
+            with mock.patch("PySide6.QtWidgets.QFileDialog.getOpenFileName", return_value=(str(replacement), "")):
+                dialog._replace_selected_image()
+            steps = repository.load_macro("네이버")["steps"]
+            alias = steps[0]["asset"]
+            self.assertNotEqual("old", alias)
+            self.assertEqual([alias], steps[0]["assets"])
+            self.assertEqual({alias: [1, 2, 30, 40]}, steps[0]["asset_regions"])
+            self.assertEqual("old", steps[1]["asset"])
+            self.assertTrue(repository.asset_path(alias).is_file())
+            dialog.close()
 
     def test_deck_input_actions_offer_target_mode_icon_and_test_controls(self) -> None:
         from macro_studio.deck_dock import DeckActionConfigDialog

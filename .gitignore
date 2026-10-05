@@ -74,5 +74,7 @@ branding/*
 *.building-*
 *.bak
 /deck_presets/*.backup-*.json
+/deck_presets/deck_before_github_restore-*.json
+/deck_presets/tetris-cleanup-backup-*/
 /deck_presets/*.json.tmp
 *.exe

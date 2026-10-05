@@ -110,11 +110,24 @@ class QuickSlotDeckTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
-            dialog = QuickSlotDeckSettingsDialog(window)
+            whale_path = r"C:\Custom Install\Whale\whale.exe"
+            with mock.patch.object(window, "_whale_executable", return_value=whale_path):
+                dialog = QuickSlotDeckSettingsDialog(window)
             hint = dialog.tab_browser.findChild(QtWidgets.QLabel, "whale_debugger_launch_hint")
             self.assertIsNotNone(hint)
-            self.assertIn('"C:\\Program Files\\Naver\\Naver Whale\\Application\\whale.exe" --silent-debugger-extension-api', hint.text())
+            expected = '"C:\\Custom Install\\Whale\\whale.exe" --silent-debugger-extension-api'
+            self.assertIn(expected, hint.text())
             self.assertIn("다른 디버깅 확장앱의 경고도 숨깁니다", hint.text())
+            copy_command = dialog.tab_browser.findChild(QtWidgets.QPushButton, "copy_whale_debugger_command")
+            self.assertIsNotNone(copy_command)
+            clipboard = QtWidgets.QApplication.clipboard()
+            previous_clipboard = clipboard.text()
+            try:
+                copy_command.click()
+                self.assertEqual(expected, clipboard.text())
+                self.assertIn("복사됨", copy_command.text())
+            finally:
+                clipboard.setText(previous_clipboard)
             dialog.tabs.setCurrentWidget(dialog.tab_browser)
             dialog.show()
             self.app.processEvents()
@@ -196,6 +209,196 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual(window.width() - grip.width(), grip.x())
             QtTest.QTest.mouseRelease(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
             self.assertEqual("", window._resize_edge)
+            window.close()
+
+    def test_bottom_left_grip_trims_only_empty_space_and_remembers_preset_height(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": [
+                {"macro": "첫 번째", "hotkey": "", "mode": "hybrid"},
+                {"macro": "두 번째", "hotkey": "", "mode": "hybrid"},
+            ]})
+            _use_legacy_compact_default(repository)
+            window = QuickSlotDeckWindow(repository)
+            window.show()
+            self.app.processEvents()
+            grip = window.bottom_padding_grip
+            self.assertTrue(grip.isVisible())
+            self.assertEqual((0, window.height() - grip.height()), (grip.x(), grip.y()))
+            tile_size = window.buttons[0].size()
+            width = window.width()
+            original_height = window.height()
+
+            QtTest.QTest.mousePress(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertEqual("bottom_padding", window._resize_edge)
+            QtTest.QTest.mouseMove(grip, QtCore.QPoint(12, 102))
+            self.app.processEvents()
+            self.assertEqual(width, window.width())
+            self.assertEqual(original_height + 90, window.height())
+            self.assertEqual(tile_size, window.buttons[0].size())
+            self.assertEqual(window.height() - grip.height(), grip.y())
+            QtTest.QTest.mouseRelease(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertEqual("", window._resize_edge)
+            self.assertEqual(90, window.config["bottom_blank_space"])
+            self.assertEqual(90, window.config["slot_presets"]["default"]["style"]["bottom_blank_space"])
+            saved = json.loads(window.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(90, saved["config"]["bottom_blank_space"])
+
+            window.refresh_slots()
+            self.app.processEvents()
+            self.assertEqual(original_height + 90, window.height())
+            self.assertEqual(tile_size, window.buttons[0].size())
+
+            window.config["slot_presets"]["other"] = window._build_slot_preset("다른 프리셋")
+            window.config["slot_presets"]["other"]["style"]["bottom_blank_space"] = 0
+            window._switch_slot_preset("other")
+            self.assertEqual(0, window.config["bottom_blank_space"])
+            window._switch_slot_preset("default")
+            self.app.processEvents()
+            self.assertEqual(90, window.config["bottom_blank_space"])
+            self.assertEqual(original_height + 90, window.height())
+            self.assertEqual(tile_size, window.buttons[0].size())
+
+            QtTest.QTest.mousePress(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            QtTest.QTest.mouseMove(grip, QtCore.QPoint(12, -100))
+            self.app.processEvents()
+            self.assertEqual(window._size_for_tile_side(window._tile_side_from_width(width)).height(), window.height())
+            self.assertEqual(tile_size, window.buttons[0].size())
+            QtTest.QTest.mouseRelease(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertEqual(0, window.config["bottom_blank_space"])
+
+            # The original right grip still scales square slots after trimming.
+            before_side = window.buttons[0].width()
+            before_geometry = window.geometry()
+            window._resize_edge = "bottom_right"
+            window._resize_start_geom = before_geometry
+            window._resize_start_pos = before_geometry.bottomRight()
+            window._handle_border_resize(before_geometry.bottomRight() + QtCore.QPoint(40, 40))
+            self.app.processEvents()
+            self.assertGreater(window.buttons[0].width(), before_side)
+            self.assertEqual(window.buttons[0].width(), window.buttons[0].height())
+            self.assertEqual(0, window.config["bottom_blank_space"])
+            window.close()
+
+    def test_bottom_left_grip_can_shrink_preset_with_hidden_empty_rows(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.save_hotkeys({"slots": [
+                {"macro": f"단계 {index}", "hotkey": "", "mode": "hybrid"}
+                for index in range(8)
+            ]})
+            (repository.root / ".quickslot_deck_config.json").write_text(json.dumps({
+                "rows": 5, "cols": 9,
+                "config": {"browser_shortcuts_version": 1, "starter_presets_version": 1,
+                           "show_empty_slots": True, "empty_slot_opacity": 100,
+                           "manual_tile_side": 60},
+            }), encoding="utf-8")
+            window = QuickSlotDeckWindow(repository)
+            window.show()
+            self.app.processEvents()
+            self.assertEqual(5, window._visible_rows)
+            self.assertEqual(45, len(window.buttons))
+            original_width, original_height = window.width(), window.height()
+            tile_size = window.buttons[0].size()
+            grip = window.bottom_padding_grip
+
+            QtTest.QTest.mousePress(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.app.processEvents()
+            self.assertEqual(original_height, window.height())
+            self.assertEqual(5, window._visible_rows)
+            self.assertEqual(45, len(window.buttons))
+            self.assertFalse(window.config["crop_trailing_empty_rows"])
+            QtTest.QTest.mouseRelease(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertEqual(5, window._visible_rows)
+            self.assertFalse(window.config["crop_trailing_empty_rows"])
+
+            QtTest.QTest.mousePress(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            QtTest.QTest.mouseMove(grip, QtCore.QPoint(12, 10))
+            self.app.processEvents()
+            self.assertEqual(5, window._visible_rows)
+            QtTest.QTest.mouseRelease(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertFalse(window.config["crop_trailing_empty_rows"])
+
+            QtTest.QTest.mousePress(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            QtTest.QTest.mouseMove(grip, QtCore.QPoint(12, -188))
+            self.app.processEvents()
+            self.assertEqual(original_width, window.width())
+            self.assertEqual(original_height - 200, window.height())
+            self.assertEqual(1, window._visible_rows)
+            self.assertEqual(9, len(window.buttons))
+            self.assertEqual(tile_size, window.buttons[0].size())
+            QtTest.QTest.mouseRelease(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertTrue(window.config["crop_trailing_empty_rows"])
+
+            window.refresh_slots()
+            self.app.processEvents()
+            self.assertEqual(1, window._visible_rows)
+            self.assertEqual(9, len(window.buttons))
+            self.assertEqual(original_height - 200, window.height())
+
+            QtTest.QTest.mousePress(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            QtTest.QTest.mouseMove(grip, QtCore.QPoint(12, -1000))
+            QtTest.QTest.mouseRelease(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertEqual(window._size_for_tile_side(60).height(), window.height())
+            self.assertEqual(tile_size, window.buttons[0].size())
+            hotkeys = repository.load_hotkeys()
+            hotkeys["slots"].extend({} for _ in range(2))
+            hotkeys["slots"][9] = {"macro": "다음 줄", "hotkey": "", "mode": "hybrid"}
+            repository.save_hotkeys(hotkeys)
+            window.refresh_slots()
+            self.app.processEvents()
+            self.assertEqual(2, window._visible_rows)
+            self.assertEqual(18, len(window.buttons))
+            self.assertEqual(window._size_for_tile_side(60).height(), window.height())
+            window.close()
+
+    def test_bottom_crop_preserves_action_only_slot_and_hides_no_action_slots(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow, deck_slot_has_content
+        from macro_studio.repository import MacroRepository
+
+        action_only = {"macro": "", "mode": "deck_action",
+                       "action": {"kind": "hotkey", "label": "액션", "keys": "Ctrl+R"}}
+        self.assertTrue(deck_slot_has_content(action_only))
+        self.assertFalse(deck_slot_has_content({"macro": "  ", "action": {}}))
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            slots = [{"macro": "첫 번째"}] + [{} for _ in range(7)]
+            slots[7] = action_only
+            repository.save_hotkeys({"slots": slots})
+            (repository.root / ".quickslot_deck_config.json").write_text(json.dumps({
+                "rows": 4, "cols": 3,
+                "config": {"browser_shortcuts_version": 1, "starter_presets_version": 1,
+                           "show_empty_slots": True, "manual_tile_side": 60},
+            }), encoding="utf-8")
+            window = QuickSlotDeckWindow(repository)
+            window.show()
+            self.app.processEvents()
+            self.assertEqual(4, window._visible_rows)
+            grip = window.bottom_padding_grip
+            QtTest.QTest.mousePress(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            QtTest.QTest.mouseMove(grip, QtCore.QPoint(12, -88))
+            QtTest.QTest.mouseRelease(grip, QtCore.Qt.LeftButton, pos=QtCore.QPoint(12, 12))
+            self.assertEqual(3, window._visible_rows)
+            self.assertEqual(9, len(window.buttons))
+            self.assertEqual(7, window.buttons[7].slot_index)
+            self.assertTrue(window.buttons[7].has_slot_content)
+
+            window.refresh_slots()
+            self.assertEqual(3, window._visible_rows)
+            self.assertEqual(7, window.buttons[7].slot_index)
+            window.config["show_empty_slots"] = False
+            window.refresh_slots()
+            self.assertEqual([0, 7], [button.slot_index for button in window.buttons])
+            self.assertTrue(window._refresh_slots_fast())
             window.close()
 
     def test_icon_refresh_preserves_manually_selected_window_size(self) -> None:
@@ -381,7 +584,7 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertTrue(show_radial.call_args.kwargs["sticky"])
             window.close()
 
-    def test_preset_badge_tap_and_empty_tile_double_click_open_radial(self) -> None:
+    def test_preset_badge_tap_returns_home_and_empty_tile_double_click_opens_radial(self) -> None:
         from PySide6 import QtCore, QtTest
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository
@@ -389,11 +592,16 @@ class QuickSlotDeckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
             window.show()
-            empty_button = next(button for button in window.buttons if not button.macro_name)
+            window._switch_slot_preset("starter-jstris")
+            self.assertEqual("starter-jstris", window.config["active_slot_preset"])
             with mock.patch.object(window, "_show_preset_radial") as show_radial:
-                window.preset_badge.click()
+                QtTest.QTest.mouseClick(window.preset_badge, QtCore.Qt.LeftButton)
+                self.assertEqual("default", window.config["active_slot_preset"])
+                self.assertEqual(window.config["slot_presets"]["default"]["slots"],
+                                 window.repository.load_hotkeys()["slots"])
+                empty_button = next(button for button in window.buttons if not button.macro_name)
                 QtTest.QTest.mouseDClick(empty_button, QtCore.Qt.LeftButton)
-            self.assertEqual(2, show_radial.call_count)
+            self.assertEqual(1, show_radial.call_count)
             self.assertTrue(all(call.kwargs["sticky"] for call in show_radial.call_args_list))
             window.close()
 
@@ -854,6 +1062,105 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual("T", window.custom_icons["0"]["emoji"])
             window.close()
 
+    def test_backup_rejects_mismatched_active_preset_before_changing_files(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            window = QuickSlotDeckWindow(repository)
+            payload = window.build_deck_backup_payload()
+            payload["hotkeys"]["slots"] = [{"macro": "다른 프리셋 슬롯"}]
+            previous_hotkeys = repository.load_hotkeys()
+            previous_config = window.config_path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "활성 프리셋과 실행 슬롯"):
+                window.restore_deck_backup_payload(payload)
+            self.assertEqual(previous_hotkeys, repository.load_hotkeys())
+            self.assertEqual(previous_config, window.config_path.read_bytes())
+            window.close()
+
+    def test_tetris_youtube_mix_is_backed_up_and_repaired_once(self) -> None:
+        from macro_studio.deck_starter_actions import default_home_slot, starter_action_pack
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            home, home_icon = default_home_slot()
+            youtube_actions, _icons = starter_action_pack("youtube")
+            copied_slots = [home] + youtube_actions
+            tetris_icons = {"0": home_icon, "1": {"emoji": "▶", "text_show": False}}
+            presets = {
+                "default": {"name": "기본", "slots": [], "rows": 3, "cols": 5},
+                "starter-youtube": {"name": "유튜브", "slots": copied_slots, "rows": 3, "cols": 5},
+                "starter-jstris": {"name": "테트리스", "slots": copied_slots,
+                                   "custom_icons": tetris_icons, "pinned_slots": {},
+                                   "rows": 3, "cols": 5},
+            }
+            repository.save_hotkeys({"slots": copied_slots})
+            config_path = repository.root / ".quickslot_deck_config.json"
+            config_path.write_text(json.dumps({"rows": 3, "cols": 5,
+                                               "custom_icons": tetris_icons,
+                                               "config": {"slot_presets": presets,
+                                                          "active_slot_preset": "starter-jstris",
+                                                          "starter_presets_version": 1,
+                                                          "browser_shortcuts_version": 1}},
+                                              ensure_ascii=False), encoding="utf-8")
+            window = QuickSlotDeckWindow(repository)
+            self.assertEqual([home], window.config["slot_presets"]["starter-jstris"]["slots"])
+            self.assertEqual([home], repository.load_hotkeys()["slots"])
+            self.assertEqual({"0": home_icon}, window.custom_icons)
+            self.assertEqual(1, window.config["tetris_youtube_mix_cleanup_version"])
+            backups = list((repository.root / "deck_presets").glob("tetris-cleanup-backup-*"))
+            self.assertEqual(1, len(backups))
+            original = json.loads((backups[0] / config_path.name).read_text(encoding="utf-8"))
+            self.assertEqual(copied_slots, original["config"]["slot_presets"]["starter-jstris"]["slots"])
+            self.assertEqual(copied_slots, json.loads((backups[0] / repository.hotkeys_path.name).read_text(encoding="utf-8"))["slots"])
+            window.close()
+
+            reopened = QuickSlotDeckWindow(repository)
+            self.assertEqual([home], reopened.config["slot_presets"]["starter-jstris"]["slots"])
+            self.assertEqual(1, len(list((repository.root / "deck_presets").glob("tetris-cleanup-backup-*"))))
+            reopened.close()
+
+    def test_saving_current_ui_over_another_preset_requires_confirmation(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow, SlotPresetDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = QuickSlotDeckWindow(MacroRepository(Path(directory)))
+            dialog = SlotPresetDialog(window)
+            target_id = next(preset_id for preset_id in dialog.presets
+                             if preset_id != dialog.active_id)
+            before = json.loads(json.dumps(dialog.presets[target_id]))
+            for row in range(dialog.list_widget.count()):
+                item = dialog.list_widget.item(row)
+                if item.data(QtCore.Qt.UserRole) == target_id:
+                    dialog.list_widget.setCurrentItem(item)
+                    break
+            with mock.patch("macro_studio.quickslot_deck.QtWidgets.QMessageBox.question",
+                            return_value=QtWidgets.QMessageBox.No) as question:
+                dialog._save_current_ui()
+            question.assert_called_once()
+            self.assertEqual(before, dialog.presets[target_id])
+            dialog.close(); window.close()
+
+    def test_tetris_repair_does_not_remove_distinct_user_slots(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            window = QuickSlotDeckWindow(repository)
+            tetris = window.config["slot_presets"]["starter-jstris"]
+            tetris["slots"].append({"macro": "내 테트리스 동작", "mode": "hybrid"})
+            original = json.loads(json.dumps(tetris["slots"]))
+            self.assertFalse(window._repair_tetris_youtube_copy())
+            self.assertEqual(original, tetris["slots"])
+            self.assertFalse(list((repository.root / "deck_presets").glob("tetris-cleanup-backup-*")))
+            window.close()
+
     def test_legacy_deck_config_import_restores_active_preset_slots(self) -> None:
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository
@@ -893,19 +1200,55 @@ class QuickSlotDeckTests(unittest.TestCase):
             image = source.assets_dir / "marker.png"
             image.write_bytes(b"sample-image")
             source._write_json(source.assets_index_path, {"marker": {"file": "assets/marker.png"}})
-            source.save_macro("차트 클릭", {"steps": [{"action": "image_search", "asset": "marker"}]})
+            source.save_macro("차트 클릭", {"steps": [{"action": "call_submacro", "macro": "이미지 확인"}]})
+            source.save_macro("이미지 확인", {"steps": [{"action": "image_search", "asset": "marker"}]})
             source_window = QuickSlotDeckWindow(source)
             backup = source_window.build_deck_backup_payload()
             self.assertIn("차트 클릭", backup["macros"])
+            self.assertIn("이미지 확인", backup["macros"])
             self.assertIn("marker", backup["assets"])
 
             target = MacroRepository(Path(target_dir))
             target_window = QuickSlotDeckWindow(target)
             target_window.restore_deck_backup_payload(backup)
-            self.assertEqual("marker", target.load_macro("차트 클릭")["steps"][0]["asset"])
+            self.assertEqual("이미지 확인", target.load_macro("차트 클릭")["steps"][0]["macro"])
+            self.assertEqual("marker", target.load_macro("이미지 확인")["steps"][0]["asset"])
             self.assertEqual(b"sample-image", (target.assets_dir / "marker.png").read_bytes())
             self.assertEqual("차트 클릭", target.load_hotkeys()["slots"][0]["action"]["macro"])
             source_window.close(); target_window.close()
+
+    def test_github_download_apply_restores_all_presets_and_keeps_previous_deck(self) -> None:
+        from macro_studio.quickslot_deck import QuickSlotDeckSettingsDialog, QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            source = MacroRepository(Path(source_dir))
+            source_window = QuickSlotDeckWindow(source)
+            extra = source_window._build_slot_preset("두 번째 프리셋")
+            extra["slots"] = [{"macro": "문구", "mode": "deck_action",
+                               "action": {"kind": "text", "text": "portable value"}}]
+            source_window.config["slot_presets"]["other-pc"] = extra
+            payload = source_window.build_deck_backup_payload()
+            self.assertIn("other-pc", payload["deck_config"]["config"]["slot_presets"])
+
+            target = MacroRepository(Path(target_dir))
+            target_window = QuickSlotDeckWindow(target)
+            target_window.config["slot_presets"]["local-only"] = target_window._build_slot_preset("이 PC의 기존 구성")
+            dialog = QuickSlotDeckSettingsDialog(target_window)
+            dialog._github_download_apply = True
+            with mock.patch("macro_studio.quickslot_deck.QtWidgets.QMessageBox.information"):
+                dialog._github_bundle_downloaded(payload)
+
+            self.assertIn("other-pc", target_window.config["slot_presets"])
+            restored_actions = [slot.get("action") or {} for slot in target_window.config["slot_presets"]["other-pc"]["slots"]]
+            self.assertIn("portable value", [action.get("text") for action in restored_actions])
+            self.assertNotIn("local-only", target_window.config["slot_presets"])
+            restore_points = list((target.root / "deck_presets").glob("deck_before_github_restore-*.json"))
+            self.assertEqual(1, len(restore_points))
+            previous = json.loads(restore_points[0].read_text(encoding="utf-8"))
+            self.assertIn("local-only", previous["deck_config"]["config"]["slot_presets"])
+            self.assertEqual(payload, json.loads((target.root / "deck_presets" / "macrorelay_bundled_deck.json").read_text(encoding="utf-8")))
+            dialog.close(); source_window.close(); target_window.close()
 
     def test_deck_dock_image_drop_applies_full_tile_icon(self) -> None:
         from PySide6 import QtCore, QtGui
@@ -1152,11 +1495,12 @@ class QuickSlotDeckTests(unittest.TestCase):
             dialog = DeckMacroStepsDialog(repository, "네이버")
             dialog.show()
             self.app.processEvents()
-            self.assertEqual(QtWidgets.QAbstractItemView.MultiSelection, dialog.steps_list.selectionMode())
+            self.assertEqual(QtWidgets.QAbstractItemView.ExtendedSelection, dialog.steps_list.selectionMode())
             for row in (0, 1):
                 item = dialog.steps_list.topLevelItem(row)
                 point = dialog.steps_list.visualItemRect(item).center()
-                QtTest.QTest.mouseClick(dialog.steps_list.viewport(), QtCore.Qt.LeftButton, pos=point)
+                modifier = QtCore.Qt.NoModifier if row == 0 else QtCore.Qt.ShiftModifier
+                QtTest.QTest.mouseClick(dialog.steps_list.viewport(), QtCore.Qt.LeftButton, modifier, point)
             self.assertEqual([0, 1], dialog._selected_indexes())
             fake_picker = mock.Mock()
             fake_picker.exec.return_value = QtWidgets.QDialog.Accepted
@@ -1172,6 +1516,56 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual("msedge.exe", steps[1]["window_exe"])
             self.assertEqual(12, steps[1]["x"])
             self.assertEqual(macro["steps"][2], steps[2])
+            dialog.close()
+
+    def test_deck_macro_step_click_replaces_selection_unless_shift_or_drag(self) -> None:
+        from PySide6 import QtCore, QtTest
+        from macro_studio.deck_dock import DeckMacroStepsDialog
+        from macro_studio.repository import MacroRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = MacroRepository(Path(directory))
+            repository.create_macro("선택 테스트")
+            macro = repository.load_macro("선택 테스트")
+            macro["steps"] = [{"action": "wait", "duration": 100} for _ in range(4)]
+            repository.save_macro("선택 테스트", macro)
+            dialog = DeckMacroStepsDialog(repository, "선택 테스트")
+            dialog.show()
+            self.app.processEvents()
+            view = dialog.steps_list.viewport()
+
+            def click(row: int, modifier=QtCore.Qt.NoModifier) -> None:
+                item = dialog.steps_list.topLevelItem(row)
+                QtTest.QTest.mouseClick(view, QtCore.Qt.LeftButton, modifier,
+                                        dialog.steps_list.visualItemRect(item).center())
+
+            click(0)
+            click(2)
+            self.assertEqual([2], dialog._selected_indexes())
+            click(0, QtCore.Qt.ShiftModifier)
+            self.assertEqual([0, 1, 2], dialog._selected_indexes())
+            click(3)
+            self.assertEqual([3], dialog._selected_indexes())
+            click(1, QtCore.Qt.ControlModifier)
+            self.assertEqual([1], dialog._selected_indexes())
+            start = dialog.steps_list.visualItemRect(dialog.steps_list.topLevelItem(0)).center()
+            end = dialog.steps_list.visualItemRect(dialog.steps_list.topLevelItem(2)).center()
+            QtTest.QTest.mousePress(view, QtCore.Qt.LeftButton, pos=start)
+            QtTest.QTest.mouseMove(view, end)
+            QtTest.QTest.mouseRelease(view, QtCore.Qt.LeftButton, pos=end)
+            self.assertEqual([0, 1, 2], dialog._selected_indexes())
+            dialog.mini_canvas.node_selected.emit(4)
+            self.assertEqual([3], dialog._selected_indexes())
+            dialog.mini_canvas.node_selected.emit(4)
+            self.assertEqual([3], dialog._selected_indexes())
+            canvas = dialog.mini_canvas
+            first_node = canvas.mapFromScene(canvas.nodes[1].sceneBoundingRect().center())
+            QtTest.QTest.mouseClick(canvas.viewport(), QtCore.Qt.LeftButton,
+                                    QtCore.Qt.ShiftModifier, first_node)
+            self.assertEqual([0, 3], dialog._selected_indexes())
+            QtTest.QTest.mouseClick(canvas.viewport(), QtCore.Qt.LeftButton,
+                                    QtCore.Qt.NoModifier, first_node)
+            self.assertEqual([0], dialog._selected_indexes())
             dialog.close()
 
     def test_deck_click_step_can_repick_client_position_directly(self) -> None:

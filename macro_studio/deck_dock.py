@@ -395,6 +395,7 @@ class DeckMacroMiniCanvas(QtWidgets.QGraphicsView):
         self.setMinimumWidth(290)
         self.nodes: dict[int, QtWidgets.QGraphicsRectItem] = {}
         self.selected_index = 0
+        self.last_click_shift = False
 
     @staticmethod
     def _targets(step: dict[str, Any], index: int, total: int) -> list[tuple[int, str]]:
@@ -502,14 +503,29 @@ class DeckMacroMiniCanvas(QtWidgets.QGraphicsView):
             self.fitInView(self.scene().sceneRect(), QtCore.Qt.KeepAspectRatio)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        item = self.itemAt(event.pos())
+        item = self.itemAt(event.position().toPoint())
         while item is not None:
             index = item.data(0)
             if isinstance(index, int) and index in self.nodes:
+                self.last_click_shift = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
                 self.node_selected.emit(index)
                 break
             item = item.parentItem()
         super().mousePressEvent(event)
+
+
+class DeckMacroStepsTree(QtWidgets.QTreeWidget):
+    """Single click replaces selection; only Shift or a drag can extend it."""
+
+    def selectionCommand(self, index: QtCore.QModelIndex, event: Optional[QtCore.QEvent] = None):
+        if (event is not None and event.type() in (
+            QtCore.QEvent.MouseButtonPress,
+            QtCore.QEvent.MouseButtonRelease,
+            QtCore.QEvent.MouseButtonDblClick,
+        ) and event.modifiers() & QtCore.Qt.ControlModifier
+                and not event.modifiers() & QtCore.Qt.ShiftModifier):
+            return QtCore.QItemSelectionModel.ClearAndSelect
+        return super().selectionCommand(index, event)
 
 
 MACRO_IMAGE_ACTIONS = {"image_search", "screen_condition", "multi_image_search", "animation_search"}
@@ -664,7 +680,7 @@ class DeckMacroStepsDialog(QtWidgets.QDialog):
         self.setMinimumSize(850, 500)
         self.setStyleSheet(deck_dock_stylesheet())
         layout = QtWidgets.QVBoxLayout(self)
-        hint = QtWidgets.QLabel("행을 마우스로 클릭해 여러 단계를 선택·해제할 수 있습니다. 저장한 내용은 이 매크로를 사용하는 모든 슬롯에 적용됩니다.")
+        hint = QtWidgets.QLabel("클릭은 한 단계만 선택합니다. 여러 단계는 Shift+클릭 또는 드래그로 선택하세요. 저장한 내용은 이 매크로를 사용하는 모든 슬롯에 적용됩니다.")
         hint.setWordWrap(True)
         hint.setObjectName("Hint")
         layout.addWidget(hint)
@@ -688,7 +704,7 @@ class DeckMacroStepsDialog(QtWidgets.QDialog):
         preview_controls.addWidget(fit_button)
         preview_layout.addLayout(preview_controls)
         content.addWidget(preview)
-        self.steps_list = QtWidgets.QTreeWidget()
+        self.steps_list = DeckMacroStepsTree()
         self.steps_list.setObjectName("MacroStepsList")
         self.steps_list.setStyleSheet("""
             QTreeWidget#MacroStepsList { background:#202329; color:#F4F6FA; border:1px solid #555B66;
@@ -700,7 +716,7 @@ class DeckMacroStepsDialog(QtWidgets.QDialog):
         """)
         self.steps_list.setHeaderLabels(["번호", "단계", "대상 프로그램"])
         self.steps_list.setRootIsDecorated(False)
-        self.steps_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        self.steps_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.steps_list.setAlternatingRowColors(False)
         self.steps_list.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         self.steps_list.header().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
@@ -746,8 +762,10 @@ class DeckMacroStepsDialog(QtWidgets.QDialog):
         for row in range(self.steps_list.topLevelItemCount()):
             item = self.steps_list.topLevelItem(row)
             if item.data(0, QtCore.Qt.UserRole) == index - 1:
-                self.steps_list.setCurrentItem(item, 0, QtCore.QItemSelectionModel.NoUpdate)
-                item.setSelected(not item.isSelected())
+                command = (QtCore.QItemSelectionModel.Select if self.mini_canvas.last_click_shift
+                           else QtCore.QItemSelectionModel.ClearAndSelect)
+                self.steps_list.setCurrentItem(item, 0, command)
+                self.mini_canvas.last_click_shift = False
                 self.steps_list.scrollToItem(item)
                 return
 

@@ -47,6 +47,10 @@ except ImportError:
     QSoundEffect = None
 
 from macro_studio.repository import MacroRepository
+from macro_studio.deck_edge_panel import (
+    EDGE_PANEL_HEADER, EDGE_PANEL_SIDES, draw_edge_direction, edge_panel_layout, nearest_screen_edge,
+)
+from macro_studio.deck_github_sync import publish_bundled_deck
 from macro_studio.portable_deck import adapt_backup_for_host, host_fingerprint
 from macro_studio.deck_starter_actions import (
     browser_site_slot, compact_starter_caption, default_home_slot, starter_action_pack,
@@ -80,8 +84,11 @@ def bundled_deck_path(app_root: Path) -> Path:
 
 
 def download_github_bundled_deck() -> Dict[str, Any]:
-    request = urllib.request.Request(GITHUB_BUNDLED_DECK_URL, headers={"User-Agent": "MacroRelay-Deck"})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    request = urllib.request.Request(
+        f"{GITHUB_BUNDLED_DECK_URL}?v={int(time.time())}",
+        headers={"User-Agent": "MacroRelay-Deck", "Cache-Control": "no-cache"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
         content = response.read(MAX_BUNDLED_DECK_BYTES + 1)
     if len(content) > MAX_BUNDLED_DECK_BYTES:
         raise ValueError("GitHub 내장 구성 파일이 허용 크기(100MB)를 넘습니다.")
@@ -90,6 +97,8 @@ def download_github_bundled_deck() -> Dict[str, Any]:
         raise ValueError("GitHub 파일이 MacroRelay Deck 백업 형식이 아닙니다.")
     if not isinstance(payload.get("hotkeys"), dict) or not isinstance(payload.get("macros"), dict):
         raise ValueError("GitHub 내장 구성에 슬롯 또는 매크로 정보가 없습니다.")
+    if not isinstance(payload.get("deck_config"), dict) or not isinstance(payload["hotkeys"].get("slots"), list):
+        raise ValueError("GitHub 내장 구성에 프리셋 또는 슬롯 데이터가 없습니다.")
     return payload
 
 
@@ -107,15 +116,38 @@ def save_bundled_deck_payload(app_root: Path, payload: Dict[str, Any]) -> Path:
     return path
 
 
+def save_deck_restore_point(app_root: Path, payload: Dict[str, Any]) -> Path:
+    """Preserve the current full Deck before applying a downloaded backup."""
+    if payload.get("format") != "macrorelay-deck-backup":
+        raise ValueError("현재 Deck 구성을 백업할 수 없습니다.")
+    directory = Path(app_root) / "deck_presets"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"deck_before_github_restore-{datetime.now():%Y%m%d-%H%M%S%f}.json"
+    temp_path = path.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp_path, path)
+    return path
+
+
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "MacroRelayQuickSlot"
 PRESET_ICON_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ico"}
 BASE_TILE_SIDE = 190
 MIN_TILE_SIDE = 48
 WINDOW_PADDING = 16
-PRESET_STYLE_KEYS = ("theme_index", "tile_scale", "tile_gap", "tile_radius", "hover_glow", "empty_slot_opacity", "show_empty_slots")
+PRESET_STYLE_KEYS = ("theme_index", "tile_scale", "tile_gap", "tile_radius", "hover_glow", "empty_slot_opacity", "show_empty_slots", "bottom_blank_space", "crop_trailing_empty_rows")
 QUICKSLOT_DOUBLE_CLICK_INTERVAL_MS = 240
 SLOT_ACCIDENTAL_REPEAT_MS = 320
+
+
+def deck_slot_has_content(slot: object) -> bool:
+    """A slot can run a Deck action even without a macro name."""
+    if not isinstance(slot, dict):
+        return False
+    action = slot.get("action")
+    return bool(str(slot.get("macro") or "").strip()
+                or (isinstance(action, dict) and action))
+
 
 # Starter modes add no actions and never enable automatic switching on their own.
 # The first-run marker prevents a deleted starter mode from reappearing later.
@@ -1509,6 +1541,7 @@ class StreamDeckButton(QtWidgets.QFrame):
         self._suppress_next_release = False
         self._last_activation_at = 0.0
         self.action_kind = ""
+        self.has_slot_content = False
         self._preview_mode = False
         self._preview_press_pos: Optional[QtCore.QPoint] = None
 
@@ -2193,18 +2226,20 @@ RADIAL_ACTION_PRESETS: Dict[str, tuple[str, str, str]] = {
     "grid": ("▦ 그리드 변경", "▦", "#F59E0B"),
     "add_slot": ("＋ 슬롯 추가", "＋", "#22C55E"),
     "preset_settings": ("★ 덱 프리셋 관리", "★", "#FBBF24"),
-    "auto_resume": ("🌐 자동 프리셋 재개", "↺", "#20BFA8"),
+    "preset_mode": ("프리셋 자동/고정", "📌", "#20BFA8"),
+    "edge_panel": ("화면 가장자리 패널", "▤", "#38BDF8"),
 }
 
 DEFAULT_MANAGEMENT_RADIAL_ITEMS = [
     "prev_page", "next_page", "settings", "deck_dock",
-    "preset_settings", "emergency", "studio", "close_app",
+    "preset_settings", "preset_mode", "edge_panel", "close_app",
 ]
 
 
 def normalize_management_radial_items(keys: Optional[List[str]]) -> List[str]:
     """Keep Deck Close in the final management-menu sector across saved layouts."""
-    actions = [key for key in (keys or []) if key in RADIAL_ACTION_PRESETS and key != "close_app"][:7]
+    keys = ["preset_mode" if key == "auto_resume" else key for key in (keys or [])]
+    actions = list(dict.fromkeys(key for key in keys if key in RADIAL_ACTION_PRESETS and key != "close_app"))[:7]
     for fallback in DEFAULT_MANAGEMENT_RADIAL_ITEMS:
         if len(actions) >= 7:
             break
@@ -2316,6 +2351,8 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         self.sticky = False
         self.center_title = "Quick Actions"
         self.center_subtitle = "관리 메뉴"
+        self.center_action_key = ""
+        self._visual_scale = 1.0
         self._sticky_timer = QtCore.QElapsedTimer()
         self._init_default_items()
 
@@ -2351,13 +2388,15 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         self.update()
 
     def popup_at(self, global_pos: QtCore.QPoint, sticky: bool = False) -> None:
-        top_left = global_pos - self.center_pt
-        if sticky:
-            screen = QtGui.QGuiApplication.screenAt(global_pos) or QtGui.QGuiApplication.primaryScreen()
-            if screen is not None:
-                available = screen.availableGeometry()
-                top_left.setX(max(available.left(), min(top_left.x(), available.right() - self.width() + 1)))
-                top_left.setY(max(available.top(), min(top_left.y(), available.bottom() - self.height() + 1)))
+        screen = QtGui.QGuiApplication.screenAt(global_pos) or QtGui.QGuiApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1920, 1080)
+        side = max(1, min(400, available.width(), available.height()))
+        self._visual_scale = side / 400.0
+        self.setFixedSize(side, side)
+        top_left = global_pos - QtCore.QPoint(round(self.center_pt.x() * self._visual_scale),
+                                             round(self.center_pt.y() * self._visual_scale))
+        top_left.setX(max(available.left(), min(top_left.x(), available.right() - self.width() + 1)))
+        top_left.setY(max(available.top(), min(top_left.y(), available.bottom() - self.height() + 1)))
         self.move(top_left)
         self.hovered_idx = -1
         self.sticky = sticky
@@ -2372,18 +2411,19 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         else:
             self.grabMouse()
 
-    def _get_item_center(self, idx: int) -> QtCore.QPointF:
+    def _get_item_center(self, idx: int, *, scaled: bool = True) -> QtCore.QPointF:
         count = len(self.items) or 8
         angle_deg = (idx * (360.0 / count)) - 90.0
         angle_rad = math.radians(angle_deg)
         label_radius = (self.inner_radius + self.radius) / 2.0
         cx = self.center_pt.x() + label_radius * math.cos(angle_rad)
         cy = self.center_pt.y() + label_radius * math.sin(angle_rad)
-        return QtCore.QPointF(cx, cy)
+        scale = self._visual_scale if scaled else 1.0
+        return QtCore.QPointF(cx * scale, cy * scale)
 
     def _update_hover_from_pos(self, pos: QtCore.QPoint) -> None:
-        dx = pos.x() - self.center_pt.x()
-        dy = pos.y() - self.center_pt.y()
+        dx = pos.x() / self._visual_scale - self.center_pt.x()
+        dy = pos.y() / self._visual_scale - self.center_pt.y()
         dist = math.hypot(dx, dy)
 
         if dist <= self.inner_radius:
@@ -2436,7 +2476,10 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
             # turn also avoids nesting a dialog inside this release handler.
             QtCore.QTimer.singleShot(0, lambda selected=item: self._trigger_item(selected))
         elif self.hovered_idx == -2:
+            center_action = self.center_action_key
             self.hide()
+            if center_action:
+                QtCore.QTimer.singleShot(0, lambda key=center_action: self.action_triggered.emit(key))
         elif not self.sticky:
             self.hide()
         super().mouseReleaseEvent(event)
@@ -2475,6 +2518,7 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+        painter.scale(self._visual_scale, self._visual_scale)
 
         # Soft floating shadow and frosted base.
         painter.setPen(QtCore.Qt.NoPen)
@@ -2525,7 +2569,7 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
             painter.setPen(QtGui.QPen(border, 1.3))
             painter.drawPath(path)
 
-            center = self._get_item_center(index)
+            center = self._get_item_center(index, scaled=False)
             icon_rect = QtCore.QRectF(center.x() - 34, center.y() - 34, 68, 34)
             title_rect = QtCore.QRectF(center.x() - 54, center.y() + 1, 108, 32)
             painter.setPen(QtGui.QColor("#172033"))
@@ -2533,7 +2577,11 @@ class RadialPieMenuWidget(QtWidgets.QWidget):
             font.setPointSize(14 if hovered else 13)
             font.setBold(True)
             painter.setFont(font)
-            painter.drawText(icon_rect, QtCore.Qt.AlignCenter, item.icon_text)
+            if item.key.startswith("edge:") and item.key.split(":", 1)[1] in EDGE_PANEL_SIDES:
+                draw_edge_direction(painter, icon_rect, item.key.split(":", 1)[1],
+                                    selected=item.title.startswith("● "))
+            else:
+                painter.drawText(icon_rect, QtCore.Qt.AlignCenter, item.icon_text)
             font.setPointSize(8 if count > 6 else 9)
             font.setBold(False)
             painter.setFont(font)
@@ -2855,6 +2903,16 @@ class SlotPresetDialog(QtWidgets.QDialog):
         if not preset_id:
             return
         name = str(self.presets[preset_id].get("name") or preset_id)
+        if preset_id != self.active_id:
+            source = str(self.presets.get(self.active_id, {}).get("name") or self.active_id)
+            answer = QtWidgets.QMessageBox.question(
+                self, "다른 프리셋에 현재 화면 저장",
+                f"현재 화면 '{source}'의 슬롯과 아이콘으로 '{name}' 프리셋을 덮어쓸까요?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
         previous = self.presets[preset_id]
         self.presets[preset_id] = self.main_window._build_slot_preset(name)
         if preset_id != "default":
@@ -2887,6 +2945,21 @@ class BundledDeckDownloadWorker(QtCore.QThread):
             self.payload_ready.emit(download_github_bundled_deck())
         except Exception as exc:
             self.download_failed.emit(str(exc))
+
+
+class BundledDeckUploadWorker(QtCore.QThread):
+    upload_complete = QtCore.Signal(object)
+    upload_failed = QtCore.Signal(str)
+
+    def __init__(self, app_root: Path, parent: QtCore.QObject):
+        super().__init__(parent)
+        self.app_root = app_root
+
+    def run(self) -> None:
+        try:
+            self.upload_complete.emit(publish_bundled_deck(self.app_root))
+        except Exception as exc:
+            self.upload_failed.emit(str(exc))
 
 
 class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
@@ -3180,6 +3253,10 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         if getattr(self, "_loading_settings", False):
             return
         self.main_window.config["show_empty_slots"] = checked
+        if checked:
+            # Explicitly showing empty slots restores the full configured grid.
+            self.main_window.config["crop_trailing_empty_rows"] = False
+            self.main_window.config["bottom_blank_space"] = 0
         if checked and self.empty_opac_spin.value() <= 0:
             self.empty_opac_spin.setValue(38)
         self.empty_opac_slider.setEnabled(checked)
@@ -3353,19 +3430,31 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         resume.clicked.connect(self._resume_browser_automatic)
         layout.addWidget(self.browser_lock_label)
         layout.addWidget(resume)
+        whale_executable = (self.main_window._whale_executable()
+                            or r"C:\Program Files\Naver\Naver Whale\Application\whale.exe")
+        self.whale_debugger_command = subprocess.list2cmdline(
+            [whale_executable, "--silent-debugger-extension-api"])
         debugger_hint = QtWidgets.QLabel(
             "웨일 디버깅 알림 숨기기(선택): 덕댁이 웨일을 새로 실행할 때는 아래 옵션을 자동으로 사용합니다. "
             "Windows 시작 프로그램이나 다른 앱이 먼저 실행한 웨일에는 적용되지 않습니다. "
             "그 경우 웨일을 완전히 종료한 뒤 해당 실행 항목의 명령에 같은 옵션을 추가하세요. "
             "설치 경로가 다르면 기존 경로를 유지하세요.\n"
-            r'"C:\Program Files\Naver\Naver Whale\Application\whale.exe" --silent-debugger-extension-api'
-            "\n이 옵션은 MacroRelay뿐 아니라 다른 디버깅 확장앱의 경고도 숨깁니다."
+            f"{self.whale_debugger_command}\n"
+            "이 옵션은 MacroRelay뿐 아니라 다른 디버깅 확장앱의 경고도 숨깁니다."
         )
         debugger_hint.setObjectName("whale_debugger_launch_hint")
         debugger_hint.setWordWrap(True)
         debugger_hint.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         debugger_hint.setStyleSheet("color: #637187; font-size: 9pt;")
         layout.addWidget(debugger_hint)
+        self.copy_whale_command_button = QtWidgets.QPushButton("📋 웨일 실행 명령 복사")
+        self.copy_whale_command_button.setObjectName("copy_whale_debugger_command")
+        self.copy_whale_command_button.clicked.connect(self._copy_whale_debugger_command)
+        layout.addWidget(self.copy_whale_command_button)
+
+    def _copy_whale_debugger_command(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(self.whale_debugger_command)
+        self.copy_whale_command_button.setText("✓ 웨일 실행 명령 복사됨")
 
     def _add_browser_rule(self, site: str = "", preset_id: str = "") -> None:
         row = self.browser_rules_table.rowCount()
@@ -3399,6 +3488,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
 
     def _resume_browser_automatic(self) -> None:
         self.main_window._resume_auto_preset()
+        self.browser_auto_check.setChecked(True)
         self.browser_lock_label.setText("자동 전환 사용 가능")
 
     def _init_backup_tab(self) -> None:
@@ -3427,13 +3517,21 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         btn_bundled.clicked.connect(self._import_bundled_config)
         self.btn_bundled = btn_bundled
 
-        btn_save_bundled = QtWidgets.QPushButton("💾 내 프리셋을 내장 구성으로 저장")
-        btn_save_bundled.setToolTip("현재 모든 프리셋·슬롯·참조 매크로·이미지·입력값을 로컬 내장 JSON으로 저장합니다. GitHub 전송은 별도입니다.")
-        btn_save_bundled.clicked.connect(self._save_current_as_bundled)
+        self.btn_save_upload_bundled = QtWidgets.QPushButton("☁️ 모든 프리셋 저장 후 GitHub 업로드")
+        self.btn_save_upload_bundled.setToolTip("현재 모든 프리셋·슬롯·참조 매크로·이미지·입력값을 로컬에 저장한 뒤 해당 JSON 파일만 GitHub에 업로드합니다. 이 PC에 Git과 GitHub 인증이 필요합니다.")
+        self.btn_save_upload_bundled.clicked.connect(self._save_and_upload_bundled)
 
-        self.btn_download_bundled = QtWidgets.QPushButton("☁️ GitHub 최신 내장 구성 내려받기")
+        self.btn_save_bundled_local = QtWidgets.QPushButton("💾 로컬 내장 구성으로만 저장")
+        self.btn_save_bundled_local.setToolTip("GitHub에 전송하지 않고 이 PC에만 모든 덕덱 프리셋을 저장합니다.")
+        self.btn_save_bundled_local.clicked.connect(self._save_current_as_bundled)
+
+        self.btn_download_bundled = QtWidgets.QPushButton("⬇️ GitHub 구성 내려받기 (적용 안 함)")
         self.btn_download_bundled.setToolTip("GitHub의 내장 Deck 백업을 이 PC의 로컬 내장 구성으로 내려받습니다. 현재 사용 중인 덱은 자동 교체하지 않습니다.")
         self.btn_download_bundled.clicked.connect(self._download_bundled_from_github)
+
+        self.btn_download_apply = QtWidgets.QPushButton("⬇️ GitHub 구성 내려받아 지금 적용")
+        self.btn_download_apply.setToolTip("다른 PC의 현재 덕덱 구성을 먼저 백업한 뒤 GitHub의 모든 프리셋·슬롯·매크로·이미지를 적용합니다.")
+        self.btn_download_apply.clicked.connect(self._download_and_apply_bundled)
 
         btn_reset_all = QtWidgets.QPushButton("⚠️ 모든 슬롯 및 설정 초기화")
         btn_reset_all.setStyleSheet("background: #FFF1F2; border: 1.5px solid #FDA4AF; color: #BE123C; font-weight: 700; padding: 10px; border-radius: 9px;")
@@ -3441,8 +3539,10 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
 
         layout.addWidget(btn_export)
         layout.addWidget(btn_import)
-        layout.addWidget(btn_save_bundled)
+        layout.addWidget(self.btn_save_upload_bundled)
+        layout.addWidget(self.btn_save_bundled_local)
         layout.addWidget(self.btn_download_bundled)
+        layout.addWidget(self.btn_download_apply)
         layout.addWidget(btn_bundled)
         layout.addWidget(btn_reset_all)
         layout.addStretch(1)
@@ -3492,6 +3592,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             self.browser_auto_check.setChecked(bool(self.main_window.config.get("auto_preset_enabled")))
             self.browser_token_edit.setText(str(self.main_window.config.get("auto_preset_token") or secrets.token_urlsafe(32)))
             self.browser_lock_label.setText(
+                "프리셋 고정 중 · '자동 전환 재개'로 해제" if self.main_window.config.get("auto_preset_pinned") else
                 "수동 선택 중 · 다음 창/탭 전환 때 재개" if self.main_window.config.get("auto_preset_manual_lock") else "자동 전환 사용 가능"
             )
             self.browser_bridge_label.setText(
@@ -3600,6 +3701,7 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         radial_items = normalize_management_radial_items(self.radial_preview.items_keys)
         self.main_window.config["radial_items"] = radial_items
         self.main_window.radial_menu.load_custom_items(radial_items)
+        self.main_window._refresh_quick_action_labels()
 
         self.main_window._capture_active_slot_preset()
         self.main_window._save_config()
@@ -3659,30 +3761,88 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
             "\n이미지 크기가 다르면 OpenCV가 빠른 검색 후 배율 대응 검색을 시도합니다."
         )
 
-    def _save_current_as_bundled(self) -> None:
+    def _save_bundled_locally(self, *, upload: bool) -> Optional[Path]:
+        destination = "로컬과 GitHub" if upload else "로컬"
         answer = QtWidgets.QMessageBox.warning(
             self, "내장 구성 저장",
-            "현재 프리셋과 참조 매크로·이미지·텍스트 입력값을 내장 JSON에 저장합니다. "
-            "이 파일을 GitHub에 올리면 입력값도 저장소 접근자에게 보입니다. 계속할까요?",
+            f"현재 모든 프리셋과 참조 매크로·이미지·텍스트 입력값을 {destination}에 저장합니다. "
+            + ("GitHub 저장소 접근자는 입력값도 볼 수 있습니다. 계속할까요?"
+               if upload else "계속할까요?"),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
         )
         if answer != QtWidgets.QMessageBox.Yes:
-            return
+            return None
         try:
             payload = self.main_window.build_deck_backup_payload()
             path = save_bundled_deck_payload(self.main_window.repository.root, payload)
             self.btn_bundled.setEnabled(True)
             self.btn_bundled.setToolTip(str(path))
+            return path
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "내장 구성 저장 실패", str(exc))
+            return None
+
+    def _save_current_as_bundled(self) -> None:
+        path = self._save_bundled_locally(upload=False)
+        if path is not None:
             QtWidgets.QMessageBox.information(
                 self, "내장 구성 저장 완료",
                 f"현재 구성을 로컬 내장 파일로 저장했습니다. 이전 파일은 시간표시 백업으로 보존했습니다.\n{path}\n\nGitHub에는 아직 업로드되지 않았습니다.",
             )
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "내장 구성 저장 실패", str(exc))
+
+    def _save_and_upload_bundled(self) -> None:
+        path = self._save_bundled_locally(upload=True)
+        if path is None:
+            return
+        self.btn_save_upload_bundled.setEnabled(False)
+        self.btn_save_bundled_local.setEnabled(False)
+        self.btn_save_upload_bundled.setText("☁️ GitHub 업로드 중…")
+        worker = BundledDeckUploadWorker(self.main_window.repository.root, self.main_window)
+        self.main_window._bundled_deck_upload_worker = worker
+        worker.upload_complete.connect(self._github_bundle_uploaded)
+        worker.upload_failed.connect(self._github_bundle_upload_failed)
+        worker.finished.connect(lambda: setattr(self.main_window, "_bundled_deck_upload_worker", None))
+        worker.start()
+
+    def _finish_bundle_upload(self) -> None:
+        self.btn_save_upload_bundled.setEnabled(True)
+        self.btn_save_bundled_local.setEnabled(True)
+        self.btn_save_upload_bundled.setText("☁️ 모든 프리셋 저장 후 GitHub 업로드")
+
+    def _github_bundle_uploaded(self, commit: Optional[str]) -> None:
+        self._finish_bundle_upload()
+        detail = (f"업로드 완료: {commit[:12]}" if commit else "GitHub에 이미 같은 구성이 저장되어 있습니다.")
+        QtWidgets.QMessageBox.information(
+            self, "GitHub 내장 구성 저장 완료",
+            f"모든 덕덱 프리셋을 로컬에 저장했습니다. {detail}\n"
+            "다른 PC에서는 'GitHub 구성 내려받아 지금 적용'을 누르면 됩니다.",
+        )
+
+    def _github_bundle_upload_failed(self, message: str) -> None:
+        self._finish_bundle_upload()
+        QtWidgets.QMessageBox.warning(
+            self, "GitHub 업로드 실패",
+            "로컬 내장 구성은 저장되어 있습니다. GitHub에는 반영되지 않았습니다.\n\n" + message,
+        )
 
     def _download_bundled_from_github(self) -> None:
+        self._start_bundled_download(apply=False)
+
+    def _download_and_apply_bundled(self) -> None:
+        answer = QtWidgets.QMessageBox.question(
+            self, "GitHub 구성 적용",
+            "GitHub의 모든 덕덱 프리셋·슬롯·참조 매크로·이미지를 내려받아 현재 구성을 교체할까요? "
+            "교체하기 전에 이 PC의 현재 구성을 별도 백업 파일로 보존합니다.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if answer == QtWidgets.QMessageBox.Yes:
+            self._start_bundled_download(apply=True)
+
+    def _start_bundled_download(self, *, apply: bool) -> None:
+        self._github_download_apply = apply
         self.btn_download_bundled.setEnabled(False)
-        self.btn_download_bundled.setText("☁️ GitHub 내장 구성 내려받는 중…")
+        self.btn_download_apply.setEnabled(False)
+        self.btn_download_bundled.setText("⬇️ GitHub 구성 내려받는 중…")
         worker = BundledDeckDownloadWorker(self.main_window)
         self.main_window._bundled_deck_download_worker = worker
         worker.payload_ready.connect(self._github_bundle_downloaded)
@@ -3690,24 +3850,43 @@ class QuickSlotDeckSettingsDialog(QtWidgets.QDialog):
         worker.finished.connect(lambda: setattr(self.main_window, "_bundled_deck_download_worker", None))
         worker.start()
 
-    def _github_bundle_downloaded(self, payload: Dict[str, Any]) -> None:
+    def _finish_bundled_download(self) -> None:
         self.btn_download_bundled.setEnabled(True)
-        self.btn_download_bundled.setText("☁️ GitHub 최신 내장 구성 내려받기")
+        self.btn_download_apply.setEnabled(True)
+        self.btn_download_bundled.setText("⬇️ GitHub 구성 내려받기 (적용 안 함)")
+
+    def _github_bundle_downloaded(self, payload: Dict[str, Any]) -> None:
+        self._finish_bundled_download()
         try:
+            restore_point = None
+            if self._github_download_apply:
+                current = self.main_window.build_deck_backup_payload()
+                restore_point = save_deck_restore_point(self.main_window.repository.root, current)
             path = save_bundled_deck_payload(self.main_window.repository.root, payload)
             self.btn_bundled.setEnabled(True)
             self.btn_bundled.setToolTip(str(path))
-            QtWidgets.QMessageBox.information(
-                self, "내려받기 완료",
-                "GitHub 구성을 이 PC의 내장 파일로 저장했습니다. 현재 덱은 바뀌지 않았습니다. "
-                "적용하려면 '내장 Deck Dock 구성 불러오기'를 누르세요.",
-            )
+            if restore_point is not None:
+                self.main_window.restore_deck_backup_payload(payload)
+                QtWidgets.QMessageBox.information(
+                    self, "GitHub 구성 적용 완료",
+                    f"GitHub의 모든 덕덱 프리셋을 적용했습니다.\n이전 구성 백업: {restore_point}"
+                    + self._portability_report_text(),
+                )
+                self.accept()
+            else:
+                QtWidgets.QMessageBox.information(
+                    self, "내려받기 완료",
+                    "GitHub 구성을 이 PC의 내장 파일로 저장했습니다. 현재 덱은 바뀌지 않았습니다. "
+                    "적용하려면 '내장 Deck Dock 구성 불러오기'를 누르세요.",
+                )
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "내려받기 저장 실패", str(exc))
+            QtWidgets.QMessageBox.critical(self, "내려받기/적용 실패", str(exc))
+        finally:
+            self._github_download_apply = False
 
     def _github_bundle_download_failed(self, message: str) -> None:
-        self.btn_download_bundled.setEnabled(True)
-        self.btn_download_bundled.setText("☁️ GitHub 최신 내장 구성 내려받기")
+        self._finish_bundled_download()
+        self._github_download_apply = False
         QtWidgets.QMessageBox.warning(self, "GitHub 내려받기 실패", message)
 
     def _reset_all_config(self) -> None:
@@ -3807,14 +3986,41 @@ class RadialMenuIconButton(QtWidgets.QPushButton):
             self.setText("🎯")
 
 
-class DeckResizeGrip(QtWidgets.QWidget):
-    """Visible corner handle using the deck's square-tile resize behavior."""
+class DeckPresetBadge(QtWidgets.QPushButton):
+    """A tap goes home; dragging a docked panel moves it without triggering the tap."""
 
-    def __init__(self, deck: "QuickSlotDeckWindow") -> None:
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        deck = self.window()
+        if event.button() == QtCore.Qt.LeftButton and deck._edge_panel_enabled():
+            deck._start_window_drag_candidate(event)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        deck = self.window()
+        if deck._edge_panel_enabled() and deck._handle_window_drag_move(event):
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        deck = self.window()
+        if deck._edge_panel_enabled() and deck._handle_window_drag_release(event):
+            self.setDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class DeckResizeGrip(QtWidgets.QWidget):
+    """Corner handles for scaling tiles or trimming only the empty bottom area."""
+
+    def __init__(self, deck: "QuickSlotDeckWindow", mode: str = "bottom_right") -> None:
         super().__init__(deck)
         self.deck = deck
+        self.mode = mode
+        self._drag_started = False
         self.setFixedSize(24, 24)
-        self.setCursor(QtCore.Qt.SizeFDiagCursor)
+        self.setCursor(QtCore.Qt.SizeVerCursor if mode == "bottom_padding" else QtCore.Qt.SizeFDiagCursor)
         self.setAttribute(QtCore.Qt.WA_Hover, True)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
@@ -3824,13 +4030,18 @@ class DeckResizeGrip(QtWidgets.QWidget):
         painter.setBrush(QtGui.QColor(10, 17, 29, 190))
         painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 7, 7)
         painter.setPen(QtGui.QPen(QtGui.QColor("#8EF0DA"), 2, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
-        for offset in (0, 5, 10):
-            painter.drawLine(8 + offset, 19, 19, 8 + offset)
+        if self.mode == "bottom_padding":
+            for y in (10, 14, 18):
+                painter.drawLine(6, y, 18, y)
+        else:
+            for offset in (0, 5, 10):
+                painter.drawLine(8 + offset, 19, 19, 8 + offset)
         painter.end()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
-            self.deck._resize_edge = "bottom_right"
+            self._drag_started = False
+            self.deck._resize_edge = self.mode
             self.deck._resize_start_geom = self.deck.geometry()
             self.deck._resize_start_pos = event.globalPosition().toPoint()
             self.deck._cancel_mouse_hold_check()
@@ -3839,16 +4050,30 @@ class DeckResizeGrip(QtWidgets.QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.buttons() & QtCore.Qt.LeftButton and getattr(self.deck, "_resize_edge", "") == "bottom_right":
-            self.deck._handle_border_resize(event.globalPosition().toPoint())
+        if event.buttons() & QtCore.Qt.LeftButton and getattr(self.deck, "_resize_edge", "") == self.mode:
+            global_pos = event.globalPosition().toPoint()
+            if self.mode == "bottom_padding" and not self._drag_started:
+                if abs(global_pos.y() - self.deck._resize_start_pos.y()) < QtWidgets.QApplication.startDragDistance():
+                    event.accept()
+                    return
+                self.deck._prepare_bottom_padding_resize()
+                self.deck._resize_start_geom = self.deck.geometry()
+                self._drag_started = True
+            self.deck._handle_border_resize(global_pos)
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == QtCore.Qt.LeftButton and getattr(self.deck, "_resize_edge", "") == "bottom_right":
+        if event.button() == QtCore.Qt.LeftButton and getattr(self.deck, "_resize_edge", "") == self.mode:
             self.deck._resize_edge = ""
-            self.deck._save_config()
+            if self.mode == "bottom_padding":
+                if self._drag_started:
+                    self.deck._remember_bottom_blank_space()
+                    self.deck._save_config()
+            else:
+                self.deck._save_config()
+            self._drag_started = False
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -3887,6 +4112,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "touch_sound_volume": 22,
             "empty_slot_opacity": 0,
             "show_empty_slots": False,
+            "bottom_blank_space": 0,
+            "crop_trailing_empty_rows": False,
             "radial_items": list(DEFAULT_MANAGEMENT_RADIAL_ITEMS),
             "slot_presets": {},
             "active_slot_preset": "default",
@@ -3894,6 +4121,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             "auto_preset_rules": [],
             "auto_program_rules": [],
             "auto_preset_manual_lock": False,
+            "auto_preset_pinned": False,
+            "edge_panel_side": "free",
         }
         self.custom_icons: Dict[str, Dict[str, Any]] = {}
         self.buttons: List[StreamDeckButton] = []
@@ -3930,7 +4159,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._auto_config_save.setSingleShot(True)
         self._auto_config_save.timeout.connect(self._save_config)
 
-        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
+        # A persistent control panel, not an application-switching destination.
+        # Qt.Tool maps to WS_EX_TOOLWINDOW on Windows (no taskbar / Alt+Tab entry).
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Tool)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
 
         self.setWindowTitle("MacroRelay QuickSlot Deck")
@@ -3942,6 +4173,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.setWindowIcon(QtGui.QIcon(str(icon_path)))
 
         self._load_config()
+        upgraded_quick_actions = self._upgrade_quick_actions()
         # Manual preset selection is a session override, not a startup lock.
         stale_manual_lock = bool(self.config.get("auto_preset_manual_lock"))
         self.config["auto_preset_manual_lock"] = False
@@ -3952,6 +4184,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         seeded_starter_actions = self._seed_starter_actions()
         seeded_browser_shortcuts = self._seed_browser_shortcuts()
         migrated_home_tiles = self._install_home_tiles()
+        repaired_tetris_mix = self._repair_tetris_youtube_copy()
         migrated_youtube_home = self._upgrade_youtube_home_action()
         self.radial_menu = RadialPieMenuWidget(self)
         self.radial_menu.load_custom_items(self.config.get("radial_items"))
@@ -3959,6 +4192,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.preset_radial_menu = RadialPieMenuWidget(self)
         self.preset_radial_menu.action_triggered.connect(self._handle_preset_radial_action)
         self._refresh_preset_radial_menu()
+        self.edge_radial_menu = RadialPieMenuWidget(self)
+        self.edge_radial_menu.action_triggered.connect(self._handle_edge_panel_action)
+        self._edge_panel_screen_obj = None
 
         self._init_ui()
         self._apply_theme()
@@ -3980,9 +4216,24 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.program_event_timer.timeout.connect(self._poll_foreground_program)
         self.program_event_timer.start()
         self._sync_browser_bridge()
-        if (seeded_starter_presets or seeded_starter_actions or seeded_browser_shortcuts
-                or migrated_home_tiles or migrated_youtube_home or stale_manual_lock):
+        if (upgraded_quick_actions or seeded_starter_presets or seeded_starter_actions or seeded_browser_shortcuts
+                or migrated_home_tiles or repaired_tetris_mix or migrated_youtube_home or stale_manual_lock):
             self._save_config()
+
+    def _upgrade_quick_actions(self) -> bool:
+        if self.config.get("quick_action_controls_version"):
+            return False
+        keys = normalize_management_radial_items(self.config.get("radial_items"))
+        protected = {"deck_dock", "preset_settings", "close_app", "preset_mode", "edge_panel"}
+        for required, preferred in (("preset_mode", "studio"), ("edge_panel", "prev_page")):
+            if required in keys:
+                continue
+            target = keys.index(preferred) if preferred in keys else next(
+                index for index in range(6, -1, -1) if keys[index] not in protected)
+            keys[target] = required
+        self.config["radial_items"] = keys
+        self.config["quick_action_controls_version"] = 1
+        return True
 
     def _init_touch_sound(self) -> None:
         if QSoundEffect is None or os.environ.get("QT_QPA_PLATFORM") == "offscreen":
@@ -4101,7 +4352,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         macros: Dict[str, Any] = {}
         assets: Dict[str, Any] = {}
         asset_index = self.repository.load_assets()
-        for name in sorted(macro_names):
+        pending_macros = sorted(macro_names)
+        while pending_macros:
+            name = pending_macros.pop()
+            if name in macros:
+                continue
             path = self.repository.macro_path(name)
             if not path.is_file():
                 continue
@@ -4110,6 +4365,10 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             for step in macro.get("steps") or []:
                 if not isinstance(step, dict):
                     continue
+                if step.get("action") == "call_submacro" and step.get("macro"):
+                    child_name = str(step["macro"])
+                    if child_name not in macros:
+                        pending_macros.append(child_name)
                 aliases = [step.get("asset")]
                 aliases.extend(step.get("assets") or [] if isinstance(step.get("assets"), list) else [])
                 for alias in aliases:
@@ -4157,6 +4416,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         hotkeys = copy.deepcopy(payload.get("hotkeys") if is_full else self._legacy_backup_hotkeys(deck_config))
         if not isinstance(hotkeys, dict) or not isinstance(hotkeys.get("slots"), list):
             raise ValueError("백업에 슬롯 구성 데이터가 없습니다.")
+        backup_config = deck_config.get("config") if isinstance(deck_config.get("config"), dict) else {}
+        backup_presets = backup_config.get("slot_presets") if isinstance(backup_config.get("slot_presets"), dict) else {}
+        active_id = str(backup_config.get("active_slot_preset") or "")
+        active_preset = backup_presets.get(active_id)
+        if (isinstance(active_preset, dict) and isinstance(active_preset.get("slots"), list)
+                and hotkeys["slots"] != active_preset["slots"]):
+            raise ValueError("백업의 활성 프리셋과 실행 슬롯이 서로 다릅니다. 다른 프리셋에 잘못 복사되지 않도록 적용을 중단했습니다.")
 
         macros = payload.get("macros") or {}
         assets = payload.get("assets") or {}
@@ -4192,6 +4458,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._load_config()
         self.config["auto_preset_token"] = secrets.token_urlsafe(32)
         self.config["auto_preset_manual_lock"] = False
+        self._upgrade_quick_actions()
         self._ensure_slot_presets()
         active_id = str(self.config.get("active_slot_preset") or "")
         active = dict(self.config.get("slot_presets", {}).get(active_id) or {})
@@ -4323,6 +4590,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         previous_url = self._last_browser_url
         self._last_browser_event_at = latest_at
         self._last_browser_url = latest_url
+        if self.config.get("auto_preset_pinned"):
+            return
         if bool(self.config.get("auto_preset_manual_lock")):
             if latest_url == previous_url:
                 return
@@ -4340,6 +4609,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if not executable or pid == os.getpid() or identity == self._last_foreground_identity:
             return
         self._last_foreground_identity = identity
+        if self.config.get("auto_preset_pinned"):
+            return
         if self.config.get("auto_preset_manual_lock"):
             self.config["auto_preset_manual_lock"] = False
             self._update_preset_badge()
@@ -4353,10 +4624,43 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self._switch_slot_preset(target, automatic=True)
 
     def _resume_auto_preset(self) -> None:
+        previous_identity = self._last_foreground_identity
+        self.config["auto_preset_enabled"] = True
+        self.config["auto_preset_pinned"] = False
         self.config["auto_preset_manual_lock"] = False
         self._last_foreground_identity = ("", 0)
+        self._sync_browser_bridge()
+        executable, pid = foreground_program()
+        if not executable or pid == os.getpid():
+            executable, _pid = previous_identity
+        if executable in {"whale.exe", "msedge.exe", "chrome.exe"}:
+            target = preset_for_url(self._last_browser_url, list(self.config.get("auto_preset_rules") or []))
+        else:
+            target = preset_for_program(executable, list(self.config.get("auto_program_rules") or []))
+        if target in self.config.get("slot_presets", {}):
+            self._switch_slot_preset(target, automatic=True)
         self._update_preset_badge()
         self._save_config()
+
+    def _toggle_preset_mode(self) -> None:
+        if self.config.get("auto_preset_pinned") or not self.config.get("auto_preset_enabled"):
+            self._resume_auto_preset()
+        else:
+            self.config["auto_preset_pinned"] = True
+            self.config["auto_preset_manual_lock"] = False
+            self._update_preset_badge()
+            self._auto_config_save.start(700)
+
+    def _refresh_quick_action_labels(self) -> None:
+        menu = getattr(self, "radial_menu", None)
+        if menu is None:
+            return
+        fixed = bool(self.config.get("auto_preset_pinned") or not self.config.get("auto_preset_enabled"))
+        for item in menu.items:
+            if item.key == "preset_mode":
+                item.title = "프리셋 자동으로" if fixed else "현재 프리셋 고정"
+                item.icon_text = "↺" if fixed else "📌"
+        menu.update()
 
     def _build_slot_preset(self, name: str) -> Dict[str, Any]:
         hotkeys = self.repository.load_hotkeys()
@@ -4449,6 +4753,51 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             preset["starter_actions_initialized"] = True
             changed = True
         return changed
+
+    def _repair_tetris_youtube_copy(self) -> bool:
+        """Remove the exact accidental YouTube copy from the Tetris starter mode once."""
+        if self.config.get("tetris_youtube_mix_cleanup_version"):
+            return False
+        presets = self.config.get("slot_presets") or {}
+        tetris = presets.get("starter-jstris")
+        youtube = presets.get("starter-youtube")
+        if not isinstance(tetris, dict) or not isinstance(youtube, dict):
+            return False
+        tetris_slots = tetris.get("slots")
+        youtube_slots = youtube.get("slots")
+        icons = tetris.get("custom_icons")
+        if (not isinstance(tetris_slots, list) or len(tetris_slots) < 3
+                or tetris_slots != youtube_slots or not is_default_home_slot(tetris_slots[0])
+                or tetris.get("pinned_slots")
+                or not isinstance(icons, dict) or set(icons) - {"0", "1"}):
+            return False
+        active = self.config.get("active_slot_preset") == "starter-jstris"
+        hotkeys = self.repository.load_hotkeys() if active else None
+        if active and hotkeys.get("slots") != tetris_slots:
+            return False
+
+        # Preserve the exact pre-repair files before changing either preset or
+        # hotkeys. A failed backup leaves the user's configuration untouched.
+        backup_dir = self.repository.root / "deck_presets" / f"tetris-cleanup-backup-{datetime.now():%Y%m%d-%H%M%S%f}"
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=False)
+            shutil.copy2(self.config_path, backup_dir / self.config_path.name)
+            shutil.copy2(self.repository.hotkeys_path, backup_dir / self.repository.hotkeys_path.name)
+        except OSError as exc:
+            self._tetris_repair_error = str(exc)
+            return False
+
+        home_slot = copy.deepcopy(tetris_slots[0])
+        home_icon = copy.deepcopy(icons.get("0"))
+        tetris["slots"] = [home_slot]
+        tetris["custom_icons"] = {"0": home_icon} if isinstance(home_icon, dict) else {}
+        if active:
+            hotkeys["slots"] = [copy.deepcopy(home_slot)]
+            self._save_preset_hotkeys(hotkeys)
+            self.custom_icons = copy.deepcopy(tetris["custom_icons"])
+        self.config["tetris_youtube_mix_cleanup_version"] = 1
+        self._tetris_repair_backup = backup_dir
+        return True
 
     def _upgrade_youtube_home_action(self) -> bool:
         """Change only the untouched starter Home action, preserving custom tiles."""
@@ -4695,6 +5044,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             for key in PRESET_STYLE_KEYS:
                 if key in style and style[key] is not None:
                     self.config[key] = copy.deepcopy(style[key])
+            # Older presets have no saved crop settings; do not inherit the
+            # previous preset's empty-area behavior.
+            for key, default in (("bottom_blank_space", 0), ("crop_trailing_empty_rows", False)):
+                if key not in style:
+                    self.config[key] = default
             self.config["active_slot_preset"] = preset_id
             self.current_page = 0
             self._apply_theme()
@@ -4704,6 +5058,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             )
             if not (automatic and old_layout == new_layout and self._refresh_slots_fast()):
                 self.refresh_slots()
+            else:
+                tile_side = self._saved_manual_tile_side() or self._tile_side_from_width(self.width())
+                self.resize(self._window_size_for_tile_side(tile_side))
         finally:
             self._applying_slot_preset = False
         self._update_preset_badge()
@@ -4723,6 +5080,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         central.setObjectName("CentralFrame")
         self.setCentralWidget(central)
         main_layout = QtWidgets.QVBoxLayout(central)
+        self.main_layout = main_layout
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(0)
 
@@ -4734,16 +5092,21 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.grid_layout = QtWidgets.QGridLayout(self.swipe_container)
         self.grid_layout.setContentsMargins(0, 0, 0, 0)
         self.grid_layout.setSpacing(10)
+        self.grid_layout.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
 
         main_layout.addWidget(self.swipe_container, 1)
-        self.preset_badge = QtWidgets.QPushButton(central)
+        self.edge_scroll = QtWidgets.QScrollArea(central)
+        self.edge_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.edge_scroll.setWidgetResizable(False)
+        self.edge_scroll.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+        self.edge_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self.edge_scroll.hide()
+        self.preset_badge = DeckPresetBadge(central)
         self.preset_badge.setObjectName("PresetBadge")
         self.preset_badge.setCursor(QtCore.Qt.PointingHandCursor)
         self.preset_badge.setFocusPolicy(QtCore.Qt.NoFocus)
         self.preset_badge.setFixedHeight(27)
-        self.preset_badge.clicked.connect(
-            lambda: self._show_preset_radial(
-                self.preset_badge.mapToGlobal(self.preset_badge.rect().center()), sticky=True))
+        self.preset_badge.clicked.connect(lambda: self._switch_slot_preset("default"))
         self._update_preset_badge()
         self.preset_badge.show()
         self.preset_badge.raise_()
@@ -4752,6 +5115,144 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.resize_grip.move(self.width() - self.resize_grip.width(), self.height() - self.resize_grip.height())
         self.resize_grip.show()
         self.resize_grip.raise_()
+        self.bottom_padding_grip = DeckResizeGrip(self, "bottom_padding")
+        self.bottom_padding_grip.setToolTip("드래그하여 슬롯 크기는 그대로 두고 아래 여백만 조절")
+        self.bottom_padding_grip.move(0, self.height() - self.bottom_padding_grip.height())
+        self.bottom_padding_grip.show()
+        self.bottom_padding_grip.raise_()
+
+        app = QtGui.QGuiApplication.instance()
+        if app:
+            app.screenAdded.connect(self._reflow_edge_panel)
+            app.screenRemoved.connect(self._reflow_edge_panel)
+
+    def _edge_panel_enabled(self) -> bool:
+        return self.config.get("edge_panel_side") in EDGE_PANEL_SIDES
+
+    def _edge_panel_screen(self):
+        screens = QtGui.QGuiApplication.screens()
+        name = str(self.config.get("edge_panel_screen") or "")
+        screen = next((screen for screen in screens if screen.name() == name), None)
+        if screen is None:
+            screen = QtGui.QGuiApplication.screenAt(self.frameGeometry().center()) or self.screen()
+        if screen is not self._edge_panel_screen_obj:
+            if self._edge_panel_screen_obj is not None:
+                try:
+                    self._edge_panel_screen_obj.availableGeometryChanged.disconnect(self._reflow_edge_panel)
+                except (RuntimeError, TypeError):
+                    pass
+            self._edge_panel_screen_obj = screen
+            if screen:
+                screen.availableGeometryChanged.connect(self._reflow_edge_panel)
+        return screen
+
+    def _reflow_edge_panel(self, *_args) -> None:
+        if self._edge_panel_enabled():
+            QtCore.QTimer.singleShot(0, self.refresh_slots)
+
+    def _show_edge_panel_menu(self, global_pos: QtCore.QPoint) -> None:
+        menu = self.edge_radial_menu
+        menu.center_title = "자유 배치"
+        menu.center_subtitle = "눌러서 고정 해제"
+        menu.center_action_key = "edge:free"
+        current = str(self.config.get("edge_panel_side") or "free")
+        menu.items = [RadialPieMenuItem(
+            f"edge:{edge}", ("● " if current == edge else "") + title, glyph, "#38BDF8")
+            for edge, title, glyph in (
+                ("top", "화면 위", ""), ("right", "화면 오른쪽", ""),
+                ("bottom", "화면 아래", ""), ("left", "화면 왼쪽", ""),
+            )]
+        menu.popup_at(global_pos, sticky=True)
+
+    def _handle_edge_panel_action(self, key: str) -> None:
+        if key.startswith("edge:"):
+            self._set_edge_panel_mode(key.split(":", 1)[1])
+
+    def _set_edge_panel_mode(self, edge: str, *, screen=None) -> None:
+        if edge not in EDGE_PANEL_SIDES | {"free"}:
+            return
+        was_docked = self._edge_panel_enabled()
+        if edge != "free":
+            if not was_docked:
+                self.config["edge_panel_free_geometry"] = bytes(self.saveGeometry().toHex()).decode("ascii")
+                self.config["edge_panel_free_position"] = [self.x(), self.y()]
+                self.config["edge_panel_tile_side"] = self._saved_manual_tile_side() or self._tile_side_from_width(self.width())
+            screen = screen or self._edge_panel_screen()
+            if screen:
+                self.config["edge_panel_screen"] = screen.name()
+        self.config["edge_panel_side"] = edge
+        if edge == "free" and was_docked:
+            saved = str(self.config.get("edge_panel_free_geometry") or "")
+            if saved:
+                self.restoreGeometry(QtCore.QByteArray.fromHex(saved.encode("ascii")))
+            self._restored_window_geometry = False
+        self.refresh_slots()
+        if edge == "free" and was_docked:
+            position = self.config.get("edge_panel_free_position")
+            if isinstance(position, list) and len(position) == 2:
+                point = QtCore.QPoint(int(position[0]), int(position[1]))
+                screen = QtGui.QGuiApplication.screenAt(point) or self.screen()
+                if screen:
+                    available = screen.availableGeometry()
+                    point.setX(max(available.left(), min(point.x(), available.right() - self.width() + 1)))
+                    point.setY(max(available.top(), min(point.y(), available.bottom() - self.height() + 1)))
+                self.move(point)
+        self._auto_config_save.start(700)
+
+    def _snap_edge_panel_to(self, global_pos: QtCore.QPoint) -> None:
+        screens = QtGui.QGuiApplication.screens()
+        screen = QtGui.QGuiApplication.screenAt(global_pos)
+        if screen is None and screens:
+            def distance(candidate):
+                bounds = candidate.availableGeometry()
+                dx = max(bounds.left() - global_pos.x(), 0, global_pos.x() - bounds.right())
+                dy = max(bounds.top() - global_pos.y(), 0, global_pos.y() - bounds.bottom())
+                return dx * dx + dy * dy
+            screen = min(screens, key=distance)
+        if screen is None:
+            screen = self._edge_panel_screen()
+        if screen:
+            edge = nearest_screen_edge(global_pos, screen.availableGeometry(),
+                                       str(self.config.get("edge_panel_side") or ""))
+            self._set_edge_panel_mode(edge, screen=screen)
+
+    def _set_edge_panel_container(self) -> None:
+        docked = self._edge_panel_enabled()
+        if docked:
+            if self.edge_scroll.widget() is None:
+                self.main_layout.removeWidget(self.swipe_container)
+                self.edge_scroll.setWidget(self.swipe_container)
+                self.main_layout.addWidget(self.edge_scroll, 1)
+            self.main_layout.setContentsMargins(8, 8 + EDGE_PANEL_HEADER, 8, 8)
+            self.edge_scroll.show()
+        else:
+            if self.edge_scroll.widget() is not None:
+                self.edge_scroll.takeWidget()
+                self.main_layout.removeWidget(self.edge_scroll)
+                self.main_layout.addWidget(self.swipe_container, 1)
+                self.swipe_container.setMinimumSize(0, 0)
+                self.swipe_container.setMaximumSize(16777215, 16777215)
+                self.swipe_container.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+                self.swipe_container.show()
+            self.edge_scroll.hide()
+            self.main_layout.setContentsMargins(8, 8, 8, 8)
+        self.resize_grip.setVisible(not docked)
+        self.bottom_padding_grip.setVisible(not docked)
+
+    def _edge_panel_slots(self, slots: List[Dict[str, Any]]) -> list[tuple[int, Dict[str, Any]]]:
+        pins = self._active_pinned_slots()
+        page_size = max(1, self.rows * self.cols)
+        highest_pin = max((int(key) for key in pins if str(key).isdigit()), default=-1)
+        visible = []
+        for index in range(max(len(slots), highest_pin + 1)):
+            # A pinned tile repeats on ordinary pages; the combined panel
+            # shows it once while retaining each action's original index.
+            if index >= page_size and str(index % page_size) in pins:
+                continue
+            slot = self._effective_slot(index, slots)
+            if deck_slot_has_content(slot):
+                visible.append((index, slot))
+        return visible
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -4759,6 +5260,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if grip is not None:
             grip.move(self.width() - grip.width(), self.height() - grip.height())
             grip.raise_()
+        padding_grip = getattr(self, "bottom_padding_grip", None)
+        if padding_grip is not None:
+            padding_grip.move(0, self.height() - padding_grip.height())
+            padding_grip.raise_()
+        self._fit_buttons_to_width()
         self._update_preset_badge()
 
     def _position_preset_badge(self) -> None:
@@ -4770,6 +5276,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         badge.raise_()
 
     def _update_preset_badge(self) -> None:
+        self._refresh_quick_action_labels()
         badge = getattr(self, "preset_badge", None)
         if badge is None:
             return
@@ -4778,7 +5285,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         preset = dict(self.config["slot_presets"].get(preset_id) or {})
         icon, color = preset_visual(preset_id, preset)
         name = str(preset.get("name") or preset_id)
-        if self.config.get("auto_preset_enabled") and self._browser_bridge_error and self.config.get("auto_preset_rules"):
+        if self.config.get("auto_preset_pinned"):
+            suffix = " · 고정"
+        elif self.config.get("auto_preset_enabled") and self._browser_bridge_error and self.config.get("auto_preset_rules"):
             suffix = " · 연결 오류"
         else:
             suffix = (" · 고정" if self.config.get("auto_preset_manual_lock") else " · 자동") if self.config.get("auto_preset_enabled") else ""
@@ -4791,10 +5300,12 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         display_text = QtGui.QFontMetrics(font).elidedText(full_text, QtCore.Qt.ElideRight, width_limit - 16)
         badge.setText(display_text)
         badge.setToolTip(
-            f"현재 프리셋: {name} · 눌러서 프리셋 전환" +
+            f"현재 프리셋: {name} · 눌러서 홈으로 이동" +
+            (" · 드래그하여 다른 화면 가장자리로 이동" if self._edge_panel_enabled() else "") +
             (f" · {self._browser_action_notice}" if self._browser_action_notice else "") +
             (f" · 브라우저 연결 실패: {self._browser_bridge_error}" if suffix == " · 연결 오류" else
-             " (수동 고정 중)" if suffix == " · 고정" else "")
+             " (퀵액션에서 자동으로 전환할 때까지 고정)" if self.config.get("auto_preset_pinned") else
+             " (수동 선택 중)" if suffix == " · 고정" else "")
         )
         badge.setFixedWidth(min(width_limit, max(72, QtGui.QFontMetrics(font).horizontalAdvance(display_text) + 20)))
         badge.setStyleSheet(
@@ -4832,6 +5343,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def _start_window_drag_candidate(self, event: QtGui.QMouseEvent) -> bool:
         if event.button() == QtCore.Qt.LeftButton:
+            self._hold_triggered = False
             self._drag_press_global = event.globalPosition().toPoint()
             self._drag_window_origin = self.pos()
             self._is_dragging_window = False
@@ -4856,17 +5368,24 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         return True
 
     def _handle_window_drag_release(self, event: QtGui.QMouseEvent) -> bool:
+        if event.button() != QtCore.Qt.LeftButton:
+            return False
         was_dragging = self._is_dragging_window
         self._is_dragging_window = False
         self._drag_press_global = None
         self._drag_window_origin = None
         if was_dragging:
             self.unsetCursor()
-            self._save_config()
+            if self._edge_panel_enabled():
+                self._snap_edge_panel_to(event.globalPosition().toPoint())
+            else:
+                self._save_config()
             return True
         return False
 
     def _get_resize_edge(self, pos: QtCore.QPoint) -> str:
+        if self._edge_panel_enabled():
+            return ""
         margin = 8
         w = self.width()
         h = self.height()
@@ -4905,6 +5424,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         dy = global_pos.y() - self._resize_start_pos.y()
 
         edge = getattr(self, "_resize_edge", "")
+        if edge == "bottom_padding":
+            # Only the blank area changes. Keep the top edge, width and tile
+            # side fixed, and never let the grip cover an occupied row.
+            tile_side = self._tile_side_from_width(orig.width())
+            minimum_height = self._size_for_tile_side(tile_side).height()
+            self.resize(orig.width(), max(minimum_height, orig.height() + dy))
+            return
         proposed_w = orig.width() + dx if "right" in edge else orig.width() - dx
         proposed_h = orig.height() + dy if "bottom" in edge else orig.height() - dy
         side_w = self._tile_side_from_width(proposed_w)
@@ -4919,7 +5445,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         else:
             tile_side = side_h
 
-        target = self._size_for_tile_side(max(MIN_TILE_SIDE, tile_side))
+        target = self._window_size_for_tile_side(max(MIN_TILE_SIDE, tile_side))
         new_x = orig.right() - target.width() + 1 if "left" in edge else orig.x()
         new_y = orig.bottom() - target.height() + 1 if "top" in edge else orig.y()
         self.setGeometry(new_x, new_y, target.width(), target.height())
@@ -4928,6 +5454,61 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def _remember_manual_tile_side(self, tile_side: float) -> None:
         self.config["manual_tile_side"] = round(max(MIN_TILE_SIDE, float(tile_side)), 3)
+
+    def _remember_bottom_blank_space(self) -> None:
+        tile_side = self._tile_side_from_width(self.width())
+        self._remember_manual_tile_side(tile_side)
+        self.config["bottom_blank_space"] = max(0, self.height() - self._size_for_tile_side(tile_side).height())
+        self._capture_active_slot_preset()
+
+    def _prepare_bottom_padding_resize(self) -> None:
+        """Release empty trailing grid rows before Qt enforces their height."""
+        if not self.config.get("show_empty_slots") or self.config.get("crop_trailing_empty_rows"):
+            return
+        columns = max(1, self._visible_cols)
+        last_occupied = max(
+            (index for index, button in enumerate(self.buttons)
+             if button.has_slot_content),
+            default=-1,
+        )
+        needed_rows = max(1, last_occupied // columns + 1)
+        if needed_rows >= self._visible_rows:
+            return
+
+        original_size = self.size()
+        for button in self.buttons[needed_rows * columns:]:
+            self.grid_layout.removeWidget(button)
+            button.hide()
+            button.setParent(None)
+            button.deleteLater()
+        self.buttons = self.buttons[:needed_rows * columns]
+        self._visible_rows = needed_rows
+        self.config["crop_trailing_empty_rows"] = True
+        for row in range(20):
+            self.grid_layout.setRowStretch(row, 1 if row < needed_rows else 0)
+        self.setMinimumSize(self._size_for_tile_side(MIN_TILE_SIDE))
+        tile_side = self._tile_side_from_width(original_size.width())
+        self.config["bottom_blank_space"] = max(
+            0, original_size.height() - self._size_for_tile_side(tile_side).height())
+        self.resize(original_size)
+
+    def _crop_empty_page_tail(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self.config.get("show_empty_slots") or not self.config.get("crop_trailing_empty_rows"):
+            return entries
+        last_occupied = max(
+            (index for index, slot in enumerate(entries)
+             if deck_slot_has_content(slot)),
+            default=-1,
+        )
+        columns = max(1, self.cols)
+        keep = max(columns, (last_occupied // columns + 1) * columns)
+        return entries[:keep]
+
+    def _bottom_blank_space(self) -> int:
+        try:
+            return max(0, int(self.config.get("bottom_blank_space") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _saved_manual_tile_side(self) -> float | None:
         try:
@@ -4950,23 +5531,36 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             max(1, round(self._visible_rows * tile_side + extra_h)),
         )
 
+    def _window_size_for_tile_side(self, tile_side: float) -> QtCore.QSize:
+        content = self._size_for_tile_side(tile_side)
+        return QtCore.QSize(content.width(), content.height() + self._bottom_blank_space())
+
+    def _fit_buttons_to_width(self) -> None:
+        if not hasattr(self, "buttons"):
+            return
+        panel = getattr(self, "_edge_panel_layout", None)
+        tile_side = panel.tile_side if self._edge_panel_enabled() and panel else max(MIN_TILE_SIDE, round(self._tile_side_from_width(self.width())))
+        for button in self.buttons:
+            if button.width() != tile_side or button.height() != tile_side:
+                button.setFixedSize(tile_side, tile_side)
+
     def _tile_side_from_width(self, width: int) -> float:
         extra_w, _ = self._grid_extras()
         return max(MIN_TILE_SIDE, (width - extra_w) / max(1, self._visible_cols))
 
     def _tile_side_from_height(self, height: int) -> float:
         _, extra_h = self._grid_extras()
-        return max(MIN_TILE_SIDE, (height - extra_h) / max(1, self._visible_rows))
+        return max(MIN_TILE_SIDE, (height - extra_h - self._bottom_blank_space()) / max(1, self._visible_rows))
 
     def resize_grid_from_width(self, width: int) -> None:
         tile_side = self._tile_side_from_width(width)
         self._remember_manual_tile_side(tile_side)
-        self.resize(self._size_for_tile_side(tile_side))
+        self.resize(self._window_size_for_tile_side(tile_side))
 
     def resize_grid_from_height(self, height: int) -> None:
         tile_side = self._tile_side_from_height(height)
         self._remember_manual_tile_side(tile_side)
-        self.resize(self._size_for_tile_side(tile_side))
+        self.resize(self._window_size_for_tile_side(tile_side))
 
     def _start_mouse_hold_check(self, global_pos: QtCore.QPoint) -> None:
         self._hold_start_pos = global_pos
@@ -5101,6 +5695,10 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self._add_slot_from_radial()
         elif key == "preset_settings":
             self._open_hold_preset_dialog()
+        elif key == "preset_mode":
+            self._toggle_preset_mode()
+        elif key == "edge_panel":
+            self._show_edge_panel_menu(QtGui.QCursor.pos())
         elif key == "auto_resume":
             self._resume_auto_preset()
         elif key in ("close_app", "close", "exit"):
@@ -5205,11 +5803,16 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.showMaximized()
 
     def _apply_always_on_top(self) -> None:
-        flags = QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window
+        was_visible = self.isVisible()
+        geometry = self.geometry()
+        flags = QtCore.Qt.FramelessWindowHint | QtCore.Qt.Tool
         if self.always_on_top:
             flags |= QtCore.Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags)
-        if self.isVisible():
+        # Changing flags hides/recreates the native window. Preserve the panel
+        # and its monitor-edge placement when toggling topmost.
+        self.setGeometry(geometry)
+        if was_visible:
             self.show()
 
     def event(self, event: QtCore.QEvent) -> bool:
@@ -5395,6 +5998,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def _refresh_slots_fast(self) -> bool:
         """Reuse visible tile widgets when auto-switching between equal grids."""
+        if self._edge_panel_enabled():
+            return False
         if not self.buttons:
             return False
         hotkeys = self.repository.load_hotkeys()
@@ -5410,8 +6015,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 continue
             if 0 <= position < page_size and isinstance(entry, dict) and isinstance(entry.get("slot"), dict):
                 page_slots[position] = entry["slot"]
+        page_slots = self._crop_empty_page_tail(page_slots)
         visible = [(index, slot) for index, slot in enumerate(page_slots)
-                   if self.config.get("show_empty_slots") or str(slot.get("macro") or "").strip()]
+                   if self.config.get("show_empty_slots") or deck_slot_has_content(slot)]
         visible_cols = min(self.cols, max(1, len(visible)))
         if (len(visible) != len(self.buttons) or visible_cols != self._visible_cols
                 or any(button.slot_index != index for button, (index, _slot) in zip(self.buttons, visible))):
@@ -5445,11 +6051,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 display_title=str(action.get("label") or "") if action else macro_name,
             )
             button.action_kind = str(action.get("kind") or "") if action else ""
+            button.has_slot_content = deck_slot_has_content(slot)
             button.set_feedback(self._slot_feedback.get(self._feedback_key(index), ""))
         self.refresh_states()
         return True
 
     def refresh_slots(self) -> None:
+        self._set_edge_panel_container()
         gap = int(self.config.get("tile_gap", 10))
         self.grid_layout.setSpacing(gap)
 
@@ -5501,27 +6109,33 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 continue
             if 0 <= position < pageSize and isinstance(entry, dict) and isinstance(entry.get("slot"), dict):
                 current_page_slots[position] = entry["slot"]
-        if show_empty_slots:
-            current_page_slots.extend(
-                {"macro": "", "hotkey": "", "mode": "hybrid"}
-                for _ in range(max(0, pageSize - len(current_page_slots)))
-            )
+        panel = None
+        if self._edge_panel_enabled():
+            page_slots = self._edge_panel_slots(slots)
+            screen = self._edge_panel_screen()
+            available = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1920, 1080)
+            panel = edge_panel_layout(
+                self.config["edge_panel_side"], len(page_slots), available,
+                float(self.config.get("edge_panel_tile_side") or self._saved_manual_tile_side() or 68), gap)
+        elif show_empty_slots:
+            current_page_slots = self._crop_empty_page_tail(current_page_slots)
             page_slots = [(start_idx + offset, slot) for offset, slot in enumerate(current_page_slots)]
         else:
             page_slots = [
                 (index, slot)
                 for index, slot in enumerate(current_page_slots, start=start_idx)
-                if str(slot.get("macro") or "").strip()
+                if deck_slot_has_content(slot)
             ]
 
-        visible_cols = min(self.cols, max(1, len(page_slots)))
-        visible_rows = max(1, math.ceil(len(page_slots) / visible_cols))
+        self._edge_panel_layout = panel
+        visible_cols = panel.cols if panel else min(self.cols, max(1, len(page_slots)))
+        visible_rows = panel.rows if panel else max(1, math.ceil(len(page_slots) / visible_cols))
         self._visible_cols = visible_cols
         self._visible_rows = visible_rows
-        self.setMinimumSize(self._size_for_tile_side(MIN_TILE_SIDE))
-        for r in range(20):
+        self.setMinimumSize(QtCore.QSize(64, 64) if panel else self._size_for_tile_side(MIN_TILE_SIDE))
+        for r in range(max(20, visible_rows, self.grid_layout.rowCount())):
             self.grid_layout.setRowStretch(r, 1 if r < visible_rows else 0)
-        for c in range(20):
+        for c in range(max(20, visible_cols, self.grid_layout.columnCount())):
             self.grid_layout.setColumnStretch(c, 1 if c < visible_cols else 0)
 
         repaired_program_icons = False
@@ -5563,6 +6177,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             is_running = self._is_macro_running(macro_name)
             btn.set_slot_data(macro_name, hotkey, mode, is_running, display_title=display_title)
             btn.action_kind = str(action.get("kind") or "") if action else ""
+            btn.has_slot_content = deck_slot_has_content(slot_info)
             btn.set_feedback(self._slot_feedback.get(self._feedback_key(slot_idx), ""))
 
             btn.slot_triggered.connect(self._run_slot_macro)
@@ -5570,8 +6185,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             btn.edit_icon_requested.connect(self._edit_slot_icon)
             btn.remove_slot_requested.connect(self._remove_slot)
 
-            row = i // visible_cols
-            col = i % visible_cols
+            row, col = panel.cell(i) if panel else divmod(i, visible_cols)
             self.grid_layout.addWidget(btn, row, col)
             self.buttons.append(btn)
         if repaired_program_icons:
@@ -5581,8 +6195,16 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
         # Dynamic Auto-Fit Window Size according to configured active slots
         manual_tile_side = self._saved_manual_tile_side()
-        if manual_tile_side is not None:
-            self.resize(self._size_for_tile_side(manual_tile_side))
+        if panel:
+            self.swipe_container.setFixedSize(panel.content_size)
+            if not self._is_dragging_window:
+                self.setGeometry(panel.geometry)
+            self.edge_scroll.horizontalScrollBar().setValue(
+                self.edge_scroll.horizontalScrollBar().maximum() if panel.edge == "right" else 0)
+            self.edge_scroll.verticalScrollBar().setValue(
+                self.edge_scroll.verticalScrollBar().maximum() if panel.edge == "bottom" else 0)
+        elif manual_tile_side is not None:
+            self.resize(self._window_size_for_tile_side(manual_tile_side))
         elif self._restored_window_geometry:
             # Existing configs already carry the size chosen by the user.
             # Adopt that size instead of overwriting it during first refresh.
@@ -5602,21 +6224,26 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 tile_scale = float(self.config.get("tile_scale", 1.0))
                 tile_side = max(MIN_TILE_SIDE, BASE_TILE_SIDE * tile_scale)
                 self.setMinimumSize(self._size_for_tile_side(MIN_TILE_SIDE))
-                self.resize(self._size_for_tile_side(tile_side))
+                self.resize(self._window_size_for_tile_side(tile_side))
             else:
                 self._visible_cols = 1
                 self._visible_rows = 1
                 self.setMinimumSize(self._size_for_tile_side(MIN_TILE_SIDE))
-                self.resize(self._size_for_tile_side(BASE_TILE_SIDE * float(self.config.get("tile_scale", 1.0))))
+                self.resize(self._window_size_for_tile_side(BASE_TILE_SIDE * float(self.config.get("tile_scale", 1.0))))
+        self._fit_buttons_to_width()
         if hasattr(self, "preset_radial_menu"):
             self._refresh_preset_radial_menu()
 
     def _prev_page(self) -> None:
+        if self._edge_panel_enabled():
+            return
         if self.current_page > 0:
             self.current_page -= 1
             self.refresh_slots()
 
     def _next_page(self) -> None:
+        if self._edge_panel_enabled():
+            return
         hotkeys_data = self.repository.load_hotkeys()
         slots = list(hotkeys_data.get("slots") or [])
         pageSize = self.rows * self.cols

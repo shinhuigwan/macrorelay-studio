@@ -5529,6 +5529,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             """)
 
     def _start_window_drag_candidate(self, event: QtGui.QMouseEvent) -> bool:
+        if self._slot_layout_editing and event.button() == QtCore.Qt.LeftButton:
+            # Missed touches on a blank drop cell must not drag the whole Deck
+            # or start a background swipe/long-press while arranging slots.
+            self._drag_press_global = None
+            return True
         if event.button() == QtCore.Qt.LeftButton:
             self._hold_triggered = False
             self._drag_press_global = event.globalPosition().toPoint()

@@ -153,6 +153,10 @@ class DeckPanelControlsTests(unittest.TestCase):
             self.assertTrue(window.centralWidget().rect().contains(window.layout_edit_button.geometry()))
             self.assertFalse(window.preset_badge.geometry().intersects(window.layout_edit_button.geometry()))
             window._set_slot_layout_editing(True)
+            original_position = window.pos()
+            self.send_drag(window.swipe_container,
+                           window.swipe_container.mapToGlobal(window.swipe_container.rect().center()) + QtCore.QPoint(100, 0))
+            self.assertEqual(original_position, window.pos())
             QtTest.QTest.mouseClick(window.buttons[0], QtCore.Qt.LeftButton)
             self.assertEqual({0: 0}, window._visual_slot_positions)
             self.send_drag(window.buttons[0], window.mapToGlobal(QtCore.QPoint(-300, -300)))

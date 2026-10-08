@@ -53,6 +53,226 @@ class DeckPanelControlsTests(unittest.TestCase):
                     self.assertFalse(window.windowFlags() & QtCore.Qt.WindowDoesNotAcceptFocus)
             window.close()
 
+    def test_layout_edit_icon_drag_swaps_and_moves_into_blank_cells_without_running(self):
+        from PySide6 import QtCore, QtTest
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            slots = [{"macro": f"슬롯 {i}", "mode": "deck_action",
+                      "action": {"kind": "text", "text": str(i)}} for i in range(3)]
+            window._save_preset_hotkeys({"slots": slots})
+            window.custom_icons = {str(i): {"icon_text": str(i)} for i in range(3)}
+            original_icons = dict(window.custom_icons)
+            window._set_edge_panel_mode("right")
+            window.show()
+            self.app.processEvents()
+            with mock.patch.object(window, "_execute_deck_action") as execute:
+                for edge in ("left", "right", "top", "bottom"):
+                    window._set_edge_panel_mode(edge)
+                    QtTest.QTest.mouseClick(window.layout_edit_button, QtCore.Qt.LeftButton)
+                    self.app.processEvents()
+                    self.assertTrue(window._slot_layout_editing)
+                    self.assertEqual("", window.layout_edit_button.text())
+                    origin = window.pos()
+                    source, target = window.buttons[0], window.buttons[2]
+                    self.send_drag(source, target.mapToGlobal(target.rect().center()))
+                    self.assertEqual(2, window._visual_slot_positions[0])
+                    self.assertEqual(0, window._visual_slot_positions[2])
+                    self.assertEqual(origin, window.pos())
+                    blank = next(widget for widget in window._layout_placeholders
+                                 if widget.property("deck_layout_position") == 3)
+                    source = next(button for button in window.buttons if button.slot_index == 0)
+                    self.send_drag(source, blank.mapToGlobal(blank.rect().center()))
+                    self.assertEqual(3, window._visual_slot_positions[0])
+                    QtTest.QTest.mouseClick(window.buttons[1], QtCore.Qt.LeftButton)
+                    QtTest.QTest.mouseDClick(window.buttons[1], QtCore.Qt.LeftButton)
+                    QtTest.QTest.mouseClick(window.layout_edit_button, QtCore.Qt.LeftButton)
+                    self.app.processEvents()
+                    self.assertFalse(window._slot_layout_editing)
+                    self.assertFalse(window._layout_placeholders)
+                    self.assertEqual(3, window._visual_slot_positions[0])
+                    self.assertEqual(slots, window.repository.load_hotkeys()["slots"])
+                    self.assertEqual(original_icons, window.custom_icons)
+                    self.assertTrue(all(button.size() == QtCore.QSize(68, 68) for button in window.buttons))
+                execute.assert_not_called()
+            window.close()
+
+    def test_layout_placement_survives_preset_capture_restart_and_backup_restore(self):
+        from PySide6 import QtCore
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        from macro_studio.repository import MacroRepository
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as target:
+            window = self.make_window(root)
+            window._save_preset_hotkeys({"slots": [{"macro": "슬롯"}]})
+            window._set_slot_layout_editing(True)
+            self.assertTrue(window._place_visual_slot(0, 8))
+            self.app.processEvents()
+            window._set_slot_layout_editing(False)
+            self.assertEqual(8, window._visual_slot_positions[0])
+            self.assertEqual((1, 3), window.grid_layout.getItemPosition(
+                window.grid_layout.indexOf(window.buttons[0]))[:2])
+            window._set_edge_panel_mode("left")
+            window._set_slot_layout_editing(True)
+            self.assertTrue(window._place_visual_slot(0, 1))
+            self.app.processEvents()
+            window._set_slot_layout_editing(False)
+            self.assertEqual(1, window._visual_slot_positions[0])
+            window._set_edge_panel_mode("right")
+            self.assertEqual(0, window._visual_slot_positions[0])
+            window._set_edge_panel_mode("left")
+            self.assertEqual(1, window._visual_slot_positions[0])
+            other = window._build_slot_preset("다른 프리셋")
+            window.config["slot_presets"]["other"] = other
+            window._set_slot_layout_editing(True)
+            window._switch_slot_preset("other", automatic=True)
+            self.assertEqual("default", window.config["active_slot_preset"])
+            window._set_slot_layout_editing(False)
+            window._switch_slot_preset("other", automatic=True)
+            self.assertEqual(0, window._visual_slot_positions[0])
+            window._switch_slot_preset("default", automatic=True)
+            self.assertEqual(1, window._visual_slot_positions[0])
+            payload = window.build_deck_backup_payload()
+            window.close()
+            reopened = QuickSlotDeckWindow(window.repository)
+            self.assertFalse(reopened._slot_layout_editing)
+            self.assertEqual(1, reopened._visual_slot_positions[0])
+            reopened.close()
+            restored = QuickSlotDeckWindow(MacroRepository(Path(target)))
+            restored.restore_deck_backup_payload(payload)
+            self.assertEqual(1, restored._visual_slot_positions[0])
+            self.assertEqual(QtCore.QSize(68, 68), restored.buttons[0].size())
+            restored.close()
+
+    def test_layout_drop_outside_and_tap_do_not_reorder_and_header_button_is_visible(self):
+        from PySide6 import QtCore, QtTest
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window._save_preset_hotkeys({"slots": [{"macro": "슬롯"}]})
+            window._set_edge_panel_mode("left")
+            window.show()
+            self.app.processEvents()
+            self.assertTrue(window.centralWidget().rect().contains(window.layout_edit_button.geometry()))
+            self.assertFalse(window.preset_badge.geometry().intersects(window.layout_edit_button.geometry()))
+            window._set_slot_layout_editing(True)
+            QtTest.QTest.mouseClick(window.buttons[0], QtCore.Qt.LeftButton)
+            self.assertEqual({0: 0}, window._visual_slot_positions)
+            self.send_drag(window.buttons[0], window.mapToGlobal(QtCore.QPoint(-300, -300)))
+            self.assertEqual({0: 0}, window._visual_slot_positions)
+            self.assertFalse(window.layout_drop_marker.isVisible())
+            window._mark_slot_status(0, "completed")  # Blank drop targets are not executable slots.
+            window.close()
+
+    def test_visual_layout_validates_duplicate_and_out_of_range_positions(self):
+        from macro_studio.deck_edge_panel import slot_visual_positions
+        positions = slot_visual_positions([10, 20, 30, 40], {"10": 5, "20": 5, "30": -1, "40": 999999})
+        self.assertEqual(5, positions[10])
+        self.assertEqual(4, len(set(positions.values())))
+        self.assertTrue(all(0 <= value < 64 for value in positions.values()))
+
+    def test_edge_size_button_opens_controls_without_unpinning_even_on_small_screen(self):
+        from PySide6 import QtCore, QtTest
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window._set_edge_panel_mode("left")
+            window.show()
+            screen = mock.Mock()
+            screen.availableGeometry.return_value = QtCore.QRect(-640, 24, 300, 280)
+            with mock.patch("macro_studio.quickslot_deck.QtGui.QGuiApplication.screenAt", return_value=screen):
+                window._show_edge_panel_menu(screen.availableGeometry().topLeft())
+                menu = window.edge_radial_menu
+                self.app.processEvents()
+                self.assertTrue(screen.availableGeometry().contains(menu.geometry()))
+                self.assertEqual(QtCore.QSize(280, 280), menu.size())
+                self.assertEqual("슬롯 크기", menu.center_secondary_action_text)
+                QtTest.QTest.qWait(260)
+                with mock.patch.object(window, "_show_edge_panel_size_dialog") as show:
+                    QtTest.QTest.mouseClick(menu, QtCore.Qt.LeftButton,
+                                           pos=menu._center_button_rect().center().toPoint())
+                    self.app.processEvents()
+                    show.assert_called_once()
+                    self.assertFalse(menu.isVisible())
+                    self.assertEqual("left", window.config["edge_panel_side"])
+            window.close()
+
+    def test_size_dialog_controls_update_square_tiles_live_at_all_edges(self):
+        from PySide6 import QtCore, QtTest, QtWidgets
+        from macro_studio.deck_edge_panel import EdgePanelSizeDialog
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            slots = [{"macro": f"슬롯 {i}"} for i in range(40)]
+            window._save_preset_hotkeys({"slots": slots})
+            free_size = window._saved_manual_tile_side()
+            window._set_edge_panel_mode("right")
+            window.show()
+            dialog = EdgePanelSizeDialog(window._edge_panel_tile_size(), window)
+            dialog.size_changed.connect(window._set_edge_panel_tile_size)
+            dialog.show()
+            QtTest.QTest.mouseClick(dialog.increase_button, QtCore.Qt.LeftButton)
+            self.assertEqual(76, window._edge_panel_tile_size())
+            QtTest.QTest.mouseClick(dialog.decrease_button, QtCore.Qt.LeftButton)
+            self.assertEqual(68, window._edge_panel_tile_size())
+            dialog.size_slider.setValue(96)
+            self.assertEqual(96, dialog.size_spin.value())
+            self.assertEqual(96, window._edge_panel_tile_size())
+            large = next(button for button in dialog.findChildren(QtWidgets.QPushButton)
+                         if button.text() == "크게 128")
+            QtTest.QTest.mouseClick(large, QtCore.Qt.LeftButton)
+            self.assertEqual(128, dialog.size_slider.value())
+            for edge in ("left", "right", "top", "bottom"):
+                window._set_edge_panel_mode(edge)
+                for size in (48, 84, 128, 256):
+                    dialog.size_spin.setValue(size)
+                    self.app.processEvents()
+                    self.assertEqual(list(range(40)), [button.slot_index for button in window.buttons])
+                    self.assertTrue(all(button.size() == QtCore.QSize(size, size) for button in window.buttons))
+                    self.assertTrue(window.screen().availableGeometry().contains(window.geometry()))
+                    self.assertEqual(edge, window.config["edge_panel_side"])
+                    self.assertEqual(free_size, window._saved_manual_tile_side())
+                    self.assertEqual(slots, window.repository.load_hotkeys()["slots"])
+            self.assertFalse(dialog.increase_button.isEnabled())
+            dialog.size_spin.setValue(48)
+            self.assertFalse(dialog.decrease_button.isEnabled())
+            dialog.close()
+            window.close()
+
+    def test_panel_size_persists_when_reentering_switching_presets_and_restarting(self):
+        from PySide6 import QtCore
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window._save_preset_hotkeys({"slots": [{"macro": "실행"}]})
+            window.refresh_slots()
+            window.show()
+            self.app.processEvents()
+            free_geometry = window.geometry()
+            # It can also be configured before the panel is docked.
+            window._set_edge_panel_tile_size(100)
+            self.assertEqual(free_geometry, window.geometry())
+            window._set_edge_panel_mode("left")
+            self.assertEqual(QtCore.QSize(100, 100), window.buttons[0].size())
+            window.config["slot_presets"]["other"] = window._build_slot_preset("다른 모드")
+            window._switch_slot_preset("other", automatic=True)
+            self.assertEqual(QtCore.QSize(100, 100), window.buttons[0].size())
+            window._set_edge_panel_mode("free")
+            self.assertEqual(68, window._saved_manual_tile_side())
+            window._set_edge_panel_mode("right")
+            self.assertEqual(100, window._edge_panel_tile_size())
+            window.close()
+            reopened = QuickSlotDeckWindow(window.repository)
+            self.assertEqual(100, reopened._edge_panel_tile_size())
+            self.assertEqual("right", reopened.config["edge_panel_side"])
+            self.assertEqual(QtCore.QSize(100, 100), reopened.buttons[0].size())
+            reopened.close()
+
+    def test_panel_size_validates_legacy_values(self):
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            for value, expected in ((12, 48), (9999, 256), ("invalid", 68), (float("nan"), 68)):
+                window.config["edge_panel_tile_side"] = value
+                self.assertEqual(expected, window._edge_panel_tile_size())
+            window._set_edge_panel_tile_size(-1)
+            self.assertEqual(48, window._edge_panel_tile_size())
+            window.close()
+
     def test_pin_survives_window_tab_changes_and_restart_then_auto_catches_up(self):
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         with tempfile.TemporaryDirectory() as root:

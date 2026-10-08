@@ -4,10 +4,10 @@ from dataclasses import dataclass
 import math
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from macro_studio.deck_controls import DECK_FOOTER_HEIGHT
 
 
 EDGE_PANEL_SIDES = {"left", "right", "top", "bottom"}
-EDGE_PANEL_HEADER = 28
 EDGE_PANEL_MIN_TILE = 48
 EDGE_PANEL_MAX_TILE = 256
 
@@ -52,7 +52,7 @@ class DeckLayoutEditButton(QtWidgets.QToolButton):
         super().paintEvent(event)
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.setPen(QtGui.QPen(QtGui.QColor("#6EE7B7" if self.isChecked() else "#E2E8F0"),
+        painter.setPen(QtGui.QPen(QtGui.QColor("#6EE7B7" if self.isChecked() else "#67E8F9"),
                                 1.7, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
         if self.isChecked():
             painter.drawPolyline(QtGui.QPolygonF([
@@ -185,7 +185,7 @@ def edge_panel_layout(edge: str, count: int, available: QtCore.QRect,
     count = max(1, int(count))
     side, gap = max(48, round(tile_side)), max(0, int(gap))
     if edge in {"left", "right"}:
-        capacity = max(1, (available.height() - padding - EDGE_PANEL_HEADER + gap) // (side + gap))
+        capacity = max(1, (available.height() - padding - DECK_FOOTER_HEIGHT + gap) // (side + gap))
         rows = min(count, capacity) if axis_span is None else max(1, min(axis_span, capacity))
         cols = math.ceil(count / rows)
     else:
@@ -195,7 +195,7 @@ def edge_panel_layout(edge: str, count: int, available: QtCore.QRect,
     content = QtCore.QSize(cols * side + (cols - 1) * gap,
                           rows * side + (rows - 1) * gap)
     width = min(available.width(), content.width() + padding)
-    height = min(available.height(), content.height() + padding + EDGE_PANEL_HEADER)
+    height = min(available.height(), content.height() + padding + DECK_FOOTER_HEIGHT)
     x = available.x() + (available.width() - width) // 2
     y = available.y() + (available.height() - height) // 2
     if edge == "left":

@@ -99,7 +99,8 @@ class QuickSlotDeckTests(unittest.TestCase):
 
             window.config["tile_scale"] = 0.25
             window.refresh_slots()
-            self.assertEqual((64, 64), (window.width(), window.height()))
+            # Minimum square tile plus borders, margins and compact footer.
+            self.assertEqual((66, 90), (window.width(), window.height()))
             dialog.close()
             window.close()
 
@@ -162,7 +163,7 @@ class QuickSlotDeckTests(unittest.TestCase):
 
     def test_border_resize_keeps_grid_cells_square(self) -> None:
         from PySide6 import QtCore
-        from macro_studio.quickslot_deck import QuickSlotDeckWindow, WINDOW_PADDING
+        from macro_studio.quickslot_deck import QuickSlotDeckWindow, WINDOW_PADDING, DECK_FOOTER_HEIGHT
         from macro_studio.repository import MacroRepository
 
         with tempfile.TemporaryDirectory() as directory:
@@ -182,7 +183,7 @@ class QuickSlotDeckTests(unittest.TestCase):
 
             gap = int(window.config["tile_gap"])
             cell_width = (window.width() - WINDOW_PADDING - gap) / 2
-            cell_height = window.height() - WINDOW_PADDING
+            cell_height = window.height() - WINDOW_PADDING - DECK_FOOTER_HEIGHT
             self.assertAlmostEqual(cell_width, cell_height, delta=1.0)
             self.assertGreaterEqual(cell_width, 48)
             window.close()
@@ -352,7 +353,9 @@ class QuickSlotDeckTests(unittest.TestCase):
             hotkeys = repository.load_hotkeys()
             hotkeys["slots"].extend({} for _ in range(2))
             hotkeys["slots"][9] = {"macro": "다음 줄", "hotkey": "", "mode": "hybrid"}
-            repository.save_hotkeys(hotkeys)
+            # Use the app's save path: a live Windows file watcher holds the
+            # file open until _save_preset_hotkeys temporarily detaches it.
+            window._save_preset_hotkeys(hotkeys)
             window.refresh_slots()
             self.app.processEvents()
             self.assertEqual(2, window._visible_rows)
@@ -584,7 +587,7 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertTrue(show_radial.call_args.kwargs["sticky"])
             window.close()
 
-    def test_preset_badge_tap_returns_home_and_empty_tile_double_click_opens_radial(self) -> None:
+    def test_preset_label_opens_menu_home_and_empty_tile_double_click_opens_radial(self) -> None:
         from PySide6 import QtCore, QtTest
         from macro_studio.quickslot_deck import QuickSlotDeckWindow
         from macro_studio.repository import MacroRepository
@@ -596,6 +599,8 @@ class QuickSlotDeckTests(unittest.TestCase):
             self.assertEqual("starter-jstris", window.config["active_slot_preset"])
             with mock.patch.object(window, "_show_preset_radial") as show_radial:
                 QtTest.QTest.mouseClick(window.preset_badge, QtCore.Qt.LeftButton)
+                self.assertTrue(window.controls_popup.isVisible())
+                QtTest.QTest.mouseClick(window.controls_popup.buttons["home"], QtCore.Qt.LeftButton)
                 self.assertEqual("default", window.config["active_slot_preset"])
                 self.assertEqual(window.config["slot_presets"]["default"]["slots"],
                                  window.repository.load_hotkeys()["slots"])

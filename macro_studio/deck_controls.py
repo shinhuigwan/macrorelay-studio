@@ -30,28 +30,6 @@ def control_icon(kind: str) -> QtGui.QIcon:
     return QtGui.QIcon(pixmap)
 
 
-def preset_identity_icon(name: str, color: str) -> QtGui.QIcon:
-    """Compact initial identity, instead of a platform-dependent emoji box."""
-    initial = next((letter for label, letter in
-                    (("유튜브", "Y"), ("네이버", "N"), ("트레이딩", "T"))
-                    if label in name), name[:1].upper() or "D")
-    pixmap = QtGui.QPixmap(20, 20)
-    pixmap.fill(QtCore.Qt.transparent)
-    painter = QtGui.QPainter(pixmap)
-    painter.setRenderHint(QtGui.QPainter.Antialiasing)
-    painter.setPen(QtCore.Qt.NoPen)
-    painter.setBrush(QtGui.QColor(color))
-    painter.drawRoundedRect(1, 1, 18, 18, 5, 5)
-    font = QtGui.QFont("Malgun Gothic")
-    font.setPixelSize(11)
-    font.setBold(True)
-    painter.setFont(font)
-    painter.setPen(QtGui.QColor("#F8FAFC"))
-    painter.drawText(pixmap.rect(), QtCore.Qt.AlignCenter, initial)
-    painter.end()
-    return QtGui.QIcon(pixmap)
-
-
 class DeckControlsPopup(QtWidgets.QFrame):
     action_requested = QtCore.Signal(str)
 

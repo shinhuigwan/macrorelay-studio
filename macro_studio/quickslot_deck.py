@@ -47,7 +47,9 @@ except ImportError:
     QSoundEffect = None
 
 from macro_studio.repository import MacroRepository
-from macro_studio.deck_controls import DECK_FOOTER_HEIGHT, DeckControlsPopup, preset_identity_icon
+from macro_studio.deck_controls import DECK_FOOTER_HEIGHT, DeckControlsPopup
+from macro_studio.deck_config_writer import DeckConfigWriter, write_deck_config
+from macro_studio.deck_layout_drag import SlotDragPreview
 from macro_studio.deck_edge_panel import (
     EDGE_PANEL_SIDES, EDGE_PANEL_MIN_TILE, EDGE_PANEL_MAX_TILE,
     DeckLayoutEditButton, EdgePanelSizeDialog, draw_edge_direction, edge_panel_layout,
@@ -4035,31 +4037,6 @@ class RadialMenuIconButton(QtWidgets.QPushButton):
             self.setText("🎯")
 
 
-class DeckPresetBadge(QtWidgets.QPushButton):
-    """Compact preset label: tap for controls, drag to move a docked panel."""
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        deck = self.window()
-        if event.button() == QtCore.Qt.LeftButton and deck._edge_panel_enabled():
-            deck._start_window_drag_candidate(event)
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        deck = self.window()
-        if deck._edge_panel_enabled() and deck._handle_window_drag_move(event):
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        deck = self.window()
-        if deck._edge_panel_enabled() and deck._handle_window_drag_release(event):
-            self.setDown(False)
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-
 class DeckResizeGrip(QtWidgets.QWidget):
     """Corner handles for scaling tiles or trimming only the empty bottom area."""
 
@@ -4129,7 +4106,7 @@ class DeckResizeGrip(QtWidgets.QWidget):
 
 
 class DeckFooterControl(DeckLayoutEditButton):
-    """Tap opens controls; a free-layout drag retains the bottom trim handle."""
+    """A text-only preset button; dragging retains the old corner gestures."""
 
     def __init__(self, deck, parent=None):
         super().__init__(parent)
@@ -4140,6 +4117,22 @@ class DeckFooterControl(DeckLayoutEditButton):
         self.setAccessibleName("덕덱 설정 / 배치 편집 완료")
         self.setStyleSheet("QToolButton#SlotLayoutToggle { background: transparent; border: none; }"
                            "QToolButton#SlotLayoutToggle:hover { background: rgba(56,189,248,30); border-radius: 6px; }")
+
+    def paintEvent(self, event):
+        # Draw the whole line ourselves: global button styles can reserve
+        # padding / icon space and clip small footer text at high DPI.
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        if self.underMouse() or self.isDown():
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(56, 189, 248, 25))
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 5, 5)
+        painter.setFont(self.font())
+        painter.setPen(QtGui.QColor("#6EE7B7" if self.isChecked() else "#BEC7D5"))
+        painter.drawText(self.rect().adjusted(4, 3, -4, -3),
+                         QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter | QtCore.Qt.TextSingleLine,
+                         self.text())
+        painter.end()
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
@@ -4207,6 +4200,10 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._layout_drag = None
         self._layout_placeholders = []
         self._visual_slot_positions = {}
+        self._layout_config_writer = None
+        self._layout_save_timer = QtCore.QTimer(self)
+        self._layout_save_timer.setSingleShot(True)
+        self._layout_save_timer.timeout.connect(self._save_layout_config)
         self._feedback_sequence: Dict[tuple[str, int], int] = {}
         self.execution_history: List[Dict[str, str]] = []
 
@@ -4421,8 +4418,20 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 pass
 
     def _save_config(self) -> None:
+        self._layout_save_timer.stop()
         try:
-            data = {
+            data = self._config_snapshot()
+            if self._layout_config_writer is None:
+                write_deck_config(self.config_path, data)
+            else:
+                self._layout_config_writer.save(self.config_path, data, wait=True)
+        except Exception:
+            pass
+
+    def _config_snapshot(self) -> Dict[str, Any]:
+        # Strings (including embedded image data) are immutable and reused by
+        # deepcopy; no image decoding or JSON serialization on the input path.
+        return copy.deepcopy({
                 "always_on_top": self.always_on_top,
                 "opacity": self.opacity_val,
                 "rows": self.rows,
@@ -4430,12 +4439,15 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 "custom_icons": self.custom_icons,
                 "geometry": bytes(self.saveGeometry().toHex()).decode("ascii"),
                 "config": self.config,
-            }
-            temp_path = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
-            temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(temp_path, self.config_path)
-        except Exception:
-            pass
+            })
+
+    def _save_layout_config(self) -> None:
+        if self._layout_drag is not None:
+            self._layout_save_timer.start(350)
+            return
+        if self._layout_config_writer is None:
+            self._layout_config_writer = DeckConfigWriter()
+        self._layout_config_writer.save(self.config_path, self._config_snapshot())
 
     def build_deck_backup_payload(self) -> Dict[str, Any]:
         """Return a portable backup containing both visuals and executable slots."""
@@ -4563,6 +4575,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 asset_index[alias] = {"file": str(target.relative_to(self.repository.root)).replace("\\", "/"), "source": "deck-backup", "size": len(image_bytes)}
             self.repository._write_json(self.repository.assets_index_path, asset_index)
 
+        # Stop delayed edits and drain the old snapshot before replacing config.
+        self._layout_save_timer.stop()
+        if self._layout_config_writer is not None:
+            self._layout_config_writer.close()
+            self._layout_config_writer = None
         temp_path = self.config_path.with_suffix(self.config_path.suffix + ".import.tmp")
         temp_path.write_text(json.dumps(deck_config, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(temp_path, self.config_path)
@@ -5222,13 +5239,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.edge_scroll.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
         self.edge_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         self.edge_scroll.hide()
-        self.preset_badge = DeckPresetBadge(central)
-        self.preset_badge.setObjectName("PresetBadge")
-        self.preset_badge.setCursor(QtCore.Qt.PointingHandCursor)
-        self.preset_badge.setFocusPolicy(QtCore.Qt.NoFocus)
-        self.preset_badge.setFixedHeight(DECK_FOOTER_HEIGHT)
-        self.preset_badge.clicked.connect(self._show_deck_controls)
         self.layout_edit_button = DeckFooterControl(self, central)
+        # One clickable name, not a settings icon plus a separate label.
+        self.preset_badge = self.layout_edit_button
         self.layout_edit_button.clicked.connect(self._handle_footer_control)
         self.layout_edit_button.show()
         self.controls_popup = DeckControlsPopup(self)
@@ -5237,6 +5250,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.layout_drop_marker.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
         self.layout_drop_marker.setStyleSheet("background: rgba(56,189,248,35); border: 3px solid #38BDF8; border-radius: 8px;")
         self.layout_drop_marker.hide()
+        self.layout_drag_preview = SlotDragPreview(self.swipe_container)
         self._update_preset_badge()
         self.preset_badge.show()
         self.preset_badge.raise_()
@@ -5423,6 +5437,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.controls_popup.hide()
         self._slot_layout_editing = bool(enabled)
         self._layout_drag = None
+        self.layout_drag_preview.clear()
         self._cancel_mouse_hold_check()
         self._drag_press_global = None
         self._is_dragging_window = False
@@ -5463,29 +5478,47 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def _begin_slot_layout_drag(self, button, event) -> None:
         self._cancel_mouse_hold_check()
+        self.layout_drag_preview.clear()
+        cells = {int(widget.property("deck_layout_position")): (widget, QtCore.QRect(widget.geometry()))
+                 for widget in [*self.buttons, *self._layout_placeholders]}
+        point = self.swipe_container.mapFromGlobal(event.globalPosition().toPoint())
+        self.layout_drag_preview.begin(button.geometry(), button.grab(), point - button.pos())
         self._layout_drag = {
             "slot": button.slot_index, "preset": self.config.get("active_slot_preset"),
             "scope": self._slot_layout_scope(), "start": event.globalPosition().toPoint(),
             "target": None, "moved": False,
+            "cells": cells, "source": int(button.property("deck_layout_position")),
+            "preview_target": None, "swap_pixmap": None,
         }
+
+    def _layout_target_at(self, drag, point):
+        # Cached rectangles include half the gap: small pointer/touch jitter in
+        # a gutter still belongs to the nearest cell, never to a different row.
+        margin = max(0, self.grid_layout.spacing() // 2)
+        return next((position for position, (_, rect) in drag["cells"].items()
+                     if rect.adjusted(-margin, -margin, margin, margin).contains(point)), None)
 
     def _move_slot_layout_drag(self, event) -> None:
         drag = self._layout_drag
         if not drag or not event.buttons() & QtCore.Qt.LeftButton:
             return
-        if (event.globalPosition().toPoint() - drag["start"]).manhattanLength() < QtWidgets.QApplication.startDragDistance():
+        if (not drag["moved"] and (event.globalPosition().toPoint() - drag["start"]).manhattanLength()
+                < QtWidgets.QApplication.startDragDistance()):
             return
         drag["moved"] = True
         local = self.swipe_container.mapFromGlobal(event.globalPosition().toPoint())
-        drag["target"] = None
-        for widget in [*self.buttons, *self._layout_placeholders]:
-            if widget.geometry().contains(local):
-                drag["target"] = widget.property("deck_layout_position")
-                self.layout_drop_marker.setGeometry(widget.geometry())
-                self.layout_drop_marker.show()
-                self.layout_drop_marker.raise_()
-                return
+        target = drag["target"] = self._layout_target_at(drag, local)
+        rect = None
+        if target is not None and target != drag["source"]:
+            widget, rect = drag["cells"][target]
+            if target != drag["preview_target"]:
+                drag["swap_pixmap"] = widget.grab() if isinstance(widget, StreamDeckButton) else None
+            self.layout_drop_marker.setGeometry(rect)
+        else:
+            drag["swap_pixmap"] = None
+        drag["preview_target"] = target
         self.layout_drop_marker.hide()
+        self.layout_drag_preview.move_preview(local, rect, drag["swap_pixmap"])
 
     def _finish_slot_layout_drag(self, event) -> None:
         if event.button() != QtCore.Qt.LeftButton:
@@ -5494,12 +5527,18 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.layout_drop_marker.hide()
         if drag:
             local = self.swipe_container.mapFromGlobal(event.globalPosition().toPoint())
-            drag["target"] = next((widget.property("deck_layout_position")
-                                   for widget in [*self.buttons, *self._layout_placeholders]
-                                   if widget.geometry().contains(local)), None)
+            drag["target"] = self._layout_target_at(drag, local)
+        placed = False
         if (drag and drag["moved"] and drag["preset"] == self.config.get("active_slot_preset")
                 and drag["scope"] == self._slot_layout_scope() and drag["target"] is not None):
-            self._place_visual_slot(drag["slot"], int(drag["target"]))
+            placed = self._place_visual_slot(drag["slot"], int(drag["target"]))
+        if drag and drag["moved"]:
+            destination = drag["target"] if placed else drag["source"]
+            if not placed:
+                self.layout_drag_preview.swap_pixmap = QtGui.QPixmap()
+            self.layout_drag_preview.land(drag["cells"][destination][1])
+        else:
+            self.layout_drag_preview.clear()
 
     def _place_visual_slot(self, slot_index: int, target: int) -> bool:
         positions = dict(self._visual_slot_positions)
@@ -5508,6 +5547,11 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 or not 0 <= target < self._visible_rows * self._visible_cols):
             return False
         other = next((index for index, position in positions.items() if position == target), None)
+        source_widget = next((widget for widget in self.buttons if widget.slot_index == slot_index), None)
+        target_widget = next((widget for widget in [*self.buttons, *self._layout_placeholders]
+                              if widget.property("deck_layout_position") == target), None)
+        if source_widget is None or target_widget is None:
+            return False
         positions[slot_index] = target
         if other is not None:
             positions[other] = source
@@ -5518,10 +5562,28 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             layout["axis_span"] = panel.rows if panel.edge in {"left", "right"} else panel.cols
         preset.setdefault("slot_layouts", {})[self._slot_layout_scope()] = layout
         self._visual_slot_positions = positions
-        self._save_config()
-        # Do not delete/rebuild the source widget inside its release handler.
-        QtCore.QTimer.singleShot(0, self.refresh_slots)
+        # Reuse buttons and decoded/scaled icons; keep action IDs, hotkeys and
+        # signal connections intact. A blank placeholder trades places too.
+        panel = self._edge_panel_layout
+        for widget in (source_widget, target_widget):
+            self.grid_layout.removeWidget(widget)
+        for widget, position in ((source_widget, target), (target_widget, source)):
+            widget.setProperty("deck_layout_position", position)
+            row, col = panel.cell(position) if panel else divmod(position, self._visible_cols)
+            self.grid_layout.addWidget(widget, row, col)
+        self.grid_layout.invalidate()
+        self.grid_layout.activate()
+        self._layout_save_timer.start(350)
         return True
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key_Escape and self._layout_drag is not None:
+            self._layout_drag = None
+            self.layout_drag_preview.clear()
+            self.layout_drop_marker.hide()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -5541,12 +5603,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         central = self.centralWidget()
         if badge is None or central is None:
             return
-        button = getattr(self, "layout_edit_button", None)
         y = max(0, central.height() - DECK_FOOTER_HEIGHT)
-        if button:
-            button.move(0, y)
-            button.raise_()
-        badge.move((button.width() + 4) if button else 2, y)
+        badge.move(0, y)
         badge.raise_()
 
     def _update_preset_badge(self) -> None:
@@ -5557,7 +5615,6 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._ensure_slot_presets()
         preset_id = str(self.config.get("active_slot_preset") or "default")
         preset = dict(self.config["slot_presets"].get(preset_id) or {})
-        icon, color = preset_visual(preset_id, preset)
         name = str(preset.get("name") or preset_id)
         if self.config.get("auto_preset_pinned"):
             suffix = " · 고정"
@@ -5565,40 +5622,46 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             suffix = " · 연결 오류"
         else:
             suffix = (" · 고정" if self.config.get("auto_preset_manual_lock") else " · 자동") if self.config.get("auto_preset_enabled") else " · 고정"
-        full_text = f"⚠ {self._browser_action_notice}" if self._browser_action_notice else f"{name}{suffix}"
-        # Reserve the left control and right resize grip. Narrow edge strips
-        # show only the preset glyph; the popup always shows the full name.
-        width_limit = max(0, self.width() - 56)
+        full_text = f"{name} · 완료" if self._slot_layout_editing else f"{name}{suffix}"
+        # The name owns the former settings-icon space. Docked panels have
+        # no resize grip, so their whole footer is available for the name.
+        width_limit = max(24, self.width() - (4 if self._edge_panel_enabled() else 26))
         font = badge.font()
-        font.setPointSize(8)
+        font.setPixelSize(min(14, max(11, round(8 * self.logicalDpiY() / 72))))
         font.setBold(False)
-        badge.setFont(font)
         metrics = QtGui.QFontMetrics(font)
-        display_text = ("" if width_limit < 72 else
-                        metrics.elidedText(full_text, QtCore.Qt.ElideRight, width_limit - 4))
-        badge.setIcon(preset_identity_icon(name, color) if width_limit < 72 else QtGui.QIcon())
-        badge.setIconSize(QtCore.QSize(18, 18))
-        badge.setText(display_text)
-        badge.setVisible(width_limit >= 18)
-        badge.setToolTip(
-            f"현재 프리셋: {name}{suffix} · 눌러서 설정 메뉴 열기" +
-            (" · 드래그하여 다른 화면 가장자리로 이동" if self._edge_panel_enabled() else "") +
-            (f" · {self._browser_action_notice}" if self._browser_action_notice else "") +
-            (f" · 브라우저 연결 실패: {self._browser_bridge_error}" if suffix == " · 연결 오류" else
-             " (퀵액션에서 자동으로 전환할 때까지 고정)" if self.config.get("auto_preset_pinned") else
-             " (수동 선택 중)" if suffix == " · 고정" else "")
-        )
-        badge.setFixedWidth(min(width_limit, 22 if width_limit < 72 else metrics.horizontalAdvance(display_text) + 4))
+        while font.pixelSize() > 10 and metrics.height() > DECK_FOOTER_HEIGHT - 6:
+            font.setPixelSize(font.pixelSize() - 1)
+            metrics = QtGui.QFontMetrics(font)
+        available = width_limit - 8
+        display_text = full_text
+        if metrics.horizontalAdvance(full_text) > available:
+            # Preserve the complete preset name before showing the state.
+            display_text = name
+            while font.pixelSize() > 10 and metrics.horizontalAdvance(name) > available:
+                font.setPixelSize(font.pixelSize() - 1)
+                metrics = QtGui.QFontMetrics(font)
+            display_text = metrics.elidedText(name, QtCore.Qt.ElideRight, available)
+            if self._slot_layout_editing:
+                display_text = "완료"
+        badge.setFont(font)
+        # QSS font declarations beat QWidget.setFont(). Override the global
+        # QToolButton 9pt/600 rule with the same font used for sizing / paint.
         badge.setStyleSheet(
-            "QPushButton#PresetBadge { color: #AEB7C5; background: transparent; "
-            "border: none; padding: 0; text-align: left; } "
-            f"QPushButton#PresetBadge:hover {{ background: rgba(38, 49, 70, 235); }}"
-        )
+            f"QToolButton#SlotLayoutToggle {{ background: transparent; border: none; padding: 0; "
+            f"font-size: {font.pixelSize()}px; font-weight: 400; }}"
+            "QToolButton#SlotLayoutToggle:hover { background: rgba(56,189,248,30); border-radius: 6px; }")
+        badge.setIcon(QtGui.QIcon())
+        badge.setText(display_text)
+        badge.show()
+        badge.setFixedWidth(min(width_limit, metrics.horizontalAdvance(display_text) + 8))
         button = getattr(self, "layout_edit_button", None)
         if button:
             button.setToolTip(" 배치 편집 완료 · 변경은 자동 저장됩니다." if self._slot_layout_editing else
                               f"현재 프리셋: {name}{suffix}\n눌러서 설정 · 드래그하여 " +
-                              ("패널 이동" if self._edge_panel_enabled() else "아래 여백 조절"))
+                              ("패널 이동" if self._edge_panel_enabled() else "아래 여백 조절") +
+                              (f"\n{self._browser_action_notice}" if self._browser_action_notice else "") +
+                              (f"\n브라우저 연결 실패: {self._browser_bridge_error}" if suffix == " · 연결 오류" else ""))
         popup = getattr(self, "controls_popup", None)
         if popup:
             popup.set_preset(name, bool(self.config.get("auto_preset_pinned") or not self.config.get("auto_preset_enabled")))
@@ -6351,6 +6414,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         return True
 
     def refresh_slots(self) -> None:
+        self._layout_drag = None
+        self.layout_drag_preview.clear()
         self._set_edge_panel_container()
         gap = int(self.config.get("tile_gap", 10))
         self.grid_layout.setSpacing(gap)
@@ -7379,6 +7444,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             self.repository.release_macro_process(proc)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.layout_drag_preview.clear()
         self.controls_popup.hide()
         self._auto_config_save.stop()
         if self._browser_bridge is not None:
@@ -7387,6 +7453,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.stop_all_macros()
         self._capture_active_slot_preset()
         self._save_config()
+        if self._layout_config_writer is not None:
+            self._layout_config_writer.close()
+            self._layout_config_writer = None
         super().closeEvent(event)
 
 

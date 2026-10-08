@@ -142,7 +142,7 @@ class DeckPanelControlsTests(unittest.TestCase):
             self.assertEqual(tile_size, window.buttons[0].size())
             window.close()
 
-    def test_narrow_footer_and_popup_use_compact_preset_identity(self):
+    def test_narrow_footer_prioritizes_name_and_popup_shows_full_identity(self):
         from PySide6 import QtCore
         with tempfile.TemporaryDirectory() as root:
             window = self.make_window(root)
@@ -151,10 +151,11 @@ class DeckPanelControlsTests(unittest.TestCase):
             window._set_edge_panel_mode("left")
             window.show()
             self.app.processEvents()
-            self.assertLessEqual(window.preset_badge.width(), 30)
+            self.assertLessEqual(window.preset_badge.width(), window.width() - 4)
+            self.assertTrue(window.preset_badge.icon().isNull())
             self.assertIn("아주 긴 프리셋 이름", window.layout_edit_button.toolTip())
             self.assertTrue(window.centralWidget().rect().contains(window.preset_badge.geometry()))
-            self.assertFalse(window.preset_badge.geometry().intersects(window.layout_edit_button.geometry()))
+            self.assertIs(window.preset_badge, window.layout_edit_button)
             screen = mock.Mock()
             screen.availableGeometry.return_value = QtCore.QRect(-640, 24, 320, 280)
             with mock.patch("macro_studio.deck_controls.QtGui.QGuiApplication.screenAt", return_value=screen):
@@ -162,6 +163,39 @@ class DeckPanelControlsTests(unittest.TestCase):
                 self.assertTrue(screen.availableGeometry().contains(window.controls_popup.geometry()))
             self.assertEqual("아주 긴 프리셋 이름", window.controls_popup.title_label.text())
             window.close()
+
+    def test_text_only_footer_fits_trading_name_without_icon_or_vertical_clipping(self):
+        from PySide6 import QtCore, QtGui, QtTest, QtWidgets
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window._save_preset_hotkeys({"slots": [{"macro": "슬롯"}]})
+            window.config["slot_presets"]["default"]["name"] = "trading"
+            window._set_edge_panel_mode("left")
+            window.show()
+            self.app.processEvents()
+            for dpi in (96, 144, 192):
+                with mock.patch.object(window, "logicalDpiY", return_value=dpi):
+                    window._update_preset_badge()
+                label = window.preset_badge
+                self.assertIn("trading", label.text())
+                self.assertNotIn("…", label.text())
+                self.assertTrue(label.icon().isNull())
+                metrics = QtGui.QFontMetrics(label.font())
+                self.assertLessEqual(metrics.height(), label.height() - 6)
+                self.assertLessEqual(metrics.horizontalAdvance(label.text()), label.width() - 8)
+            # Global Studio button padding must not clip the custom text paint.
+            old_style = self.app.styleSheet()
+            try:
+                self.app.setStyleSheet("QToolButton { padding: 12px; }")
+                window._update_preset_badge()
+                QtTest.QTest.mouseClick(window.preset_badge, QtCore.Qt.LeftButton)
+                self.assertTrue(window.controls_popup.isVisible())
+                self.assertEqual("trading", window.controls_popup.title_label.text())
+                self.assertIs(window.preset_badge, window.bottom_padding_grip)
+                self.assertEqual(1, len(window.centralWidget().findChildren(QtWidgets.QToolButton)))
+            finally:
+                window.close()
+                self.app.setStyleSheet(old_style)
 
     def test_layout_edit_icon_drag_swaps_and_moves_into_blank_cells_without_running(self):
         from PySide6 import QtCore, QtTest
@@ -183,7 +217,8 @@ class DeckPanelControlsTests(unittest.TestCase):
                     QtTest.QTest.mouseClick(window.controls_popup.buttons["layout"], QtCore.Qt.LeftButton)
                     self.app.processEvents()
                     self.assertTrue(window._slot_layout_editing)
-                    self.assertEqual("", window.layout_edit_button.text())
+                    self.assertTrue(window.layout_edit_button.text())
+                    self.assertTrue(window.layout_edit_button.icon().isNull())
                     origin = window.pos()
                     source, target = window.buttons[0], window.buttons[2]
                     self.send_drag(source, target.mapToGlobal(target.rect().center()))
@@ -254,6 +289,88 @@ class DeckPanelControlsTests(unittest.TestCase):
             self.assertEqual(QtCore.QSize(68, 68), restored.buttons[0].size())
             restored.close()
 
+    def test_consecutive_drops_reuse_widgets_and_defer_disk_writes(self):
+        from PySide6 import QtCore
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window._save_preset_hotkeys({"slots": [{"macro": str(i)} for i in range(5)]})
+            window.show()
+            for side in ("free", "left", "right", "top", "bottom"):
+                window._set_edge_panel_mode(side)
+                window._set_slot_layout_editing(True)
+                self.app.processEvents()
+                widgets = tuple(window.buttons)
+                blanks = tuple(window._layout_placeholders)
+                with mock.patch.object(window, "refresh_slots") as refresh, mock.patch.object(window, "_save_config") as save:
+                    for _ in range(12):
+                        source = widgets[0]
+                        target = widgets[1]
+                        self.send_drag(source, target.mapToGlobal(target.rect().center()))
+                        self.assertIs(source, window.buttons[0])
+                        self.assertEqual(window._visual_slot_positions[0], source.property("deck_layout_position"))
+                    blank = blanks[0]
+                    self.send_drag(source, blank.mapToGlobal(blank.rect().center()))
+                    self.assertEqual(tuple(window.buttons), widgets)
+                    self.assertEqual(tuple(window._layout_placeholders), blanks)
+                    self.assertEqual(QtCore.QSize(68, 68), source.size())
+                    self.assertTrue(window._layout_save_timer.isActive())
+                    refresh.assert_not_called()
+                    save.assert_not_called()
+                window._set_slot_layout_editing(False)
+            window.close()
+
+    def test_drag_preview_swap_gap_escape_and_landing_are_mouse_transparent(self):
+        from PySide6 import QtCore, QtGui, QtTest, QtWidgets
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window._save_preset_hotkeys({"slots": [{"macro": "첫째"}, {"macro": "둘째"}]})
+            window.show()
+            window._set_slot_layout_editing(True)
+            self.app.processEvents()
+            source, target = window.buttons[:2]
+            original = dict(window._visual_slot_positions)
+            QtTest.QTest.mousePress(source, QtCore.Qt.LeftButton, pos=source.rect().center())
+            point = target.mapToGlobal(target.rect().center())
+            QtWidgets.QApplication.sendEvent(source, QtGui.QMouseEvent(
+                QtCore.QEvent.MouseMove, QtCore.QPointF(source.mapFromGlobal(point)), QtCore.QPointF(point),
+                QtCore.Qt.NoButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+            preview = window.layout_drag_preview
+            self.assertTrue(preview.isVisible())
+            self.assertTrue(preview.testAttribute(QtCore.Qt.WA_TransparentForMouseEvents))
+            self.assertFalse(preview.pixmap.isNull())
+            self.assertFalse(preview.swap_pixmap.isNull())
+            self.assertEqual(target.geometry(), preview.target)
+            self.assertEqual(source.geometry(), preview.swap)
+            # Half-gap hit slop accepts small imprecision without extra Qt lookups.
+            gap_point = target.geometry().topLeft() - QtCore.QPoint(2, 0)
+            self.assertEqual(1, window._layout_target_at(window._layout_drag, gap_point))
+            QtTest.QTest.keyClick(window, QtCore.Qt.Key_Escape)
+            QtTest.QTest.mouseRelease(source, QtCore.Qt.LeftButton)
+            self.assertFalse(preview.isVisible())
+            self.assertEqual(original, window._visual_slot_positions)
+            self.send_drag(source, target.mapToGlobal(target.rect().center()))
+            self.assertTrue(preview.landing)
+            self.assertEqual(120, preview.animation.duration())
+            QtTest.QTest.qWait(150)
+            self.assertFalse(preview.isVisible())
+            window.close()
+
+    def test_pending_layout_save_cannot_overwrite_a_restored_backup(self):
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window._save_preset_hotkeys({"slots": [{"macro": "슬롯"}]})
+            window.refresh_slots()
+            payload = window.build_deck_backup_payload()
+            window._set_slot_layout_editing(True)
+            window._place_visual_slot(window.buttons[0].slot_index, window._layout_placeholders[0].property("deck_layout_position"))
+            with mock.patch("macro_studio.deck_config_writer.write_deck_config") as write:
+                window._save_layout_config()
+                window.restore_deck_backup_payload(payload)
+                self.assertIsNone(window._layout_config_writer)
+                self.assertFalse(window._layout_save_timer.isActive())
+                write.assert_called()
+            window.close()
+
     def test_layout_drop_outside_and_tap_do_not_reorder_and_footer_button_is_visible(self):
         from PySide6 import QtCore, QtTest
         with tempfile.TemporaryDirectory() as root:
@@ -263,7 +380,7 @@ class DeckPanelControlsTests(unittest.TestCase):
             window.show()
             self.app.processEvents()
             self.assertTrue(window.centralWidget().rect().contains(window.layout_edit_button.geometry()))
-            self.assertFalse(window.preset_badge.geometry().intersects(window.layout_edit_button.geometry()))
+            self.assertIs(window.preset_badge, window.layout_edit_button)
             window._set_slot_layout_editing(True)
             original_position = window.pos()
             self.send_drag(window.swipe_container,

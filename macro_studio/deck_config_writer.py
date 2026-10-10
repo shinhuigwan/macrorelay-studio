@@ -25,6 +25,7 @@ class DeckConfigWriter:
         self.pending = self.executor.submit(write_deck_config, path, snapshot)
         if wait:
             self.pending.result()
+        return self.pending
 
     def close(self):
         self.executor.shutdown(wait=True)

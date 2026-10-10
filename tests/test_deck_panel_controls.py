@@ -371,6 +371,114 @@ class DeckPanelControlsTests(unittest.TestCase):
                 write.assert_called()
             window.close()
 
+    def test_layout_keyboard_undo_redo_in_all_scopes_preserves_actions(self):
+        from PySide6 import QtCore, QtTest
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            slots = [{"macro": str(i), "action": {"kind": "text", "text": str(i)}} for i in range(3)]
+            window._save_preset_hotkeys({"slots": slots})
+            window.custom_icons = {str(i): {"icon_text": str(i)} for i in range(3)}
+            icons = dict(window.custom_icons)
+            window.show()
+            for side in ("free", "left", "right", "top", "bottom"):
+                window._set_edge_panel_mode(side)
+                window._set_slot_layout_editing(True)
+                window.activateWindow()
+                QtTest.QTest.qWait(20)
+                original = dict(window._visual_slot_positions)
+                widgets = tuple(window.buttons)
+                window._place_visual_slot(0, window._visual_slot_positions[1])
+                swapped = dict(window._visual_slot_positions)
+                blank = window._layout_placeholders[0].property("deck_layout_position")
+                window._place_visual_slot(0, blank)
+                moved = dict(window._visual_slot_positions)
+                QtTest.QTest.keyClick(window, QtCore.Qt.Key_Z, QtCore.Qt.ControlModifier)
+                self.assertEqual(swapped, window._visual_slot_positions)
+                QtTest.QTest.keyClick(window, QtCore.Qt.Key_Z, QtCore.Qt.ControlModifier)
+                self.assertEqual(original, window._visual_slot_positions)
+                QtTest.QTest.keyClick(window, QtCore.Qt.Key_Z, QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+                self.assertEqual(swapped, window._visual_slot_positions)
+                QtTest.QTest.keyClick(window, QtCore.Qt.Key_Z, QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+                self.assertEqual(moved, window._visual_slot_positions)
+                self.assertEqual(widgets, tuple(window.buttons))
+                self.assertEqual(slots, window.repository.load_hotkeys()["slots"])
+                self.assertEqual(icons, window.custom_icons)
+                window._set_slot_layout_editing(False)
+                window._undo_slot_layout()
+                self.assertEqual(moved, window._visual_slot_positions)
+            window.close()
+
+    def test_save_failure_is_visible_retry_is_bounded_and_newer_edits_win(self):
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window.show()
+            saved_file = window.config_path.read_bytes()
+            with mock.patch("macro_studio.quickslot_deck.write_deck_config", side_effect=OSError("disk full")):
+                self.assertFalse(window._save_config())
+                self.assertEqual("failed", window._config_save_state)
+                self.assertIn("저장 실패", window.preset_badge.text())
+                self.assertIn("disk full", window.preset_badge.toolTip())
+                self.assertTrue(window._config_retry_timer.isActive())
+                self.assertEqual(saved_file, window.config_path.read_bytes())
+                with self.assertRaises(OSError):
+                    window.build_deck_backup_payload()
+            revision = window._config_save_revision
+            for _ in range(3):
+                window._config_retry_timer.stop()
+                window._on_config_write_finished(revision, "disk full")
+            self.assertEqual(3, window._config_retry_count)
+            self.assertFalse(window._config_retry_timer.isActive())
+            window._queue_layout_save()
+            window._on_config_write_finished(revision, "")
+            self.assertNotEqual("saved", window._config_save_state)
+            self.assertTrue(window._save_config())
+            self.assertEqual("saved", window._config_save_state)
+            self.assertIn("저장됨", window.preset_badge.text())
+            window._clear_config_save_status()
+            self.assertNotIn("저장됨", window.preset_badge.text())
+            window.close()
+
+    def test_async_error_is_reported_and_retry_saves_latest_config(self):
+        from PySide6 import QtCore, QtTest
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window.show()
+            def wait_until(predicate):
+                for _ in range(100):
+                    self.app.processEvents()
+                    if predicate():
+                        return
+                    QtTest.QTest.qWait(10)
+                self.fail("Save result was not delivered to the GUI thread")
+            window._queue_layout_save()
+            window._layout_save_timer.stop()
+            with mock.patch("macro_studio.deck_config_writer.write_deck_config", side_effect=OSError("denied")):
+                window._save_layout_config()
+                wait_until(lambda: window._config_save_state == "failed")
+            self.assertTrue(window._config_retry_timer.isActive())
+            window._config_retry_timer.stop()
+            window.config["test_latest_value"] = "newest"
+            window._save_layout_config()
+            wait_until(lambda: window._config_save_state == "saved")
+            config = json.loads(window.config_path.read_text(encoding="utf-8"))
+            self.assertEqual("newest", config["config"]["test_latest_value"])
+            self.assertFalse(window._config_retry_timer.isActive())
+            window.close()
+
+    def test_failed_close_keeps_window_and_macros_alive_until_saved(self):
+        with tempfile.TemporaryDirectory() as root:
+            window = self.make_window(root)
+            window.show()
+            with mock.patch("macro_studio.quickslot_deck.write_deck_config", side_effect=OSError("disk full")), \
+                    mock.patch("PySide6.QtWidgets.QMessageBox.warning") as warning, \
+                    mock.patch.object(window, "stop_all_macros") as stop:
+                self.assertFalse(window.close())
+                self.assertTrue(window.isVisible())
+                self.assertEqual(1, window._config_retry_count)
+                warning.assert_called_once()
+                stop.assert_not_called()
+            self.assertTrue(window.close())
+
     def test_layout_drop_outside_and_tap_do_not_reorder_and_footer_button_is_visible(self):
         from PySide6 import QtCore, QtTest
         with tempfile.TemporaryDirectory() as root:

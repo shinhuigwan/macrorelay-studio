@@ -50,6 +50,8 @@ from macro_studio.repository import MacroRepository
 from macro_studio.deck_controls import DECK_FOOTER_HEIGHT, DeckControlsPopup
 from macro_studio.deck_config_writer import DeckConfigWriter, write_deck_config
 from macro_studio.deck_layout_drag import SlotDragPreview
+from macro_studio.deck_layout_history import LayoutHistory
+from macro_studio.deck_instance import DeckSingleInstance
 from macro_studio.deck_edge_panel import (
     EDGE_PANEL_SIDES, EDGE_PANEL_MIN_TILE, EDGE_PANEL_MAX_TILE,
     DeckLayoutEditButton, EdgePanelSizeDialog, draw_edge_direction, edge_panel_layout,
@@ -4128,7 +4130,9 @@ class DeckFooterControl(DeckLayoutEditButton):
             painter.setBrush(QtGui.QColor(56, 189, 248, 25))
             painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 5, 5)
         painter.setFont(self.font())
-        painter.setPen(QtGui.QColor("#6EE7B7" if self.isChecked() else "#BEC7D5"))
+        color = "#FB923C" if self.deck._config_save_state == "failed" else (
+            "#6EE7B7" if self.isChecked() or self.deck._config_save_state == "saved" else "#BEC7D5")
+        painter.setPen(QtGui.QColor(color))
         painter.drawText(self.rect().adjusted(4, 3, -4, -3),
                          QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter | QtCore.Qt.TextSingleLine,
                          self.text())
@@ -4185,6 +4189,7 @@ class DeckFooterControl(DeckLayoutEditButton):
 
 class QuickSlotDeckWindow(QtWidgets.QMainWindow):
     """Stream Deck Style Standalone QuickSlot Window with full fill and text position controls."""
+    config_write_finished = QtCore.Signal(int, str)
 
     def __init__(self, repository: Optional[MacroRepository] = None, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
@@ -4201,6 +4206,20 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self._layout_placeholders = []
         self._visual_slot_positions = {}
         self._layout_config_writer = None
+        self._layout_history = LayoutHistory()
+        self._config_save_revision = 0
+        self._config_save_state = ""
+        self._config_save_error = ""
+        self._config_retry_count = 0
+        self._config_closing = False
+        self._config_save_announcements = False
+        self.config_write_finished.connect(self._on_config_write_finished, QtCore.Qt.QueuedConnection)
+        self._config_status_timer = QtCore.QTimer(self)
+        self._config_status_timer.setSingleShot(True)
+        self._config_status_timer.timeout.connect(self._clear_config_save_status)
+        self._config_retry_timer = QtCore.QTimer(self)
+        self._config_retry_timer.setSingleShot(True)
+        self._config_retry_timer.timeout.connect(self._save_layout_config)
         self._layout_save_timer = QtCore.QTimer(self)
         self._layout_save_timer.setSingleShot(True)
         self._layout_save_timer.timeout.connect(self._save_layout_config)
@@ -4332,6 +4351,12 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 or migrated_home_tiles or repaired_tetris_mix or migrated_youtube_home or stale_manual_lock):
             self._save_config()
 
+        self._config_save_announcements = True
+        self._layout_undo_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
+        self._layout_undo_shortcut.activated.connect(self._undo_slot_layout)
+        self._layout_redo_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+Z"), self)
+        self._layout_redo_shortcut.activated.connect(self._redo_slot_layout)
+
     def _upgrade_quick_actions(self) -> bool:
         if self.config.get("quick_action_controls_version"):
             return False
@@ -4417,16 +4442,59 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-    def _save_config(self) -> None:
+    def _save_config(self) -> bool:
         self._layout_save_timer.stop()
+        self._config_retry_timer.stop()
+        self._config_save_revision += 1
+        self._config_retry_count = 0
+        revision = self._config_save_revision
+        self._set_config_save_status("saving")
         try:
             data = self._config_snapshot()
             if self._layout_config_writer is None:
                 write_deck_config(self.config_path, data)
             else:
                 self._layout_config_writer.save(self.config_path, data, wait=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._on_config_write_finished(revision, str(exc) or type(exc).__name__)
+            return False
+        self._on_config_write_finished(revision, "")
+        return True
+
+    def _set_config_save_status(self, state: str) -> None:
+        self._config_status_timer.stop()
+        self._config_save_state = state if self._config_save_announcements or state == "failed" else ""
+        self._update_preset_badge()
+
+    def _clear_config_save_status(self) -> None:
+        if self._config_save_state != "saved":
+            return
+        self._config_save_state = ""
+        self._update_preset_badge()
+
+    def _on_config_write_finished(self, revision: int, error: str) -> None:
+        if revision != self._config_save_revision:
+            return  # An older save must not mark a newer edit as saved.
+        self._config_save_error = error
+        if error:
+            self._set_config_save_status("failed")
+            if not self._config_closing and self._config_retry_count < 3:
+                self._config_retry_count += 1
+                self._config_retry_timer.start(1000 * self._config_retry_count)
+        else:
+            self._config_retry_timer.stop()
+            self._config_retry_count = 0
+            self._set_config_save_status("saved")
+            self._config_status_timer.start(2000)
+
+    def _queue_layout_save(self) -> None:
+        self._config_save_revision += 1
+        self._config_retry_count = 0
+        self._config_retry_timer.stop()
+        self._config_status_timer.stop()
+        self._config_save_state = ""
+        self._update_preset_badge()
+        self._layout_save_timer.start(350)
 
     def _config_snapshot(self) -> Dict[str, Any]:
         # Strings (including embedded image data) are immutable and reused by
@@ -4445,14 +4513,27 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         if self._layout_drag is not None:
             self._layout_save_timer.start(350)
             return
-        if self._layout_config_writer is None:
-            self._layout_config_writer = DeckConfigWriter()
-        self._layout_config_writer.save(self.config_path, self._config_snapshot())
+        revision = self._config_save_revision
+        self._set_config_save_status("saving")
+        try:
+            if self._layout_config_writer is None:
+                self._layout_config_writer = DeckConfigWriter()
+            future = self._layout_config_writer.save(self.config_path, self._config_snapshot())
+        except Exception as exc:
+            self._on_config_write_finished(revision, str(exc) or type(exc).__name__)
+            return
+        def report(completed):
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            self.config_write_finished.emit(revision, (str(error) or type(error).__name__) if error is not None else "")
+        future.add_done_callback(report)
 
     def build_deck_backup_payload(self) -> Dict[str, Any]:
         """Return a portable backup containing both visuals and executable slots."""
         self._capture_active_slot_preset()
-        self._save_config()
+        if not self._save_config():
+            raise OSError(f"최신 설정 저장에 실패하여 백업을 중단했습니다: {self._config_save_error}")
         deck_config = json.loads(self.config_path.read_text(encoding="utf-8"))
         deck_config.get("config", {}).pop("auto_preset_token", None)
         # The active preset already owns an identical icon set. Avoid storing
@@ -4577,6 +4658,8 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
         # Stop delayed edits and drain the old snapshot before replacing config.
         self._layout_save_timer.stop()
+        self._config_retry_timer.stop()
+        self._config_save_revision += 1
         if self._layout_config_writer is not None:
             self._layout_config_writer.close()
             self._layout_config_writer = None
@@ -5555,26 +5638,57 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         positions[slot_index] = target
         if other is not None:
             positions[other] = source
+        before = dict(self._visual_slot_positions)
+        if not self._apply_visual_positions(positions):
+            return False
+        self._layout_history.record(before, positions)
+        return True
+
+    def _apply_visual_positions(self, positions: Dict[int, int]) -> bool:
+        cells = self._visible_rows * self._visible_cols
+        if (not self._slot_layout_editing or positions.keys() != self._visual_slot_positions.keys()
+                or len(set(positions.values())) != len(positions)
+                or any(not isinstance(value, int) or not 0 <= value < cells for value in positions.values())):
+            return False
         preset = self.config["slot_presets"][str(self.config.get("active_slot_preset") or "default")]
         layout = {"positions": {str(index): position for index, position in positions.items()}}
         if self._edge_panel_enabled():
             panel = self._edge_panel_layout
             layout["axis_span"] = panel.rows if panel.edge in {"left", "right"} else panel.cols
         preset.setdefault("slot_layouts", {})[self._slot_layout_scope()] = layout
-        self._visual_slot_positions = positions
+        self._visual_slot_positions = dict(positions)
         # Reuse buttons and decoded/scaled icons; keep action IDs, hotkeys and
         # signal connections intact. A blank placeholder trades places too.
         panel = self._edge_panel_layout
-        for widget in (source_widget, target_widget):
+        widgets = [*self.buttons, *self._layout_placeholders]
+        for widget in widgets:
             self.grid_layout.removeWidget(widget)
-        for widget, position in ((source_widget, target), (target_widget, source)):
+        blanks = iter(sorted(set(range(cells)) - set(positions.values())))
+        for widget in widgets:
+            position = positions[widget.slot_index] if isinstance(widget, StreamDeckButton) else next(blanks)
             widget.setProperty("deck_layout_position", position)
             row, col = panel.cell(position) if panel else divmod(position, self._visible_cols)
             self.grid_layout.addWidget(widget, row, col)
         self.grid_layout.invalidate()
         self.grid_layout.activate()
-        self._layout_save_timer.start(350)
+        self._queue_layout_save()
         return True
+
+    def _undo_slot_layout(self) -> None:
+        self._restore_layout_history(redo=False)
+
+    def _redo_slot_layout(self) -> None:
+        self._restore_layout_history(redo=True)
+
+    def _restore_layout_history(self, *, redo: bool) -> None:
+        if not self._slot_layout_editing:
+            return
+        self._layout_drag = None
+        self.layout_drag_preview.clear()
+        self.layout_drop_marker.hide()
+        positions = (self._layout_history.redo if redo else self._layout_history.undo)(self._visual_slot_positions)
+        if positions is not None and not self._apply_visual_positions(positions):
+            self._layout_history.clear()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() == QtCore.Qt.Key_Escape and self._layout_drag is not None:
@@ -5623,6 +5737,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         else:
             suffix = (" · 고정" if self.config.get("auto_preset_manual_lock") else " · 자동") if self.config.get("auto_preset_enabled") else " · 고정"
         full_text = f"{name} · 완료" if self._slot_layout_editing else f"{name}{suffix}"
+        save_text = {"saving": "저장 중", "saved": "저장됨", "failed": "저장 실패"}.get(self._config_save_state, "")
+        if save_text:
+            full_text = f"{name} · {save_text}"
         # The name owns the former settings-icon space. Docked panels have
         # no resize grip, so their whole footer is available for the name.
         width_limit = max(24, self.width() - (4 if self._edge_panel_enabled() else 26))
@@ -5642,7 +5759,9 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                 font.setPixelSize(font.pixelSize() - 1)
                 metrics = QtGui.QFontMetrics(font)
             display_text = metrics.elidedText(name, QtCore.Qt.ElideRight, available)
-            if self._slot_layout_editing:
+            if save_text:
+                display_text = metrics.elidedText(save_text, QtCore.Qt.ElideRight, available)
+            elif self._slot_layout_editing:
                 display_text = "완료"
         badge.setFont(font)
         # QSS font declarations beat QWidget.setFont(). Override the global
@@ -5662,6 +5781,13 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
                               ("패널 이동" if self._edge_panel_enabled() else "아래 여백 조절") +
                               (f"\n{self._browser_action_notice}" if self._browser_action_notice else "") +
                               (f"\n브라우저 연결 실패: {self._browser_bridge_error}" if suffix == " · 연결 오류" else ""))
+            if self._slot_layout_editing:
+                button.setToolTip(f"현재 프리셋: {name}\n배치 편집 완료 · Ctrl+Z 되돌리기 / Ctrl+Shift+Z 다시 적용")
+            if save_text:
+                button.setToolTip(button.toolTip() + f"\n{save_text}" +
+                                  (f": {self._config_save_error}\n자동 재시도 최대 3회 · 변경 내용은 창에 유지됩니다."
+                                   if self._config_save_state == "failed" else ""))
+            button.update()
         popup = getattr(self, "controls_popup", None)
         if popup:
             popup.set_preset(name, bool(self.config.get("auto_preset_pinned") or not self.config.get("auto_preset_enabled")))
@@ -6415,6 +6541,7 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
     def refresh_slots(self) -> None:
         self._layout_drag = None
+        self._layout_history.clear()
         self.layout_drag_preview.clear()
         self._set_edge_panel_container()
         gap = int(self.config.get("tile_gap", 10))
@@ -7447,12 +7574,22 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
         self.layout_drag_preview.clear()
         self.controls_popup.hide()
         self._auto_config_save.stop()
+        self._config_closing = True
+        self._capture_active_slot_preset()
+        if not self._save_config():
+            self._config_closing = False
+            event.ignore()
+            self._config_retry_count = 1
+            self._config_retry_timer.start(1000)
+            QtWidgets.QMessageBox.warning(self, "설정 저장 실패",
+                "변경 내용을 저장하지 못해 덕덱을 닫지 않았습니다.\n"
+                "폴더 권한과 디스크 여유 공간을 확인한 뒤 다시 종료해 주세요.\n\n" + self._config_save_error)
+            return
+        self._config_status_timer.stop()
         if self._browser_bridge is not None:
             self._browser_bridge.close()
             self._browser_bridge = None
         self.stop_all_macros()
-        self._capture_active_slot_preset()
-        self._save_config()
         if self._layout_config_writer is not None:
             self._layout_config_writer.close()
             self._layout_config_writer = None
@@ -7461,13 +7598,28 @@ class QuickSlotDeckWindow(QtWidgets.QMainWindow):
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
-    window = QuickSlotDeckWindow()
-    app.setWindowIcon(window.windowIcon())
-    if bool(window.config.get("start_minimized", False)):
-        window.showMinimized()
-    else:
-        window.show()
-    return app.exec()
+    configured = os.environ.get("MACRORELAY_HOME", "").strip() or os.environ.get("MACRO_STUDIO_HOME", "").strip()
+    root = Path(configured).expanduser() if configured else Path(__file__).resolve().parents[1]
+    try:
+        instance = DeckSingleInstance(root, app)
+    except OSError as exc:
+        QtWidgets.QMessageBox.warning(None, "덕덱 실행 실패", str(exc))
+        return 1
+    if not instance.acquire_or_notify():
+        if instance.error:
+            QtWidgets.QMessageBox.warning(None, "덕덱 실행 확인", instance.error)
+        return 1 if instance.error else 0
+    try:
+        window = QuickSlotDeckWindow()
+        app.setWindowIcon(window.windowIcon())
+        if bool(window.config.get("start_minimized", False)):
+            window.showMinimized()
+        else:
+            window.show()
+        instance.bind_window(window)
+        return app.exec()
+    finally:
+        instance.close()
 
 
 if __name__ == "__main__":
